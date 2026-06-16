@@ -1,4 +1,4 @@
-"""Forge Backend — B2B Lead Generation API for Apprend Technologies.
+"""Landline Backend — B2B Lead Generation API for Apprend Technologies.
 
 Main FastAPI application entry point. Wires up routers, middleware, and lifecycle events.
 """
@@ -26,16 +26,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
-    logger.info("Starting Forge API (%s)", settings.app_env)
+    logger.info("Starting Landline API (%s)", settings.app_env)
     yield
-    logger.info("Shutting down Forge API")
+    logger.info("Shutting down Landline API")
     # Close the database engine
     from app.database import engine
     await engine.dispose()
 
 
 app = FastAPI(
-    title="Forge — Lead Generation API",
+    title="Landline — Lead Generation API",
     description=(
         "B2B lead generation backend for Apprend Technologies. "
         "Discovers, scores, and engages manufacturing companies in the US and Canada."
@@ -77,7 +77,7 @@ async def health_check():
 async def root():
     """Root endpoint — API info."""
     return {
-        "name": "Forge Lead Generation API",
+        "name": "Landline Lead Generation API",
         "by": "Apprend Technologies",
         "docs": "/docs",
         "health": "/health",

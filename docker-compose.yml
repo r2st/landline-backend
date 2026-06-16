@@ -3,28 +3,28 @@ version: "3.9"
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: forge-postgres
+    container_name: landline-postgres
     environment:
-      POSTGRES_USER: forge
-      POSTGRES_PASSWORD: forge_secret
-      POSTGRES_DB: forge_db
+      POSTGRES_USER: landline
+      POSTGRES_PASSWORD: landline_secret
+      POSTGRES_DB: landline_db
     ports:
       - "5432:5432"
     volumes:
-      - forge_pgdata:/var/lib/postgresql/data
+      - landline_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U forge -d forge_db"]
+      test: ["CMD-SHELL", "pg_isready -U landline -d landline_db"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: forge-redis
+    container_name: landline-redis
     ports:
       - "6379:6379"
     volumes:
-      - forge_redis:/data
+      - landline_redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -32,5 +32,5 @@ services:
       retries: 5
 
 volumes:
-  forge_pgdata:
-  forge_redis:
+  landline_pgdata:
+  landline_redis:

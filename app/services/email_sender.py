@@ -42,7 +42,7 @@ class EmailSender:
             "\n\n---\n"
             "Apprend Technologies | Manufacturing Software Solutions\n"
             f"To unsubscribe, reply with 'UNSUBSCRIBE' or click: "
-            f"https://forge.apprendtechnologies.com/unsubscribe?email={contact_email}\n"
+            f"https://landline.apprendtechnologies.com/unsubscribe?email={contact_email}\n"
             "Apprend Technologies, 123 Innovation Drive, Suite 400, Toronto, ON M5V 1A1, Canada"
         )
 

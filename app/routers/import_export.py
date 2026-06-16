@@ -193,7 +193,7 @@ async def export_companies_csv(
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=forge_companies_export.csv"},
+        headers={"Content-Disposition": "attachment; filename=landline_companies_export.csv"},
     )
 
 
@@ -229,5 +229,5 @@ async def export_contacts_csv(
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=forge_contacts_export.csv"},
+        headers={"Content-Disposition": "attachment; filename=landline_contacts_export.csv"},
     )

@@ -1,8 +1,8 @@
-# Forge — B2B Lead Generation Backend
+# Landline — B2B Lead Generation Backend
 
 **By Apprend Technologies**
 
-Forge is a standalone B2B lead generation tool designed for Apprend Technologies to discover, score, and engage manufacturing companies in the United States and Canada. It automates the process of finding potential clients for Apprend's manufacturing software products (press operations, quality control, factory floor management).
+Landline is a standalone B2B lead generation tool designed for Apprend Technologies to discover, score, and engage manufacturing companies in the United States and Canada. It automates the process of finding potential clients for Apprend's manufacturing software products (press operations, quality control, factory floor management).
 
 ## Features
 
@@ -42,7 +42,7 @@ Forge is a standalone B2B lead generation tool designed for Apprend Technologies
 ### 1. Clone and Set Up
 
 ```bash
-cd forge-backend
+cd landline-backend
 python -m venv .venv
 source .venv/bin/activate    # Linux/Mac
 # .venv\Scripts\activate     # Windows
@@ -194,7 +194,7 @@ Tests use an in-memory SQLite database and do not require PostgreSQL or Redis.
 ## Project Structure
 
 ```
-forge-backend/
+landline-backend/
 ├── alembic/               # Database migrations
 ├── app/
 │   ├── main.py            # FastAPI application entry

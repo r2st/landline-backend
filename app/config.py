@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     # Database
-    database_url: str = "postgresql+asyncpg://forge:forge_secret@localhost:5432/forge_db"
+    database_url: str = "postgresql+asyncpg://landline:landline_secret@localhost:5432/landline_db"
 
     # Redis / Celery
     redis_url: str = "redis://localhost:6379/0"
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
-    ses_sender_email: str = "forge@apprendtechnologies.com"
+    ses_sender_email: str = "landline@apprendtechnologies.com"
 
     # Claude API
     anthropic_api_key: str = ""
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     census_api_key: str = ""
 
     # App
-    app_name: str = "Forge"
+    app_name: str = "Landline"
     app_env: str = "development"
     log_level: str = "INFO"
     api_prefix: str = "/api/v1"

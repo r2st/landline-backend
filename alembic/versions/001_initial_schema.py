@@ -1,4 +1,4 @@
-"""Initial schema — all tables for Forge lead generation.
+"""Initial schema — all tables for Landline lead generation.
 
 Revision ID: 001_initial
 Revises:
