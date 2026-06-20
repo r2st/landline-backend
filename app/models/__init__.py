@@ -8,6 +8,7 @@ from app.models.sequence import OutreachSequence, SequenceStep
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.interaction import Interaction
 from app.models.email_template import EmailTemplate, EmailSend
+from app.models.follow_up import FollowUp
 
 __all__ = [
     "Company",
@@ -21,4 +22,5 @@ __all__ = [
     "Interaction",
     "EmailTemplate",
     "EmailSend",
+    "FollowUp",
 ]

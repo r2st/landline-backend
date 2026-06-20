@@ -1,9 +1,10 @@
 """Dashboard metrics and analytics endpoints."""
 
 import logging
+from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select, case
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func, select, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -11,15 +12,23 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 from app.models.outreach import OutreachEvent
+from app.models.email_template import EmailSend
 from app.schemas.dashboard import (
+    ActivityItem,
     DashboardOverview,
+    EmailTrendPoint,
+    IndustryStat,
     OutreachMetrics,
     PipelineStageStat,
     ScoringDistribution,
+    TopLead,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+# Email sends that count as "delivered to the prospect" for the emails-sent metric.
+SENT_STATUSES = ("sent", "skipped")
 
 
 @router.get("/overview", response_model=DashboardOverview)
@@ -44,16 +53,26 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
     total_scored = row[0] or 0
     avg_fit_score = round(float(row[1]), 1) if row[1] else None
 
+    # Emails actually composed/sent (from the compose flow's send log).
+    result = await db.execute(
+        select(func.count(EmailSend.id)).where(EmailSend.status.in_(SENT_STATUSES))
+    )
+    emails_sent = result.scalar() or 0
+
+    # Leads added in the last 7 days.
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    result = await db.execute(
+        select(func.count(Company.id)).where(Company.created_at >= week_ago)
+    )
+    leads_this_week = result.scalar() or 0
+
     # Pipeline stages
     result = await db.execute(
         select(Company.stage, func.count(Company.id))
         .group_by(Company.stage)
         .order_by(func.count(Company.id).desc())
     )
-    pipeline = [
-        PipelineStageStat(stage=row[0], count=row[1])
-        for row in result.all()
-    ]
+    pipeline = [PipelineStageStat(stage=r[0], count=r[1]) for r in result.all()]
 
     # Outreach metrics
     outreach = await _get_outreach_metrics(db)
@@ -61,14 +80,20 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
     # Score distribution buckets
     score_dist = await _get_score_distribution(db)
 
+    # Industry breakdown
+    industry_breakdown = await _get_industry_breakdown(db)
+
     return DashboardOverview(
         total_companies=total_companies,
         total_contacts=total_contacts,
         total_scored=total_scored,
         avg_fit_score=avg_fit_score,
+        emails_sent=emails_sent,
+        leads_this_week=leads_this_week,
         pipeline=pipeline,
         outreach=outreach,
         score_distribution=score_dist,
+        industry_breakdown=industry_breakdown,
     )
 
 
@@ -87,6 +112,177 @@ async def get_pipeline_stats(db: AsyncSession = Depends(get_db)):
 async def get_outreach_stats(db: AsyncSession = Depends(get_db)):
     """Get outreach email performance metrics."""
     return await _get_outreach_metrics(db)
+
+
+@router.get("/industry", response_model=list[IndustryStat])
+async def get_industry_breakdown(
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the company count by industry segment (top N)."""
+    return await _get_industry_breakdown(db, limit=limit)
+
+
+@router.get("/top-leads", response_model=list[TopLead])
+async def get_top_leads(
+    limit: int = Query(5, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the highest-scoring companies (by latest rule-based fit score)."""
+    latest_score = (
+        select(
+            LeadScore.company_id,
+            func.max(LeadScore.scored_at).label("max_scored_at"),
+        )
+        .where(LeadScore.score_type == "rule_based")
+        .group_by(LeadScore.company_id)
+        .subquery()
+    )
+
+    query = (
+        select(
+            Company.id,
+            Company.name,
+            Company.stage,
+            Company.industry_segment,
+            LeadScore.fit_score,
+        )
+        .outerjoin(latest_score, Company.id == latest_score.c.company_id)
+        .outerjoin(
+            LeadScore,
+            and_(
+                LeadScore.company_id == Company.id,
+                LeadScore.scored_at == latest_score.c.max_scored_at,
+                LeadScore.score_type == "rule_based",
+            ),
+        )
+        .order_by(LeadScore.fit_score.desc().nullslast())
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    return [
+        TopLead(
+            id=r.id,
+            name=r.name,
+            stage=r.stage,
+            score=r.fit_score,
+            industry=r.industry_segment,
+        )
+        for r in result.all()
+    ]
+
+
+@router.get("/recent-activity", response_model=list[ActivityItem])
+async def get_recent_activity(
+    limit: int = Query(15, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a unified recent-activity feed across the data we track.
+
+    Combines: newly added companies and contacts, lead scores, and email
+    sends — sorted newest first. (Stage transitions are not audited, so they
+    are not included.)
+    """
+    activity: list[ActivityItem] = []
+
+    # Recently added companies
+    result = await db.execute(
+        select(Company).order_by(Company.created_at.desc()).limit(limit)
+    )
+    for c in result.scalars().all():
+        activity.append(ActivityItem(
+            id=f"company-{c.id}",
+            type="company_added",
+            description=f"{c.name} added to pipeline",
+            company_id=c.id,
+            created_at=c.created_at,
+        ))
+
+    # Recently added contacts
+    result = await db.execute(
+        select(Contact).order_by(Contact.created_at.desc()).limit(limit)
+    )
+    for ct in result.scalars().all():
+        name = ct.full_name
+        label = f" ({ct.title})" if ct.title else ""
+        activity.append(ActivityItem(
+            id=f"contact-{ct.id}",
+            type="contact_added",
+            description=f"Added {name}{label}",
+            company_id=ct.company_id,
+            contact_id=ct.id,
+            created_at=ct.created_at,
+        ))
+
+    # Recent lead scores
+    result = await db.execute(
+        select(LeadScore, Company.name)
+        .outerjoin(Company, Company.id == LeadScore.company_id)
+        .order_by(LeadScore.scored_at.desc())
+        .limit(limit)
+    )
+    for score, company_name in result.all():
+        activity.append(ActivityItem(
+            id=f"score-{score.id}",
+            type="lead_scored",
+            description=f"{company_name or 'Company'} scored {score.fit_score}",
+            company_id=score.company_id,
+            created_at=score.scored_at,
+        ))
+
+    # Recent email sends
+    result = await db.execute(
+        select(EmailSend).order_by(EmailSend.sent_at.desc()).limit(limit)
+    )
+    for send in result.scalars().all():
+        activity.append(ActivityItem(
+            id=f"send-{send.id}",
+            type="email_sent",
+            description=f"Email sent to {send.to_email or 'a contact'}",
+            contact_id=send.contact_id,
+            created_at=send.sent_at,
+        ))
+
+    activity.sort(key=lambda a: _aware(a.created_at), reverse=True)
+    return activity[:limit]
+
+
+@router.get("/email-trends", response_model=list[EmailTrendPoint])
+async def get_email_trends(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the number of emails sent per day over the last `days` days."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    day = func.date(EmailSend.sent_at)
+    result = await db.execute(
+        select(day.label("day"), func.count(EmailSend.id))
+        .where(EmailSend.sent_at >= since, EmailSend.status.in_(SENT_STATUSES))
+        .group_by(day)
+        .order_by(day)
+    )
+    return [EmailTrendPoint(date=str(r[0]), sent=r[1]) for r in result.all()]
+
+
+# --- Helpers ---
+
+def _aware(dt: datetime) -> datetime:
+    """Normalize a (possibly naive) datetime to aware UTC for safe sorting."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def _get_industry_breakdown(db: AsyncSession, limit: int = 10) -> list[IndustryStat]:
+    """Company count grouped by industry segment (non-null), top N."""
+    result = await db.execute(
+        select(Company.industry_segment, func.count(Company.id))
+        .where(Company.industry_segment.isnot(None))
+        .group_by(Company.industry_segment)
+        .order_by(func.count(Company.id).desc())
+        .limit(limit)
+    )
+    return [IndustryStat(industry=r[0], count=r[1]) for r in result.all()]
 
 
 async def _get_outreach_metrics(db: AsyncSession) -> OutreachMetrics:

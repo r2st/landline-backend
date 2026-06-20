@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.company import Company
+from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 from app.schemas.company import (
     CompanyCreate,
@@ -21,6 +22,50 @@ from app.schemas.company import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/companies", tags=["companies"])
+
+
+async def _attach_extras(db: AsyncSession, companies: list[Company]) -> None:
+    """Attach derived ``fit_score`` (latest rule-based) and ``contact_count``
+    onto company instances so they serialize into CompanyRead. Bulk-queried to
+    avoid N+1."""
+    if not companies:
+        return
+    ids = [c.id for c in companies]
+
+    # Latest rule-based fit score per company.
+    latest = (
+        select(
+            LeadScore.company_id,
+            func.max(LeadScore.scored_at).label("max_scored_at"),
+        )
+        .where(LeadScore.company_id.in_(ids), LeadScore.score_type == "rule_based")
+        .group_by(LeadScore.company_id)
+        .subquery()
+    )
+    score_rows = await db.execute(
+        select(LeadScore.company_id, LeadScore.fit_score)
+        .join(
+            latest,
+            and_(
+                LeadScore.company_id == latest.c.company_id,
+                LeadScore.scored_at == latest.c.max_scored_at,
+            ),
+        )
+        .where(LeadScore.score_type == "rule_based")
+    )
+    score_by_company = {row[0]: row[1] for row in score_rows.all()}
+
+    # Contact counts per company.
+    count_rows = await db.execute(
+        select(Contact.company_id, func.count(Contact.id))
+        .where(Contact.company_id.in_(ids))
+        .group_by(Contact.company_id)
+    )
+    count_by_company = {row[0]: row[1] for row in count_rows.all()}
+
+    for c in companies:
+        c.fit_score = score_by_company.get(c.id)
+        c.contact_count = count_by_company.get(c.id, 0)
 
 
 @router.post("/", response_model=CompanyRead, status_code=201)
@@ -109,6 +154,8 @@ async def list_companies(
     result = await db.execute(query)
     companies = list(result.scalars().all())
 
+    await _attach_extras(db, companies)
+
     return CompanyListResponse(
         items=companies,
         total=total,
@@ -127,6 +174,7 @@ async def get_company(
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
+    await _attach_extras(db, [company])
     return company
 
 

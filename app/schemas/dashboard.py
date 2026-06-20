@@ -1,5 +1,7 @@
 """Pydantic schemas for the dashboard / metrics endpoints."""
 
+import uuid
+from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel
@@ -7,6 +9,11 @@ from pydantic import BaseModel
 
 class PipelineStageStat(BaseModel):
     stage: str
+    count: int
+
+
+class IndustryStat(BaseModel):
+    industry: str
     count: int
 
 
@@ -33,9 +40,34 @@ class DashboardOverview(BaseModel):
     total_contacts: int
     total_scored: int
     avg_fit_score: Optional[float] = None
+    emails_sent: int = 0
+    leads_this_week: int = 0
     pipeline: list[PipelineStageStat]
     outreach: OutreachMetrics
     score_distribution: list[ScoringDistribution]
+    industry_breakdown: list[IndustryStat] = []
+
+
+class ActivityItem(BaseModel):
+    id: str
+    type: str
+    description: str
+    company_id: Optional[uuid.UUID] = None
+    contact_id: Optional[uuid.UUID] = None
+    created_at: datetime
+
+
+class TopLead(BaseModel):
+    id: uuid.UUID
+    name: str
+    stage: str
+    score: Optional[int] = None
+    industry: Optional[str] = None
+
+
+class EmailTrendPoint(BaseModel):
+    date: str
+    sent: int
 
 
 class CSVImportResult(BaseModel):

@@ -113,6 +113,8 @@ async def get_pipeline(
             Company.country,
             Company.employee_count,
             Company.industry_segment,
+            Company.source,
+            Company.city,
             LeadScore.fit_score,
         )
         .outerjoin(
@@ -176,6 +178,8 @@ async def get_pipeline(
             country=row.country,
             employee_count=row.employee_count,
             industry_segment=row.industry_segment,
+            source=row.source,
+            city=row.city,
         )
         for row in rows
     ]

@@ -70,6 +70,9 @@ class CompanyRead(CompanyBase):
     stage: str
     created_at: datetime
     updated_at: datetime
+    # Derived, attached by the router (not stored on the model itself).
+    fit_score: Optional[int] = None
+    contact_count: Optional[int] = None
 
 
 class CompanyListResponse(BaseModel):

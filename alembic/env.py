@@ -9,7 +9,7 @@ from app.config import get_settings
 from app.database import Base
 
 # Import all models so Alembic sees them
-from app.models import company, contact, lead_score, consent, sequence, outreach, interaction, email_template  # noqa: F401
+from app.models import company, contact, lead_score, consent, sequence, outreach, interaction, email_template, follow_up  # noqa: F401
 
 config = context.config
 

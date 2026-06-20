@@ -46,6 +46,8 @@ class LeadPipelineItem(BaseModel):
     country: str
     employee_count: Optional[int] = None
     industry_segment: Optional[str] = None
+    source: Optional[str] = None
+    city: Optional[str] = None
 
 
 class LeadPipelineResponse(BaseModel):
