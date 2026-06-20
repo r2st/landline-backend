@@ -9,6 +9,7 @@ from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.interaction import Interaction
 from app.models.email_template import EmailTemplate, EmailSend
 from app.models.follow_up import FollowUp
+from app.models.gmail_account import GmailAccount
 
 __all__ = [
     "Company",
@@ -23,4 +24,5 @@ __all__ = [
     "EmailTemplate",
     "EmailSend",
     "FollowUp",
+    "GmailAccount",
 ]

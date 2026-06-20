@@ -5,7 +5,6 @@ templates (one marked default), previewing merged output for a contact, and
 composing/sending outreach emails to selected contacts.
 """
 
-import asyncio
 import logging
 import uuid
 from typing import Optional
@@ -31,7 +30,7 @@ from app.schemas.email_template import (
     TemplatePreviewResponse,
 )
 from app.services.email_compose import SAMPLE_CONTEXT, build_merge_context, render
-from app.services.email_sender import EmailSender
+from app.services.email_dispatch import resolve_sender_info, send_outreach_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["email"])
@@ -239,7 +238,8 @@ async def compose_and_send(
         if template is None:
             raise HTTPException(status_code=400, detail="No default template configured")
 
-    sender = EmailSender()
+    # Resolve who this batch is sent as (selected/active Gmail account, else SES).
+    sender_info = await resolve_sender_info(db, payload.sender_account_id)
     results: list[EmailComposeResult] = []
     sent = skipped = errors = 0
 
@@ -273,11 +273,12 @@ async def compose_and_send(
         subject = render(template.subject, context)
         body_html = render(template.body, context)
 
-        send_result = await asyncio.to_thread(
-            sender.send_email,
+        send_result = await send_outreach_email(
+            db,
             to_email=contact.email,
             subject=subject,
             body_html=body_html,
+            sender_account_id=payload.sender_account_id,
         )
         status = send_result.get("status", "error")
         message_id = send_result.get("message_id")
@@ -316,11 +317,18 @@ async def compose_and_send(
 
     await db.flush()
     logger.info(
-        "Compose to %d contacts via '%s': sent=%d skipped=%d errors=%d",
-        len(payload.contact_ids), template.name, sent, skipped, errors,
+        "Compose to %d contacts via '%s' as %s (%s): sent=%d skipped=%d errors=%d",
+        len(payload.contact_ids), template.name, sender_info.from_email,
+        sender_info.transport, sent, skipped, errors,
     )
     return EmailComposeResponse(
-        template_id=template.id, sent=sent, skipped=skipped, errors=errors, results=results
+        template_id=template.id,
+        sent=sent,
+        skipped=skipped,
+        errors=errors,
+        transport=sender_info.transport,
+        sender=sender_info.from_email,
+        results=results,
     )
 
 

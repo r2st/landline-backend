@@ -22,11 +22,25 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
 
-    # AWS SES
+    # AWS SES (fallback email transport when no Gmail account is connected)
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
     ses_sender_email: str = "landline@apprendtechnologies.com"
+
+    # Google / Gmail OAuth (per-user email sending)
+    # Create these in Google Cloud Console — see deploy/GOOGLE-OAUTH-SETUP.md
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    # Must EXACTLY match an Authorized redirect URI configured in Google Cloud.
+    # e.g. https://landline-api.apprendtechnologies.com/api/v1/gmail/oauth/callback
+    google_oauth_redirect_uri: str = "http://localhost:8000/api/v1/gmail/oauth/callback"
+    # Where to send the user's browser back to after a connect attempt (the frontend).
+    # The OAuth callback closes the popup and notifies this origin via postMessage.
+    frontend_url: str = "http://localhost:5173"
+    # Fernet key used to encrypt stored OAuth refresh/access tokens at rest.
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    token_encryption_key: str = ""
 
     # Claude API
     anthropic_api_key: str = ""

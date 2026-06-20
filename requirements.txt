@@ -9,6 +9,9 @@ celery[redis]==5.4.0
 redis==5.2.1
 boto3==1.35.86
 anthropic==0.40.0
+google-auth==2.37.0
+google-api-python-client==2.157.0
+cryptography==44.0.0
 httpx==0.28.1
 beautifulsoup4==4.12.3
 python-multipart==0.0.19

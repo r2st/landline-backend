@@ -15,7 +15,8 @@ from app.models.consent import ConsentRecord
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.services.consent import check_consent
-from app.services.email_sender import EmailSender
+from app.services.email_compose import render
+from app.services.email_dispatch import send_outreach_email
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -111,13 +112,17 @@ def send_sequence_step(self, enrollment_id: str):
                     "company_industry": company.industry_segment or "",
                 }
 
-                # Send email
-                sender = EmailSender()
-                send_result = sender.send_sequence_email(
+                # Send email via the active connected Gmail account (falls back
+                # to SES when no account is connected). Templates are rendered
+                # here; the dispatcher appends the CAN-SPAM footer.
+                subject = render(step.subject_template, template_context)
+                body = render(step.body_template, template_context)
+                send_result = await send_outreach_email(
+                    db,
                     to_email=contact.email,
-                    subject_template=step.subject_template,
-                    body_template=step.body_template,
-                    context=template_context,
+                    subject=subject,
+                    body_html=body,
+                    body_text=body,
                 )
 
                 # Record event

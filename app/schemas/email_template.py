@@ -62,6 +62,9 @@ class TemplatePreviewResponse(BaseModel):
 class EmailComposeRequest(BaseModel):
     contact_ids: list[uuid.UUID] = Field(..., min_length=1)
     template_id: Optional[uuid.UUID] = None
+    # Connected Gmail account to send as. Defaults to the active account, then
+    # falls back to SES when no Gmail account is connected.
+    sender_account_id: Optional[uuid.UUID] = None
 
 
 class EmailComposeResult(BaseModel):
@@ -76,6 +79,9 @@ class EmailComposeResponse(BaseModel):
     sent: int
     skipped: int
     errors: int
+    # How the batch was sent: "gmail" or "ses", and the visible From address.
+    transport: str
+    sender: str
     results: list[EmailComposeResult]
 
 
