@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import companies, contacts, leads, outreach, dashboard, import_export
+from app.routers import companies, contacts, leads, outreach, dashboard, import_export, email_templates
 
 settings = get_settings()
 
@@ -60,6 +60,7 @@ app.include_router(leads.router, prefix=settings.api_prefix)
 app.include_router(outreach.router, prefix=settings.api_prefix)
 app.include_router(dashboard.router, prefix=settings.api_prefix)
 app.include_router(import_export.router, prefix=settings.api_prefix)
+app.include_router(email_templates.router, prefix=settings.api_prefix)
 
 
 @app.get("/health")

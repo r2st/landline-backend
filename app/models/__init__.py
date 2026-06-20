@@ -7,6 +7,7 @@ from app.models.consent import ConsentRecord
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.interaction import Interaction
+from app.models.email_template import EmailTemplate, EmailSend
 
 __all__ = [
     "Company",
@@ -18,4 +19,6 @@ __all__ = [
     "OutreachEnrollment",
     "OutreachEvent",
     "Interaction",
+    "EmailTemplate",
+    "EmailSend",
 ]
