@@ -1,7 +1,7 @@
 """Company news monitoring endpoints."""
 
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -16,23 +16,27 @@ router = APIRouter(prefix="/news", tags=["news"])
 
 @router.get("")
 async def list_news(
-    limit: int = 20,
+    limit: int = Query(20, ge=1, le=200),
     actionable_only: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """List recent company news, newest first."""
-    query = select(CompanyNews).order_by(CompanyNews.discovered_at.desc()).limit(limit)
+    # Join the company name in a single query (avoids an N+1 per article).
+    query = (
+        select(CompanyNews, Company.name)
+        .outerjoin(Company, Company.id == CompanyNews.company_id)
+        .order_by(CompanyNews.discovered_at.desc())
+        .limit(limit)
+    )
     if actionable_only:
         query = query.where(CompanyNews.is_actionable == True)
     result = await db.execute(query)
-    news = result.scalars().all()
-    
+    rows = result.all()
+
     items = []
-    for n in news:
-        # Get company name
-        cr = await db.execute(select(Company.name).where(Company.id == n.company_id))
-        company_name = cr.scalar_one_or_none() or "Unknown"
-        
+    for n, company_name in rows:
+        company_name = company_name or "Unknown"
+
         items.append({
             "id": str(n.id),
             "company_id": str(n.company_id),
