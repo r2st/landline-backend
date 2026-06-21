@@ -183,7 +183,7 @@ EMAIL TYPE: {template_type}
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
         message = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
@@ -204,7 +204,7 @@ EMAIL TYPE: {template_type}
             "body": result.get("body", ""),
             "demo_link": demo_link,
             "ai_generated": True,
-            "model": "claude-3-haiku-20240307",
+            "model": "claude-sonnet-4-6",
             "template_type": template_type,
         }
 
