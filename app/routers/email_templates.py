@@ -336,6 +336,20 @@ async def compose_and_send(
             ))
             continue
 
+        # Never email a contact who has unsubscribed (CAN-SPAM / CASL).
+        if contact.unsubscribed:
+            skipped += 1
+            results.append(EmailComposeResult(
+                contact_id=contact_id, to_email=contact.email,
+                status="skipped", detail="unsubscribed",
+            ))
+            db.add(EmailSend(
+                template_id=template.id, contact_id=contact.id,
+                to_email=contact.email, subject=template.subject,
+                status="skipped", error="unsubscribed",
+            ))
+            continue
+
         company_result = await db.execute(
             select(Company).where(Company.id == contact.company_id)
         )
