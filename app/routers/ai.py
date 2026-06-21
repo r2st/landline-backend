@@ -281,8 +281,13 @@ async def scan_business_card(file: UploadFile = File(...)):
 
     image_base64 = base64.b64encode(contents).decode("utf-8")
 
+    # Pass the real media type through; Claude vision only accepts these, so
+    # fall back to JPEG for anything else (e.g. HEIC) as a best effort.
+    supported = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    media_type = file.content_type if file.content_type in supported else "image/jpeg"
+
     ai = get_ai_service()
-    result = await ai.extract_business_card(image_base64)
+    result = await ai.extract_business_card(image_base64, media_type=media_type)
 
     if "error" in result:
         raise HTTPException(status_code=422, detail=result["error"])

@@ -348,7 +348,7 @@ Auto-send rules:
             logger.error("AI reply analysis failed: %s", str(e))
             return {"error": str(e), "should_send": False, "should_auto_send": False}
 
-    async def extract_business_card(self, image_base64: str) -> dict:
+    async def extract_business_card(self, image_base64: str, media_type: str = "image/jpeg") -> dict:
         """Extract contact information from a business card image using Claude vision."""
         try:
             message = await self.client.messages.create(
@@ -361,7 +361,7 @@ Auto-send rules:
                             "type": "image",
                             "source": {
                                 "type": "base64",
-                                "media_type": "image/jpeg",
+                                "media_type": media_type,
                                 "data": image_base64,
                             },
                         },

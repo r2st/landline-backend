@@ -155,9 +155,34 @@ async def get_company_contacts(
     return ContactListResponse(items=contacts, total=len(contacts))
 
 
-# --- Quick Add (compose shortcut) ---
+# --- Quick Add (compose shortcut + business-card scanner) ---
 
 from app.schemas.contact import QuickAddRequest, QuickAddResponse
+
+# Companies are constrained to these two countries (see Company check constraint),
+# so free-text country values from OCR must be mapped onto US/CA.
+_COUNTRY_MAP = {
+    "us": "US", "usa": "US", "u.s.": "US", "u.s.a.": "US",
+    "united states": "US", "united states of america": "US", "america": "US",
+    "ca": "CA", "can": "CA", "canada": "CA",
+}
+
+
+def _normalize_country(raw: Optional[str]) -> str:
+    return _COUNTRY_MAP.get((raw or "").strip().lower(), "US")
+
+
+def _valid_email(raw: Optional[str]) -> Optional[str]:
+    """Return a syntactically valid email or None, so bad OCR never blocks a save."""
+    from pydantic import TypeAdapter, EmailStr
+
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        return TypeAdapter(EmailStr).validate_python(value)
+    except Exception:
+        return None
 
 
 @router.post("/quick-add", response_model=QuickAddResponse, status_code=201)
@@ -165,46 +190,67 @@ async def quick_add_contact(
     payload: QuickAddRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a contact from the compose view.
+    """Create a contact on the fly (compose view or business-card scanner).
 
-    Looks up the company by name (case-insensitive). If none exists, a new
-    company is created with source='manual'. The contact is then linked to
-    that company. This lets users add a recipient on the fly without leaving
-    the compose tab.
+    Finds or creates the Company by name, then attaches the contact. Person
+    fields (name, title, email, phone, LinkedIn) live on the Contact; company
+    and location fields are stored on the Company. The caller's ``source`` is
+    preserved unchanged so the frontend "Scanned" filter keeps working.
     """
-    company_name = payload.company_name.strip()
+    source = (payload.source or "manual").strip() or "manual"
+    company_name = (payload.company_name or "").strip()
     company_created = False
 
-    # Try to find an existing company by name (case-insensitive).
-    result = await db.execute(
-        select(Company).where(func.lower(Company.name) == company_name.lower())
-    )
-    company = result.scalar_one_or_none()
+    company = None
+    if company_name:
+        result = await db.execute(
+            select(Company).where(func.lower(Company.name) == company_name.lower())
+        )
+        company = result.scalar_one_or_none()
 
     if company is None:
-        company = Company(name=company_name, source="manual", country="US")
+        # Company.name is required; fall back to the person's name or email.
+        fallback_name = (
+            company_name
+            or " ".join(p for p in (payload.first_name, payload.last_name) if p).strip()
+            or (payload.email or "").strip()
+            or "Unknown Company"
+        )
+        company = Company(
+            name=fallback_name,
+            city=(payload.city or None),
+            state_province=(payload.state or None),
+            country=_normalize_country(payload.country),
+            website=(payload.website or None),
+            phone=(payload.phone or None),
+            notes=(payload.address or None),
+            source=source,
+        )
         db.add(company)
         await db.flush()
         company_created = True
-        logger.info("Quick-add created company '%s' (%s)", company_name, company.id)
+        logger.info("Quick-add created company '%s' (%s)", company.name, company.id)
 
     contact = Contact(
         company_id=company.id,
-        first_name=payload.first_name,
-        last_name=payload.last_name,
-        email=payload.email,
-        title=payload.title,
-        source="quick-add",
+        first_name=(payload.first_name or None),
+        last_name=(payload.last_name or None),
+        title=(payload.title or None),
+        email=_valid_email(payload.email),
+        phone=(payload.phone or None),
+        linkedin_url=(payload.linkedin_url or None),
+        source=source,
     )
     db.add(contact)
     await db.flush()
     await db.refresh(contact)
     logger.info(
-        "Quick-add created contact %s <%s> for company '%s'",
-        contact.id, payload.email, company_name,
+        "Quick-add created contact %s <%s> for company '%s' (source=%s)",
+        contact.id, contact.email, company.name, source,
     )
     return QuickAddResponse(
         contact=contact,
-        company_name=company_name,
+        company_id=company.id,
+        company_name=company.name,
         company_created=company_created,
     )
