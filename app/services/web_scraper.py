@@ -37,7 +37,7 @@ class WebScraper:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                 # Scrape homepage
                 resp = await client.get(url, headers=self.HEADERS)
                 if resp.status_code != 200:

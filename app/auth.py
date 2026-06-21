@@ -5,6 +5,7 @@ X-API-Key header — except for a small set of public paths (health checks,
 docs, OAuth callbacks, webhooks).
 """
 
+import hmac
 import logging
 
 from fastapi import Request
@@ -59,7 +60,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
         # Validate the API key header.
         provided_key = request.headers.get("X-API-Key", "")
-        if provided_key != settings.api_key:
+        if not hmac.compare_digest(provided_key, settings.api_key):
             logger.warning("Rejected request to %s — invalid or missing API key", path)
             return JSONResponse(
                 status_code=401,

@@ -90,8 +90,14 @@ class Settings(BaseSettings):
     @classmethod
     def parse_cors(cls, v):
         if isinstance(v, str):
-            import json
-            return json.loads(v)
+            value = v.strip()
+            if not value:
+                return []
+            # Accept a JSON array or a plain comma-separated list.
+            if value.startswith("["):
+                import json
+                return json.loads(value)
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
         return v
 
     @property
