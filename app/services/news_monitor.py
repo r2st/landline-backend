@@ -191,7 +191,7 @@ Return ONLY valid JSON:
   "outreach_angle": "how to reference this in outreach"
 }}"""
 
-            message = ai.client.messages.create(
+            message = await ai.client.messages.create(
                 model=ai.model,
                 max_tokens=512,
                 messages=[{"role": "user", "content": prompt}],
