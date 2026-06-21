@@ -17,6 +17,14 @@ from app.services.ai_service import get_ai_service
 router = APIRouter(prefix="/ai", tags=["ai"])
 
 
+def _uuid_or_400(raw: str, field: str = "id") -> UUID:
+    """Parse a UUID from request-body text, returning HTTP 400 on bad input."""
+    try:
+        return UUID(str(raw))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: not a valid UUID")
+
+
 class GenerateEmailRequest(BaseModel):
     company_id: Optional[str] = None
     contact_id: Optional[str] = None
@@ -79,7 +87,7 @@ async def generate_email(
 
     if payload.company_id:
         result = await db.execute(
-            select(Company).where(Company.id == UUID(payload.company_id))
+            select(Company).where(Company.id == _uuid_or_400(payload.company_id, "company_id"))
         )
         company = result.scalar_one_or_none()
         if company:
@@ -88,7 +96,7 @@ async def generate_email(
 
     if payload.contact_id:
         result = await db.execute(
-            select(Contact).where(Contact.id == UUID(payload.contact_id))
+            select(Contact).where(Contact.id == _uuid_or_400(payload.contact_id, "contact_id"))
         )
         contact = result.scalar_one_or_none()
         if contact:
@@ -130,7 +138,7 @@ async def score_lead(
 ):
     """Intelligently score a lead using AI."""
     result = await db.execute(
-        select(Company).where(Company.id == UUID(payload.company_id))
+        select(Company).where(Company.id == _uuid_or_400(payload.company_id, "company_id"))
     )
     company = result.scalar_one_or_none()
     if not company:
@@ -155,12 +163,12 @@ async def score_lead(
 
 @router.post("/analyze-company/{company_id}")
 async def analyze_company(
-    company_id: str,
+    company_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
     """Analyze a company and get AI-powered outreach strategy."""
     result = await db.execute(
-        select(Company).where(Company.id == UUID(company_id))
+        select(Company).where(Company.id == company_id)
     )
     company = result.scalar_one_or_none()
     if not company:

@@ -1,7 +1,8 @@
 """Company discovery and enrichment endpoints."""
 
+import uuid
 from typing import Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -58,18 +59,16 @@ async def search_companies(
 
 @router.post("/enrich/{company_id}")
 async def enrich_company(
-    company_id: str,
+    company_id: uuid.UUID,
     payload: EnrichCompanyRequest,
     db: AsyncSession = Depends(get_db),
 ):
     """Enrich a company with Apollo data and optionally find contacts."""
-    from uuid import UUID
     result = await db.execute(
-        select(Company).where(Company.id == UUID(company_id))
+        select(Company).where(Company.id == company_id)
     )
     company = result.scalar_one_or_none()
     if not company:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Company not found")
 
     service = get_enrichment_service()
@@ -106,7 +105,6 @@ async def scrape_website(
     from app.services.web_scraper import get_web_scraper
     domain = payload.get("domain", "").strip()
     if not domain:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="domain is required")
     scraper = get_web_scraper()
     return await scraper.scrape_company(domain)

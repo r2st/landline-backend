@@ -53,9 +53,9 @@ async def list_news(
 
 
 @router.post("/check/{company_id}")
-async def check_company_news(company_id: str, db: AsyncSession = Depends(get_db)):
+async def check_company_news(company_id: UUID, db: AsyncSession = Depends(get_db)):
     """Check for news about a specific company."""
-    result = await db.execute(select(Company).where(Company.id == UUID(company_id)))
+    result = await db.execute(select(Company).where(Company.id == company_id))
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -79,9 +79,9 @@ async def check_all_news(limit: int = 10, db: AsyncSession = Depends(get_db)):
 
 
 @router.patch("/{news_id}/action")
-async def mark_actioned(news_id: str, db: AsyncSession = Depends(get_db)):
+async def mark_actioned(news_id: UUID, db: AsyncSession = Depends(get_db)):
     """Mark a news item as actioned."""
-    result = await db.execute(select(CompanyNews).where(CompanyNews.id == UUID(news_id)))
+    result = await db.execute(select(CompanyNews).where(CompanyNews.id == news_id))
     news = result.scalar_one_or_none()
     if not news:
         raise HTTPException(status_code=404, detail="News item not found")
