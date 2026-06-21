@@ -100,15 +100,16 @@ class EmailSender:
             return {"status": "sent", "message_id": message_id}
 
         except Exception as e:
-            # Handle boto3 ClientError specifically if boto3 is available
+            # Handle boto3 ClientError specifically if boto3 is available, and
+            # fall back to a generic error dict for any other failure. Both
+            # paths must return (never re-raise) so callers get a consistent
+            # result shape instead of an unhandled 500.
             error_response = getattr(e, "response", None)
             if error_response and "Error" in error_response:
                 error_code = error_response["Error"]["Code"]
                 error_msg = error_response["Error"]["Message"]
                 logger.error("SES error sending to %s: [%s] %s", to_email, error_code, error_msg)
                 return {"status": "error", "error_code": error_code, "detail": error_msg}
-            raise
-        except Exception as e:
             logger.error("Failed to send email to %s: %s", to_email, str(e))
             return {"status": "error", "detail": str(e)}
 
