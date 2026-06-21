@@ -10,6 +10,7 @@ Key features:
 - Graceful fallback to static templates
 """
 
+import json
 import logging
 from typing import Optional
 
@@ -191,7 +192,6 @@ EMAIL TYPE: {template_type}
         response_text = message.content[0].text.strip()
 
         # Parse JSON response
-        import json
         # Handle potential markdown wrapping
         if response_text.startswith("```"):
             response_text = response_text.split("\n", 1)[1]
