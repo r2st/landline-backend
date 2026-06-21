@@ -16,6 +16,41 @@ from app.models.company import Company
 router = APIRouter(prefix="/groups", tags=["groups"])
 
 
+def _parse_uuids(raw_ids: list[str]) -> list[uuid.UUID]:
+    """Parse a list of UUID strings, skipping any that are malformed."""
+    parsed = []
+    for raw in raw_ids:
+        try:
+            parsed.append(uuid.UUID(str(raw)))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return parsed
+
+
+async def _insert_new_members(db: AsyncSession, group_id, company_ids) -> int:
+    """Insert membership rows, skipping ones that already exist.
+
+    Pre-checks existing members rather than catching duplicate-key errors:
+    on async Postgres a failed INSERT aborts the whole transaction, so the
+    old try/except-pass approach would break every subsequent insert.
+    """
+    existing = await db.execute(
+        select(company_group_members.c.company_id).where(
+            company_group_members.c.group_id == group_id
+        )
+    )
+    have = {row[0] for row in existing.all()}
+    inserted = 0
+    for cid in company_ids:
+        if cid not in have:
+            await db.execute(
+                company_group_members.insert().values(group_id=group_id, company_id=cid)
+            )
+            have.add(cid)
+            inserted += 1
+    return inserted
+
+
 class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
@@ -67,9 +102,9 @@ async def create_group(payload: GroupCreate, db: AsyncSession = Depends(get_db))
 
 
 @router.patch("/{group_id}")
-async def update_group(group_id: str, payload: GroupUpdate, db: AsyncSession = Depends(get_db)):
+async def update_group(group_id: uuid.UUID, payload: GroupUpdate, db: AsyncSession = Depends(get_db)):
     """Update a group's name, description, or color."""
-    result = await db.execute(select(CompanyGroup).where(CompanyGroup.id == uuid.UUID(group_id)))
+    result = await db.execute(select(CompanyGroup).where(CompanyGroup.id == group_id))
     group = result.scalar_one_or_none()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -84,9 +119,9 @@ async def update_group(group_id: str, payload: GroupUpdate, db: AsyncSession = D
 
 
 @router.delete("/{group_id}")
-async def delete_group(group_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_group(group_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Delete a group (does not delete the companies)."""
-    result = await db.execute(select(CompanyGroup).where(CompanyGroup.id == uuid.UUID(group_id)))
+    result = await db.execute(select(CompanyGroup).where(CompanyGroup.id == group_id))
     group = result.scalar_one_or_none()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -96,41 +131,46 @@ async def delete_group(group_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/{group_id}/members")
-async def add_members(group_id: str, payload: GroupMembersUpdate, db: AsyncSession = Depends(get_db)):
+async def add_members(group_id: uuid.UUID, payload: GroupMembersUpdate, db: AsyncSession = Depends(get_db)):
     """Add companies to a group."""
     result = await db.execute(
-        select(CompanyGroup).options(selectinload(CompanyGroup.companies)).where(CompanyGroup.id == uuid.UUID(group_id))
+        select(CompanyGroup).options(selectinload(CompanyGroup.companies)).where(CompanyGroup.id == group_id)
     )
     group = result.scalar_one_or_none()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    
-    existing_ids = {str(c.id) for c in group.companies}
+
+    existing_ids = {c.id for c in group.companies}
     added = 0
-    for cid in payload.company_ids:
+    for cid in _parse_uuids(payload.company_ids):
         if cid not in existing_ids:
-            result = await db.execute(select(Company).where(Company.id == uuid.UUID(cid)))
+            result = await db.execute(select(Company).where(Company.id == cid))
             company = result.scalar_one_or_none()
             if company:
                 group.companies.append(company)
+                existing_ids.add(cid)
                 added += 1
-    
+
     await db.commit()
-    return {"added": added, "total_members": len(group.companies) + added}
+    # group.companies already reflects the appended members.
+    return {"added": added, "total_members": len(group.companies)}
 
 
 @router.delete("/{group_id}/members")
-async def remove_members(group_id: str, payload: GroupMembersUpdate, db: AsyncSession = Depends(get_db)):
+async def remove_members(group_id: uuid.UUID, payload: GroupMembersUpdate, db: AsyncSession = Depends(get_db)):
     """Remove companies from a group."""
-    for cid in payload.company_ids:
-        await db.execute(
+    company_ids = _parse_uuids(payload.company_ids)
+    removed = 0
+    for cid in company_ids:
+        res = await db.execute(
             delete(company_group_members).where(
-                company_group_members.c.group_id == uuid.UUID(group_id),
-                company_group_members.c.company_id == uuid.UUID(cid),
+                company_group_members.c.group_id == group_id,
+                company_group_members.c.company_id == cid,
             )
         )
+        removed += res.rowcount or 0
     await db.commit()
-    return {"removed": len(payload.company_ids)}
+    return {"removed": removed}
 
 
 @router.post("/auto-group-by-industry")
@@ -163,15 +203,9 @@ async def auto_group_by_industry(db: AsyncSession = Depends(get_db)):
             await db.flush()
             created += 1
         
-        # Add companies
-        for cid in company_ids:
-            try:
-                await db.execute(
-                    company_group_members.insert().values(group_id=group.id, company_id=cid)
-                )
-            except Exception:
-                pass  # Already a member
-    
+        # Add companies (skipping any already in the group)
+        await _insert_new_members(db, group.id, company_ids)
+
     await db.commit()
     return {"groups_created": created, "industries_found": len(industry_map)}
 
@@ -210,13 +244,7 @@ async def auto_group_by_country(db: AsyncSession = Depends(get_db)):
             await db.flush()
             created += 1
 
-        for cid in company_ids:
-            try:
-                await db.execute(
-                    company_group_members.insert().values(group_id=group.id, company_id=cid)
-                )
-            except Exception:
-                pass
+        await _insert_new_members(db, group.id, company_ids)
 
     await db.commit()
     return {"groups_created": created, "countries_found": len(country_map)}
@@ -277,13 +305,7 @@ async def auto_group_by_stage(db: AsyncSession = Depends(get_db)):
             await db.flush()
             created += 1
 
-        for cid in company_ids:
-            try:
-                await db.execute(
-                    company_group_members.insert().values(group_id=group.id, company_id=cid)
-                )
-            except Exception:
-                pass
+        await _insert_new_members(db, group.id, company_ids)
 
     await db.commit()
     return {"groups_created": created, "stages_found": len(stage_map)}
