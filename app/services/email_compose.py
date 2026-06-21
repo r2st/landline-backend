@@ -6,7 +6,7 @@ Merge fields supported in template subject/body:
     {{industry_segment}}— company industry segment
     {{city}}            — company city
     {{contact_title}}   — contact job title
-    {{demo_link}}       — the Apprend demo link (constant)
+    {{demo_link}}       — dynamically resolved demo link based on industry
 
 A few convenience aliases are also exposed: {{last_name}}, {{full_name}},
 {{company_name}}, {{title}}, {{industry}}.
@@ -14,8 +14,7 @@ A few convenience aliases are also exposed: {{last_name}}, {{full_name}},
 
 from jinja2.sandbox import SandboxedEnvironment
 
-# The Apprend demo link surfaced in every outreach template.
-DEMO_LINK = "https://true-molding-demo.pages.dev"
+from app.services.ai_email_generator import resolve_demo_link, DEFAULT_DEMO_LINK
 
 # Placeholder values used when previewing a template with no real contact.
 SAMPLE_CONTEXT = {
@@ -29,8 +28,11 @@ SAMPLE_CONTEXT = {
     "city": "Cleveland",
     "contact_title": "VP of Operations",
     "title": "VP of Operations",
-    "demo_link": DEMO_LINK,
+    "demo_link": DEFAULT_DEMO_LINK,
 }
+
+# Keep backward compat
+DEMO_LINK = DEFAULT_DEMO_LINK
 
 
 def build_merge_context(contact, company) -> dict:
@@ -44,6 +46,9 @@ def build_merge_context(contact, company) -> dict:
     industry = (getattr(company, "industry_segment", None) or "") if company else ""
     city = (getattr(company, "city", None) or "") if company else ""
 
+    # Dynamically resolve demo link based on industry/company
+    demo_link = resolve_demo_link(industry, company_name)
+
     return {
         "first_name": first_name,
         "last_name": last_name,
@@ -55,7 +60,7 @@ def build_merge_context(contact, company) -> dict:
         "city": city,
         "contact_title": title,
         "title": title,
-        "demo_link": DEMO_LINK,
+        "demo_link": demo_link,
     }
 
 

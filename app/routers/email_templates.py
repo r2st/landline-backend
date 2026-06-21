@@ -30,8 +30,11 @@ from app.schemas.email_template import (
     TemplatePreviewResponse,
     SendTestRequest,
     SendTestResponse,
+    AIEmailGenerateRequest,
+    AIEmailGenerateResponse,
 )
 from app.services.email_compose import SAMPLE_CONTEXT, build_merge_context, render
+from app.services.ai_email_generator import generate_email as ai_generate_email
 from app.services.email_dispatch import resolve_sender_info, send_outreach_email
 from app.routers.tracking import generate_tracking_pixel_url
 
@@ -422,3 +425,40 @@ async def list_email_sends(
         query = query.where(EmailSend.contact_id == contact_id)
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+# --- AI Email Generation ---
+
+@router.post("/email-templates/generate", response_model=AIEmailGenerateResponse)
+async def generate_ai_email(payload: AIEmailGenerateRequest):
+    """Generate a personalized outreach email using AI.
+
+    Takes lead data (name, company, industry, title) and produces a
+    tailored subject + body. Falls back to a template-based response
+    if AI generation fails.
+
+    The demo_link in the response is dynamically selected based on
+    the target company's industry.
+    """
+    lead_data = {
+        "first_name": payload.first_name,
+        "company_name": payload.company_name,
+        "industry": payload.industry,
+        "title": payload.title,
+        "city": payload.city,
+    }
+
+    result = await ai_generate_email(
+        lead_data=lead_data,
+        template_type=payload.template_type,
+        custom_instructions=payload.custom_instructions,
+    )
+
+    return AIEmailGenerateResponse(
+        subject=result["subject"],
+        body=result["body"],
+        demo_link=result["demo_link"],
+        ai_generated=result["ai_generated"],
+        model=result.get("model"),
+        template_type=result["template_type"],
+    )

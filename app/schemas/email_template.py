@@ -115,3 +115,25 @@ class SendTestResponse(BaseModel):
     status: str  # "sent" or "failed"
     detail: Optional[str] = None
     subject: Optional[str] = None
+
+
+# --- AI Email Generation ---
+
+class AIEmailGenerateRequest(BaseModel):
+    """Request body for AI-powered email generation."""
+    first_name: str = Field(..., max_length=100)
+    company_name: str = Field("", max_length=255)
+    industry: str = Field("", max_length=255)
+    title: str = Field("", max_length=255)
+    city: str = Field("", max_length=255)
+    template_type: str = Field("first_touch", max_length=50)
+    custom_instructions: Optional[str] = Field(None, max_length=500)
+
+
+class AIEmailGenerateResponse(BaseModel):
+    subject: str
+    body: str
+    demo_link: str
+    ai_generated: bool
+    model: Optional[str] = None
+    template_type: str

@@ -131,7 +131,7 @@ def _unsubscribe_footer(contact_email: str) -> str:
         "Apprend Technologies | Manufacturing Software Solutions\n"
         f"To unsubscribe, reply with UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
-        "Apprend Technologies, 123 Innovation Drive, Suite 400, Toronto, ON M5V 1A1, Canada"
+        "Apprend Technologies, Toronto, ON, Canada"
     )
 
 
