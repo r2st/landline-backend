@@ -220,3 +220,70 @@ async def auto_group_by_country(db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     return {"groups_created": created, "countries_found": len(country_map)}
+
+
+@router.post("/auto-group-by-stage")
+async def auto_group_by_stage(db: AsyncSession = Depends(get_db)):
+    """Automatically create groups based on pipeline stage (prospect category)."""
+    stage_labels = {
+        "new": "New Prospects",
+        "researched": "Researched",
+        "scored": "Scored Leads",
+        "contacted": "Contacted",
+        "engaged": "Engaged / Replies",
+        "qualified": "Qualified",
+        "proposal": "Proposal Sent",
+        "won": "Won / Customers",
+        "lost": "Lost / Closed",
+    }
+    stage_colors = {
+        "new": "#6b7280",
+        "researched": "#3b82f6",
+        "scored": "#8b5cf6",
+        "contacted": "#f59e0b",
+        "engaged": "#10b981",
+        "qualified": "#06b6d4",
+        "proposal": "#ec4899",
+        "won": "#22c55e",
+        "lost": "#ef4444",
+    }
+
+    result = await db.execute(
+        select(Company.stage, Company.id)
+        .where(Company.stage.isnot(None))
+        .where(Company.stage != "")
+    )
+    rows = result.all()
+
+    stage_map = {}
+    for stage, company_id in rows:
+        stage_map.setdefault(stage, []).append(company_id)
+
+    created = 0
+    for stage, company_ids in stage_map.items():
+        group_name = stage_labels.get(stage, stage.title())
+        existing = await db.execute(
+            select(CompanyGroup).where(CompanyGroup.name == group_name)
+        )
+        group = existing.scalar_one_or_none()
+
+        if not group:
+            group = CompanyGroup(
+                name=group_name,
+                description=f"Companies in '{stage}' pipeline stage",
+                color=stage_colors.get(stage, "#3b82f6"),
+            )
+            db.add(group)
+            await db.flush()
+            created += 1
+
+        for cid in company_ids:
+            try:
+                await db.execute(
+                    company_group_members.insert().values(group_id=group.id, company_id=cid)
+                )
+            except Exception:
+                pass
+
+    await db.commit()
+    return {"groups_created": created, "stages_found": len(stage_map)}
