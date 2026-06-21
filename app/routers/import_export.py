@@ -19,6 +19,19 @@ from app.schemas.dashboard import CSVImportResult
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/import-export", tags=["import/export"])
 
+# Characters that spreadsheet apps (Excel, Sheets, LibreOffice) interpret as the
+# start of a formula. A cell beginning with one of these can execute when the
+# exported CSV is opened, so we defuse it by prefixing a single quote.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value) -> str:
+    """Neutralize CSV formula injection in an exported cell value."""
+    text = "" if value is None else str(value)
+    if text and text[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + text
+    return text
+
 
 def _trigger_scoring_for_companies(company_ids: list[str]):
     """Dispatch Celery enrichment and scoring tasks for newly imported companies."""
@@ -204,14 +217,14 @@ async def export_companies_csv(
     ])
 
     for c in companies:
-        writer.writerow([
+        writer.writerow([_csv_safe(v) for v in (
             str(c.id), c.name, c.domain or "", c.city or "",
             c.state_province or "", c.country, c.employee_count or "",
             c.naics_code or "", c.naics_description or "",
             c.industry_segment or "", c.website or "", c.phone or "",
             c.stage, c.source, ",".join(c.tags or []),
             c.created_at.isoformat() if c.created_at else "",
-        ])
+        )])
 
     output.seek(0)
     return StreamingResponse(
@@ -241,13 +254,13 @@ async def export_contacts_csv(
     ])
 
     for contact, company_name in rows:
-        writer.writerow([
+        writer.writerow([_csv_safe(v) for v in (
             str(contact.id), company_name or "", contact.first_name or "",
             contact.last_name or "", contact.title or "",
             contact.email or "", contact.phone or "",
             contact.linkedin_url or "", contact.is_primary,
             contact.source or "", contact.created_at.isoformat() if contact.created_at else "",
-        ])
+        )])
 
     output.seek(0)
     return StreamingResponse(
