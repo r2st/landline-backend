@@ -6,7 +6,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,10 +20,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/import-export", tags=["import/export"])
 
 
+def _trigger_scoring_for_companies(company_ids: list[str]):
+    """Dispatch Celery enrichment and scoring tasks for newly imported companies."""
+    try:
+        from app.tasks.enrichment import enrich_company, auto_score_leads
+        for cid in company_ids:
+            enrich_company.delay(cid)
+        # Also trigger a scoring pass
+        auto_score_leads.delay()
+        logger.info("Dispatched enrichment for %d imported companies + scoring pass", len(company_ids))
+    except Exception as e:
+        logger.error("Failed to dispatch post-import tasks: %s", str(e))
+
+
 @router.post("/import/csv", response_model=CSVImportResult)
 async def import_csv(
     file: UploadFile = File(...),
     source: str = "csv_import",
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: AsyncSession = Depends(get_db),
 ):
     """Import companies and contacts from a CSV file.
@@ -36,7 +50,10 @@ async def import_csv(
     if not file.filename or not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a .csv")
 
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB
     content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File too large. Maximum 10MB allowed.")
     try:
         text = content.decode("utf-8-sig")  # Handle BOM
     except UnicodeDecodeError:
@@ -48,6 +65,7 @@ async def import_csv(
     imported_contacts = 0
     skipped = 0
     errors = []
+    new_company_ids = []  # Track newly created companies for auto-scoring
 
     for row_num, row in enumerate(reader, start=2):  # Row 1 is header
         try:
@@ -104,6 +122,7 @@ async def import_csv(
                 db.add(company)
                 await db.flush()
                 imported_companies += 1
+                new_company_ids.append(str(company.id))
 
             # Handle contact if present
             contact_name = row.get("contact_name", "").strip()
@@ -148,6 +167,11 @@ async def import_csv(
                 break
 
     await db.flush()
+
+    # Auto-enrich and auto-score newly imported companies
+    if new_company_ids:
+        background_tasks.add_task(_trigger_scoring_for_companies, new_company_ids)
+
     logger.info(
         "CSV import: %d companies, %d contacts, %d skipped, %d errors",
         imported_companies, imported_contacts, skipped, len(errors),

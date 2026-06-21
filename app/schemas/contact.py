@@ -46,3 +46,22 @@ class ContactRead(ContactBase):
 class ContactListResponse(BaseModel):
     items: list[ContactRead]
     total: int
+
+
+# --- Quick Add (compose shortcut) ---
+
+class QuickAddRequest(BaseModel):
+    """Add a contact from the compose view — creates the company if needed."""
+    company_name: str = Field(..., min_length=1, max_length=255)
+    first_name: Optional[str] = Field(None, max_length=100)
+    last_name: Optional[str] = Field(None, max_length=100)
+    email: EmailStr
+    title: Optional[str] = Field(None, max_length=150)
+
+
+class QuickAddResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    contact: ContactRead
+    company_name: str
+    company_created: bool

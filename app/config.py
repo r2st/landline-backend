@@ -55,8 +55,33 @@ class Settings(BaseSettings):
     # App
     app_name: str = "Landline"
     app_env: str = "development"
+
+    # API key authentication (empty = disabled for backward compat)
+    api_key: str = ""
+
+    # Secret key for signing tokens (unsubscribe links, etc.)
+    secret_key: str = ""
+    notification_email: str = ""
     log_level: str = "INFO"
     api_prefix: str = "/api/v1"
+
+
+    # Anti-spam / sending limits
+    max_emails_per_contact_per_sequence: int = 5       # Max steps in any sequence
+    max_emails_per_day: int = 50                        # Max emails per day across all sequences
+    min_days_between_followups: int = 3                 # Minimum gap between follow-ups to same contact
+    max_emails_per_contact_per_month: int = 8           # Hard cap per contact per 30 days
+    warmup_enabled: bool = True                         # Gradual ramp-up
+    warmup_daily_limit_week1: int = 10                  # Week 1 daily limit
+    warmup_daily_limit_week2: int = 25                  # Week 2 daily limit
+    warmup_daily_limit_week3: int = 40                  # Week 3+ daily limit
+    warmup_start_date: str = ""                         # ISO date when warmup started
+
+    # Smart auto-reply
+    auto_reply_enabled: bool = True                        # Auto-send AI-drafted replies for clear positive intents
+
+    # Scheduling link (Calendly or similar) — included in auto-replies when set
+    scheduling_link: str = ""
 
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173"]

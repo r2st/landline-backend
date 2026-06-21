@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 # --- Templates ---
@@ -60,7 +60,7 @@ class TemplatePreviewResponse(BaseModel):
 # --- Compose / Send ---
 
 class EmailComposeRequest(BaseModel):
-    contact_ids: list[uuid.UUID] = Field(..., min_length=1)
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=50)
     template_id: Optional[uuid.UUID] = None
     # Connected Gmail account to send as. Defaults to the active account, then
     # falls back to SES when no Gmail account is connected.
@@ -97,3 +97,21 @@ class EmailSendRead(BaseModel):
     subject: Optional[str] = None
     status: str
     sent_at: datetime
+    opened_at: Optional[datetime] = None
+    clicked_at: Optional[datetime] = None
+
+# Intentional empty line above for readability
+
+
+# --- Send Test ---
+
+class SendTestRequest(BaseModel):
+    template_id: uuid.UUID
+    test_email: EmailStr
+    sender_account_id: Optional[uuid.UUID] = None
+
+
+class SendTestResponse(BaseModel):
+    status: str  # "sent" or "failed"
+    detail: Optional[str] = None
+    subject: Optional[str] = None

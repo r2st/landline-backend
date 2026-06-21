@@ -3,7 +3,9 @@
 import logging
 from typing import Optional
 
-from jinja2 import Template
+from jinja2.sandbox import SandboxedEnvironment
+
+from itsdangerous import URLSafeTimedSerializer
 
 from app.config import get_settings
 
@@ -32,17 +34,24 @@ class EmailSender:
         return self._client
 
     def render_template(self, template_str: str, context: dict) -> str:
-        """Render a Jinja2 template string with the given context."""
-        tmpl = Template(template_str)
+        """Render a Jinja2 template string with the given context.
+
+        Uses SandboxedEnvironment to prevent server-side template injection.
+        """
+        env = SandboxedEnvironment()
+        tmpl = env.from_string(template_str)
         return tmpl.render(**context)
 
     def _build_unsubscribe_footer(self, contact_email: str) -> str:
-        """CAN-SPAM compliant unsubscribe footer."""
+        """CAN-SPAM compliant unsubscribe footer with signed token (no PII in URL)."""
+        serializer = URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
+        token = serializer.dumps(contact_email, salt="unsubscribe")
+        unsubscribe_url = f"https://landline.apprendtechnologies.com/unsubscribe?token={token}"
         return (
             "\n\n---\n"
             "Apprend Technologies | Manufacturing Software Solutions\n"
-            f"To unsubscribe, reply with 'UNSUBSCRIBE' or click: "
-            f"https://landline.apprendtechnologies.com/unsubscribe?email={contact_email}\n"
+            f"To unsubscribe, reply with UNSUBSCRIBE or click: "
+            f"{unsubscribe_url}\n"
             "Apprend Technologies, 123 Innovation Drive, Suite 400, Toronto, ON M5V 1A1, Canada"
         )
 

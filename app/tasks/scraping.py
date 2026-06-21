@@ -5,7 +5,7 @@ import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import async_session_factory
+from app.database_celery import celery_session
 from app.scrapers.thomasnet import ThomasNetScraper
 from app.scrapers.census import CensusBPScraper
 from app.tasks.celery_app import celery_app
@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def _run_async(coro):
-    """Run an async function in a new event loop for Celery workers."""
+    """Run async code in Celery's sync context with a fresh event loop."""
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
@@ -40,7 +41,7 @@ def scrape_thomasnet(
 
     async def _run():
         scraper = ThomasNetScraper()
-        async with async_session_factory() as db:
+        async with celery_session() as db:
             try:
                 result = await scraper.run(
                     db, keyword=keyword, state=state, max_pages=max_pages
@@ -76,7 +77,7 @@ def scrape_census(
 
     async def _run():
         scraper = CensusBPScraper()
-        async with async_session_factory() as db:
+        async with celery_session() as db:
             try:
                 result = await scraper.run(
                     db,

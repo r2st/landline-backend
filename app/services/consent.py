@@ -49,6 +49,15 @@ async def check_consent(
     """
     country = company.country
 
+    # Global check: if contact has explicitly unsubscribed via link, block all sends
+    if getattr(contact, "unsubscribed", False):
+        return ConsentCheckResult(
+            can_email=False,
+            reason="Contact has unsubscribed via email link",
+            regime="CAN-SPAM" if country == "US" else "CASL" if country == "CA" else "unknown",
+            consent_type="none",
+        )
+
     if country == "US":
         # CAN-SPAM: opt-out model — check they haven't unsubscribed
         result = await db.execute(

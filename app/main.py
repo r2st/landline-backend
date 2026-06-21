@@ -10,7 +10,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import companies, contacts, leads, outreach, dashboard, import_export, email_templates, follow_ups, gmail
+from app.auth import ApiKeyMiddleware
+from app.routers import companies, contacts, leads, outreach, dashboard, import_export, email_templates, follow_ups, gmail, discovery, tracking, ai, groups, news
 
 settings = get_settings()
 
@@ -53,6 +54,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# API key authentication (only when configured)
+if settings.api_key:
+    app.add_middleware(ApiKeyMiddleware)
+
 # Mount routers under the API prefix
 app.include_router(companies.router, prefix=settings.api_prefix)
 app.include_router(contacts.router, prefix=settings.api_prefix)
@@ -63,11 +68,27 @@ app.include_router(import_export.router, prefix=settings.api_prefix)
 app.include_router(email_templates.router, prefix=settings.api_prefix)
 app.include_router(follow_ups.router, prefix=settings.api_prefix)
 app.include_router(gmail.router, prefix=settings.api_prefix)
+app.include_router(discovery.router, prefix=settings.api_prefix)
+app.include_router(tracking.router, prefix=settings.api_prefix)
+app.include_router(ai.router, prefix=settings.api_prefix)
+app.include_router(groups.router, prefix=settings.api_prefix)
+app.include_router(news.router, prefix=settings.api_prefix)
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "app": settings.app_name,
+        "env": settings.app_env,
+        "version": "1.0.0",
+    }
+
+
+@app.get(f"{settings.api_prefix}/health")
+async def api_health_check():
+    """Health check under the API prefix."""
     return {
         "status": "healthy",
         "app": settings.app_name,

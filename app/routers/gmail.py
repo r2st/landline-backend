@@ -1,15 +1,16 @@
 """Gmail OAuth connection endpoints.
 
-Lets a user connect their own Google account so outreach mail is sent as them
-(via the Gmail API), with proper SPF/DKIM/DMARC so it stays out of spam.
+Supports multiple connected Gmail accounts with individual sending toggles
+and round-robin sender rotation across enabled accounts.
 
 Flow:
-    GET  /gmail/oauth/authorize        -> { authorization_url, state }
-    GET  /gmail/oauth/callback?code&state -> upserts account, closes the popup
-    GET  /gmail/status                 -> connection status + connected accounts
-    GET  /gmail/accounts               -> list connected accounts
-    POST /gmail/accounts/{id}/set-active -> choose the active sender
-    DELETE /gmail/accounts/{id}        -> disconnect (revokes at Google)
+    GET  /gmail/oauth/authorize          -> { authorization_url, state }
+    GET  /gmail/oauth/callback?code&state-> upserts account, closes popup
+    GET  /gmail/status                   -> connection status + all accounts
+    GET  /gmail/accounts                 -> list connected accounts
+    POST /gmail/accounts/{id}/set-active -> choose the primary sender
+    POST /gmail/accounts/{id}/toggle-sending -> enable/disable for rotation
+    DELETE /gmail/accounts/{id}          -> disconnect (revokes at Google)
 """
 
 import html
@@ -25,7 +26,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.models.gmail_account import GmailAccount
-from app.schemas.gmail import AuthorizeResponse, GmailAccountRead, GmailStatusResponse
+from app.schemas.gmail import (
+    AuthorizeResponse,
+    GmailAccountRead,
+    GmailStatusResponse,
+    ToggleSendingRequest,
+)
 from app.services import crypto, google_oauth
 
 logger = logging.getLogger(__name__)
@@ -89,11 +95,11 @@ async def oauth_callback(
         connected = google_oauth.exchange_code(code)
     except google_oauth.OAuthError as exc:
         return HTMLResponse(_callback_html(False, f"Could not connect: {exc}"))
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception:
         logger.exception("Unexpected OAuth callback failure")
         return HTMLResponse(_callback_html(False, "Unexpected error connecting Gmail."))
 
-    # Upsert by google_sub so re-connecting the same account updates tokens.
+    # Upsert by google_sub
     result = await db.execute(
         select(GmailAccount).where(GmailAccount.google_sub == connected.google_sub)
     )
@@ -104,13 +110,12 @@ async def oauth_callback(
 
     if account is None:
         if not connected.refresh_token:
-            # Without a refresh token we can't send later; ask the user to retry.
             return HTMLResponse(_callback_html(
                 False,
                 "Google did not return a refresh token. Remove Landline's access "
                 "in your Google Account and try connecting again.",
             ))
-        # First connected account becomes the active sender automatically.
+        # First account becomes active automatically
         any_existing = (await db.execute(select(GmailAccount.id).limit(1))).first()
         account = GmailAccount(
             email=connected.email,
@@ -122,6 +127,7 @@ async def oauth_callback(
             scopes=connected.scopes,
             status="connected",
             is_active=(any_existing is None),
+            sending_enabled=True,  # New accounts are sending-enabled by default
         )
         db.add(account)
     else:
@@ -135,7 +141,10 @@ async def oauth_callback(
             account.refresh_token_encrypted = crypto.encrypt(connected.refresh_token)
 
     await db.flush()
-    logger.info("Connected Gmail account %s (active=%s)", account.email, account.is_active)
+    logger.info(
+        "Connected Gmail account %s (active=%s, sending=%s)",
+        account.email, account.is_active, account.sending_enabled,
+    )
     return HTMLResponse(_callback_html(True, f"Connected {connected.email}."))
 
 
@@ -150,11 +159,15 @@ async def status(db: AsyncSession = Depends(get_db)):
     )
     accounts = list(result.scalars().all())
     active = next((a for a in accounts if a.is_active and a.status == "connected"), None)
+    sending_count = sum(
+        1 for a in accounts if a.sending_enabled and a.status == "connected"
+    )
     return GmailStatusResponse(
         configured=google_oauth.is_configured(),
         connected=any(a.status == "connected" for a in accounts),
         active_email=active.email if active else None,
         active_account_id=active.id if active else None,
+        sending_enabled_count=sending_count,
         fallback_sender=settings.ses_sender_email,
         accounts=accounts,
     )
@@ -162,7 +175,7 @@ async def status(db: AsyncSession = Depends(get_db)):
 
 @router.get("/accounts", response_model=list[GmailAccountRead])
 async def list_accounts(db: AsyncSession = Depends(get_db)):
-    """List all connected Gmail accounts (active first, then newest)."""
+    """List all connected Gmail accounts."""
     result = await db.execute(
         select(GmailAccount).order_by(
             GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
@@ -173,7 +186,7 @@ async def list_accounts(db: AsyncSession = Depends(get_db)):
 
 @router.post("/accounts/{account_id}/set-active", response_model=GmailAccountRead)
 async def set_active(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Make a connected account the active sender (clears the flag on others)."""
+    """Make a connected account the primary sender (clears the flag on others)."""
     result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
     account = result.scalar_one_or_none()
     if account is None:
@@ -187,17 +200,37 @@ async def set_active(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     account.is_active = True
     await db.flush()
     await db.refresh(account)
-    logger.info("Set active Gmail sender to %s", account.email)
+    logger.info("Set primary Gmail sender to %s", account.email)
+    return account
+
+
+@router.post("/accounts/{account_id}/toggle-sending", response_model=GmailAccountRead)
+async def toggle_sending(
+    account_id: uuid.UUID,
+    body: ToggleSendingRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Enable or disable an account for the sending rotation pool."""
+    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+    if account.status != "connected":
+        raise HTTPException(
+            status_code=400,
+            detail="This account is not connected — reconnect it first.",
+        )
+    account.sending_enabled = body.sending_enabled
+    await db.flush()
+    await db.refresh(account)
+    state = "enabled" if body.sending_enabled else "disabled"
+    logger.info("Sending %s for Gmail account %s", state, account.email)
     return account
 
 
 @router.delete("/accounts/{account_id}", status_code=204)
 async def disconnect(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Disconnect an account: revoke its token at Google and delete it locally.
-
-    If the active account is removed, the most recently connected remaining
-    account is promoted to active.
-    """
+    """Disconnect an account: revoke its token at Google and delete it locally."""
     result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
     account = result.scalar_one_or_none()
     if account is None:
@@ -207,7 +240,7 @@ async def disconnect(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     try:
         refresh_token = crypto.decrypt(account.refresh_token_encrypted)
         google_oauth.revoke_token(refresh_token)
-    except Exception as exc:  # revocation is best-effort
+    except Exception as exc:
         logger.warning("Could not revoke token for %s: %s", account.email, exc)
 
     await db.delete(account)

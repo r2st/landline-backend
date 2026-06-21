@@ -1,10 +1,9 @@
 """Unified outreach email dispatch: Gmail-as-user, with SES fallback.
 
-A single entry point — :func:`send_outreach_email` — used by both the compose
-endpoint and the Celery sequence task. It picks the sender in this order:
+Supports multiple sending accounts with round-robin rotation. Picks sender:
 
     1. An explicitly requested connected Gmail account (``sender_account_id``)
-    2. The currently active connected Gmail account
+    2. Round-robin rotation across all ``sending_enabled`` + connected accounts
     3. Amazon SES (legacy fallback, used when no Gmail account is connected)
 
 The CAN-SPAM unsubscribe footer is appended here so every transport sends the
@@ -18,8 +17,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from itsdangerous import URLSafeTimedSerializer
 
 from app.config import get_settings
 from app.models.gmail_account import GmailAccount
@@ -37,7 +38,7 @@ class SenderInfo:
     from_email: str
     display_name: Optional[str] = None
     account_id: Optional[uuid.UUID] = None
-    connected: bool = False  # True when a Gmail account is the sender
+    connected: bool = False
 
 
 async def get_active_account(db: AsyncSession) -> Optional[GmailAccount]:
@@ -57,6 +58,38 @@ async def get_account(db: AsyncSession, account_id: uuid.UUID) -> Optional[Gmail
     return result.scalar_one_or_none()
 
 
+async def get_next_rotation_account(db: AsyncSession) -> Optional[GmailAccount]:
+    """Pick the least-recently-used sending-enabled account for round-robin rotation.
+
+    Orders by last_used_at ascending (NULL first, so brand-new accounts get used
+    first), then connected_at ascending as a tiebreaker.
+    """
+    result = await db.execute(
+        select(GmailAccount)
+        .where(
+            GmailAccount.sending_enabled == True,  # noqa: E712
+            GmailAccount.status == "connected",
+        )
+        .order_by(
+            GmailAccount.last_used_at.asc().nulls_first(),
+            GmailAccount.connected_at.asc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_sending_accounts(db: AsyncSession) -> list[GmailAccount]:
+    """Return all sending-enabled, connected Gmail accounts."""
+    result = await db.execute(
+        select(GmailAccount).where(
+            GmailAccount.sending_enabled == True,  # noqa: E712
+            GmailAccount.status == "connected",
+        )
+    )
+    return list(result.scalars().all())
+
+
 async def resolve_sender_info(
     db: AsyncSession, sender_account_id: Optional[uuid.UUID] = None
 ) -> SenderInfo:
@@ -64,6 +97,12 @@ async def resolve_sender_info(
     account = None
     if sender_account_id is not None:
         account = await get_account(db, sender_account_id)
+
+    # Try rotation (least recently used sending-enabled account)
+    if account is None:
+        account = await get_next_rotation_account(db)
+
+    # Fallback to active account
     if account is None:
         account = await get_active_account(db)
 
@@ -83,11 +122,15 @@ async def resolve_sender_info(
 
 
 def _unsubscribe_footer(contact_email: str) -> str:
+    settings = get_settings()
+    serializer = URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
+    token = serializer.dumps(contact_email, salt="unsubscribe")
+    unsubscribe_url = f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
     return (
         "\n\n---\n"
         "Apprend Technologies | Manufacturing Software Solutions\n"
-        f"To unsubscribe, reply with 'UNSUBSCRIBE' or click: "
-        f"https://landline.apprendtechnologies.com/unsubscribe?email={contact_email}\n"
+        f"To unsubscribe, reply with UNSUBSCRIBE or click: "
+        f"{unsubscribe_url}\n"
         "Apprend Technologies, 123 Innovation Drive, Suite 400, Toronto, ON M5V 1A1, Canada"
     )
 
@@ -112,6 +155,12 @@ async def send_outreach_email(
         account = await get_account(db, sender_account_id)
         if account is None or account.status != "connected":
             account = None
+
+    # Use rotation: pick least-recently-used sending-enabled account
+    if account is None:
+        account = await get_next_rotation_account(db)
+
+    # Last resort: the primary active account (even if sending_enabled is False)
     if account is None:
         account = await get_active_account(db)
 
@@ -131,14 +180,14 @@ async def send_outreach_email(
             body_text=body_text,
             reply_to=reply_to,
         )
-        # Record usage; mark the account as errored if Google rejected us so the
-        # UI can prompt a re-connect and future sends fall back to SES.
+        # Update usage tracking
         account.last_used_at = datetime.now(timezone.utc)
+        account.daily_send_count = (account.daily_send_count or 0) + 1
         if result.get("status") == "error":
             account.status = "error"
         return result
 
-    # Fallback: Amazon SES. The footer is already appended above.
+    # Fallback: Amazon SES
     ses = EmailSender()
     result = await asyncio.to_thread(
         ses.send_email,

@@ -21,7 +21,9 @@ class GmailAccountRead(BaseModel):
     email: str
     display_name: Optional[str] = None
     is_active: bool
+    sending_enabled: bool = True
     status: str
+    daily_send_count: int = 0
     connected_at: datetime
     last_used_at: Optional[datetime] = None
 
@@ -29,9 +31,14 @@ class GmailAccountRead(BaseModel):
 class GmailStatusResponse(BaseModel):
     """Overall connection status for the settings UI and compose 'From' line."""
 
-    configured: bool  # whether Google OAuth env vars are set on the server
-    connected: bool  # whether at least one account is connected
+    configured: bool
+    connected: bool
     active_email: Optional[str] = None
     active_account_id: Optional[uuid.UUID] = None
-    fallback_sender: str  # the SES sender used when nothing is connected
+    sending_enabled_count: int = 0
+    fallback_sender: str
     accounts: list[GmailAccountRead] = []
+
+
+class ToggleSendingRequest(BaseModel):
+    sending_enabled: bool

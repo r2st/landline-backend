@@ -92,7 +92,7 @@ services:
       CELERY_BROKER_URL: "redis://redis:6379/0"
       CELERY_RESULT_BACKEND: "redis://redis:6379/1"
       APP_ENV: "staging"
-    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--beat", "--loglevel=info", "--concurrency=1", "-Q", "celery,outreach,scraping,enrichment"]
     logging:
       driver: json-file
       options:

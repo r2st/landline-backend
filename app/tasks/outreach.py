@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import async_session_factory
+from app.database_celery import celery_session
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.consent import ConsentRecord
@@ -18,12 +18,15 @@ from app.services.consent import check_consent
 from app.services.email_compose import render
 from app.services.email_dispatch import send_outreach_email
 from app.tasks.celery_app import celery_app
+from app.services.send_limiter import get_send_limiter
 
 logger = logging.getLogger(__name__)
 
 
 def _run_async(coro):
+    """Run async code in Celery's sync context with a fresh event loop."""
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
@@ -39,7 +42,7 @@ def send_sequence_step(self, enrollment_id: str):
     logger.info("Processing sequence step for enrollment %s", enrollment_id)
 
     async def _run():
-        async with async_session_factory() as db:
+        async with celery_session() as db:
             try:
                 # Load enrollment with related data
                 result = await db.execute(
@@ -173,7 +176,7 @@ def process_outreach_queue():
     logger.info("Processing outreach queue")
 
     async def _run():
-        async with async_session_factory() as db:
+        async with celery_session() as db:
             result = await db.execute(
                 select(OutreachEnrollment)
                 .where(OutreachEnrollment.status == "active")
@@ -224,11 +227,64 @@ def process_outreach_queue():
                     if now < due_date:
                         continue
 
+                # --- Anti-spam checks ---
+                limiter = get_send_limiter()
+
+                # Check daily limit — if hit, stop processing entirely
+                can_send, reason = await limiter.can_send_today(db)
+                if not can_send:
+                    logger.warning("Daily send limit reached: %s — stopping queue processing", reason)
+                    break
+
+                # Load contact to check per-contact limits
+                contact_result = await db.execute(
+                    select(Contact).where(Contact.id == enrollment.contact_id)
+                )
+                contact = contact_result.scalar_one_or_none()
+                if contact and contact.email:
+                    can_send_contact, contact_reason = await limiter.can_send_to_contact(db, contact.email)
+                    if not can_send_contact:
+                        logger.info("Skipping enrollment %s: %s", enrollment.id, contact_reason)
+                        continue
+
                 # Dispatch the send
                 send_sequence_step.delay(str(enrollment.id))
                 dispatched += 1
 
             await db.commit()
             return {"active_enrollments": len(enrollments), "dispatched": dispatched}
+
+    return _run_async(_run())
+
+
+@celery_app.task(name="app.tasks.outreach.check_email_replies")
+def check_email_replies():
+    """Periodic task: check Gmail for replies and auto-respond with AI.
+
+    Uses the SmartReplyService to detect replies, classify intent with Claude,
+    draft human-like responses, and optionally auto-send for clear positive
+    intents.  Falls back to logging-only when AI analysis is unavailable.
+    """
+    logger.info("Checking Gmail for outreach replies (smart reply)")
+
+    async def _run():
+        from app.services.smart_reply import get_smart_reply_service
+
+        service = get_smart_reply_service()
+        async with celery_session() as db:
+            results = await service.process_replies(db)
+            if results:
+                logger.info("Processed %d replies", len(results))
+                for r in results:
+                    logger.info(
+                        "Reply from %s (%s) -- intent: %s, auto-sent: %s",
+                        r.get("contact_name"),
+                        r.get("from_email"),
+                        r.get("analysis", {}).get("intent", "unknown"),
+                        r.get("auto_sent", False),
+                    )
+            else:
+                logger.info("No new replies found")
+            return results
 
     return _run_async(_run())

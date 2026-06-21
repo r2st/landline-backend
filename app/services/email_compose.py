@@ -12,7 +12,7 @@ A few convenience aliases are also exposed: {{last_name}}, {{full_name}},
 {{company_name}}, {{title}}, {{industry}}.
 """
 
-from jinja2 import Template
+from jinja2.sandbox import SandboxedEnvironment
 
 # The Apprend demo link surfaced in every outreach template.
 DEMO_LINK = "https://true-molding-demo.pages.dev"
@@ -62,6 +62,9 @@ def build_merge_context(contact, company) -> dict:
 def render(template_str: str, context: dict) -> str:
     """Render a template string with the given context.
 
+    Uses a SandboxedEnvironment to prevent server-side template injection.
     Undefined merge fields render as empty strings (Jinja2 default).
     """
-    return Template(template_str or "").render(**context)
+    env = SandboxedEnvironment()
+    template = env.from_string(template_str or "")
+    return template.render(**context)

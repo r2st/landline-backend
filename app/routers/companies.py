@@ -140,8 +140,9 @@ async def list_companies(
     total_result = await db.execute(count_query)
     total = total_result.scalar()
 
-    # Sort
-    sort_column = getattr(Company, sort_by, Company.created_at)
+    # Sort — whitelist allowed columns to prevent attribute access abuse
+    ALLOWED_SORTS = {"name", "created_at", "stage", "country", "employee_count", "city", "domain"}
+    sort_column = getattr(Company, sort_by) if sort_by in ALLOWED_SORTS else Company.created_at
     if sort_dir == "asc":
         query = query.order_by(sort_column.asc())
     else:

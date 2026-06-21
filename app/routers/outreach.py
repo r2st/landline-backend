@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.models.email_template import EmailSend
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.schemas.outreach import (
     EnrollmentCreate,
@@ -291,3 +292,47 @@ async def get_enrollment_events(
         .order_by(OutreachEvent.occurred_at.asc())
     )
     return list(result.scalars().all())
+
+
+# --- Reply tracking stats ---
+
+@router.get("/reply-stats")
+async def get_reply_stats(db: AsyncSession = Depends(get_db)):
+    """Get reply tracking statistics across all outreach emails."""
+
+    # Count by status
+    result = await db.execute(
+        select(EmailSend.status, func.count(EmailSend.id)).group_by(EmailSend.status)
+    )
+    status_counts = dict(result.all())
+
+    # Recent replies (last 10)
+    result = await db.execute(
+        select(EmailSend)
+        .where(EmailSend.status == "replied")
+        .order_by(EmailSend.replied_at.desc())
+        .limit(10)
+    )
+    recent_replies = result.scalars().all()
+
+    total_sent = sum(status_counts.values())
+    replied = status_counts.get("replied", 0)
+
+    return {
+        "total_sent": total_sent,
+        "replied": replied,
+        "opened": status_counts.get("opened", 0),
+        "clicked": status_counts.get("clicked", 0),
+        "bounced": status_counts.get("bounced", 0),
+        "reply_rate": round(replied / max(total_sent, 1) * 100, 1),
+        "recent_replies": [
+            {
+                "id": str(r.id),
+                "to_email": r.to_email,
+                "subject": r.subject,
+                "replied_at": r.replied_at.isoformat() if r.replied_at else None,
+                "sent_at": r.sent_at.isoformat() if r.sent_at else None,
+            }
+            for r in recent_replies
+        ],
+    }

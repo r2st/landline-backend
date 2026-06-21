@@ -28,9 +28,12 @@ from app.schemas.email_template import (
     EmailTemplateUpdate,
     TemplatePreviewRequest,
     TemplatePreviewResponse,
+    SendTestRequest,
+    SendTestResponse,
 )
 from app.services.email_compose import SAMPLE_CONTEXT, build_merge_context, render
 from app.services.email_dispatch import resolve_sender_info, send_outreach_email
+from app.routers.tracking import generate_tracking_pixel_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["email"])
@@ -221,6 +224,71 @@ async def preview_email_template(
 
 # --- Compose / Send ---
 
+
+# --- Send Test ---
+
+@router.post("/email-templates/send-test", response_model=SendTestResponse)
+async def send_test_email(
+    payload: SendTestRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a single test email using a template with placeholder merge data.
+
+    Renders the template with sample values, prefixes the subject with
+    ``[TEST]``, and sends to the provided ``test_email`` address. Useful for
+    verifying template content and deliverability before sending to real
+    contacts.
+    """
+    template = await _get_template_or_404(db, payload.template_id)
+
+    # Build sample merge context for test rendering.
+    context = {
+        "first_name": "Test",
+        "last_name": "User",
+        "full_name": "Test User",
+        "company": "Sample Company",
+        "company_name": "Sample Company",
+        "industry_segment": "Technology",
+        "industry": "Technology",
+        "city": "New York",
+        "contact_title": "VP of Marketing",
+        "title": "VP of Marketing",
+        "email": payload.test_email,
+        "demo_link": "https://true-molding-demo.pages.dev",
+    }
+
+    subject = "[TEST] " + render(template.subject, context)
+    body_html = render(template.body, context)
+
+    try:
+        send_result = await send_outreach_email(
+            db,
+            to_email=payload.test_email,
+            subject=subject,
+            body_html=body_html,
+            sender_account_id=payload.sender_account_id,
+        )
+        status = send_result.get("status", "error")
+        detail = send_result.get("reason") or send_result.get("detail")
+
+        if status in ("sent", "skipped"):
+            logger.info(
+                "Test email sent to %s using template %s",
+                payload.test_email, payload.template_id,
+            )
+            return SendTestResponse(status="sent", subject=subject, detail=detail)
+
+        logger.warning(
+            "Test email failed for %s using template %s: %s",
+            payload.test_email, payload.template_id, detail,
+        )
+        return SendTestResponse(status="failed", subject=subject, detail=detail)
+    except Exception as exc:
+        logger.exception("Test email error for %s", payload.test_email)
+        return SendTestResponse(
+            status="failed", subject=subject, detail=str(exc),
+        )
+
 @router.post("/email-compose", response_model=EmailComposeResponse)
 async def compose_and_send(
     payload: EmailComposeRequest,
@@ -273,6 +341,21 @@ async def compose_and_send(
         subject = render(template.subject, context)
         body_html = render(template.body, context)
 
+        # Create an EmailSend record first so we have a send_id for tracking
+        email_send = EmailSend(
+            template_id=template.id,
+            contact_id=contact.id,
+            to_email=contact.email,
+            subject=subject,
+            status="pending",
+        )
+        db.add(email_send)
+        await db.flush()
+
+        # Inject open tracking pixel into email body
+        tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
+        body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
+
         send_result = await send_outreach_email(
             db,
             to_email=contact.email,
@@ -284,15 +367,10 @@ async def compose_and_send(
         message_id = send_result.get("message_id")
         detail = send_result.get("reason") or send_result.get("detail")
 
-        db.add(EmailSend(
-            template_id=template.id,
-            contact_id=contact.id,
-            to_email=contact.email,
-            subject=subject,
-            status=status,
-            provider_message_id=message_id,
-            error=None if status == "sent" else detail,
-        ))
+        # Update the existing EmailSend record with send result
+        email_send.status = status
+        email_send.provider_message_id = message_id
+        email_send.error = None if status == "sent" else detail
 
         if status in ("sent", "skipped"):
             # "skipped" means SES creds aren't configured — still a successful compose.

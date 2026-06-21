@@ -20,6 +20,7 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_acks_late=True,
+    broker_connection_retry_on_startup=True,
     worker_prefetch_multiplier=1,
     task_soft_time_limit=300,
     task_time_limit=600,
@@ -27,13 +28,37 @@ celery_app.conf.update(
         "app.tasks.scraping.*": {"queue": "scraping"},
         "app.tasks.enrichment.*": {"queue": "enrichment"},
         "app.tasks.outreach.*": {"queue": "outreach"},
+        "app.tasks.news.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
             "task": "app.tasks.outreach.process_outreach_queue",
             "schedule": 300.0,  # every 5 minutes
         },
+        "check-email-replies": {
+            "task": "app.tasks.outreach.check_email_replies",
+            "schedule": 600.0,  # every 10 minutes
+        },
+        "check-company-news": {
+            "task": "app.tasks.news.check_company_news_batch",
+            "schedule": 21600.0,  # every 6 hours
+        },
+        "auto-enrich-companies": {
+            "task": "app.tasks.enrichment.auto_enrich_companies",
+            "schedule": 3600.0,  # every hour
+        },
+        "auto-score-new-leads": {
+            "task": "app.tasks.enrichment.auto_score_leads",
+            "schedule": 1800.0,  # every 30 minutes
+        },
     },
 )
 
-celery_app.autodiscover_tasks(["app.tasks"])
+# Explicitly include task modules so autodiscover finds them
+celery_app.autodiscover_tasks(["app.tasks"], force=True)
+
+# Force-import all task modules to guarantee registration
+import app.tasks.outreach  # noqa: F401
+import app.tasks.news  # noqa: F401
+import app.tasks.scraping  # noqa: F401
+import app.tasks.enrichment  # noqa: F401

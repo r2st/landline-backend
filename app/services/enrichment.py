@@ -153,5 +153,109 @@ class ApolloEnrichmentService:
             return []
 
 
+
+    async def search_companies(
+        self,
+        db: AsyncSession,
+        industry: str = "",
+        location: str = "",
+        min_employees: int = None,
+        max_employees: int = None,
+        keywords: list[str] = None,
+        per_page: int = 10,
+    ) -> list[dict]:
+        """Search Apollo for companies matching criteria and import them."""
+        if not self.api_key:
+            return []
+
+        try:
+            params = {
+                "api_key": self.api_key,
+                "page": 1,
+                "per_page": min(per_page, 25),
+            }
+            if industry:
+                params["organization_industry_tag_ids"] = []
+            if keywords or industry:
+                params["q_organization_keyword_tags"] = keywords or [industry]
+            if location:
+                params["organization_locations"] = [location]
+            if min_employees is not None:
+                params["organization_num_employees_ranges"] = [f"{min_employees or 1},{max_employees or 10000}"]
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/mixed_companies/search",
+                    headers=self.headers,
+                    json=params,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            orgs = data.get("organizations", [])
+            imported = []
+
+            for org in orgs:
+                domain = org.get("primary_domain")
+                name = org.get("name")
+                if not name:
+                    continue
+
+                from sqlalchemy import func as sqla_func
+                from sqlalchemy import select
+                existing = None
+                if domain:
+                    result = await db.execute(
+                        select(Company).where(Company.domain == domain)
+                    )
+                    existing = result.scalar_one_or_none()
+                if not existing:
+                    result = await db.execute(
+                        select(Company).where(sqla_func.lower(Company.name) == name.lower())
+                    )
+                    existing = result.scalar_one_or_none()
+
+                if existing:
+                    imported.append({"name": name, "status": "exists", "id": str(existing.id)})
+                    continue
+
+                company = Company(
+                    name=name,
+                    domain=domain,
+                    city=org.get("city"),
+                    state_province=org.get("state"),
+                    country=org.get("country", "US")[:2].upper() if org.get("country") else "US",
+                    employee_count=org.get("estimated_num_employees"),
+                    industry_segment=org.get("industry"),
+                    website=org.get("website_url"),
+                    phone=org.get("phone"),
+                    source="apollo-search",
+                    stage="new",
+                )
+                if company.country not in ("US", "CA"):
+                    company.country = "US"
+                db.add(company)
+                await db.flush()
+
+                imported.append({
+                    "name": name,
+                    "domain": domain,
+                    "status": "imported",
+                    "id": str(company.id),
+                    "industry": org.get("industry"),
+                    "employee_count": org.get("estimated_num_employees"),
+                    "city": org.get("city"),
+                    "state": org.get("state"),
+                })
+
+            await db.commit()
+            return imported
+
+        except Exception as e:
+            logger.error("Apollo company search failed: %s", str(e))
+            await db.rollback()
+            return []
+
+
 def get_enrichment_service() -> ApolloEnrichmentService:
     return ApolloEnrichmentService()

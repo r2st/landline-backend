@@ -153,3 +153,58 @@ async def get_company_contacts(
     contacts = list(contacts_result.scalars().all())
 
     return ContactListResponse(items=contacts, total=len(contacts))
+
+
+# --- Quick Add (compose shortcut) ---
+
+from app.schemas.contact import QuickAddRequest, QuickAddResponse
+
+
+@router.post("/quick-add", response_model=QuickAddResponse, status_code=201)
+async def quick_add_contact(
+    payload: QuickAddRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a contact from the compose view.
+
+    Looks up the company by name (case-insensitive). If none exists, a new
+    company is created with source='manual'. The contact is then linked to
+    that company. This lets users add a recipient on the fly without leaving
+    the compose tab.
+    """
+    company_name = payload.company_name.strip()
+    company_created = False
+
+    # Try to find an existing company by name (case-insensitive).
+    result = await db.execute(
+        select(Company).where(func.lower(Company.name) == company_name.lower())
+    )
+    company = result.scalar_one_or_none()
+
+    if company is None:
+        company = Company(name=company_name, source="manual", country="US")
+        db.add(company)
+        await db.flush()
+        company_created = True
+        logger.info("Quick-add created company '%s' (%s)", company_name, company.id)
+
+    contact = Contact(
+        company_id=company.id,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        email=payload.email,
+        title=payload.title,
+        source="quick-add",
+    )
+    db.add(contact)
+    await db.flush()
+    await db.refresh(contact)
+    logger.info(
+        "Quick-add created contact %s <%s> for company '%s'",
+        contact.id, payload.email, company_name,
+    )
+    return QuickAddResponse(
+        contact=contact,
+        company_name=company_name,
+        company_created=company_created,
+    )

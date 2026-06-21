@@ -26,6 +26,7 @@ class Contact(Base):
     phone: Mapped[str | None] = mapped_column(String(30))
     linkedin_url: Mapped[str | None] = mapped_column(Text)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+    unsubscribed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     source: Mapped[str | None] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
