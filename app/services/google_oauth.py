@@ -114,7 +114,6 @@ def build_authorization_url(state: str) -> str:
         # re-connect of an already-authorized account.
         "access_type": "offline",
         "prompt": "consent",
-        "include_granted_scopes": "true",
     }
     return f"{_AUTH_URI}?{urlencode(params)}"
 
