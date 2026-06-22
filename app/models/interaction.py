@@ -25,7 +25,15 @@ class Interaction(Base):
     interaction_type: Mapped[str] = mapped_column(String(30), nullable=False)
     subject: Mapped[str | None] = mapped_column(String(255))
     notes: Mapped[str | None] = mapped_column(Text)
+    # Free-form body of the interaction (meeting notes, call summary, email text).
+    # Distinct from the legacy ``notes`` field, which is retained for back-compat.
+    content: Mapped[str | None] = mapped_column(Text)
     occurred_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+    # Optional date to follow up on this interaction (drives reminders).
+    follow_up_date: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
 
