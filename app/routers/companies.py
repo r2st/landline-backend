@@ -13,6 +13,8 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 from app.schemas.company import (
+    BulkOpResult,
+    BulkUpdateStageRequest,
     CompanyCreate,
     CompanyListResponse,
     CompanyMergeRequest,
@@ -89,6 +91,7 @@ async def list_companies(
     q: Optional[str] = Query(None, description="Search name, domain, or industry"),
     country: Optional[str] = Query(None, pattern="^(US|CA)$"),
     stage: Optional[str] = Query(None),
+    pipeline_stage: Optional[str] = Query(None, description="Kanban pipeline stage"),
     naics_code: Optional[str] = Query(None),
     industry_segment: Optional[str] = Query(None),
     min_employees: Optional[int] = Query(None, ge=0),
@@ -120,6 +123,8 @@ async def list_companies(
         conditions.append(Company.country == country)
     if stage:
         conditions.append(Company.stage == stage)
+    if pipeline_stage:
+        conditions.append(Company.pipeline_stage == pipeline_stage)
     if naics_code:
         conditions.append(Company.naics_code.startswith(naics_code))
     if industry_segment:
@@ -143,7 +148,7 @@ async def list_companies(
     total = total_result.scalar()
 
     # Sort — whitelist allowed columns to prevent attribute access abuse
-    ALLOWED_SORTS = {"name", "created_at", "stage", "country", "employee_count", "city", "domain"}
+    ALLOWED_SORTS = {"name", "created_at", "stage", "pipeline_stage", "country", "employee_count", "city", "domain"}
     sort_column = getattr(Company, sort_by) if sort_by in ALLOWED_SORTS else Company.created_at
     if sort_dir == "asc":
         query = query.order_by(sort_column.asc())
@@ -165,6 +170,29 @@ async def list_companies(
         page=page,
         page_size=page_size,
     )
+
+
+@router.post("/bulk-update-stage", response_model=BulkOpResult)
+async def bulk_update_stage(
+    payload: BulkUpdateStageRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Move a set of companies to a new kanban pipeline stage in one call."""
+    result = await db.execute(
+        update(Company)
+        .where(Company.id.in_(payload.company_ids))
+        .values(pipeline_stage=payload.pipeline_stage)
+    )
+    # Report how many of the requested ids actually exist vs were updated.
+    matched_result = await db.execute(
+        select(func.count(Company.id)).where(Company.id.in_(payload.company_ids))
+    )
+    matched = matched_result.scalar() or 0
+    await db.flush()
+    logger.info(
+        "Bulk pipeline-stage -> %s for %d companies", payload.pipeline_stage, result.rowcount or 0
+    )
+    return BulkOpResult(matched=matched, updated=result.rowcount or 0)
 
 
 @router.get("/{company_id}", response_model=CompanyRead)

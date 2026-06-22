@@ -18,6 +18,10 @@ class Company(Base):
             "stage IN ('new','researched','scored','contacted','engaged','qualified','opportunity','customer','disqualified')",
             name="ck_companies_stage",
         ),
+        CheckConstraint(
+            "pipeline_stage IN ('new_lead','researching','outreach','engaged','negotiating','client','churned')",
+            name="ck_companies_pipeline_stage",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -37,6 +41,12 @@ class Company(Base):
     website: Mapped[str | None] = mapped_column(Text)
     phone: Mapped[str | None] = mapped_column(String(30))
     stage: Mapped[str] = mapped_column(String(20), nullable=False, default="new")
+    # Kanban pipeline stage — distinct from the lifecycle ``stage`` above. Drives
+    # the deal-board view (new_lead → researching → outreach → engaged →
+    # negotiating → client / churned).
+    pipeline_stage: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="new_lead", server_default="new_lead"
+    )
     tags: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(

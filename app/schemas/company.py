@@ -12,6 +12,11 @@ VALID_STAGES = (
     "new", "researched", "scored", "contacted", "engaged",
     "qualified", "opportunity", "customer", "disqualified",
 )
+# Kanban deal-board stages (distinct from the lifecycle ``stage`` above).
+VALID_PIPELINE_STAGES = (
+    "new_lead", "researching", "outreach", "engaged",
+    "negotiating", "client", "churned",
+)
 VALID_COUNTRIES = ("US", "CA")
 
 
@@ -55,6 +60,7 @@ class CompanyUpdate(BaseModel):
     website: Optional[str] = None
     phone: Optional[str] = Field(None, max_length=30)
     stage: Optional[str] = None
+    pipeline_stage: Optional[str] = None
     tags: Optional[list[str]] = None
     notes: Optional[str] = None
     source: Optional[str] = Field(None, max_length=50)
@@ -65,6 +71,13 @@ class CompanyUpdate(BaseModel):
     def _normalize_domain(cls, v):
         return normalize_domain(v) if v else v
 
+    @field_validator("pipeline_stage")
+    @classmethod
+    def _validate_pipeline_stage(cls, v):
+        if v is not None and v not in VALID_PIPELINE_STAGES:
+            raise ValueError(f"pipeline_stage must be one of {VALID_PIPELINE_STAGES}")
+        return v
+
 
 class CompanyStageUpdate(BaseModel):
     stage: str
@@ -74,6 +87,58 @@ class CompanyStageUpdate(BaseModel):
             raise ValueError(f"stage must be one of {VALID_STAGES}")
 
 
+class CompanyPipelineStageUpdate(BaseModel):
+    pipeline_stage: str
+
+    @field_validator("pipeline_stage")
+    @classmethod
+    def _validate(cls, v):
+        if v not in VALID_PIPELINE_STAGES:
+            raise ValueError(f"pipeline_stage must be one of {VALID_PIPELINE_STAGES}")
+        return v
+
+
+class BulkUpdateStageRequest(BaseModel):
+    company_ids: list[uuid.UUID] = Field(..., min_length=1)
+    pipeline_stage: str
+
+    @field_validator("pipeline_stage")
+    @classmethod
+    def _validate(cls, v):
+        if v not in VALID_PIPELINE_STAGES:
+            raise ValueError(f"pipeline_stage must be one of {VALID_PIPELINE_STAGES}")
+        return v
+
+
+class BulkTagRequest(BaseModel):
+    company_ids: list[uuid.UUID] = Field(..., min_length=1)
+    add: list[str] = Field(default_factory=list)
+    remove: list[str] = Field(default_factory=list)
+
+
+class BulkOpResult(BaseModel):
+    matched: int
+    updated: int
+
+
+class BulkExportRequest(BaseModel):
+    # When omitted/empty, export every company.
+    company_ids: Optional[list[uuid.UUID]] = None
+    include_contacts: bool = True
+    include_scores: bool = True
+    include_activity: bool = False
+
+
+class PipelineStageCount(BaseModel):
+    stage: str
+    count: int
+
+
+class PipelineSummary(BaseModel):
+    stages: list[PipelineStageCount]
+    total: int
+
+
 class CompanyRead(CompanyBase):
     model_config = ConfigDict(from_attributes=True)
 
@@ -81,6 +146,7 @@ class CompanyRead(CompanyBase):
     source: str
     source_url: Optional[str] = None
     stage: str
+    pipeline_stage: str
     created_at: datetime
     updated_at: datetime
     # Derived, attached by the router (not stored on the model itself).
