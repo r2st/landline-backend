@@ -254,7 +254,11 @@ def process_outreach_queue():
             await db.commit()
             return {"active_enrollments": len(enrollments), "dispatched": dispatched}
 
-    return _run_async(_run())
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("process_outreach_queue failed: %s", str(exc))
+        return {"status": "error", "error": str(exc)}
 
 
 @celery_app.task(name="app.tasks.outreach.check_email_replies")
@@ -287,4 +291,8 @@ def check_email_replies():
                 logger.info("No new replies found")
             return results
 
-    return _run_async(_run())
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("check_email_replies failed: %s", str(exc))
+        return {"status": "error", "error": str(exc)}

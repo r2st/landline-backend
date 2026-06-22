@@ -80,6 +80,14 @@ class Settings(BaseSettings):
     # Smart auto-reply
     auto_reply_enabled: bool = True                        # Auto-send AI-drafted replies for clear positive intents
 
+    # Autonomous follow-up + re-scoring (Celery beat)
+    stale_lead_followup_days: int = 7                      # Active-pipeline lead with no touch in N days → auto follow-up reminder
+    stale_lead_followup_stages: List[str] = [             # Stages worth chasing automatically
+        "contacted", "engaged", "qualified", "opportunity",
+    ]
+    auto_followup_batch_limit: int = 50                    # Max reminders created per beat run
+    rescore_batch_limit: int = 50                          # Max companies re-scored per beat run
+
     # Scheduling link (Calendly or similar) — included in auto-replies when set
     scheduling_link: str = ""
 

@@ -29,6 +29,7 @@ celery_app.conf.update(
         "app.tasks.enrichment.*": {"queue": "enrichment"},
         "app.tasks.outreach.*": {"queue": "outreach"},
         "app.tasks.news.*": {"queue": "enrichment"},
+        "app.tasks.followups.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -51,6 +52,14 @@ celery_app.conf.update(
             "task": "app.tasks.enrichment.auto_score_leads",
             "schedule": 1800.0,  # every 30 minutes
         },
+        "generate-stale-lead-followups": {
+            "task": "app.tasks.followups.generate_stale_lead_followups",
+            "schedule": 14400.0,  # every 4 hours
+        },
+        "rescore-active-leads": {
+            "task": "app.tasks.followups.rescore_active_leads",
+            "schedule": 43200.0,  # twice a day
+        },
     },
 )
 
@@ -62,3 +71,4 @@ import app.tasks.outreach  # noqa: F401
 import app.tasks.news  # noqa: F401
 import app.tasks.scraping  # noqa: F401
 import app.tasks.enrichment  # noqa: F401
+import app.tasks.followups  # noqa: F401
