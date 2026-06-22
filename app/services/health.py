@@ -13,6 +13,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.client_health import ClientHealthSnapshot
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
@@ -159,3 +160,51 @@ async def compute_health_by_id(db: AsyncSession, company_id: uuid.UUID) -> Optio
     if not company:
         return None
     return await compute_company_health(db, company)
+
+
+async def record_health_snapshot(
+    db: AsyncSession,
+    company_id: uuid.UUID,
+    satisfaction_score: Optional[float] = None,
+) -> Optional[ClientHealthSnapshot]:
+    """Compute current health and persist it as a snapshot for over-time
+    tracking. Returns ``None`` if the company doesn't exist.
+
+    ``satisfaction_score`` is an optional manual signal stored alongside the
+    activity-derived metrics; it does not affect the computed score.
+    """
+    company = (
+        await db.execute(select(Company).where(Company.id == company_id))
+    ).scalar_one_or_none()
+    if not company:
+        return None
+
+    health = await compute_company_health(db, company)
+    snapshot = ClientHealthSnapshot(
+        company_id=company.id,
+        score=health.score,
+        health_status=health.health_status,
+        last_contact_date=health.signals.last_contact_at,
+        response_rate=health.signals.response_rate,
+        meeting_frequency=health.signals.meetings_last_90d,
+        satisfaction_score=satisfaction_score,
+    )
+    db.add(snapshot)
+    await db.flush()
+    await db.refresh(snapshot)
+    return snapshot
+
+
+async def get_health_history(
+    db: AsyncSession, company_id: uuid.UUID, limit: int = 50
+) -> list[ClientHealthSnapshot]:
+    """Return a company's health snapshots, most recent first."""
+    rows = (
+        await db.execute(
+            select(ClientHealthSnapshot)
+            .where(ClientHealthSnapshot.company_id == company_id)
+            .order_by(ClientHealthSnapshot.recorded_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return list(rows)

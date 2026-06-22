@@ -14,6 +14,7 @@ from app.models.smtp_account import SmtpAccount
 from app.models.company_news import CompanyNews
 from app.models.deal import Deal
 from app.models.task import Task
+from app.models.client_health import ClientHealthSnapshot
 
 __all__ = [
     "Company",
@@ -33,4 +34,5 @@ __all__ = [
     "CompanyNews",
     "Deal",
     "Task",
+    "ClientHealthSnapshot",
 ]

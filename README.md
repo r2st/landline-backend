@@ -157,6 +157,8 @@ Post-conversion client management: deals, tasks, logged interactions, client hea
 | GET | `/tasks/upcoming` | Open tasks due within N days (incl. overdue) for the dashboard |
 | POST / GET / PATCH / DELETE | `/interactions` | Logged touchpoints (meeting/call/email/note) with content + follow_up_date |
 | GET | `/companies/{id}/health` | Client health score 0-100 + status (healthy/at_risk/churned) from activity |
+| POST | `/companies/{id}/health/snapshot` | Persist a point-in-time health snapshot (optional manual `satisfaction_score`) |
+| GET | `/companies/{id}/health/history` | Recorded health snapshots over time, most recent first |
 | GET | `/clients/overview` | Client count, won revenue, health distribution, at-risk list, upcoming tasks |
 | GET | `/reports/client-retention` | Current clients vs churned + deals won/lost in period (`start_date`/`end_date`) |
 | GET | `/reports/revenue-pipeline` | Won revenue, open pipeline, lost value, avg deal size by status |

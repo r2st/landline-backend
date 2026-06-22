@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class HealthComponents(BaseModel):
@@ -34,3 +34,30 @@ class ClientHealth(BaseModel):
     components: HealthComponents
     signals: HealthSignals
     computed_at: datetime
+
+
+class HealthSnapshotCreate(BaseModel):
+    """Request to record a point-in-time health snapshot.
+
+    Health is recomputed from current activity; ``satisfaction_score`` is an
+    optional manual CSAT-style signal (0..100) that activity can't capture.
+    """
+
+    satisfaction_score: Optional[float] = Field(None, ge=0, le=100)
+
+
+class ClientHealthSnapshotRead(BaseModel):
+    """A persisted client-health snapshot row (the over-time history record)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    company_id: uuid.UUID
+    score: int
+    health_status: str
+    last_contact_date: Optional[datetime] = None
+    response_rate: float
+    meeting_frequency: int
+    satisfaction_score: Optional[float] = None
+    recorded_at: datetime
+    created_at: datetime
