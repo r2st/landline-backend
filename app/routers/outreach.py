@@ -280,6 +280,48 @@ async def record_event(
     return event
 
 
+@router.get("/events")
+async def list_events(
+    company_id: Optional[uuid.UUID] = Query(None),
+    contact_id: Optional[uuid.UUID] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """List outreach events, optionally scoped to a company or contact.
+
+    Returns events newest-first. Each row carries both the canonical
+    (``event_type``/``occurred_at``) and the UI-friendly (``type``/``created_at``)
+    field names so the company-timeline and activity-feed views render without
+    a field-name mismatch.
+    """
+    query = (
+        select(OutreachEvent)
+        .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+        .join(Contact, OutreachEnrollment.contact_id == Contact.id)
+    )
+    if company_id is not None:
+        query = query.where(Contact.company_id == company_id)
+    if contact_id is not None:
+        query = query.where(OutreachEnrollment.contact_id == contact_id)
+    query = query.order_by(OutreachEvent.occurred_at.desc()).limit(limit)
+
+    events = list((await db.execute(query)).scalars().all())
+    return [
+        {
+            "id": str(e.id),
+            "enrollment_id": str(e.enrollment_id),
+            "step_number": e.step_number,
+            "type": e.event_type,
+            "event_type": e.event_type,
+            "subject": (e.event_metadata or {}).get("subject"),
+            "occurred_at": e.occurred_at,
+            "created_at": e.occurred_at,
+            "metadata": e.event_metadata or {},
+        }
+        for e in events
+    ]
+
+
 @router.get("/events/{enrollment_id}", response_model=list[OutreachEventRead])
 async def get_enrollment_events(
     enrollment_id: uuid.UUID,

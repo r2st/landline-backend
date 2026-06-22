@@ -88,3 +88,38 @@ async def test_overview_at_risk_list_and_tasks(
     assert any(c["company_id"] == str(c1.id) for c in data["at_risk_clients"])
     assert data["upcoming_task_count"] >= 1
     assert any(t["title"] == "Renewal call" for t in data["upcoming_tasks"])
+    # avg_health_score is the mean computed score across clients.
+    assert data["avg_health_score"] is not None
+
+
+@pytest.mark.asyncio
+async def test_list_clients_empty(client: AsyncClient):
+    data = (await client.get("/api/v1/clients")).json()
+    assert data == []
+
+
+@pytest.mark.asyncio
+async def test_list_clients_enriched(client: AsyncClient, db_session: AsyncSession):
+    c1 = await _client_company(db_session, "Enriched Client")
+    # A non-client company should not appear.
+    db_session.add(Company(id=_uuid.uuid4(), name="Lead", country="US",
+                           source="test", pipeline_stage="outreach"))
+    db_session.add(Deal(id=_uuid.uuid4(), company_id=c1.id, title="Won",
+                        value=12000, status="won"))
+    db_session.add(Deal(id=_uuid.uuid4(), company_id=c1.id, title="Lost",
+                        value=3000, status="lost"))
+    db_session.add(Task(id=_uuid.uuid4(), company_id=c1.id, title="Call",
+                        status="pending"))
+    await db_session.commit()
+
+    data = (await client.get("/api/v1/clients")).json()
+    assert isinstance(data, list) and len(data) == 1
+    row = data[0]
+    assert row["company_id"] == str(c1.id)
+    assert row["name"] == "Enriched Client"
+    # Only the won deal counts toward account value.
+    assert row["deal_value"] == 12000
+    assert row["upcoming_tasks"] == 1
+    assert "health_score" in row
+    # health_status is intentionally omitted (frontend derives it from score).
+    assert "health_status" not in row

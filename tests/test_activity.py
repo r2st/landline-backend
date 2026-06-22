@@ -184,3 +184,53 @@ async def test_activity_pagination(
     assert len(data["items"]) == 2
     assert data["page"] == 1
     assert data["page_size"] == 2
+
+
+@pytest.mark.asyncio
+async def test_list_outreach_events_by_company(
+    client: AsyncClient, db_session: AsyncSession,
+    sample_company: Company, sample_contact: Contact,
+):
+    """GET /outreach/events?company_id=… returns UI-friendly event rows and
+    excludes events for other companies."""
+    seq = OutreachSequence(id=_uuid.uuid4(), name="Seq B")
+    db_session.add(seq)
+    await db_session.flush()
+    enrollment = OutreachEnrollment(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, sequence_id=seq.id,
+    )
+    db_session.add(enrollment)
+    await db_session.flush()
+    db_session.add(OutreachEvent(
+        id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+        event_type="sent", event_metadata={"subject": "Intro"},
+        occurred_at=datetime.now(timezone.utc) - timedelta(days=1),
+    ))
+
+    # An event for an unrelated company should not be returned.
+    other_co = Company(id=_uuid.uuid4(), name="Other", country="US", source="test")
+    db_session.add(other_co)
+    await db_session.flush()
+    other_contact = Contact(id=_uuid.uuid4(), company_id=other_co.id,
+                            first_name="X", email="x@o.com", source="test")
+    db_session.add(other_contact)
+    await db_session.flush()
+    other_enr = OutreachEnrollment(id=_uuid.uuid4(), contact_id=other_contact.id,
+                                   sequence_id=seq.id)
+    db_session.add(other_enr)
+    await db_session.flush()
+    db_session.add(OutreachEvent(
+        id=_uuid.uuid4(), enrollment_id=other_enr.id, step_number=1,
+        event_type="opened", occurred_at=datetime.now(timezone.utc),
+    ))
+    await db_session.commit()
+
+    data = (await client.get(
+        "/api/v1/outreach/events", params={"company_id": str(sample_company.id)}
+    )).json()
+    assert isinstance(data, list) and len(data) == 1
+    row = data[0]
+    # Both canonical and UI-friendly field names are present.
+    assert row["type"] == "sent" and row["event_type"] == "sent"
+    assert row["subject"] == "Intro"
+    assert row["created_at"] is not None and row["occurred_at"] is not None

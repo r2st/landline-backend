@@ -21,6 +21,8 @@ class ClientOverview(BaseModel):
     won_deal_count: int
     # status -> count, e.g. {"healthy": 4, "at_risk": 2, "churned": 1}
     health_distribution: dict[str, int]
+    # Mean health score across scored clients (None when there are no clients).
+    avg_health_score: Optional[float] = None
     at_risk_clients: list[AtRiskClient]
     upcoming_tasks: list[TaskRead]
     upcoming_task_count: int

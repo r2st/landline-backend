@@ -121,3 +121,99 @@ async def test_activity_summary_empty(client: AsyncClient):
     assert data["emails_sent"] == 0
     assert data["response_rate"] == 0.0
     assert data["interactions_by_type"] == {}
+
+
+# ─── Frontend-facing report series ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_revenue_funnel(client: AsyncClient, db_session: AsyncSession):
+    c1 = Company(id=_uuid.uuid4(), name="StageA", country="US", source="test",
+                 stage="customer")
+    c2 = Company(id=_uuid.uuid4(), name="StageB", country="US", source="test",
+                 stage="customer")
+    c3 = Company(id=_uuid.uuid4(), name="StageC", country="US", source="test",
+                 stage="contacted")
+    db_session.add_all([c1, c2, c3])
+    await db_session.flush()
+    db_session.add(Deal(id=_uuid.uuid4(), company_id=c1.id, title="D1", value=1000, status="won"))
+    db_session.add(Deal(id=_uuid.uuid4(), company_id=c2.id, title="D2", value=500, status="pending"))
+    await db_session.commit()
+
+    data = (await client.get("/api/v1/reports/revenue-funnel")).json()
+    assert isinstance(data, list)
+    by_stage = {row["stage"]: row for row in data}
+    # Every valid lifecycle stage is present (zero-filled).
+    assert "customer" in by_stage and "contacted" in by_stage and "new" in by_stage
+    assert by_stage["customer"]["count"] == 2
+    assert by_stage["customer"]["value"] == 1500
+    assert by_stage["contacted"]["count"] == 1
+    assert by_stage["contacted"]["value"] == 0
+
+
+@pytest.mark.asyncio
+async def test_activity_heatmap(client: AsyncClient, db_session: AsyncSession,
+                                sample_company: Company, sample_contact: Contact):
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email="x@y.com",
+        subject="hi", status="sent", sent_at=NOW - timedelta(days=1),
+    ))
+    db_session.add(Interaction(
+        id=_uuid.uuid4(), company_id=sample_company.id, interaction_type="call",
+        subject="Ring", occurred_at=NOW - timedelta(days=1),
+    ))
+    await db_session.commit()
+
+    data = (await client.get("/api/v1/reports/activity-heatmap")).json()
+    assert isinstance(data, list)
+    target = (NOW - timedelta(days=1)).date().isoformat()
+    point = next((p for p in data if p["date"] == target), None)
+    assert point is not None
+    assert point["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_top_clients(client: AsyncClient, db_session: AsyncSession):
+    big = Company(id=_uuid.uuid4(), name="BigCo", country="US", source="test")
+    small = Company(id=_uuid.uuid4(), name="SmallCo", country="US", source="test")
+    db_session.add_all([big, small])
+    await db_session.flush()
+    db_session.add_all([
+        Deal(id=_uuid.uuid4(), company_id=big.id, title="W1", value=50000, status="won"),
+        Deal(id=_uuid.uuid4(), company_id=big.id, title="W2", value=20000, status="won"),
+        Deal(id=_uuid.uuid4(), company_id=small.id, title="W3", value=5000, status="won"),
+        Deal(id=_uuid.uuid4(), company_id=small.id, title="P1", value=9999, status="pending"),
+    ])
+    await db_session.commit()
+
+    data = (await client.get("/api/v1/reports/top-clients")).json()
+    assert isinstance(data, list) and len(data) == 2
+    # Ranked by won revenue desc; pending deal excluded.
+    assert data[0]["name"] == "BigCo"
+    assert data[0]["revenue"] == 70000
+    assert data[0]["deals"] == 2
+    assert data[1]["revenue"] == 5000
+
+
+@pytest.mark.asyncio
+async def test_retention_series(client: AsyncClient, db_session: AsyncSession,
+                                sample_company: Company):
+    from app.models.client_health import ClientHealthSnapshot
+    # Three snapshots in the same month: 2 retained, 1 churned -> 66.7%.
+    base = NOW.replace(day=10)
+    for status in ("healthy", "at_risk", "churned"):
+        db_session.add(ClientHealthSnapshot(
+            id=_uuid.uuid4(), company_id=sample_company.id, score=50,
+            health_status=status, recorded_at=base,
+        ))
+    await db_session.commit()
+
+    data = (await client.get("/api/v1/reports/retention")).json()
+    assert isinstance(data, list) and len(data) == 1
+    assert data[0]["rate"] == pytest.approx(66.7, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_retention_empty(client: AsyncClient):
+    data = (await client.get("/api/v1/reports/retention")).json()
+    assert data == []

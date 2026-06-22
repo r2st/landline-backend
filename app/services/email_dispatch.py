@@ -223,9 +223,21 @@ async def send_outreach_email(
             body_text=body_text,
             reply_to=reply_to,
         )
-        # Update usage tracking
-        account.last_used_at = datetime.now(timezone.utc)
-        account.daily_send_count = (account.daily_send_count or 0) + 1
+        # Update usage tracking. Roll the per-account daily counter over at the
+        # UTC date boundary so ``daily_send_count`` reflects *today's* sends
+        # rather than growing without bound.
+        now = datetime.now(timezone.utc)
+        reset_at = account.daily_count_reset_at
+        if reset_at is not None and reset_at.tzinfo is None:
+            reset_at = reset_at.replace(tzinfo=timezone.utc)
+        if reset_at is None or reset_at.date() < now.date():
+            account.daily_send_count = 0
+            account.daily_count_reset_at = now
+        account.last_used_at = now
+        # Only count sends that actually went out (not skipped/errored) toward
+        # the daily total.
+        if result.get("status") == "sent":
+            account.daily_send_count = (account.daily_send_count or 0) + 1
         if result.get("status") == "error":
             account.status = "error"
         return result

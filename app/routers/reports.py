@@ -6,8 +6,8 @@ Rows are windowed and aggregated in Python so naive (SQLite) and aware
 """
 
 import logging
-from collections import Counter
-from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -15,11 +15,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models.client_health import ClientHealthSnapshot
 from app.models.company import Company
 from app.models.deal import Deal
 from app.models.email_template import EmailSend
 from app.models.interaction import Interaction
 from app.models.task import Task
+from app.schemas.company import VALID_STAGES
 from app.schemas.reports import (
     ActivitySummaryReport,
     ClientRetentionReport,
@@ -52,6 +54,18 @@ def _in_window(ts: Optional[datetime], start: Optional[datetime], end: Optional[
 
 def _f(value) -> float:
     return float(value) if value is not None else 0.0
+
+
+def _parse_bound(value: Optional[str]) -> Optional[datetime]:
+    """Parse a ``start``/``end`` query value (ISO date or datetime) to an aware
+    datetime, tolerating the ``YYYY-MM-DD`` shape the date pickers send. Returns
+    ``None`` on empty/invalid input so a bad param never 500s the report."""
+    if not value:
+        return None
+    try:
+        return _aware(datetime.fromisoformat(value))
+    except (ValueError, TypeError):
+        return None
 
 
 @router.get("/client-retention", response_model=ClientRetentionReport)
@@ -183,3 +197,167 @@ async def activity_summary(
         tasks_created=tasks_created,
         tasks_completed=tasks_completed,
     )
+
+
+# ─── Frontend-facing report series ───────────────────────────────────────────
+# The Reports page renders charts/tables that expect array (series) payloads.
+# These endpoints accept ``start``/``end`` (ISO date) query params and return
+# plain JSON arrays so the page's hooks (which coerce to arrays) light up.
+
+
+@router.get("/revenue-funnel")
+async def revenue_funnel(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revenue + company count per lifecycle ``stage`` for the funnel view.
+
+    ``value`` is the summed deal value of companies in that stage; ``count`` is
+    how many companies sit in the stage. Every valid stage is present (zero
+    filled) so the funnel renders a stable set of bars.
+    """
+    lo, hi = _parse_bound(start), _parse_bound(end)
+
+    companies = list((await db.execute(select(Company.id, Company.stage))).all())
+    stage_by_company = {cid: stage for cid, stage in companies}
+    company_count: Counter = Counter(stage for _cid, stage in companies)
+
+    deals = list((await db.execute(select(Deal))).scalars().all())
+    value_by_stage: dict[str, float] = defaultdict(float)
+    for d in deals:
+        if not _in_window(d.created_at, lo, hi):
+            continue
+        stage = stage_by_company.get(d.company_id)
+        if stage is not None:
+            value_by_stage[stage] += _f(d.value)
+
+    return [
+        {
+            "stage": stage,
+            "value": round(value_by_stage.get(stage, 0.0), 2),
+            "count": company_count.get(stage, 0),
+        }
+        for stage in VALID_STAGES
+    ]
+
+
+@router.get("/activity-heatmap")
+async def activity_heatmap(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Daily activity counts (emails sent + interactions + tasks created) for the
+    heatmap. Defaults to the last ~120 days when no window is given."""
+    lo, hi = _parse_bound(start), _parse_bound(end)
+    if lo is None:
+        lo = datetime.now(timezone.utc) - timedelta(days=119)
+
+    counts: dict[str, int] = defaultdict(int)
+
+    def _bump(ts):
+        ts = _aware(ts)
+        if ts is None:
+            return
+        if lo is not None and ts < lo:
+            return
+        if hi is not None and ts > hi:
+            return
+        counts[ts.date().isoformat()] += 1
+
+    for s in (await db.execute(select(EmailSend.sent_at))).scalars().all():
+        _bump(s)
+    for occurred in (await db.execute(select(Interaction.occurred_at))).scalars().all():
+        _bump(occurred)
+    for created in (await db.execute(select(Task.created_at))).scalars().all():
+        _bump(created)
+
+    return [{"date": day, "count": counts[day]} for day in sorted(counts)]
+
+
+@router.get("/top-clients")
+async def top_clients(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """Companies ranked by won-deal revenue, for the Top Clients table.
+
+    Honors the ``start``/``end`` window against each deal's ``close_date``.
+    """
+    lo, hi = _parse_bound(start), _parse_bound(end)
+
+    rows = (
+        await db.execute(
+            select(
+                Deal.company_id,
+                Company.name,
+                func.coalesce(func.sum(Deal.value), 0),
+                func.count(Deal.id),
+            )
+            .join(Company, Company.id == Deal.company_id)
+            .where(Deal.status == "won")
+            .group_by(Deal.company_id, Company.name)
+        )
+    ).all()
+
+    # Re-aggregate in Python when a window is given (close_date may be null and
+    # the SQL above doesn't filter on it, to keep null-date won deals visible).
+    if lo is not None or hi is not None:
+        won = list((await db.execute(select(Deal).where(Deal.status == "won"))).scalars().all())
+        names = {cid: name for cid, name, _v, _c in rows}
+        revenue: dict = defaultdict(float)
+        deal_count: dict = defaultdict(int)
+        for d in won:
+            if not _in_window(d.close_date, lo, hi):
+                continue
+            revenue[d.company_id] += _f(d.value)
+            deal_count[d.company_id] += 1
+        rows = [(cid, names.get(cid), revenue[cid], deal_count[cid]) for cid in revenue]
+
+    ranked = sorted(rows, key=lambda r: _f(r[2]), reverse=True)[:limit]
+    return [
+        {
+            "company_id": str(cid),
+            "name": name,
+            "revenue": round(_f(value), 2),
+            "deals": int(count),
+        }
+        for cid, name, value, count in ranked
+    ]
+
+
+@router.get("/retention")
+async def retention(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Monthly retention rate from recorded client-health snapshots.
+
+    For each month, ``rate`` = share of snapshots that are not ``churned``.
+    Returns an empty series when no snapshots exist yet (the page then shows its
+    empty state rather than a misleading flat line)."""
+    lo, hi = _parse_bound(start), _parse_bound(end)
+
+    snapshots = list((await db.execute(select(ClientHealthSnapshot))).scalars().all())
+    by_month_total: dict[str, int] = defaultdict(int)
+    by_month_retained: dict[str, int] = defaultdict(int)
+    for snap in snapshots:
+        ts = _aware(snap.recorded_at)
+        if ts is None or not _in_window(ts, lo, hi):
+            continue
+        key = f"{ts.year:04d}-{ts.month:02d}-01"
+        by_month_total[key] += 1
+        if snap.health_status != "churned":
+            by_month_retained[key] += 1
+
+    return [
+        {
+            "date": month,
+            "rate": round(by_month_retained[month] / by_month_total[month] * 100, 1),
+        }
+        for month in sorted(by_month_total)
+    ]

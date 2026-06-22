@@ -179,3 +179,51 @@ async def test_compose_uses_gmail_when_connected(client, db_session, sample_cont
     assert data["sender"] == "vidhi@example.com"
     assert data["sent"] == 1
     assert sent["from"] == "vidhi@example.com"
+
+
+async def test_daily_send_count_rolls_over_at_day_boundary(client, db_session, monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    from app.services.email_dispatch import send_outreach_email
+
+    monkeypatch.setattr(
+        "app.services.email_dispatch.GmailSender.send_email",
+        lambda self, **kw: {"status": "sent", "message_id": "x", "transport": "gmail"},
+    )
+
+    account = await _make_account(db_session, "rotate@example.com", active=True)
+    # Yesterday's stale counter should reset before today's send is counted.
+    account.daily_send_count = 42
+    account.daily_count_reset_at = datetime.now(timezone.utc) - timedelta(days=1)
+    await db_session.commit()
+
+    await send_outreach_email(
+        db_session, to_email="lead@x.com", subject="Hi", body_html="<p>Hi</p>",
+        include_unsubscribe=False,
+    )
+    await db_session.commit()
+    await db_session.refresh(account)
+    assert account.daily_send_count == 1
+    reset = account.daily_count_reset_at
+    if reset.tzinfo is None:
+        reset = reset.replace(tzinfo=timezone.utc)
+    assert reset.date() == datetime.now(timezone.utc).date()
+
+
+async def test_daily_send_count_not_incremented_on_skip(client, db_session, monkeypatch):
+    from app.services.email_dispatch import send_outreach_email
+
+    monkeypatch.setattr(
+        "app.services.email_dispatch.GmailSender.send_email",
+        lambda self, **kw: {"status": "error", "transport": "gmail", "detail": "boom"},
+    )
+    account = await _make_account(db_session, "fails@example.com", active=True)
+    await db_session.commit()
+
+    await send_outreach_email(
+        db_session, to_email="lead@x.com", subject="Hi", body_html="<p>Hi</p>",
+        include_unsubscribe=False,
+    )
+    await db_session.commit()
+    await db_session.refresh(account)
+    # Errored send must not count toward the daily total.
+    assert account.daily_send_count == 0

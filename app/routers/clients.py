@@ -28,6 +28,70 @@ def _aware(dt):
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+@router.get("")
+async def list_clients(
+    max_clients: int = Query(500, ge=1, le=2000),
+    db: AsyncSession = Depends(get_db),
+):
+    """List converted clients (companies in the ``client`` pipeline stage),
+    enriched with health score, account value, last-contact, open-task count
+    and industry — the columns the Clients table renders.
+
+    ``health_status`` is intentionally omitted; the frontend derives its RAG
+    badge from ``health_score`` so the two stay in sync.
+    """
+    clients = list(
+        (
+            await db.execute(
+                select(Company)
+                .where(Company.pipeline_stage == _CLIENT_STAGE)
+                .order_by(Company.name.asc())
+                .limit(max_clients)
+            )
+        ).scalars().all()
+    )
+    if not clients:
+        return []
+
+    client_ids = [c.id for c in clients]
+
+    # Won-deal value per client (account value).
+    deal_rows = (
+        await db.execute(
+            select(Deal.company_id, func.coalesce(func.sum(Deal.value), 0))
+            .where(Deal.status == "won", Deal.company_id.in_(client_ids))
+            .group_by(Deal.company_id)
+        )
+    ).all()
+    deal_value = {cid: float(total or 0) for cid, total in deal_rows}
+
+    # Open-task count per client.
+    task_rows = (
+        await db.execute(
+            select(Task.company_id, func.count(Task.id))
+            .where(Task.status.in_(_OPEN_TASK_STATUSES), Task.company_id.in_(client_ids))
+            .group_by(Task.company_id)
+        )
+    ).all()
+    open_tasks = {cid: int(count) for cid, count in task_rows}
+
+    out = []
+    for company in clients:
+        health = await compute_company_health(db, company)
+        out.append({
+            "id": str(company.id),
+            "company_id": str(company.id),
+            "name": company.name,
+            "company_name": company.name,
+            "health_score": health.score,
+            "deal_value": deal_value.get(company.id, 0.0),
+            "last_contact_at": health.signals.last_contact_at,
+            "upcoming_tasks": open_tasks.get(company.id, 0),
+            "industry": company.industry_segment,
+        })
+    return out
+
+
 @router.get("/overview", response_model=ClientOverview)
 async def clients_overview(
     upcoming_days: int = Query(7, ge=1, le=365),
@@ -64,9 +128,11 @@ async def clients_overview(
     # --- Health per client ---
     distribution = {"healthy": 0, "at_risk": 0, "churned": 0}
     at_risk: list[AtRiskClient] = []
+    score_sum = 0
     for company in clients:
         health = await compute_company_health(db, company)
         distribution[health.health_status] = distribution.get(health.health_status, 0) + 1
+        score_sum += health.score
         if health.health_status == "at_risk":
             at_risk.append(AtRiskClient(
                 company_id=company.id,
@@ -100,6 +166,7 @@ async def clients_overview(
         total_won_revenue=total_won_revenue,
         won_deal_count=won_deal_count,
         health_distribution=distribution,
+        avg_health_score=round(score_sum / len(clients), 1) if clients else None,
         at_risk_clients=at_risk,
         upcoming_tasks=upcoming[:25],
         upcoming_task_count=len(upcoming),
