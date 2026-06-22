@@ -112,13 +112,38 @@ All endpoints are prefixed with `/api/v1`.
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/companies/` | Create a company |
-| GET | `/companies/` | List/search companies (with filtering and pagination) |
+| GET | `/companies/` | List/search companies (filter by `stage`, `pipeline_stage`, country, NAICS, tags, …) |
 | GET | `/companies/{id}` | Get company details |
-| PATCH | `/companies/{id}` | Update company fields |
-| PATCH | `/companies/{id}/stage` | Transition pipeline stage |
+| PATCH | `/companies/{id}` | Update company fields (incl. `pipeline_stage`) |
+| PATCH | `/companies/{id}/stage` | Transition lifecycle stage |
 | DELETE | `/companies/{id}` | Delete company (cascading) |
 | POST | `/companies/{id}/merge` | Merge a duplicate company into this one (reassigns contacts/scores/news/follow-ups, backfills fields, deletes the source) |
 | GET | `/companies/{id}/scores` | Get company's lead scores |
+| GET | `/companies/{id}/activity` | Unified chronological activity feed (emails, replies, outreach events, score changes, news, notes, contacts); paginated + `activity_type` filter |
+| POST | `/companies/bulk-update-stage` | Move many companies to a kanban `pipeline_stage` |
+| POST | `/companies/bulk-tag` | Add/remove tags across many companies |
+| POST | `/companies/bulk-export` | Export companies as JSON with all fields (optional contacts, scores, activity) |
+
+### Pipeline (kanban)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/pipeline/summary` | Company counts per kanban `pipeline_stage` (zero-filled) for the deal board |
+
+Kanban stages: `new_lead → researching → outreach → engaged → negotiating → client / churned`. This is distinct from the lifecycle `stage` used by lead scoring.
+
+### Sequences
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/sequences` | List sequences with step + enrollment counts (for the picker) |
+| POST | `/sequences/{id}/enroll` | Batch-enroll a list of contact IDs (per-contact skip reasons; first step dispatched best-effort) |
+
+### Suggestions
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/suggestions` | Ranked next-best-action suggestions from overdue follow-ups, stale leads, fresh actionable news, and high-scoring un-worked leads |
 
 ### Contacts
 

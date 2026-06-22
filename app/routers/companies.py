@@ -13,7 +13,9 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 from app.schemas.company import (
+    BulkExportRequest,
     BulkOpResult,
+    BulkTagRequest,
     BulkUpdateStageRequest,
     CompanyCreate,
     CompanyListResponse,
@@ -193,6 +195,165 @@ async def bulk_update_stage(
         "Bulk pipeline-stage -> %s for %d companies", payload.pipeline_stage, result.rowcount or 0
     )
     return BulkOpResult(matched=matched, updated=result.rowcount or 0)
+
+
+@router.post("/bulk-tag", response_model=BulkOpResult)
+async def bulk_tag(
+    payload: BulkTagRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Add and/or remove tags across a set of companies in one call.
+
+    Tags to add are unioned in; tags to remove are stripped out. A company whose
+    tag set is unchanged is counted as matched but not updated.
+    """
+    if not payload.add and not payload.remove:
+        raise HTTPException(status_code=400, detail="Provide tags to add and/or remove")
+
+    add = [t.strip() for t in payload.add if t.strip()]
+    remove = {t.strip() for t in payload.remove if t.strip()}
+
+    result = await db.execute(
+        select(Company).where(Company.id.in_(payload.company_ids))
+    )
+    companies = list(result.scalars().all())
+
+    updated = 0
+    for company in companies:
+        current = list(company.tags or [])
+        new_tags = [t for t in current if t not in remove]
+        for t in add:
+            if t not in new_tags:
+                new_tags.append(t)
+        if new_tags != current:
+            company.tags = new_tags
+            updated += 1
+
+    await db.flush()
+    logger.info(
+        "Bulk-tag: +%s -%s across %d companies (%d changed)",
+        add, sorted(remove), len(companies), updated,
+    )
+    return BulkOpResult(matched=len(companies), updated=updated)
+
+
+@router.post("/bulk-export")
+async def bulk_export(
+    payload: BulkExportRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Export companies as structured JSON with all fields, optionally including
+    each company's contacts, lead scores, and full activity timeline.
+
+    When ``company_ids`` is omitted, every company is exported.
+    """
+    from datetime import datetime, timezone
+
+    query = select(Company)
+    if payload.company_ids:
+        query = query.where(Company.id.in_(payload.company_ids))
+    query = query.order_by(Company.created_at.desc())
+    companies = list((await db.execute(query)).scalars().all())
+
+    company_ids = [c.id for c in companies]
+
+    # Bulk-load contacts and scores to avoid per-company round-trips.
+    contacts_by_company: dict = {}
+    if payload.include_contacts and company_ids:
+        rows = await db.execute(
+            select(Contact).where(Contact.company_id.in_(company_ids))
+        )
+        for c in rows.scalars().all():
+            contacts_by_company.setdefault(c.company_id, []).append(c)
+
+    scores_by_company: dict = {}
+    if payload.include_scores and company_ids:
+        rows = await db.execute(
+            select(LeadScore)
+            .where(LeadScore.company_id.in_(company_ids))
+            .order_by(LeadScore.scored_at.desc())
+        )
+        for s in rows.scalars().all():
+            scores_by_company.setdefault(s.company_id, []).append(s)
+
+    def _company_dict(c: Company) -> dict:
+        return {
+            "id": str(c.id),
+            "name": c.name,
+            "domain": c.domain,
+            "city": c.city,
+            "state_province": c.state_province,
+            "country": c.country,
+            "employee_count": c.employee_count,
+            "naics_code": c.naics_code,
+            "naics_description": c.naics_description,
+            "industry_segment": c.industry_segment,
+            "website": c.website,
+            "phone": c.phone,
+            "source": c.source,
+            "source_url": c.source_url,
+            "stage": c.stage,
+            "pipeline_stage": c.pipeline_stage,
+            "tags": list(c.tags or []),
+            "notes": c.notes,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+
+    def _contact_dict(c: Contact) -> dict:
+        return {
+            "id": str(c.id),
+            "first_name": c.first_name,
+            "last_name": c.last_name,
+            "full_name": c.full_name,
+            "title": c.title,
+            "department": c.department,
+            "email": c.email,
+            "phone": c.phone,
+            "mobile": c.mobile,
+            "linkedin_url": c.linkedin_url,
+            "is_primary": c.is_primary,
+            "unsubscribed": c.unsubscribed,
+            "source": c.source,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        }
+
+    def _score_dict(s: LeadScore) -> dict:
+        return {
+            "id": str(s.id),
+            "score_type": s.score_type,
+            "fit_score": s.fit_score,
+            "industry_score": s.industry_score,
+            "size_score": s.size_score,
+            "location_score": s.location_score,
+            "engagement_score": s.engagement_score,
+            "factors": s.factors,
+            "scored_at": s.scored_at.isoformat() if s.scored_at else None,
+        }
+
+    exported = []
+    for c in companies:
+        record = _company_dict(c)
+        if payload.include_contacts:
+            record["contacts"] = [
+                _contact_dict(ct) for ct in contacts_by_company.get(c.id, [])
+            ]
+        if payload.include_scores:
+            record["scores"] = [
+                _score_dict(s) for s in scores_by_company.get(c.id, [])
+            ]
+        if payload.include_activity:
+            from app.routers.activity import _collect_activities
+            items = await _collect_activities(db, c.id)
+            items.sort(key=lambda i: i.timestamp, reverse=True)
+            record["activity"] = [i.model_dump(mode="json") for i in items]
+        exported.append(record)
+
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(exported),
+        "companies": exported,
+    }
 
 
 @router.get("/{company_id}", response_model=CompanyRead)
