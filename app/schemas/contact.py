@@ -82,6 +82,10 @@ class ContactDetailRead(ContactRead):
 class ContactListResponse(BaseModel):
     items: list[ContactRead]
     total: int
+    # Pagination metadata (mirrors CompanyListResponse). Optional so callers that
+    # return a full, unpaginated set (all contacts for one company) can omit them.
+    page: Optional[int] = None
+    page_size: Optional[int] = None
 
 
 # --- Quick Add (compose shortcut + business-card scanner) ---

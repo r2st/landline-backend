@@ -46,44 +46,61 @@ async def create_contact(
     return contact
 
 
+_CONTACT_SORTS = {"created_at", "first_name", "last_name", "email", "title"}
+
+
 @router.get("/", response_model=ContactListResponse)
 async def list_contacts(
     company_id: Optional[uuid.UUID] = Query(None),
     q: Optional[str] = Query(None, description="Search name, email, or title"),
+    unsubscribed: Optional[bool] = Query(None, description="Filter by unsubscribe status"),
+    has_email: Optional[bool] = Query(None, description="Only contacts with/without an email"),
+    sort_by: str = Query("created_at", description="created_at, first_name, last_name, email, title"),
+    sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    """List contacts, optionally filtered by company."""
+    """List contacts with filtering, search, sorting, and pagination."""
     query = select(Contact)
     count_query = select(func.count(Contact.id))
 
+    conditions = []
     if company_id:
-        query = query.where(Contact.company_id == company_id)
-        count_query = count_query.where(Contact.company_id == company_id)
-
+        conditions.append(Contact.company_id == company_id)
+    if unsubscribed is not None:
+        conditions.append(Contact.unsubscribed == unsubscribed)
+    if has_email is not None:
+        conditions.append(Contact.email.isnot(None) if has_email else Contact.email.is_(None))
     if q:
         search = f"%{q}%"
         from sqlalchemy import or_
-        search_filter = or_(
+        conditions.append(or_(
             Contact.first_name.ilike(search),
             Contact.last_name.ilike(search),
             Contact.email.ilike(search),
             Contact.title.ilike(search),
-        )
-        query = query.where(search_filter)
-        count_query = count_query.where(search_filter)
+        ))
+
+    if conditions:
+        from sqlalchemy import and_
+        combined = and_(*conditions)
+        query = query.where(combined)
+        count_query = count_query.where(combined)
 
     total_result = await db.execute(count_query)
     total = total_result.scalar()
 
+    sort_col = getattr(Contact, sort_by) if sort_by in _CONTACT_SORTS else Contact.created_at
+    query = query.order_by(sort_col.asc() if sort_dir == "asc" else sort_col.desc())
+
     offset = (page - 1) * page_size
-    query = query.order_by(Contact.created_at.desc()).offset(offset).limit(page_size)
+    query = query.offset(offset).limit(page_size)
 
     result = await db.execute(query)
     contacts = list(result.scalars().all())
 
-    return ContactListResponse(items=contacts, total=total)
+    return ContactListResponse(items=contacts, total=total, page=page, page_size=page_size)
 
 
 @router.get("/{contact_id}", response_model=ContactDetailRead)

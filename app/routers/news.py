@@ -90,5 +90,7 @@ async def mark_actioned(news_id: UUID, db: AsyncSession = Depends(get_db)):
     if not news:
         raise HTTPException(status_code=404, detail="News item not found")
     news.actioned = True
-    await db.commit()
-    return {"status": "actioned"}
+    # get_db commits on success; flush keeps this consistent with the rest of
+    # the app and lets the surrounding transaction own the commit.
+    await db.flush()
+    return {"status": "actioned", "id": str(news.id), "actioned": True}
