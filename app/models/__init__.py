@@ -11,6 +11,7 @@ from app.models.email_template import EmailTemplate, EmailSend
 from app.models.follow_up import FollowUp
 from app.models.gmail_account import GmailAccount
 from app.models.company_news import CompanyNews
+from app.models.deal import Deal
 
 __all__ = [
     "Company",
@@ -27,4 +28,5 @@ __all__ = [
     "FollowUp",
     "GmailAccount",
     "CompanyNews",
+    "Deal",
 ]
