@@ -15,6 +15,7 @@ from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
 from app.schemas.dashboard import CSVImportResult
+from app.services.normalize import normalize_domain
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/import-export", tags=["import/export"])
@@ -91,7 +92,7 @@ async def import_csv(
                 continue
 
             # Check for existing company by domain first, then name
-            domain = row.get("domain", "").strip() or None
+            domain = normalize_domain(row.get("domain"))
             existing = None
 
             if domain:

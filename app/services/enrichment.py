@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
+from app.services.normalize import normalize_domain
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -127,14 +128,21 @@ class ApolloEnrichmentService:
 
             people = data.get("people", [])
             created_contacts = []
+            existing_emails = await _existing_contact_emails(db, company.id)
 
             for person in people:
-                email = person.get("email")
+                email = (person.get("email") or "").strip() or None
                 first_name = person.get("first_name")
                 last_name = person.get("last_name")
 
                 if not (first_name or last_name):
                     continue
+
+                # Dedup: don't re-create a contact we already have for this company.
+                if email and email.lower() in existing_emails:
+                    continue
+                if email:
+                    existing_emails.add(email.lower())
 
                 contact = Contact(
                     company_id=company.id,
@@ -295,7 +303,7 @@ class ApolloEnrichmentService:
             imported = []
 
             for org in orgs:
-                domain = org.get("primary_domain")
+                domain = normalize_domain(org.get("primary_domain") or org.get("website_url"))
                 name = org.get("name")
                 if not name:
                     continue

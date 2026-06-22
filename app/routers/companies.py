@@ -5,7 +5,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select, or_, and_
+from sqlalchemy import func, select, or_, and_, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -15,6 +15,8 @@ from app.models.lead_score import LeadScore
 from app.schemas.company import (
     CompanyCreate,
     CompanyListResponse,
+    CompanyMergeRequest,
+    CompanyMergeResponse,
     CompanyRead,
     CompanyStageUpdate,
     CompanyUpdate,
@@ -239,6 +241,109 @@ async def delete_company(
     await db.delete(company)
     await db.flush()
     logger.info("Deleted company %s (%s)", company.name, company_id)
+
+
+@router.post("/{company_id}/merge", response_model=CompanyMergeResponse)
+async def merge_company(
+    company_id: uuid.UUID,
+    payload: CompanyMergeRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Merge a duplicate company (``source_id``) into the company in the path.
+
+    Reassigns all related records to the survivor, backfills any empty survivor
+    fields from the source, then deletes the source. Idempotent guard: refuses
+    to merge a company into itself.
+    """
+    if payload.source_id == company_id:
+        raise HTTPException(status_code=400, detail="Cannot merge a company into itself")
+
+    survivor = (await db.execute(select(Company).where(Company.id == company_id))).scalar_one_or_none()
+    if not survivor:
+        raise HTTPException(status_code=404, detail="Survivor company not found")
+    source = (await db.execute(select(Company).where(Company.id == payload.source_id))).scalar_one_or_none()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source company not found")
+
+    from app.models.interaction import Interaction
+    from app.models.company_news import CompanyNews
+    from app.models.follow_up import FollowUp
+    from app.models.company_group import company_group_members
+
+    async def _reassign(model, fk="company_id") -> int:
+        result = await db.execute(
+            update(model)
+            .where(getattr(model, fk) == source.id)
+            .values(**{fk: survivor.id})
+        )
+        return result.rowcount or 0
+
+    contacts_moved = await _reassign(Contact)
+    scores_moved = await _reassign(LeadScore)
+    news_moved = await _reassign(CompanyNews)
+    interactions_moved = await _reassign(Interaction)
+    follow_ups_moved = await _reassign(FollowUp)
+
+    # Group memberships: move only those the survivor isn't already in (composite PK).
+    existing_groups = await db.execute(
+        select(company_group_members.c.group_id).where(
+            company_group_members.c.company_id == survivor.id
+        )
+    )
+    survivor_group_ids = {r[0] for r in existing_groups.all()}
+    src_groups = await db.execute(
+        select(company_group_members.c.group_id).where(
+            company_group_members.c.company_id == source.id
+        )
+    )
+    for (gid,) in src_groups.all():
+        if gid in survivor_group_ids:
+            continue
+        await db.execute(
+            update(company_group_members)
+            .where(
+                company_group_members.c.group_id == gid,
+                company_group_members.c.company_id == source.id,
+            )
+            .values(company_id=survivor.id)
+        )
+
+    # Snapshot the source's values, then delete it BEFORE writing them onto the
+    # survivor — otherwise the survivor UPDATE could flush a duplicate `domain`
+    # before the source DELETE and trip the unique index.
+    backfill_fields = (
+        "domain", "city", "state_province", "employee_count", "naics_code",
+        "naics_description", "industry_segment", "website", "phone", "source_url",
+    )
+    source_values = {f: getattr(source, f) for f in backfill_fields}
+    source_tags = list(source.tags or [])
+
+    # Delete via a Core statement (not db.delete) so the ORM's selectin-loaded
+    # Company.contacts/lead_scores collections don't cascade-delete the rows we
+    # just reassigned to the survivor.
+    db.expunge(source)
+    await db.execute(delete(Company).where(Company.id == payload.source_id))
+    await db.flush()
+
+    for field in backfill_fields:
+        if not getattr(survivor, field) and source_values[field]:
+            setattr(survivor, field, source_values[field])
+    if source_tags:
+        survivor.tags = sorted(set(survivor.tags or []) | set(source_tags))
+
+    await db.flush()
+    await db.refresh(survivor)
+    await _attach_extras(db, [survivor])
+    logger.info("Merged company %s into %s", source.id, survivor.id)
+    return CompanyMergeResponse(
+        survivor_id=survivor.id,
+        merged_id=source.id,
+        contacts_moved=contacts_moved,
+        scores_moved=scores_moved,
+        news_moved=news_moved,
+        interactions_moved=interactions_moved,
+        follow_ups_moved=follow_ups_moved,
+    )
 
 
 @router.get("/{company_id}/scores")

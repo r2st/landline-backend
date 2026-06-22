@@ -4,7 +4,9 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.services.normalize import normalize_domain
 
 VALID_STAGES = (
     "new", "researched", "scored", "contacted", "engaged",
@@ -27,6 +29,12 @@ class CompanyBase(BaseModel):
     phone: Optional[str] = Field(None, max_length=30)
     tags: list[str] = Field(default_factory=list)
     notes: Optional[str] = None
+
+    @field_validator("domain", mode="before")
+    @classmethod
+    def _normalize_domain(cls, v):
+        # Store a bare lowercase host so domain-based dedup is reliable.
+        return normalize_domain(v) if v else v
 
 
 class CompanyCreate(CompanyBase):
@@ -51,6 +59,11 @@ class CompanyUpdate(BaseModel):
     notes: Optional[str] = None
     source: Optional[str] = Field(None, max_length=50)
     source_url: Optional[str] = None
+
+    @field_validator("domain", mode="before")
+    @classmethod
+    def _normalize_domain(cls, v):
+        return normalize_domain(v) if v else v
 
 
 class CompanyStageUpdate(BaseModel):
@@ -80,6 +93,26 @@ class CompanyListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class CompanyMergeRequest(BaseModel):
+    """Merge ``source_id`` (the duplicate) into the company in the path (survivor).
+
+    All related records (contacts, scores, news, interactions, follow-ups, group
+    memberships) are reassigned to the survivor, missing survivor fields are
+    backfilled from the source, and the source company is deleted.
+    """
+    source_id: uuid.UUID
+
+
+class CompanyMergeResponse(BaseModel):
+    survivor_id: uuid.UUID
+    merged_id: uuid.UUID
+    contacts_moved: int
+    scores_moved: int
+    news_moved: int
+    interactions_moved: int
+    follow_ups_moved: int
 
 
 class CompanySearchParams(BaseModel):
