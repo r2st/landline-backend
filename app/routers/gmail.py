@@ -13,6 +13,7 @@ Flow:
     DELETE /gmail/accounts/{id}          -> disconnect (revokes at Google)
 """
 
+import asyncio
 import html
 import logging
 import uuid
@@ -26,13 +27,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.models.gmail_account import GmailAccount
+from app.models.smtp_account import SmtpAccount
 from app.schemas.gmail import (
     AuthorizeResponse,
     GmailAccountRead,
     GmailStatusResponse,
     ToggleSendingRequest,
 )
+from app.schemas.smtp import TestSendRequest, TestSendResult
 from app.services import crypto, google_oauth
+from app.services.gmail_sender import GmailSender
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gmail", tags=["gmail"])
@@ -196,7 +200,9 @@ async def set_active(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
             status_code=400,
             detail="This account is not connected — reconnect it before making it active.",
         )
+    # The primary sender spans Gmail + SMTP, so demote every other sender.
     await db.execute(update(GmailAccount).values(is_active=False))
+    await db.execute(update(SmtpAccount).values(is_active=False))
     account.is_active = True
     await db.flush()
     await db.refresh(account)
@@ -258,3 +264,47 @@ async def disconnect(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
             replacement.is_active = True
             await db.flush()
     logger.info("Disconnected Gmail account %s", account.email)
+
+
+@router.post("/accounts/{account_id}/test", response_model=TestSendResult)
+async def test_send(
+    account_id: uuid.UUID,
+    body: TestSendRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a real test email from this Gmail account to confirm sending works."""
+    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+    if account.status != "connected":
+        raise HTTPException(
+            status_code=400,
+            detail="This account isn't connected — reconnect it before testing.",
+        )
+    to_email = str(body.to_email) if body.to_email else account.email
+    send_result = await asyncio.to_thread(
+        GmailSender(account).send_email,
+        to_email=to_email,
+        subject="Landline test email",
+        body_html=(
+            "<p>This is a test email from <strong>Landline</strong>.</p>"
+            f"<p>If you received this, sending from <strong>{account.email}</strong> "
+            "is working correctly.</p>"
+        ),
+        body_text=(
+            "This is a test email from Landline. If you received this, sending "
+            f"from {account.email} is working correctly."
+        ),
+    )
+    if send_result.get("status") == "sent":
+        account.last_used_at = datetime.now(timezone.utc)
+    else:
+        account.status = "error"
+    await db.flush()
+    return TestSendResult(
+        status=send_result.get("status", "error"),
+        detail=send_result.get("detail"),
+        sender=account.email,
+        transport="gmail",
+    )

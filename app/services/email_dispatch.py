@@ -24,70 +24,113 @@ from itsdangerous import URLSafeTimedSerializer
 
 from app.config import get_settings
 from app.models.gmail_account import GmailAccount
+from app.models.smtp_account import SmtpAccount
 from app.services.email_sender import EmailSender
 from app.services.gmail_sender import GmailSender
+from app.services.smtp_sender import SmtpSender
 
 logger = logging.getLogger(__name__)
+
+
+def _make_sender(account):
+    """Return the transport sender object for a Gmail or SMTP account."""
+    if isinstance(account, SmtpAccount):
+        return SmtpSender(account)
+    return GmailSender(account)
+
+
+def _transport_for(account) -> str:
+    return "smtp" if isinstance(account, SmtpAccount) else "gmail"
+
+
+def _rotation_key(account):
+    """Sort key for round-robin: never-used first, then least-recently-used.
+
+    Avoids comparing ``None`` directly (Python 3 forbids it) by sorting on a
+    has-been-used flag first, then falling back to ``connected_at``.
+    """
+    last_used = account.last_used_at
+    connected = account.connected_at
+    return (0 if last_used is None else 1, last_used or connected, connected)
 
 
 @dataclass
 class SenderInfo:
     """Describes who outreach mail will be sent as."""
 
-    transport: str  # "gmail" | "ses"
+    transport: str  # "gmail" | "smtp" | "ses"
     from_email: str
     display_name: Optional[str] = None
     account_id: Optional[uuid.UUID] = None
     connected: bool = False
 
 
-async def get_active_account(db: AsyncSession) -> Optional[GmailAccount]:
-    result = await db.execute(
-        select(GmailAccount).where(
-            GmailAccount.is_active == True,  # noqa: E712
-            GmailAccount.status == "connected",
+async def get_active_account(db: AsyncSession):
+    """The primary sender across all account types (Gmail preferred, then SMTP)."""
+    gmail = (
+        await db.execute(
+            select(GmailAccount).where(
+                GmailAccount.is_active == True,  # noqa: E712
+                GmailAccount.status == "connected",
+            )
         )
-    )
-    return result.scalar_one_or_none()
+    ).scalar_one_or_none()
+    if gmail is not None:
+        return gmail
+    return (
+        await db.execute(
+            select(SmtpAccount).where(
+                SmtpAccount.is_active == True,  # noqa: E712
+                SmtpAccount.status == "connected",
+            )
+        )
+    ).scalar_one_or_none()
 
 
-async def get_account(db: AsyncSession, account_id: uuid.UUID) -> Optional[GmailAccount]:
-    result = await db.execute(
-        select(GmailAccount).where(GmailAccount.id == account_id)
-    )
-    return result.scalar_one_or_none()
+async def get_account(db: AsyncSession, account_id: uuid.UUID):
+    """Look up a sender by id across both Gmail and SMTP accounts."""
+    gmail = (
+        await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
+    ).scalar_one_or_none()
+    if gmail is not None:
+        return gmail
+    return (
+        await db.execute(select(SmtpAccount).where(SmtpAccount.id == account_id))
+    ).scalar_one_or_none()
 
 
-async def get_next_rotation_account(db: AsyncSession) -> Optional[GmailAccount]:
-    """Pick the least-recently-used sending-enabled account for round-robin rotation.
+async def get_sending_accounts(db: AsyncSession) -> list:
+    """Return all sending-enabled, connected senders (Gmail + SMTP)."""
+    gmail = (
+        await db.execute(
+            select(GmailAccount).where(
+                GmailAccount.sending_enabled == True,  # noqa: E712
+                GmailAccount.status == "connected",
+            )
+        )
+    ).scalars().all()
+    smtp = (
+        await db.execute(
+            select(SmtpAccount).where(
+                SmtpAccount.sending_enabled == True,  # noqa: E712
+                SmtpAccount.status == "connected",
+            )
+        )
+    ).scalars().all()
+    return list(gmail) + list(smtp)
 
-    Orders by last_used_at ascending (NULL first, so brand-new accounts get used
-    first), then connected_at ascending as a tiebreaker.
+
+async def get_next_rotation_account(db: AsyncSession):
+    """Pick the least-recently-used sending-enabled sender for round-robin.
+
+    Considers every sending-enabled, connected account across Gmail and SMTP so
+    volume is spread evenly regardless of transport. Brand-new accounts (never
+    used) are picked first.
     """
-    result = await db.execute(
-        select(GmailAccount)
-        .where(
-            GmailAccount.sending_enabled == True,  # noqa: E712
-            GmailAccount.status == "connected",
-        )
-        .order_by(
-            GmailAccount.last_used_at.asc().nulls_first(),
-            GmailAccount.connected_at.asc(),
-        )
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
-
-
-async def get_sending_accounts(db: AsyncSession) -> list[GmailAccount]:
-    """Return all sending-enabled, connected Gmail accounts."""
-    result = await db.execute(
-        select(GmailAccount).where(
-            GmailAccount.sending_enabled == True,  # noqa: E712
-            GmailAccount.status == "connected",
-        )
-    )
-    return list(result.scalars().all())
+    accounts = await get_sending_accounts(db)
+    if not accounts:
+        return None
+    return min(accounts, key=_rotation_key)
 
 
 async def resolve_sender_info(
@@ -108,7 +151,7 @@ async def resolve_sender_info(
 
     if account is not None and account.status == "connected":
         return SenderInfo(
-            transport="gmail",
+            transport=_transport_for(account),
             from_email=account.email,
             display_name=account.display_name,
             account_id=account.id,
@@ -171,7 +214,7 @@ async def send_outreach_email(
             body_text = body_text + footer
 
     if account is not None:
-        sender = GmailSender(account)
+        sender = _make_sender(account)
         result = await asyncio.to_thread(
             sender.send_email,
             to_email=to_email,
