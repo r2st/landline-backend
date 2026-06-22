@@ -51,6 +51,38 @@ class SequenceRead(BaseModel):
     steps: list[SequenceStepRead] = []
 
 
+class SequenceWithCounts(BaseModel):
+    """A sequence summarized for the picker — includes step and enrollment counts."""
+
+    id: uuid.UUID
+    name: str
+    description: Optional[str] = None
+    is_active: bool
+    created_at: datetime
+    step_count: int
+    enrollment_count: int
+    active_enrollment_count: int
+
+
+# --- Batch enrollment ---
+
+class EnrollBatchRequest(BaseModel):
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1)
+
+
+class EnrollSkip(BaseModel):
+    contact_id: uuid.UUID
+    reason: str
+
+
+class EnrollBatchResult(BaseModel):
+    sequence_id: uuid.UUID
+    enrolled: list[uuid.UUID]
+    skipped: list[EnrollSkip]
+    enrolled_count: int
+    skipped_count: int
+
+
 # --- Enrollments ---
 
 class EnrollmentCreate(BaseModel):
