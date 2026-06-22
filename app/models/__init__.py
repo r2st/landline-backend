@@ -12,6 +12,7 @@ from app.models.follow_up import FollowUp
 from app.models.gmail_account import GmailAccount
 from app.models.company_news import CompanyNews
 from app.models.deal import Deal
+from app.models.task import Task
 
 __all__ = [
     "Company",
@@ -29,4 +30,5 @@ __all__ = [
     "GmailAccount",
     "CompanyNews",
     "Deal",
+    "Task",
 ]
