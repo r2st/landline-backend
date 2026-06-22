@@ -139,6 +139,52 @@ async def test_list_excludes_heavy_image_blob(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_check_duplicate_matches_email_phone_and_name(client: AsyncClient):
+    """Duplicate detection flags an existing contact by email, phone, or name."""
+    await client.post("/api/v1/contacts/quick-add", json=_full_payload())
+
+    # Exact email match.
+    r = await client.get("/api/v1/contacts/check-duplicate", params={"email": "JANE.DOE@acme.com"})
+    assert r.status_code == 200, r.text
+    matches = r.json()["matches"]
+    assert len(matches) == 1
+    assert matches[0]["company_name"] == "Acme Robotics"
+    assert "email" in matches[0]["match_reasons"]
+
+    # Phone match despite different formatting (and a +1 country code).
+    r = await client.get("/api/v1/contacts/check-duplicate", params={"phone": "+1 (555) 100-2000"})
+    assert r.status_code == 200
+    assert "phone" in r.json()["matches"][0]["match_reasons"]
+
+    # An additional_phones-only number (the "Direct" line) is matched too.
+    r = await client.get("/api/v1/contacts/check-duplicate", params={"phone": "5551005000"})
+    assert "phone" in r.json()["matches"][0]["match_reasons"]
+
+    # Full first+last name match.
+    r = await client.get("/api/v1/contacts/check-duplicate", params={"first_name": "Jane", "last_name": "Doe"})
+    assert "name" in r.json()["matches"][0]["match_reasons"]
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_no_false_positive(client: AsyncClient):
+    """A different person / number / email returns no matches."""
+    await client.post("/api/v1/contacts/quick-add", json=_full_payload())
+
+    r = await client.get("/api/v1/contacts/check-duplicate", params={"email": "someone.else@other.com"})
+    assert r.status_code == 200
+    assert r.json()["matches"] == []
+
+    # First name only (no last) is not enough to flag a name dup.
+    r = await client.get("/api/v1/contacts/check-duplicate", params={"first_name": "Jane"})
+    assert r.json()["matches"] == []
+
+    # Empty probe → empty result, no error.
+    r = await client.get("/api/v1/contacts/check-duplicate")
+    assert r.status_code == 200
+    assert r.json()["matches"] == []
+
+
+@pytest.mark.asyncio
 async def test_bad_email_does_not_block_save(client: AsyncClient):
     """An imperfect OCR email must not 422 the whole save (issue: partial reads)."""
     payload = _full_payload()

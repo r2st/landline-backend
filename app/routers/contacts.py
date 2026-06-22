@@ -19,6 +19,8 @@ from app.schemas.contact import (
     ContactListResponse,
     ContactRead,
     ContactUpdate,
+    DuplicateCheckResponse,
+    DuplicateMatch,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,87 @@ async def list_contacts(
     contacts = list(result.scalars().all())
 
     return ContactListResponse(items=contacts, total=total, page=page, page_size=page_size)
+
+
+@router.get("/check-duplicate", response_model=DuplicateCheckResponse)
+async def check_duplicate_contact(
+    email: Optional[str] = Query(None),
+    phone: Optional[str] = Query(None, description="Any phone number from the card"),
+    first_name: Optional[str] = Query(None),
+    last_name: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Find existing contacts that look like the one about to be saved.
+
+    Used by the card scanner before a quick-add to warn about (and offer to open)
+    a likely duplicate. Matches on exact email, on a shared phone number (compared
+    by significant digits across every stored number), or on a full first+last
+    name match. Phone/name comparison is done in Python so it works the same on
+    Postgres and the SQLite test DB and tolerates formatting differences.
+    """
+    email_n = (email or "").strip().lower()
+    first_n = (first_name or "").strip().lower()
+    last_n = (last_name or "").strip().lower()
+    # Significant digits of the probe phone (drop a leading US country code so
+    # "+1 555…" matches "555…"); require 7+ to avoid matching on extensions.
+    probe_digits = _digits(phone or "")
+    if len(probe_digits) == 11 and probe_digits.startswith("1"):
+        probe_digits = probe_digits[1:]
+
+    if not email_n and not probe_digits and not (first_n and last_n):
+        return DuplicateCheckResponse(matches=[])
+
+    # Pull a bounded, recent candidate set with its company name. additional_phones
+    # is a normal (non-deferred) column, so it loads here for the phone comparison.
+    rows = await db.execute(
+        select(Contact, Company.name)
+        .join(Company, Contact.company_id == Company.id)
+        .order_by(Contact.created_at.desc())
+        .limit(2000)
+    )
+
+    def phone_digits_of(c: Contact) -> set[str]:
+        out: set[str] = set()
+        nums = [c.phone, c.mobile, c.fax]
+        for p in (c.additional_phones or []):
+            if isinstance(p, dict):
+                nums.append(p.get("number"))
+        for n in nums:
+            d = _digits(n or "")
+            if len(d) == 11 and d.startswith("1"):
+                d = d[1:]
+            if len(d) >= 7:
+                out.add(d)
+        return out
+
+    matches: list[DuplicateMatch] = []
+    for contact, company_name in rows.all():
+        reasons: list[str] = []
+        if email_n and (contact.email or "").strip().lower() == email_n:
+            reasons.append("email")
+        if probe_digits and len(probe_digits) >= 7:
+            if any(d == probe_digits or d.endswith(probe_digits) or probe_digits.endswith(d)
+                   for d in phone_digits_of(contact)):
+                reasons.append("phone")
+        if first_n and last_n and (contact.first_name or "").strip().lower() == first_n \
+                and (contact.last_name or "").strip().lower() == last_n:
+            reasons.append("name")
+        if reasons:
+            matches.append(DuplicateMatch(
+                id=contact.id,
+                first_name=contact.first_name,
+                last_name=contact.last_name,
+                title=contact.title,
+                email=contact.email,
+                company_id=contact.company_id,
+                company_name=company_name,
+                source=contact.source,
+                has_card_image=contact.has_card_image,
+                created_at=contact.created_at,
+                match_reasons=reasons,
+            ))
+
+    return DuplicateCheckResponse(matches=matches)
 
 
 @router.get("/{contact_id}", response_model=ContactDetailRead)

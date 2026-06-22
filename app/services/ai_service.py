@@ -24,14 +24,24 @@ class AIService:
         self.model = "claude-sonnet-4-6"
 
     def _parse_json_response(self, response_text: str) -> dict:
-        """Parse JSON from Claude response, handling markdown code blocks."""
+        """Parse JSON from Claude response, handling markdown code blocks and
+        any stray prose the model puts before/after the JSON object."""
         text = response_text.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
             text = text.strip()
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Fall back to the first {...} / [...] span, so a stray preamble like
+            # "Here is the JSON:" doesn't blow up an otherwise-valid response.
+            start = min((i for i in (text.find("{"), text.find("[")) if i != -1), default=-1)
+            end = max(text.rfind("}"), text.rfind("]"))
+            if start != -1 and end > start:
+                return json.loads(text[start : end + 1])
+            raise
 
     async def _complete_json(self, prompt: str, max_tokens: int = 1024) -> dict:
         """Send a single-shot prompt to Claude and parse the JSON reply.
@@ -530,11 +540,19 @@ Provide 5-8 steps."""
         return await self._complete_json(prompt, max_tokens=1500)
 
     async def extract_business_card(self, image_base64: str, media_type: str = "image/jpeg") -> dict:
-        """Extract contact information from a business card image using Claude vision."""
+        """Extract contact information from a business card image using Claude vision.
+
+        Returns the extracted fields plus a ``_confidence`` map (field -> 0..1)
+        and an ``_overall_confidence`` score so the UI can flag fields that need
+        a human check. Handles international/multilingual cards and multiple
+        phone numbers in mixed formats. Never raises — returns ``{"error": ...}``
+        on failure so the request handler can surface it cleanly.
+        """
         try:
             message = await self.client.messages.create(
                 model=self.model,
-                max_tokens=1024,
+                max_tokens=1536,
+                temperature=0,  # deterministic transcription, not creative writing
                 messages=[{
                     "role": "user",
                     "content": [
@@ -548,9 +566,9 @@ Provide 5-8 steps."""
                         },
                         {
                             "type": "text",
-                            "text": """Extract all contact information from this business card image.
+                            "text": """You are a precise OCR engine for business cards. Extract every piece of contact information from this card image.
 
-Return ONLY valid JSON with these fields (use empty string if not found):
+Return ONLY valid JSON with these fields (use an empty string "" if a field is not present on the card):
 {
   "first_name": "",
   "last_name": "",
@@ -569,31 +587,50 @@ Return ONLY valid JSON with these fields (use empty string if not found):
   "postal_code": "",
   "country": "",
   "linkedin_url": "",
-  "notes": ""
+  "notes": "",
+  "_confidence": {},
+  "_overall_confidence": 0.0
 }
 
-Rules:
-- Capture EVERY phone number on the card. Put the main/office number in "phone",
-  a cell/mobile number in "mobile", and a fax number in "fax". List ALL numbers
+Extraction rules:
+- PHONES: Capture EVERY phone number. Put the main/office number in "phone", a
+  cell/mobile number in "mobile", and a fax number in "fax". List ALL numbers
   (including those three) in the "phones" array, each with a short label such as
-  "Office", "Mobile", "Fax", "Direct", "Toll-free" based on the card. If a number
-  has no label, use "Phone".
-- "address" is the street line(s) only; put the city, state/province, ZIP/postal
-  code and country in their own fields.
-- Be thorough -- check for all text on the card including small print.""",
+  "Office", "Mobile", "Fax", "Direct", "Toll-free", "Tel", "WhatsApp" based on
+  the card's own labels/icons. If a number has no label, use "Phone". Preserve
+  international formats verbatim, INCLUDING the country code and "+" (e.g.
+  "+49 30 1234567", "+81-3-1234-5678"). Do not reformat or strip digits.
+- NAMES: Split the person's name into first/last. For names written
+  family-name-first (common on East-Asian cards), still map the personal/given
+  name to "first_name" and the family name to "last_name". If the card shows the
+  name in a non-Latin script with a Latin transliteration, use the Latin form.
+- MULTILINGUAL: Cards may be in any language. Translate the FIELD MEANINGS, not
+  the values — keep proper nouns (names, company, street) as printed; you may
+  normalize the country to its common English name.
+- ADDRESS: "address" is the street line(s) only; put city, state/province,
+  ZIP/postal code and country in their own fields. Map regions sensibly
+  (e.g. a German "PLZ" is the postal_code).
+- EMAIL/WEB: Fix obvious OCR slips in emails/URLs only when unambiguous (e.g.
+  a clearly-misread "@"); otherwise transcribe exactly. Do not invent domains.
+- Be thorough — read ALL text including small print, taglines and back-of-card
+  details. Put anything useful that has no field (slogan, hours, second person)
+  into "notes".
+
+Confidence rules:
+- "_confidence" maps EACH field you populated (non-empty) to a number from 0 to
+  1 reflecting how sure you are it is correct and legible (1 = crystal clear,
+  0.5 = partly obscured/ambiguous, <0.3 = a guess). Omit fields you left empty.
+- "_overall_confidence" is your overall read quality for the whole card (0..1),
+  factoring in image clarity, glare, blur and how much you had to guess.""",
                         },
                     ],
                 }],
             )
 
-            response_text = message.content[0].text.strip()
-            if response_text.startswith("```"):
-                response_text = response_text.split("```")[1]
-                if response_text.startswith("json"):
-                    response_text = response_text[4:]
-                response_text = response_text.strip()
-
-            return json.loads(response_text)
+            result = self._parse_json_response(message.content[0].text)
+            if not isinstance(result, dict):
+                return {"error": "Failed to parse extracted data"}
+            return result
         except json.JSONDecodeError as e:
             logger.error("Failed to parse card extraction: %s", str(e))
             return {"error": "Failed to parse extracted data"}

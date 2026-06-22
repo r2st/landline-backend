@@ -135,3 +135,25 @@ class QuickAddResponse(BaseModel):
     company_id: uuid.UUID
     company_name: str
     company_created: bool
+
+
+# --- Duplicate detection (run before saving a scanned card) ---
+
+class DuplicateMatch(BaseModel):
+    """An existing contact that looks like the one about to be saved."""
+    id: uuid.UUID
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    title: Optional[str] = None
+    email: Optional[str] = None
+    company_id: uuid.UUID
+    company_name: Optional[str] = None
+    source: Optional[str] = None
+    has_card_image: bool = False
+    created_at: datetime
+    # Why this was flagged: any of "email", "phone", "name".
+    match_reasons: list[str] = []
+
+
+class DuplicateCheckResponse(BaseModel):
+    matches: list[DuplicateMatch] = []
