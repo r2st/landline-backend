@@ -176,3 +176,40 @@ async def test_score_company_minimal(db_session: AsyncSession):
     assert score.fit_score == 0 + 5 + 20 + 0  # no industry, unknown size, US, no data
     assert score.industry_score == 0
     assert score.size_score == 5
+
+
+@pytest.mark.asyncio
+async def test_score_includes_engagement_signals(
+    db_session: AsyncSession,
+    sample_company: Company,
+    sample_contact: Contact,
+):
+    """A reply on a company's contact should add an engagement bonus to its score."""
+    from datetime import datetime, timezone
+    from app.models.email_template import EmailSend
+
+    # Baseline score with no engagement.
+    base = await score_company_rule_based(db_session, sample_company)
+    base_engagement = base.factors["engagement"]["score"]
+    assert base_engagement == 0
+
+    # Record an opened + replied email for the contact.
+    db_session.add(EmailSend(
+        contact_id=sample_contact.id,
+        to_email=sample_contact.email,
+        subject="hi",
+        status="replied",
+        opened_at=datetime.now(timezone.utc),
+        replied_at=datetime.now(timezone.utc),
+    ))
+    await db_session.flush()
+
+    rescored = await score_company_rule_based(db_session, sample_company)
+    eng = rescored.factors["engagement"]
+    # replied(12) + opened(3) = 15
+    assert eng["score"] == 15
+    assert eng["breakdown"]["replied"] == 1
+    assert eng["breakdown"]["opened"] == 1
+    # engagement folds into the engagement_score column (sample_company is already
+    # a perfect 100 lead, so the capped fit_score itself can't climb further).
+    assert rescored.engagement_score > base.engagement_score

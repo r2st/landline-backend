@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.company import Company
@@ -11,6 +11,12 @@ from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 
 logger = logging.getLogger(__name__)
+
+# Engagement bonus weights (points added on top of data-completeness). These
+# reward real buying signals — a reply is worth far more than an open.
+_ENGAGEMENT_WEIGHTS = {"replied": 12, "clicked": 7, "opened": 3}
+_NEWS_ACTIONABLE_BONUS = 5
+_MAX_ENGAGEMENT_BONUS = 25
 
 
 def _industry_score(naics_code: Optional[str]) -> tuple[int, str]:
@@ -90,11 +96,70 @@ def _completeness_score(
     return score, breakdown
 
 
+async def _engagement_signal(
+    db: AsyncSession, company: Company
+) -> tuple[int, dict]:
+    """Score real engagement signals for a company: email opens/clicks/replies
+    and recent actionable news. Returns (points, breakdown). Capped so a hot
+    lead can't run away with the score.
+
+    Imported lazily to avoid import cycles and to keep the firmographic-only
+    unit tests (which never create sends/news) returning zero here.
+    """
+    from app.models.email_template import EmailSend
+    from app.models.company_news import CompanyNews
+
+    breakdown: dict = {}
+    points = 0
+
+    # Email engagement across all of this company's contacts.
+    eng = await db.execute(
+        select(
+            func.count(EmailSend.opened_at),
+            func.count(EmailSend.clicked_at),
+            func.count(EmailSend.replied_at),
+        )
+        .join(Contact, Contact.id == EmailSend.contact_id)
+        .where(Contact.company_id == company.id)
+    )
+    opened, clicked, replied = eng.one()
+    if replied:
+        points += _ENGAGEMENT_WEIGHTS["replied"]
+        breakdown["replied"] = int(replied)
+    if clicked:
+        points += _ENGAGEMENT_WEIGHTS["clicked"]
+        breakdown["clicked"] = int(clicked)
+    if opened:
+        points += _ENGAGEMENT_WEIGHTS["opened"]
+        breakdown["opened"] = int(opened)
+
+    # A recent, actionable news event is a timely outreach trigger.
+    news_count = await db.execute(
+        select(func.count(CompanyNews.id)).where(
+            CompanyNews.company_id == company.id,
+            CompanyNews.is_actionable.is_(True),
+        )
+    )
+    actionable_news = news_count.scalar() or 0
+    if actionable_news:
+        points += _NEWS_ACTIONABLE_BONUS
+        breakdown["actionable_news"] = int(actionable_news)
+
+    points = min(points, _MAX_ENGAGEMENT_BONUS)
+    return points, breakdown
+
+
 async def score_company_rule_based(
     db: AsyncSession,
     company: Company,
 ) -> LeadScore:
-    """Apply rule-based scoring to a company. Returns the new LeadScore."""
+    """Apply rule-based scoring to a company. Returns the new LeadScore.
+
+    Combines firmographic fit (industry, size, location), data completeness, and
+    real engagement signals (email opens/clicks/replies, actionable news). The
+    ``engagement_score`` column holds completeness + engagement so that
+    fit = industry + size + location + engagement_score, capped at 100.
+    """
     # Load contacts
     result = await db.execute(
         select(Contact).where(Contact.company_id == company.id)
@@ -105,14 +170,18 @@ async def score_company_rule_based(
     size_pts, size_reason = _size_score(company.employee_count)
     loc_pts, loc_reason = _location_score(company.country)
     completeness_pts, completeness_breakdown = _completeness_score(company, contacts)
+    engagement_pts, engagement_breakdown = await _engagement_signal(db, company)
 
-    fit_score = industry_pts + size_pts + loc_pts + completeness_pts
+    # completeness + live engagement form the non-firmographic bucket.
+    other_pts = completeness_pts + engagement_pts
+    fit_score = min(100, industry_pts + size_pts + loc_pts + other_pts)
 
     factors = {
         "industry": {"score": industry_pts, "reason": industry_reason},
         "size": {"score": size_pts, "reason": size_reason},
         "location": {"score": loc_pts, "reason": loc_reason},
         "completeness": {"score": completeness_pts, "breakdown": completeness_breakdown},
+        "engagement": {"score": engagement_pts, "breakdown": engagement_breakdown},
     }
 
     lead_score = LeadScore(
@@ -122,16 +191,17 @@ async def score_company_rule_based(
         industry_score=industry_pts,
         size_score=size_pts,
         location_score=loc_pts,
-        engagement_score=completeness_pts,
+        engagement_score=other_pts,
         factors=factors,
     )
     db.add(lead_score)
     await db.flush()
 
     logger.info(
-        "Scored company %s (%s): fit=%d [industry=%d, size=%d, location=%d, completeness=%d]",
+        "Scored company %s (%s): fit=%d [industry=%d, size=%d, location=%d, "
+        "completeness=%d, engagement=%d]",
         company.name, company.id, fit_score,
-        industry_pts, size_pts, loc_pts, completeness_pts,
+        industry_pts, size_pts, loc_pts, completeness_pts, engagement_pts,
     )
     return lead_score
 
@@ -180,14 +250,22 @@ Contacts:
 Respond with ONLY the JSON object, no markdown fences."""
 
     try:
+        # Keep the AI scorer on the same current model as the rest of the app.
+        from app.services.ai_service import get_ai_service
         message = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=get_ai_service().model,
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
 
         import json
-        response_text = message.content[0].text
+        response_text = message.content[0].text.strip()
+        # Tolerate markdown code fences around the JSON.
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
         data = json.loads(response_text)
 
         lead_score = LeadScore(
