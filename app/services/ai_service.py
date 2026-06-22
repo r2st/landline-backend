@@ -374,19 +374,32 @@ Return ONLY valid JSON with these fields (use empty string if not found):
   "first_name": "",
   "last_name": "",
   "title": "",
+  "department": "",
   "company_name": "",
   "email": "",
   "phone": "",
+  "mobile": "",
+  "fax": "",
+  "phones": [{"label": "", "number": ""}],
   "website": "",
   "address": "",
   "city": "",
   "state": "",
+  "postal_code": "",
   "country": "",
   "linkedin_url": "",
   "notes": ""
 }
 
-Be thorough -- check for all text on the card including small print.""",
+Rules:
+- Capture EVERY phone number on the card. Put the main/office number in "phone",
+  a cell/mobile number in "mobile", and a fax number in "fax". List ALL numbers
+  (including those three) in the "phones" array, each with a short label such as
+  "Office", "Mobile", "Fax", "Direct", "Toll-free" based on the card. If a number
+  has no label, use "Phone".
+- "address" is the street line(s) only; put the city, state/province, ZIP/postal
+  code and country in their own fields.
+- Be thorough -- check for all text on the card including small print.""",
                         },
                     ],
                 }],

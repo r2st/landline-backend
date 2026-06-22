@@ -6,6 +6,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
+from sqlalchemy.orm import undefer
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -13,6 +15,7 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.schemas.contact import (
     ContactCreate,
+    ContactDetailRead,
     ContactListResponse,
     ContactRead,
     ContactUpdate,
@@ -83,17 +86,55 @@ async def list_contacts(
     return ContactListResponse(items=contacts, total=total)
 
 
-@router.get("/{contact_id}", response_model=ContactRead)
+@router.get("/{contact_id}", response_model=ContactDetailRead)
 async def get_contact(
     contact_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single contact by ID."""
-    result = await db.execute(select(Contact).where(Contact.id == contact_id))
+    """Get a single contact by ID, including its scanned card image (if any)."""
+    result = await db.execute(
+        select(Contact).where(Contact.id == contact_id).options(undefer(Contact.card_image))
+    )
     contact = result.scalar_one_or_none()
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     return contact
+
+
+@router.get("/{contact_id}/card-image")
+async def get_contact_card_image(
+    contact_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the raw scanned business-card image for a contact.
+
+    Serves the decoded bytes with the correct content type so the image can be
+    fetched as a blob (the API-key auth header rules out a bare <img src>)."""
+    import base64
+    from fastapi import Response
+
+    result = await db.execute(
+        select(Contact).where(Contact.id == contact_id).options(undefer(Contact.card_image))
+    )
+    contact = result.scalar_one_or_none()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    if not contact.card_image:
+        raise HTTPException(status_code=404, detail="No card image for this contact")
+
+    data_url = contact.card_image
+    media_type = "image/jpeg"
+    b64 = data_url
+    if data_url.startswith("data:"):
+        header, _, b64 = data_url.partition(",")
+        # header looks like "data:image/png;base64"
+        if ":" in header and ";" in header:
+            media_type = header.split(":", 1)[1].split(";", 1)[0] or media_type
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Stored card image is corrupt")
+    return Response(content=raw, media_type=media_type)
 
 
 @router.patch("/{contact_id}", response_model=ContactRead)
@@ -172,6 +213,35 @@ def _normalize_country(raw: Optional[str]) -> str:
     return _COUNTRY_MAP.get((raw or "").strip().lower(), "US")
 
 
+def _digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def _collect_phones(payload: "QuickAddRequest") -> list[dict]:
+    """Merge phone / mobile / fax / additional_phones into one de-duplicated,
+    labelled list so a card with several numbers keeps all of them."""
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    def add(label: Optional[str], number: Optional[str]):
+        num = (number or "").strip()
+        if not num:
+            return
+        key = _digits(num) or num.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append({"label": label, "number": num})
+
+    add("Office", payload.phone)
+    add("Mobile", payload.mobile)
+    add("Fax", payload.fax)
+    for p in (payload.additional_phones or []):
+        # p is a PhoneEntry pydantic model
+        add(p.label, p.number)
+    return entries
+
+
 def _valid_email(raw: Optional[str]) -> Optional[str]:
     """Return a syntactically valid email or None, so bad OCR never blocks a save."""
     from pydantic import TypeAdapter, EmailStr
@@ -231,19 +301,41 @@ async def quick_add_contact(
         company_created = True
         logger.info("Quick-add created company '%s' (%s)", company.name, company.id)
 
+    # Preserve every phone number the scan found, labelled, with no duplicates.
+    extra_phones = _collect_phones(payload)
+
     contact = Contact(
         company_id=company.id,
         first_name=(payload.first_name or None),
         last_name=(payload.last_name or None),
         title=(payload.title or None),
+        department=(payload.department or None),
         email=_valid_email(payload.email),
         phone=(payload.phone or None),
+        mobile=(payload.mobile or None),
+        fax=(payload.fax or None),
+        additional_phones=(extra_phones or None),
         linkedin_url=(payload.linkedin_url or None),
+        website=(payload.website or None),
+        # Location mirrored onto the contact so the detail view shows the card
+        # exactly as scanned (the company keeps its own normalized copy).
+        address=(payload.address or None),
+        city=(payload.city or None),
+        state=(payload.state or None),
+        postal_code=(payload.postal_code or None),
+        country=(payload.country or None),
+        notes=(payload.notes or None),
+        card_image=(payload.card_image or None),
         source=source,
     )
     db.add(contact)
     await db.flush()
     await db.refresh(contact)
+    if payload.card_image:
+        # refresh() re-expires the deferred card_image column; mark the value we
+        # just persisted as already-loaded (no extra UPDATE) so has_card_image
+        # is accurate in the response without shipping the blob itself.
+        set_committed_value(contact, "card_image", payload.card_image)
     logger.info(
         "Quick-add created contact %s <%s> for company '%s' (source=%s)",
         contact.id, contact.email, company.name, source,
