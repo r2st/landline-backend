@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+async def _existing_contact_emails(db: AsyncSession, company_id) -> set[str]:
+    """Return the lowercased set of emails already on a company's contacts,
+    used to skip duplicate inserts during enrichment/discovery."""
+    from sqlalchemy import select as _select
+    result = await db.execute(
+        _select(Contact.email).where(
+            Contact.company_id == company_id, Contact.email.isnot(None)
+        )
+    )
+    return {e.lower() for (e,) in result.all() if e}
+
+
 class ApolloEnrichmentService:
     """Wraps the Apollo.io API for company and contact enrichment."""
 
@@ -153,6 +165,93 @@ class ApolloEnrichmentService:
             return []
 
 
+
+    async def discover_executives(
+        self,
+        db: AsyncSession,
+        company: Company,
+        titles: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """Find decision-maker executives at a company and create de-duplicated
+        contacts. Returns rich dicts (first/last/title/email/linkedin/seniority)
+        for the Tactics view. Skips people whose email already exists on the
+        company so repeat runs don't pile up duplicates.
+
+        Returns an empty list when Apollo isn't usable (no key / no domain) —
+        the caller surfaces a friendly message in that case.
+        """
+        if not self.api_key or not company.domain:
+            return []
+
+        if titles is None:
+            titles = [
+                "VP Manufacturing", "Director of Operations", "Plant Manager",
+                "Quality Manager", "VP Operations", "Production Manager",
+                "CTO", "VP Engineering", "Owner", "President",
+            ]
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/mixed_people/search",
+                    headers=self.headers,
+                    json={
+                        "api_key": self.api_key,
+                        "q_organization_domains": company.domain,
+                        "person_titles": titles,
+                        "page": 1,
+                        "per_page": 10,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as e:
+            logger.error("Apollo executive search failed for %s: %s", company.name, str(e))
+            return []
+
+        existing_emails = await _existing_contact_emails(db, company.id)
+        people = data.get("people", [])
+        discovered: list[dict] = []
+
+        for person in people:
+            first_name = person.get("first_name")
+            last_name = person.get("last_name")
+            email = (person.get("email") or "").strip() or None
+            if not (first_name or last_name):
+                continue
+            # Dedup: skip anyone whose email we already track for this company.
+            if email and email.lower() in existing_emails:
+                continue
+
+            phone = None
+            if person.get("phone_numbers"):
+                phone = person["phone_numbers"][0].get("sanitized_number")
+
+            contact = Contact(
+                company_id=company.id,
+                first_name=first_name,
+                last_name=last_name,
+                title=person.get("title"),
+                email=email,
+                phone=phone,
+                linkedin_url=person.get("linkedin_url"),
+                source="apollo",
+            )
+            db.add(contact)
+            if email:
+                existing_emails.add(email.lower())
+            discovered.append({
+                "first_name": first_name,
+                "last_name": last_name,
+                "title": person.get("title"),
+                "email": email,
+                "linkedin_url": person.get("linkedin_url"),
+                "seniority": person.get("seniority") or "Executive",
+            })
+
+        await db.flush()
+        logger.info("Discovered %d executives for %s", len(discovered), company.name)
+        return discovered
 
     async def search_companies(
         self,

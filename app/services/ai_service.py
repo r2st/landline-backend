@@ -33,6 +33,29 @@ class AIService:
             text = text.strip()
         return json.loads(text)
 
+    async def _complete_json(self, prompt: str, max_tokens: int = 1024) -> dict:
+        """Send a single-shot prompt to Claude and parse the JSON reply.
+
+        Centralizes the messages.create + markdown-fence-tolerant JSON parse used
+        by the playbook/tactics helpers. Returns ``{"error": ...}`` on any
+        failure so callers never raise into the request handler.
+        """
+        response_text = ""
+        try:
+            message = await self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = message.content[0].text
+            return self._parse_json_response(response_text)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse AI JSON response: %s", str(e))
+            return {"error": "Failed to parse AI response", "raw": response_text}
+        except Exception as e:
+            logger.error("AI completion failed: %s", str(e))
+            return {"error": str(e)}
+
     async def generate_email(
         self,
         company_name: str,
@@ -347,6 +370,164 @@ Auto-send rules:
         except Exception as e:
             logger.error("AI reply analysis failed: %s", str(e))
             return {"error": str(e), "should_send": False, "should_auto_send": False}
+
+    # ------------------------------------------------------------------
+    # Sales tactics / playbook generators
+    #
+    # These power the frontend "Tactics" tab — multi-channel outreach assets
+    # for a single lead. All return plain dicts (never raise) and share the
+    # same Apprend voice rules as the cold-email generator above.
+    # ------------------------------------------------------------------
+
+    _VOICE_RULES = (
+        "VOICE: Write like a real person, not a marketing team. Short, concrete, "
+        "conversational (contractions OK). NO buzzwords (leverage, synergy, "
+        "cutting-edge, revolutionary, transform, streamline). NO generic openers "
+        '("I hope this finds you well", "I came across"). One clear ask.'
+    )
+
+    async def linkedin_messages(
+        self,
+        company_name: str,
+        contact_name: str,
+        contact_title: str = "",
+        company_industry: str = "",
+        company_domain: str = "",
+        topic: str = "",
+    ) -> dict:
+        """Draft LinkedIn connection note, follow-up, and a post-comment."""
+        topic_line = f"Angle/topic to lead with: {topic}" if topic else ""
+        prompt = f"""You are Suman from Apprend Technologies (custom manufacturing software —
+quoting tools, ERP integrations, shop-floor dashboards, quality tracking).
+
+Write LinkedIn outreach to:
+Name: {contact_name}
+Title: {contact_title}
+Company: {company_name}
+Industry: {company_industry}
+{topic_line}
+
+{self._VOICE_RULES}
+
+Produce three assets:
+1. connection_note: a connection request note, HARD MAX 300 characters, no link.
+2. follow_up_message: a short message to send after they accept (2-3 sentences, one soft ask).
+3. comment_draft: a thoughtful comment to leave on one of their recent posts (1-2 sentences, adds value, not salesy).
+
+Return ONLY valid JSON: {{"connection_note": "...", "follow_up_message": "...", "comment_draft": "..."}}"""
+        return await self._complete_json(prompt, max_tokens=768)
+
+    async def phone_script(
+        self,
+        company_name: str,
+        contact_name: str,
+        contact_title: str = "",
+        company_industry: str = "",
+        product: str = "",
+    ) -> dict:
+        """Build a cold-call script: opener, value prop, discovery, objections, close, voicemail."""
+        product_line = f"Product/service to pitch: {product}" if product else "Pitch our custom manufacturing software broadly."
+        prompt = f"""You are coaching Suman from Apprend Technologies for a cold call.
+
+Prospect: {contact_name}, {contact_title} at {company_name} ({company_industry}).
+{product_line}
+
+{self._VOICE_RULES}
+Keep every spoken line natural and brief — this is talked, not read aloud.
+
+Return ONLY valid JSON with these fields:
+{{
+  "opener": "first 2 sentences when they pick up — pattern-interrupt, not 'how are you'",
+  "value_proposition": "one tight sentence on the outcome we deliver for shops like theirs",
+  "discovery_questions": ["3-5 open questions about their current process/pain"],
+  "objection_responses": {{"we already have a system": "...", "no budget": "...", "send me an email": "..."}},
+  "close": "the specific ask — a 15-min call/demo",
+  "voicemail_script": "a 15-second voicemail if they don't answer"
+}}"""
+        return await self._complete_json(prompt, max_tokens=1024)
+
+    async def referral_request(
+        self,
+        company_name: str,
+        referrer_name: str,
+        target_name: str,
+        target_title: str = "",
+        company_industry: str = "",
+    ) -> dict:
+        """Draft a warm-intro request to a mutual connection + a forwardable blurb."""
+        prompt = f"""You are Suman from Apprend Technologies (custom manufacturing software).
+
+You want an introduction to {target_name} ({target_title}) at {company_name} ({company_industry}).
+You'll ask {referrer_name}, a mutual connection, to make the intro.
+
+{self._VOICE_RULES}
+
+Produce:
+1. referral_email: a short note to {referrer_name} asking for the intro — make it EASY to say yes, give context, no pressure.
+2. forwardable_blurb: a 2-3 sentence blurb {referrer_name} can paste/forward straight to {target_name} describing who you are and why it's worth 15 minutes.
+
+Return ONLY valid JSON: {{"referral_email": "...", "forwardable_blurb": "..."}}"""
+        return await self._complete_json(prompt, max_tokens=768)
+
+    async def event_outreach(
+        self,
+        company_name: str,
+        contact_name: str,
+        event_name: str,
+        event_type: str = "conference",
+        company_industry: str = "",
+    ) -> dict:
+        """Draft a 3-touch event sequence: pre-event, at-event, post-event."""
+        prompt = f"""You are Suman from Apprend Technologies (custom manufacturing software).
+
+You and {contact_name} from {company_name} ({company_industry}) will both be at
+{event_name} (a {event_type}). Write a 3-touch sequence around the event.
+
+{self._VOICE_RULES}
+
+Produce:
+1. pre_event_email: before the event — suggest meeting up / grabbing coffee there.
+2. at_event_message: a short text/LinkedIn message to send during the event to connect in person.
+3. post_event_followup: after the event — reference the event, propose next step.
+
+Return ONLY valid JSON: {{"pre_event_email": "...", "at_event_message": "...", "post_event_followup": "..."}}"""
+        return await self._complete_json(prompt, max_tokens=1024)
+
+    async def multi_touch_plan(
+        self,
+        company_name: str,
+        company_industry: str = "",
+        employee_count: Optional[int] = None,
+        location: str = "",
+        contacts_summary: str = "",
+        fit_score: Optional[int] = None,
+    ) -> dict:
+        """Generate a sequenced multi-channel campaign plan for one company."""
+        emp = str(employee_count) if employee_count else "Unknown"
+        score_line = f"Current fit score: {fit_score}/100." if fit_score is not None else ""
+        prompt = f"""You are a B2B sales strategist for Apprend Technologies (custom manufacturing
+software — quoting, ERP integrations, shop-floor dashboards, quality tracking).
+
+Design a realistic multi-channel outreach campaign for this account:
+Company: {company_name}
+Industry: {company_industry}
+Employees: {emp}
+Location: {location}
+Known contacts: {contacts_summary or 'none yet — discovery needed'}
+{score_line}
+
+Mix channels (email, linkedin, phone, referral) across ~2-4 weeks. Be specific and
+sequenced — each step builds on the last. {self._VOICE_RULES}
+
+Return ONLY valid JSON:
+{{
+  "summary": "one-paragraph strategy overview tailored to this account",
+  "steps": [
+    {{"channel": "email|linkedin|phone|referral", "timing": "e.g. Day 1", "action": "exactly what to do/say"}}
+  ]
+}}
+Provide 5-8 steps."""
+        return await self._complete_json(prompt, max_tokens=1500)
 
     async def extract_business_card(self, image_base64: str, media_type: str = "image/jpeg") -> dict:
         """Extract contact information from a business card image using Claude vision."""
