@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.auth import ApiKeyMiddleware
-from app.routers import companies, contacts, leads, outreach, dashboard, import_export, email_templates, follow_ups, gmail, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients
+from app.routers import companies, contacts, leads, outreach, dashboard, import_export, email_templates, follow_ups, gmail, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports
 
 settings = get_settings()
 
@@ -83,6 +83,7 @@ app.include_router(tasks.router, prefix=settings.api_prefix)
 app.include_router(interactions.router, prefix=settings.api_prefix)
 app.include_router(health.router, prefix=settings.api_prefix)
 app.include_router(clients.router, prefix=settings.api_prefix)
+app.include_router(reports.router, prefix=settings.api_prefix)
 
 
 @app.get("/health")

@@ -145,6 +145,23 @@ Kanban stages: `new_lead → researching → outreach → engaged → negotiatin
 |--------|------|-------------|
 | GET | `/suggestions` | Ranked next-best-action suggestions from overdue follow-ups, stale leads, fresh actionable news, and high-scoring un-worked leads |
 
+### Client Management
+
+Post-conversion client management: deals, tasks, logged interactions, client health, and reporting.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST / GET / PATCH / DELETE | `/deals` | Deal CRUD (value, currency, close_date, status won/lost/pending) |
+| GET | `/deals/summary` | Revenue metrics: won revenue, open pipeline, win rate (optional `company_id`) |
+| POST / GET / PATCH / DELETE | `/tasks` | Task CRUD (priority, status, task_type, assigned_to, due_date) |
+| GET | `/tasks/upcoming` | Open tasks due within N days (incl. overdue) for the dashboard |
+| POST / GET / PATCH / DELETE | `/interactions` | Logged touchpoints (meeting/call/email/note) with content + follow_up_date |
+| GET | `/companies/{id}/health` | Client health score 0-100 + status (healthy/at_risk/churned) from activity |
+| GET | `/clients/overview` | Client count, won revenue, health distribution, at-risk list, upcoming tasks |
+| GET | `/reports/client-retention` | Current clients vs churned + deals won/lost in period (`start_date`/`end_date`) |
+| GET | `/reports/revenue-pipeline` | Won revenue, open pipeline, lost value, avg deal size by status |
+| GET | `/reports/activity-summary` | Emails/replies, interactions by type, tasks created/completed in period |
+
 ### Contacts
 
 | Method | Path | Description |
