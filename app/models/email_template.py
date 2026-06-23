@@ -72,6 +72,8 @@ class EmailSend(Base):
     opened_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     clicked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     replied_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    ab_variant: Mapped[str | None] = mapped_column(String(1), nullable=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
     # Relationships
     template: Mapped["EmailTemplate | None"] = relationship("EmailTemplate", back_populates="sends")

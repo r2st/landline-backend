@@ -59,9 +59,6 @@ class Settings(BaseSettings):
     # API key authentication (empty = disabled for backward compat)
     api_key: str = ""
 
-    # Base URL for email tracking pixel / click-redirect endpoints
-    tracking_base_url: str = "http://localhost:8000"
-
     # Secret key for signing tokens (unsubscribe links, etc.)
     secret_key: str = ""
     notification_email: str = ""

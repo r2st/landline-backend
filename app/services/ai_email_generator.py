@@ -180,9 +180,9 @@ EMAIL TYPE: {template_type}
         user_prompt += f"\nADDITIONAL INSTRUCTIONS: {custom_instructions}\n"
 
     try:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
-        message = await client.messages.create(
+        message = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=300,
             system=SYSTEM_PROMPT,

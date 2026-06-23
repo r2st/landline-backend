@@ -7,10 +7,11 @@ composing/sending outreach emails to selected contacts.
 
 import logging
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -19,6 +20,9 @@ from app.models.contact import Contact
 from app.models.email_template import EmailSend, EmailTemplate
 from app.models.interaction import Interaction
 from app.schemas.email_template import (
+    ABStats,
+    ABStatsResponse,
+    CampaignAnalytics,
     EmailComposeRequest,
     EmailComposeResponse,
     EmailComposeResult,
@@ -314,7 +318,7 @@ async def compose_and_send(
     results: list[EmailComposeResult] = []
     sent = skipped = errors = 0
 
-    for contact_id in payload.contact_ids:
+    for i, contact_id in enumerate(payload.contact_ids):
         result = await db.execute(select(Contact).where(Contact.id == contact_id))
         contact = result.scalar_one_or_none()
         if not contact:
@@ -350,12 +354,20 @@ async def compose_and_send(
             ))
             continue
 
+        # A/B variant selection
+        variant = "B" if payload.subject_b and i % 2 else "A" if payload.subject_b else None
+
         company_result = await db.execute(
             select(Company).where(Company.id == contact.company_id)
         )
         company = company_result.scalar_one_or_none()
         context = build_merge_context(contact, company)
-        subject = render(template.subject, context)
+
+        # Use variant B subject if applicable
+        if variant == "B":
+            subject = render(payload.subject_b, context)
+        else:
+            subject = render(template.subject, context)
         body_html = render(template.body, context)
 
         # Create an EmailSend record first so we have a send_id for tracking
@@ -365,9 +377,21 @@ async def compose_and_send(
             to_email=contact.email,
             subject=subject,
             status="pending",
+            ab_variant=variant,
         )
         db.add(email_send)
         await db.flush()
+
+        # Handle scheduled sends
+        if payload.scheduled_at:
+            email_send.status = "scheduled"
+            email_send.scheduled_at = payload.scheduled_at
+            sent += 1
+            results.append(EmailComposeResult(
+                contact_id=contact_id, to_email=contact.email,
+                status="scheduled", detail="scheduled for later",
+            ))
+            continue
 
         # Inject open tracking pixel into email body
         tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
@@ -439,6 +463,121 @@ async def list_email_sends(
         query = query.where(EmailSend.contact_id == contact_id)
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+@router.get("/email-sends/ab-stats", response_model=ABStatsResponse)
+async def get_ab_stats(
+    template_id: uuid.UUID = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get A/B test results for a template."""
+    from sqlalchemy import func as sa_func
+
+    result = await db.execute(
+        select(
+            EmailSend.ab_variant,
+            sa_func.count(EmailSend.id).label("total"),
+            sa_func.count(EmailSend.opened_at).label("opened"),
+            sa_func.count(EmailSend.clicked_at).label("clicked"),
+        )
+        .where(
+            EmailSend.template_id == template_id,
+            EmailSend.ab_variant.isnot(None),
+        )
+        .group_by(EmailSend.ab_variant)
+    )
+    rows = result.all()
+    stats = []
+    for row in rows:
+        total = row.total or 0
+        stats.append(ABStats(
+            variant=row.ab_variant,
+            total=total,
+            opened=row.opened or 0,
+            clicked=row.clicked or 0,
+            open_rate=round((row.opened or 0) / total * 100, 1) if total else 0,
+            click_rate=round((row.clicked or 0) / total * 100, 1) if total else 0,
+        ))
+    return ABStatsResponse(template_id=template_id, stats=stats)
+
+
+@router.get("/email-sends/analytics", response_model=CampaignAnalytics)
+async def get_campaign_analytics(db: AsyncSession = Depends(get_db)):
+    """Get campaign analytics summary."""
+    from datetime import timedelta
+    from sqlalchemy import cast, Date
+
+    # Total counts by time period
+    all_sends = await db.execute(
+        select(func.count(EmailSend.id)).where(EmailSend.status != "scheduled")
+    )
+    total_all = all_sends.scalar() or 0
+
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+
+    sends_7d = await db.execute(
+        select(func.count(EmailSend.id)).where(
+            EmailSend.sent_at >= seven_days_ago,
+            EmailSend.status != "scheduled",
+        )
+    )
+    total_7d = sends_7d.scalar() or 0
+
+    sends_30d = await db.execute(
+        select(func.count(EmailSend.id)).where(
+            EmailSend.sent_at >= thirty_days_ago,
+            EmailSend.status != "scheduled",
+        )
+    )
+    total_30d = sends_30d.scalar() or 0
+
+    # Rates
+    if total_all > 0:
+        opened = await db.execute(
+            select(func.count(EmailSend.id)).where(EmailSend.opened_at.isnot(None))
+        )
+        clicked = await db.execute(
+            select(func.count(EmailSend.id)).where(EmailSend.clicked_at.isnot(None))
+        )
+        replied = await db.execute(
+            select(func.count(EmailSend.id)).where(EmailSend.replied_at.isnot(None))
+        )
+        bounced = await db.execute(
+            select(func.count(EmailSend.id)).where(EmailSend.status == "bounced")
+        )
+        open_rate = round((opened.scalar() or 0) / total_all * 100, 1)
+        click_rate = round((clicked.scalar() or 0) / total_all * 100, 1)
+        reply_rate = round((replied.scalar() or 0) / total_all * 100, 1)
+        bounce_rate = round((bounced.scalar() or 0) / total_all * 100, 1)
+    else:
+        open_rate = click_rate = reply_rate = bounce_rate = 0.0
+
+    # Daily sends for last 30 days
+    daily = await db.execute(
+        select(
+            cast(EmailSend.sent_at, Date).label("date"),
+            func.count(EmailSend.id).label("count"),
+        )
+        .where(
+            EmailSend.sent_at >= thirty_days_ago,
+            EmailSend.status != "scheduled",
+        )
+        .group_by(cast(EmailSend.sent_at, Date))
+        .order_by(cast(EmailSend.sent_at, Date))
+    )
+    daily_sends = [{"date": str(row.date), "count": row.count} for row in daily.all()]
+
+    return CampaignAnalytics(
+        total_sent_7d=total_7d,
+        total_sent_30d=total_30d,
+        total_sent_all=total_all,
+        open_rate=open_rate,
+        click_rate=click_rate,
+        reply_rate=reply_rate,
+        bounce_rate=bounce_rate,
+        daily_sends=daily_sends,
+    )
 
 
 # --- AI Email Generation ---

@@ -20,6 +20,7 @@ from app.schemas.outreach import (
     EnrollBatchRequest,
     EnrollBatchResult,
     EnrollSkip,
+    SequenceStatusUpdate,
     SequenceWithCounts,
 )
 
@@ -75,6 +76,7 @@ async def list_sequences_with_counts(
             name=s.name,
             description=s.description,
             is_active=s.is_active,
+            status=s.status,
             created_at=s.created_at,
             step_count=step_counts.get(s.id, 0),
             enrollment_count=enroll_counts.get(s.id, 0),
@@ -175,4 +177,43 @@ async def enroll_contacts(
         skipped=skipped,
         enrolled_count=len(enrolled),
         skipped_count=len(skipped),
+    )
+
+
+@router.patch("/{sequence_id}/status", response_model=SequenceWithCounts)
+async def update_sequence_status(
+    sequence_id: uuid.UUID,
+    payload: SequenceStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Pause or resume a sequence."""
+    sequence = (
+        await db.execute(
+            select(OutreachSequence).where(OutreachSequence.id == sequence_id)
+        )
+    ).scalar_one_or_none()
+    if not sequence:
+        raise HTTPException(status_code=404, detail="Sequence not found")
+
+    sequence.status = payload.status
+    # Sync is_active with status
+    sequence.is_active = payload.status == "active"
+    await db.flush()
+    await db.refresh(sequence)
+
+    # Return with counts
+    step_count = len(sequence.steps) if sequence.steps else 0
+    enrollment_count = len(sequence.enrollments) if sequence.enrollments else 0
+    active_enrollment_count = sum(1 for e in (sequence.enrollments or []) if e.status == "active")
+
+    return SequenceWithCounts(
+        id=sequence.id,
+        name=sequence.name,
+        description=sequence.description,
+        is_active=sequence.is_active,
+        status=sequence.status,
+        created_at=sequence.created_at,
+        step_count=step_count,
+        enrollment_count=enrollment_count,
+        active_enrollment_count=active_enrollment_count,
     )
