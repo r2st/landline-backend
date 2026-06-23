@@ -104,7 +104,15 @@ class EmailSendRead(BaseModel):
     ab_variant: Optional[str] = None
     scheduled_at: Optional[datetime] = None
 
-# Intentional empty line above for readability
+# --- Paginated Send History ---
+
+class EmailSendPaginatedResponse(BaseModel):
+    """Paginated email send history response."""
+    items: list[EmailSendRead]
+    total: int
+    page: int
+    per_page: int
+    pages: int
 
 
 # --- A/B Testing ---

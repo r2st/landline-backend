@@ -5,12 +5,15 @@ templates (one marked default), previewing merged output for a contact, and
 composing/sending outreach emails to selected contacts.
 """
 
+import csv
+import io
 import logging
 import uuid
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, date
+from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +29,7 @@ from app.schemas.email_template import (
     EmailComposeRequest,
     EmailComposeResponse,
     EmailComposeResult,
+    EmailSendPaginatedResponse,
     EmailSendRead,
     EmailTemplateCreate,
     EmailTemplateRead,
@@ -313,6 +317,12 @@ async def compose_and_send(
         if template is None:
             raise HTTPException(status_code=400, detail="No default template configured")
 
+    # Validate template subject and body are not empty before sending.
+    if not template.subject or not template.subject.strip():
+        raise HTTPException(status_code=400, detail="Template subject cannot be empty")
+    if not template.body or not template.body.strip():
+        raise HTTPException(status_code=400, detail="Template body cannot be empty")
+
     # Resolve who this batch is sent as (selected/active Gmail account, else SES).
     sender_info = await resolve_sender_info(db, payload.sender_account_id)
     results: list[EmailComposeResult] = []
@@ -354,85 +364,95 @@ async def compose_and_send(
             ))
             continue
 
-        # A/B variant selection
-        variant = "B" if payload.subject_b and i % 2 else "A" if payload.subject_b else None
+        try:
+            # A/B variant selection
+            variant = "B" if payload.subject_b and i % 2 else "A" if payload.subject_b else None
 
-        company_result = await db.execute(
-            select(Company).where(Company.id == contact.company_id)
-        )
-        company = company_result.scalar_one_or_none()
-        context = build_merge_context(contact, company)
+            company_result = await db.execute(
+                select(Company).where(Company.id == contact.company_id)
+            )
+            company = company_result.scalar_one_or_none()
+            context = build_merge_context(contact, company)
 
-        # Use variant B subject if applicable
-        if variant == "B":
-            subject = render(payload.subject_b, context)
-        else:
-            subject = render(template.subject, context)
-        body_html = render(template.body, context)
+            # Use variant B subject if applicable
+            if variant == "B":
+                subject = render(payload.subject_b, context)
+            else:
+                subject = render(template.subject, context)
+            body_html = render(template.body, context)
 
-        # Create an EmailSend record first so we have a send_id for tracking
-        email_send = EmailSend(
-            template_id=template.id,
-            contact_id=contact.id,
-            to_email=contact.email,
-            subject=subject,
-            status="pending",
-            ab_variant=variant,
-        )
-        db.add(email_send)
-        await db.flush()
-
-        # Handle scheduled sends
-        if payload.scheduled_at:
-            email_send.status = "scheduled"
-            email_send.scheduled_at = payload.scheduled_at
-            sent += 1
-            results.append(EmailComposeResult(
-                contact_id=contact_id, to_email=contact.email,
-                status="scheduled", detail="scheduled for later",
-            ))
-            continue
-
-        # Inject open tracking pixel into email body
-        tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
-        body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
-
-        send_result = await send_outreach_email(
-            db,
-            to_email=contact.email,
-            subject=subject,
-            body_html=body_html,
-            sender_account_id=payload.sender_account_id,
-        )
-        status = send_result.get("status", "error")
-        message_id = send_result.get("message_id")
-        detail = send_result.get("reason") or send_result.get("detail")
-
-        # Update the existing EmailSend record with send result
-        email_send.status = status
-        email_send.provider_message_id = message_id
-        email_send.error = None if status == "sent" else detail
-
-        if status in ("sent", "skipped"):
-            # "skipped" means SES creds aren't configured — still a successful compose.
-            db.add(Interaction(
-                company_id=contact.company_id,
+            # Create an EmailSend record first so we have a send_id for tracking
+            email_send = EmailSend(
+                template_id=template.id,
                 contact_id=contact.id,
-                interaction_type="email",
+                to_email=contact.email,
                 subject=subject,
-                notes=f"Outreach email composed via template '{template.name}'",
+                status="pending",
+                ab_variant=variant,
+            )
+            db.add(email_send)
+            await db.flush()
+
+            # Handle scheduled sends
+            if payload.scheduled_at:
+                email_send.status = "scheduled"
+                email_send.scheduled_at = payload.scheduled_at
+                sent += 1
+                results.append(EmailComposeResult(
+                    contact_id=contact_id, to_email=contact.email,
+                    status="scheduled", detail="scheduled for later",
+                ))
+                continue
+
+            # Inject open tracking pixel into email body
+            tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
+            body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
+
+            send_result = await send_outreach_email(
+                db,
+                to_email=contact.email,
+                subject=subject,
+                body_html=body_html,
+                sender_account_id=payload.sender_account_id,
+            )
+            status = send_result.get("status", "error")
+            message_id = send_result.get("message_id")
+            detail = send_result.get("reason") or send_result.get("detail")
+
+            # Update the existing EmailSend record with send result
+            email_send.status = status
+            email_send.provider_message_id = message_id
+            email_send.error = None if status == "sent" else detail
+
+            if status in ("sent", "skipped"):
+                # "skipped" means SES creds aren't configured — still a successful compose.
+                db.add(Interaction(
+                    company_id=contact.company_id,
+                    contact_id=contact.id,
+                    interaction_type="email",
+                    subject=subject,
+                    notes=f"Outreach email composed via template '{template.name}'",
+                ))
+
+            if status == "sent":
+                sent += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                errors += 1
+
+            results.append(EmailComposeResult(
+                contact_id=contact_id, to_email=contact.email, status=status, detail=detail
             ))
-
-        if status == "sent":
-            sent += 1
-        elif status == "skipped":
-            skipped += 1
-        else:
+        except Exception as exc:
+            logger.exception("Error processing contact %s in compose batch", contact_id)
             errors += 1
-
-        results.append(EmailComposeResult(
-            contact_id=contact_id, to_email=contact.email, status=status, detail=detail
-        ))
+            results.append(EmailComposeResult(
+                contact_id=contact_id,
+                to_email=getattr(contact, "email", None),
+                status="error",
+                detail=str(exc),
+            ))
 
     await db.flush()
     logger.info(
@@ -451,18 +471,132 @@ async def compose_and_send(
     )
 
 
-@router.get("/email-sends", response_model=list[EmailSendRead])
-async def list_email_sends(
-    contact_id: Optional[uuid.UUID] = Query(None),
-    limit: int = Query(500, ge=1, le=2000),
-    db: AsyncSession = Depends(get_db),
+def _apply_email_send_filters(
+    query,
+    contact_id: Optional[uuid.UUID] = None,
+    status: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
 ):
-    """List email send history (most recent first) for the tracking view."""
-    query = select(EmailSend).order_by(EmailSend.sent_at.desc()).limit(limit)
+    """Apply common filters to an EmailSend query."""
     if contact_id is not None:
         query = query.where(EmailSend.contact_id == contact_id)
+    if status is not None:
+        query = query.where(EmailSend.status == status)
+    if date_from is not None:
+        query = query.where(EmailSend.sent_at >= datetime.combine(date_from, datetime.min.time()))
+    if date_to is not None:
+        query = query.where(EmailSend.sent_at <= datetime.combine(date_to, datetime.max.time()))
+    return query
+
+
+@router.get(
+    "/email-sends",
+    response_model=Union[EmailSendPaginatedResponse, list[EmailSendRead]],
+)
+async def list_email_sends(
+    contact_id: Optional[uuid.UUID] = Query(None),
+    status: Optional[str] = Query(None, description="Filter by status (sent, skipped, error, scheduled, bounced)"),
+    date_from: Optional[date] = Query(None, description="Filter sends on or after this date (YYYY-MM-DD)"),
+    date_to: Optional[date] = Query(None, description="Filter sends on or before this date (YYYY-MM-DD)"),
+    page: Optional[int] = Query(None, ge=1, description="Page number (enables pagination when provided)"),
+    per_page: int = Query(50, ge=1, le=200, description="Items per page (used with page param)"),
+    limit: int = Query(500, ge=1, le=2000, description="Max results when not using pagination"),
+    db: AsyncSession = Depends(get_db),
+):
+    """List email send history (most recent first) for the tracking view.
+
+    Supports two modes:
+    - **List mode** (default): returns a flat list, controlled by ``limit``.
+      Backward-compatible with existing frontend hooks.
+    - **Paginated mode**: when ``page`` is provided, returns
+      ``{items, total, page, per_page, pages}``.
+
+    Both modes accept optional ``contact_id``, ``status``, ``date_from``,
+    and ``date_to`` filters.
+    """
+    base = select(EmailSend).order_by(EmailSend.sent_at.desc())
+    base = _apply_email_send_filters(base, contact_id, status, date_from, date_to)
+
+    if page is not None:
+        # Paginated mode
+        count_q = select(func.count()).select_from(
+            _apply_email_send_filters(
+                select(EmailSend.id), contact_id, status, date_from, date_to
+            ).subquery()
+        )
+        total = (await db.execute(count_q)).scalar() or 0
+        pages = max(1, -(-total // per_page))  # ceil division
+
+        query = base.offset((page - 1) * per_page).limit(per_page)
+        result = await db.execute(query)
+        items = list(result.scalars().all())
+
+        return EmailSendPaginatedResponse(
+            items=items,
+            total=total,
+            page=page,
+            per_page=per_page,
+            pages=pages,
+        )
+
+    # Legacy list mode
+    query = base.limit(limit)
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+@router.get("/email-sends/export-csv")
+async def export_email_sends_csv(
+    contact_id: Optional[uuid.UUID] = Query(None),
+    status: Optional[str] = Query(None),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export email send history as a CSV file.
+
+    Accepts the same filters as the list endpoint. Returns all matching
+    rows (no pagination limit).
+    """
+    query = select(EmailSend).order_by(EmailSend.sent_at.desc())
+    query = _apply_email_send_filters(query, contact_id, status, date_from, date_to)
+
+    result = await db.execute(query)
+    sends = list(result.scalars().all())
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "template_id", "contact_id", "to_email", "subject",
+        "status", "sent_at", "opened_at", "clicked_at", "ab_variant",
+        "scheduled_at", "error",
+    ])
+    for s in sends:
+        writer.writerow([
+            str(s.id),
+            str(s.template_id) if s.template_id else "",
+            str(s.contact_id) if s.contact_id else "",
+            s.to_email or "",
+            s.subject or "",
+            s.status,
+            s.sent_at.isoformat() if s.sent_at else "",
+            s.opened_at.isoformat() if s.opened_at else "",
+            s.clicked_at.isoformat() if s.clicked_at else "",
+            s.ab_variant or "",
+            s.scheduled_at.isoformat() if s.scheduled_at else "",
+            s.error or "",
+        ])
+
+    output.seek(0)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="email_sends_{timestamp}.csv"'
+        },
+    )
 
 
 @router.get("/email-sends/ab-stats", response_model=ABStatsResponse)
