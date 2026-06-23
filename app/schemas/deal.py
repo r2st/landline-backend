@@ -16,6 +16,7 @@ class DealCreate(BaseModel):
     currency: str = Field("USD", min_length=3, max_length=3)
     close_date: Optional[datetime] = None
     status: str = "pending"
+    lost_reason: Optional[str] = Field(None, max_length=255)
     notes: Optional[str] = None
 
     @field_validator("status")
@@ -37,6 +38,7 @@ class DealUpdate(BaseModel):
     currency: Optional[str] = Field(None, min_length=3, max_length=3)
     close_date: Optional[datetime] = None
     status: Optional[str] = None
+    lost_reason: Optional[str] = Field(None, max_length=255)
     notes: Optional[str] = None
 
     @field_validator("status")
@@ -62,6 +64,7 @@ class DealRead(BaseModel):
     currency: str
     close_date: Optional[datetime] = None
     status: str
+    lost_reason: Optional[str] = None
     notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime

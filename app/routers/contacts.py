@@ -77,11 +77,15 @@ async def list_contacts(
     if q:
         search = f"%{q}%"
         from sqlalchemy import or_
+        # Join Company so we can also search by company name
+        query = query.join(Company, Contact.company_id == Company.id, isouter=True)
+        count_query = count_query.join(Company, Contact.company_id == Company.id, isouter=True)
         conditions.append(or_(
             Contact.first_name.ilike(search),
             Contact.last_name.ilike(search),
             Contact.email.ilike(search),
             Contact.title.ilike(search),
+            Company.name.ilike(search),
         ))
 
     if conditions:

@@ -27,20 +27,20 @@ class Company(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     domain: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     city: Mapped[str | None] = mapped_column(String(100))
     state_province: Mapped[str | None] = mapped_column(String(100))
-    country: Mapped[str] = mapped_column(String(2), nullable=False, default="US")
+    country: Mapped[str] = mapped_column(String(2), nullable=False, default="US", index=True)
     employee_count: Mapped[int | None] = mapped_column(Integer)
     naics_code: Mapped[str | None] = mapped_column(String(10))
     naics_description: Mapped[str | None] = mapped_column(String(255))
-    industry_segment: Mapped[str | None] = mapped_column(String(100))
+    industry_segment: Mapped[str | None] = mapped_column(String(100), index=True)
     source: Mapped[str] = mapped_column(String(50), nullable=False)
     source_url: Mapped[str | None] = mapped_column(Text)
     website: Mapped[str | None] = mapped_column(Text)
     phone: Mapped[str | None] = mapped_column(String(30))
-    stage: Mapped[str] = mapped_column(String(20), nullable=False, default="new")
+    stage: Mapped[str] = mapped_column(String(20), nullable=False, default="new", index=True)
     # Kanban pipeline stage — distinct from the lifecycle ``stage`` above. Drives
     # the deal-board view (new_lead → researching → outreach → engaged →
     # negotiating → client / churned).

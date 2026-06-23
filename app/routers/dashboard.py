@@ -10,8 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
+from app.models.deal import Deal
 from app.models.lead_score import LeadScore
 from app.models.outreach import OutreachEvent
+from app.models.task import Task
 from app.models.email_template import EmailSend
 from app.schemas.dashboard import (
     ActivityItem,
@@ -83,6 +85,33 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
     # Industry breakdown
     industry_breakdown = await _get_industry_breakdown(db)
 
+    # Tasks due today (not completed/cancelled)
+    result = await db.execute(
+        select(func.count(Task.id)).where(
+            Task.due_date.isnot(None),
+            func.date(Task.due_date) == func.current_date(),
+            Task.status.notin_(["completed", "cancelled"]),
+        )
+    )
+    tasks_due_today = result.scalar() or 0
+
+    # Active deals (pending)
+    result = await db.execute(
+        select(
+            func.count(Deal.id),
+            func.coalesce(func.sum(Deal.value), 0),
+        ).where(Deal.status == "pending")
+    )
+    deals_row = result.one()
+    active_deals_count = deals_row[0] or 0
+    active_deals_value = float(deals_row[1] or 0)
+
+    # Contacts added in the last 7 days
+    result = await db.execute(
+        select(func.count(Contact.id)).where(Contact.created_at >= week_ago)
+    )
+    contacts_this_week = result.scalar() or 0
+
     return DashboardOverview(
         total_companies=total_companies,
         total_contacts=total_contacts,
@@ -90,6 +119,10 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
         avg_fit_score=avg_fit_score,
         emails_sent=emails_sent,
         leads_this_week=leads_this_week,
+        tasks_due_today=tasks_due_today,
+        active_deals_count=active_deals_count,
+        active_deals_value=active_deals_value,
+        contacts_this_week=contacts_this_week,
         pipeline=pipeline,
         outreach=outreach,
         score_distribution=score_dist,
@@ -262,6 +295,26 @@ async def get_email_trends(
         .order_by(day)
     )
     return [EmailTrendPoint(date=str(r[0]), sent=r[1]) for r in result.all()]
+
+
+@router.get("/contact-growth")
+async def contact_growth(
+    days: int = Query(90, ge=7, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """New contacts added per week over the last N days."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    week_col = func.date_trunc('week', Contact.created_at)
+    result = await db.execute(
+        select(week_col.label("week"), func.count(Contact.id))
+        .where(Contact.created_at >= since)
+        .group_by(week_col)
+        .order_by(week_col)
+    )
+    return [
+        {"week": str(r[0].date() if hasattr(r[0], 'date') else r[0]), "count": r[1]}
+        for r in result.all()
+    ]
 
 
 # --- Helpers ---

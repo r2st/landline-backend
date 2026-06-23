@@ -42,6 +42,10 @@ class DashboardOverview(BaseModel):
     avg_fit_score: Optional[float] = None
     emails_sent: int = 0
     leads_this_week: int = 0
+    tasks_due_today: int = 0
+    active_deals_count: int = 0
+    active_deals_value: float = 0
+    contacts_this_week: int = 0
     pipeline: list[PipelineStageStat]
     outreach: OutreachMetrics
     score_distribution: list[ScoringDistribution]
