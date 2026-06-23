@@ -48,7 +48,7 @@ async def create_contact(
     return contact
 
 
-_CONTACT_SORTS = {"created_at", "first_name", "last_name", "email", "title"}
+_CONTACT_SORTS = {"created_at", "first_name", "last_name", "email", "title", "company_name"}
 
 
 @router.get("/", response_model=ContactListResponse)
@@ -57,29 +57,68 @@ async def list_contacts(
     q: Optional[str] = Query(None, description="Search name, email, or title"),
     unsubscribed: Optional[bool] = Query(None, description="Filter by unsubscribe status"),
     has_email: Optional[bool] = Query(None, description="Only contacts with/without an email"),
-    sort_by: str = Query("created_at", description="created_at, first_name, last_name, email, title"),
+    status: Optional[str] = Query(None, description="subscribed, unsubscribed, or no_email"),
+    city: Optional[str] = Query(None, description="Filter by city"),
+    source: Optional[str] = Query(None, description="Filter by source"),
+    company_name: Optional[str] = Query(None, description="Filter by company name"),
+    sort_by: str = Query("created_at", description="created_at, first_name, last_name, email, title, company_name"),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
     """List contacts with filtering, search, sorting, and pagination."""
+    from sqlalchemy import or_, and_
+
     query = select(Contact)
     count_query = select(func.count(Contact.id))
 
     conditions = []
+    # Track whether we've already joined Company on both queries so we
+    # don't join twice (the `q` search, `company_name` filter, and
+    # `company_name` sort can all require the Company join).
+    company_joined = False
+
+    def _ensure_company_join():
+        nonlocal query, count_query, company_joined
+        if not company_joined:
+            query = query.join(Company, Contact.company_id == Company.id, isouter=True)
+            count_query = count_query.join(Company, Contact.company_id == Company.id, isouter=True)
+            company_joined = True
+
     if company_id:
         conditions.append(Contact.company_id == company_id)
     if unsubscribed is not None:
         conditions.append(Contact.unsubscribed == unsubscribed)
     if has_email is not None:
         conditions.append(Contact.email.isnot(None) if has_email else Contact.email.is_(None))
+
+    # Status filter (combines unsubscribed and email presence logic)
+    if status is not None:
+        if status == "subscribed":
+            conditions.append(Contact.unsubscribed == False)
+            conditions.append(Contact.email.isnot(None))
+        elif status == "unsubscribed":
+            conditions.append(Contact.unsubscribed == True)
+        elif status == "no_email":
+            conditions.append(Contact.email.is_(None))
+
+    # City filter (case-insensitive partial match)
+    if city:
+        conditions.append(Contact.city.ilike(f"%{city}%"))
+
+    # Source filter (exact match)
+    if source:
+        conditions.append(Contact.source == source)
+
+    # Company name filter (case-insensitive partial match, requires Company join)
+    if company_name:
+        _ensure_company_join()
+        conditions.append(Company.name.ilike(f"%{company_name}%"))
+
     if q:
         search = f"%{q}%"
-        from sqlalchemy import or_
-        # Join Company so we can also search by company name
-        query = query.join(Company, Contact.company_id == Company.id, isouter=True)
-        count_query = count_query.join(Company, Contact.company_id == Company.id, isouter=True)
+        _ensure_company_join()
         conditions.append(or_(
             Contact.first_name.ilike(search),
             Contact.last_name.ilike(search),
@@ -89,7 +128,6 @@ async def list_contacts(
         ))
 
     if conditions:
-        from sqlalchemy import and_
         combined = and_(*conditions)
         query = query.where(combined)
         count_query = count_query.where(combined)
@@ -97,7 +135,14 @@ async def list_contacts(
     total_result = await db.execute(count_query)
     total = total_result.scalar()
 
-    sort_col = getattr(Contact, sort_by) if sort_by in _CONTACT_SORTS else Contact.created_at
+    # Sorting — company_name requires joining Company
+    if sort_by == "company_name":
+        _ensure_company_join()
+        sort_col = Company.name
+    elif sort_by in _CONTACT_SORTS:
+        sort_col = getattr(Contact, sort_by)
+    else:
+        sort_col = Contact.created_at
     query = query.order_by(sort_col.asc() if sort_dir == "asc" else sort_col.desc())
 
     offset = (page - 1) * page_size
@@ -203,6 +248,62 @@ async def get_contact(
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     return contact
+
+
+@router.get("/{contact_id}/timeline")
+async def get_contact_timeline(
+    contact_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get activity timeline for a contact."""
+    result = await db.execute(select(Contact).where(Contact.id == contact_id))
+    contact = result.scalar_one_or_none()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    timeline = []
+
+    # Contact creation event
+    timeline.append({
+        "type": "contact_created",
+        "description": f"Contact created via {contact.source or 'unknown'}",
+        "timestamp": contact.created_at.isoformat() if contact.created_at else None,
+    })
+
+    # Interactions linked to this contact
+    from app.models.interaction import Interaction
+    interactions_result = await db.execute(
+        select(Interaction)
+        .where(Interaction.contact_id == contact_id)
+        .order_by(Interaction.created_at.desc())
+        .limit(50)
+    )
+    for interaction in interactions_result.scalars().all():
+        timeline.append({
+            "type": f"interaction_{interaction.interaction_type}",
+            "description": interaction.subject or interaction.notes or str(interaction),
+            "timestamp": interaction.created_at.isoformat() if interaction.created_at else None,
+        })
+
+    # Outreach enrollments for this contact
+    from app.models.outreach import OutreachEnrollment
+    enrollments_result = await db.execute(
+        select(OutreachEnrollment)
+        .where(OutreachEnrollment.contact_id == contact_id)
+        .order_by(OutreachEnrollment.enrolled_at.desc())
+        .limit(20)
+    )
+    for enrollment in enrollments_result.scalars().all():
+        timeline.append({
+            "type": "outreach_enrolled",
+            "description": f"Enrolled in sequence (status: {enrollment.status})",
+            "timestamp": enrollment.enrolled_at.isoformat() if enrollment.enrolled_at else None,
+        })
+
+    # Sort by timestamp descending
+    timeline.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+
+    return {"contact_id": str(contact_id), "timeline": timeline}
 
 
 @router.get("/{contact_id}/card-image")

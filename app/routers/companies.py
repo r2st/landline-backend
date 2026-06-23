@@ -99,6 +99,9 @@ async def list_companies(
     min_employees: Optional[int] = Query(None, ge=0),
     max_employees: Optional[int] = Query(None, ge=0),
     tags: Optional[str] = Query(None, description="Comma-separated tags"),
+    has_contacts: Optional[bool] = Query(None, description="Only companies with/without contacts"),
+    enriched: Optional[str] = Query(None, description="enriched or not_enriched"),
+    source: Optional[str] = Query(None, description="Filter by source"),
     sort_by: Optional[str] = Query("created_at", description="Sort field"),
     sort_dir: Optional[str] = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
@@ -139,6 +142,30 @@ async def list_companies(
         tag_list = [t.strip() for t in tags.split(",")]
         for tag in tag_list:
             conditions.append(Company.tags.any(tag))
+
+    # has_contacts filter: correlated subquery checking for contact existence
+    if has_contacts is not None:
+        contact_exists = (
+            select(func.count(Contact.id))
+            .where(Contact.company_id == Company.id)
+            .correlate(Company)
+            .scalar_subquery()
+        )
+        if has_contacts:
+            conditions.append(contact_exists > 0)
+        else:
+            conditions.append(contact_exists == 0)
+
+    # enriched filter: companies with/without a domain
+    if enriched is not None:
+        if enriched == "enriched":
+            conditions.append(Company.domain.isnot(None))
+        elif enriched == "not_enriched":
+            conditions.append(Company.domain.is_(None))
+
+    # source filter: exact match
+    if source:
+        conditions.append(Company.source == source)
 
     if conditions:
         combined = and_(*conditions)

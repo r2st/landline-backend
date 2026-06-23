@@ -13,6 +13,8 @@ from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.models.company_news import CompanyNews
 from app.models.deal import Deal
+from app.models.deal_activity import DealActivity
+from app.models.deal_note import DealNote
 from app.models.task import Task
 from app.models.client_health import ClientHealthSnapshot
 from app.models.email_signature import EmailSignature
@@ -34,6 +36,8 @@ __all__ = [
     "SmtpAccount",
     "CompanyNews",
     "Deal",
+    "DealActivity",
+    "DealNote",
     "Task",
     "ClientHealthSnapshot",
     "EmailSignature",

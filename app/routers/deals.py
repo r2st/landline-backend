@@ -11,9 +11,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.company import Company
 from app.models.deal import Deal
+from app.models.deal_activity import DealActivity
+from app.models.deal_note import DealNote
 from app.schemas.deal import (
+    DEAL_STAGE_PROBABILITIES,
+    DealActivityRead,
     DealCreate,
+    DealMetrics,
+    DealNoteCreate,
+    DealNoteRead,
     DealRead,
+    DealStageBreakdown,
     DealStatusBreakdown,
     DealSummary,
     DealUpdate,
@@ -41,6 +49,16 @@ async def create_deal(payload: DealCreate, db: AsyncSession = Depends(get_db)):
     db.add(deal)
     await db.flush()
     await db.refresh(deal)
+
+    activity = DealActivity(
+        deal_id=deal.id,
+        activity_type="created",
+        description=f"Deal '{deal.title}' created",
+        new_value=deal.status,
+    )
+    db.add(activity)
+    await db.flush()
+
     logger.info("Created deal %s for company %s", deal.id, payload.company_id)
     return deal
 
@@ -49,6 +67,7 @@ async def create_deal(payload: DealCreate, db: AsyncSession = Depends(get_db)):
 async def list_deals(
     company_id: Optional[uuid.UUID] = Query(None),
     status: Optional[str] = Query(None, pattern="^(won|lost|pending)$"),
+    deal_stage: Optional[str] = Query(None, pattern="^(qualification|discovery|proposal|negotiation|closing)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
@@ -59,6 +78,8 @@ async def list_deals(
         query = query.where(Deal.company_id == company_id)
     if status:
         query = query.where(Deal.status == status)
+    if deal_stage:
+        query = query.where(Deal.deal_stage == deal_stage)
     query = query.order_by(Deal.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     return list((await db.execute(query)).scalars().all())

@@ -17,6 +17,10 @@ class Deal(Base):
             "status IN ('won','lost','pending')",
             name="ck_deals_status",
         ),
+        CheckConstraint(
+            "deal_stage IN ('qualification','discovery','proposal','negotiation','closing')",
+            name="ck_deals_deal_stage",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -30,6 +34,7 @@ class Deal(Base):
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     close_date: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    deal_stage: Mapped[str] = mapped_column(String(20), nullable=False, default="qualification")
     lost_reason: Mapped[str | None] = mapped_column(String(255))
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
