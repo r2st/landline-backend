@@ -63,6 +63,13 @@ async def create_deal(payload: DealCreate, db: AsyncSession = Depends(get_db)):
     return deal
 
 
+def _attach_company_name(deal, company_name: str | None):
+    """Return a dict with company_name injected for serialization."""
+    d = DealRead.model_validate(deal).model_dump()
+    d["company_name"] = company_name
+    return d
+
+
 @router.get("", response_model=list[DealRead])
 async def list_deals(
     company_id: Optional[uuid.UUID] = Query(None),
@@ -73,7 +80,9 @@ async def list_deals(
     db: AsyncSession = Depends(get_db),
 ):
     """List deals, newest first, with optional filters."""
-    query = select(Deal)
+    query = select(Deal, Company.name.label("company_name")).join(
+        Company, Deal.company_id == Company.id, isouter=True
+    )
     if company_id:
         query = query.where(Deal.company_id == company_id)
     if status:
@@ -82,7 +91,8 @@ async def list_deals(
         query = query.where(Deal.deal_stage == deal_stage)
     query = query.order_by(Deal.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
-    return list((await db.execute(query)).scalars().all())
+    rows = (await db.execute(query)).all()
+    return [_attach_company_name(deal, cname) for deal, cname in rows]
 
 
 @router.get("/summary", response_model=DealSummary)

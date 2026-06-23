@@ -93,6 +93,7 @@ class DealRead(BaseModel):
     notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    company_name: Optional[str] = None
 
 
 class DealStatusBreakdown(BaseModel):
