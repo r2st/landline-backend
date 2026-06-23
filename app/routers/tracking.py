@@ -1,6 +1,7 @@
 """Email open and click tracking endpoints."""
 
 import logging
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -16,6 +17,11 @@ from app.models.email_template import EmailSend
 from app.models.contact import Contact
 
 logger = logging.getLogger(__name__)
+
+# Random per-process fallback key — used only when secret_key is not configured.
+# Tokens signed with this key will NOT survive a process restart, but that is
+# preferable to using a hardcoded, guessable secret.
+_FALLBACK_KEY = secrets.token_urlsafe(32)
 router = APIRouter(prefix="/track", tags=["tracking"])
 
 # Status hierarchy — higher number = more advanced state; never downgrade
@@ -40,26 +46,38 @@ PIXEL_GIF = bytes([
 
 def _get_serializer():
     settings = get_settings()
-    return URLSafeTimedSerializer(settings.secret_key or "landline-tracking-secret")
+    key = settings.secret_key
+    if not key:
+        logger.warning("secret_key not set — tracking tokens will use a random per-process key")
+        key = _FALLBACK_KEY
+    return URLSafeTimedSerializer(key)
 
 
 def _get_unsubscribe_serializer():
     settings = get_settings()
-    return URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
+    key = settings.secret_key
+    if not key:
+        logger.warning("secret_key not set — unsubscribe tokens will use a random per-process key")
+        key = _FALLBACK_KEY
+    return URLSafeTimedSerializer(key)
 
 
 def generate_tracking_pixel_url(send_id: str) -> str:
     """Generate a tracking pixel URL for an email send."""
     serializer = _get_serializer()
     token = serializer.dumps(send_id, salt="open-track")
-    return f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/open/{token}"
+    settings = get_settings()
+    base = settings.tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/open/{token}"
 
 
 def generate_click_url(send_id: str, original_url: str) -> str:
     """Wrap a URL for click tracking."""
     serializer = _get_serializer()
     token = serializer.dumps({"send_id": send_id, "url": original_url}, salt="click-track")
-    return f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/click/{token}"
+    settings = get_settings()
+    base = settings.tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/click/{token}"
 
 
 @router.get("/open/{token}")
