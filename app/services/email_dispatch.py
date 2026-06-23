@@ -34,22 +34,38 @@ from app.services.smtp_sender import SmtpSender
 logger = logging.getLogger(__name__)
 
 
+def _is_html(text: str) -> bool:
+    """Check if text contains block-level HTML tags (is already formatted HTML)."""
+    return bool(re.search(r'<(p|div|ul|ol|h[1-6]|table|br|hr)\b', text, re.IGNORECASE))
+
+
+def _plain_text_to_html(text: str) -> str:
+    """Convert plain text with newlines to simple HTML with <br> tags.
+
+    This mimics how Gmail composes emails — each newline becomes a <br>,
+    producing a natural email look without marketing-style paragraph spacing.
+    """
+    # Double newlines → paragraph break (two <br>s)
+    # Single newlines → line break (one <br>)
+    return text.replace('\n', '<br>\n')
+
+
 def _inject_inline_styles(html: str) -> str:
     """Add inline styles to common HTML tags for email client compatibility."""
     replacements = [
-        (r'<p(?=[\s>])', '<p style="margin:0 0 16px 0"'),
-        (r'<ul(?=[\s>])', '<ul style="margin:0 0 16px 0;padding-left:24px"'),
-        (r'<ol(?=[\s>])', '<ol style="margin:0 0 16px 0;padding-left:24px"'),
-        (r'<li(?=[\s>])', '<li style="margin:0 0 8px 0"'),
+        (r'<p(?=[\s>])', '<p style="margin:0 0 10px 0"'),
+        (r'<ul(?=[\s>])', '<ul style="margin:0 0 10px 0;padding-left:24px"'),
+        (r'<ol(?=[\s>])', '<ol style="margin:0 0 10px 0;padding-left:24px"'),
+        (r'<li(?=[\s>])', '<li style="margin:0 0 4px 0"'),
         (r'<strong(?=[\s>])', '<strong style="font-weight:bold"'),
         (r'<b(?=[\s>])', '<b style="font-weight:bold"'),
         (r'<em(?=[\s>])', '<em style="font-style:italic"'),
         (r'<i(?=[\s>])', '<i style="font-style:italic"'),
-        (r'<a(?=[\s>])', '<a style="color:#2563eb;text-decoration:underline"'),
-        (r'<h2(?=[\s>])', '<h2 style="font-size:20px;font-weight:bold;margin:24px 0 12px 0"'),
-        (r'<h3(?=[\s>])', '<h3 style="font-size:17px;font-weight:bold;margin:20px 0 10px 0"'),
-        (r'<hr(?=[\s>/])', '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0"'),
-        (r'<blockquote(?=[\s>])', '<blockquote style="border-left:3px solid #d1d5db;padding-left:16px;margin:0 0 16px 0;color:#6b7280"'),
+        (r'<a(?=[\s>])', '<a style="color:#1a73e8;text-decoration:underline"'),
+        (r'<h2(?=[\s>])', '<h2 style="font-size:18px;font-weight:bold;margin:16px 0 8px 0"'),
+        (r'<h3(?=[\s>])', '<h3 style="font-size:16px;font-weight:bold;margin:14px 0 6px 0"'),
+        (r'<hr(?=[\s>/])', '<hr style="border:none;border-top:1px solid #dadce0;margin:16px 0"'),
+        (r'<blockquote(?=[\s>])', '<blockquote style="border-left:3px solid #dadce0;padding-left:12px;margin:0 0 10px 0;color:#5f6368"'),
     ]
     for pattern, replacement in replacements:
         html = re.sub(pattern, replacement, html)
@@ -57,25 +73,26 @@ def _inject_inline_styles(html: str) -> str:
 
 
 def wrap_html_email(body_html: str) -> str:
-    """Wrap an HTML fragment in a complete email-safe HTML document with inline styles."""
+    """Wrap email content in a simple HTML document that looks like a normal Gmail email.
+
+    No marketing-style card layout — just clean, simple formatting that matches
+    how Gmail composes and sends emails.
+    """
+    # Convert plain text to HTML if needed
+    if not _is_html(body_html):
+        body_html = _plain_text_to_html(body_html)
+
     styled = _inject_inline_styles(body_html)
     return (
         '<!DOCTYPE html>'
         '<html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
         '</head>'
-        '<body style="margin:0;padding:0;background-color:#f9fafb">'
-        '<table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f9fafb">'
-        '<tr><td align="center" style="padding:24px 16px">'
-        '<table width="600" cellpadding="0" cellspacing="0" '
-        'style="max-width:600px;width:100%;background-color:#ffffff;border-radius:8px;overflow:hidden">'
-        '<tr><td style="padding:32px 40px;font-family:Arial,Helvetica,sans-serif;'
-        'font-size:15px;line-height:1.6;color:#333333">'
+        '<body style="margin:0;padding:0">'
+        '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;'
+        'line-height:1.5;color:#222222">'
         f'{styled}'
-        '</td></tr>'
-        '</table>'
-        '</td></tr>'
-        '</table>'
+        '</div>'
         '</body></html>'
     )
 
