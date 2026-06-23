@@ -15,6 +15,7 @@ from app.models.company_news import CompanyNews
 from app.models.deal import Deal
 from app.models.task import Task
 from app.models.client_health import ClientHealthSnapshot
+from app.models.email_signature import EmailSignature
 
 __all__ = [
     "Company",
@@ -35,4 +36,5 @@ __all__ = [
     "Deal",
     "Task",
     "ClientHealthSnapshot",
+    "EmailSignature",
 ]
