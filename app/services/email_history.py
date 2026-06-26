@@ -832,7 +832,7 @@ class EmailHistoryService:
             "subject": reply.subject,
             "body_html": reply.body_html,
             "body_text": reply.body_text,
-            "snippet": reply.snippet,
+            "snippet": html_mod.unescape(reply.snippet) if reply.snippet else None,
             "status": direction,
             "gmail_thread_id": reply.gmail_thread_id,
             "gmail_message_id": reply.gmail_message_id,
