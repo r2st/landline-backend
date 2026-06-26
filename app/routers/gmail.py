@@ -300,6 +300,13 @@ async def purge_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db
         )
     )).scalar() or 0
 
+    # Count incoming emails (where this account is the recipient)
+    incoming_replies = (await db.execute(
+        select(sa_func.count()).select_from(EmailReply).where(
+            EmailReply.to_email == email_address,
+        )
+    )).scalar() or 0
+
     # Delete email_replies linked to this account
     await db.execute(
         delete(EmailReply).where(EmailReply.gmail_account_id == account_id)
@@ -311,6 +318,11 @@ async def purge_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db
                 EmailReply.from_email == email_address,
                 EmailReply.gmail_account_id.is_(None),
             )
+        )
+    # Delete incoming emails where this account is the recipient
+    if incoming_replies:
+        await db.execute(
+            delete(EmailReply).where(EmailReply.to_email == email_address)
         )
 
     # Null out sender_account_id on email_sends before deleting
@@ -343,16 +355,74 @@ async def purge_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db
             replacement.is_active = True
             await db.flush()
 
-    total_replies = replies_count + extra_replies
+    total_replies = replies_count + extra_replies + incoming_replies
     logger.info(
-        "Purged Gmail account %s: %d replies, %d sends deleted",
-        email_address, total_replies, sends_count,
+        "Purged Gmail account %s: %d replies (%d linked, %d from, %d incoming), %d sends deleted",
+        email_address, total_replies, replies_count, extra_replies, incoming_replies, sends_count,
     )
     return {
         "email": email_address,
         "replies_deleted": total_replies,
         "sends_deleted": sends_count,
         "total_deleted": total_replies + sends_count,
+    }
+
+
+@router.delete("/cleanup-emails")
+async def cleanup_orphaned_emails(
+    email: str = Query(..., description="Email address to clean up"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all email_replies and email_sends associated with an email address.
+
+    Use this after an account has already been removed to clean up orphaned emails
+    that were synced from that account.
+    """
+    from sqlalchemy import or_
+
+    # Count what we're about to delete
+    replies_count = (await db.execute(
+        select(sa_func.count()).select_from(EmailReply).where(
+            or_(
+                EmailReply.from_email == email,
+                EmailReply.to_email == email,
+            )
+        )
+    )).scalar() or 0
+
+    sends_count = (await db.execute(
+        select(sa_func.count()).select_from(EmailSend).where(
+            or_(
+                EmailSend.from_email == email,
+                EmailSend.to_email == email,
+            )
+        )
+    )).scalar() or 0
+
+    # Delete
+    await db.execute(
+        delete(EmailReply).where(
+            or_(
+                EmailReply.from_email == email,
+                EmailReply.to_email == email,
+            )
+        )
+    )
+    await db.execute(
+        delete(EmailSend).where(
+            or_(
+                EmailSend.from_email == email,
+                EmailSend.to_email == email,
+            )
+        )
+    )
+
+    logger.info("Cleaned up orphaned emails for %s: %d replies, %d sends", email, replies_count, sends_count)
+    return {
+        "email": email,
+        "replies_deleted": replies_count,
+        "sends_deleted": sends_count,
+        "total_deleted": replies_count + sends_count,
     }
 
 
