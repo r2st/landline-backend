@@ -236,11 +236,11 @@ def _unsubscribe_footer_text(contact_email: str) -> str:
     token = serializer.dumps(contact_email, salt="unsubscribe")
     unsubscribe_url = f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
     return (
-        "\n\n---\n"
-        "Apprend Technologies | Manufacturing Software Solutions\n"
-        f"To unsubscribe, reply with UNSUBSCRIBE or click: "
+        "\n\n—\n"
+        "Apprend Technologies\n"
+        f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
-        "Apprend Technologies, Toronto, ON, Canada"
+        "Toronto, ON, Canada"
     )
 
 
@@ -251,14 +251,12 @@ def _unsubscribe_footer_html(contact_email: str) -> str:
     token = serializer.dumps(contact_email, salt="unsubscribe")
     unsubscribe_url = f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
     return (
-        '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0">'
-        '<p style="margin:0 0 4px 0;font-size:12px;color:#9ca3af">'
-        'Apprend Technologies | Manufacturing Software Solutions</p>'
-        '<p style="margin:0;font-size:12px;color:#9ca3af">'
-        'To unsubscribe, reply with UNSUBSCRIBE or '
-        f'<a href="{unsubscribe_url}" style="color:#9ca3af">click here</a></p>'
+        '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0 12px 0">'
+        '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
+        'Apprend Technologies &middot; Toronto, ON, Canada</p>'
         '<p style="margin:0;font-size:11px;color:#9ca3af">'
-        'Apprend Technologies, Toronto, ON, Canada</p>'
+        'Don\'t want these emails? Reply UNSUBSCRIBE or '
+        f'<a href="{unsubscribe_url}" style="color:#9ca3af">unsubscribe here</a></p>'
     )
 
 

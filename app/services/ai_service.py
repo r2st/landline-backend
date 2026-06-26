@@ -82,33 +82,33 @@ class AIService:
             if additional_context:
                 ctx_line = f"Additional Context: {additional_context}"
 
-            prompt = f"""You are writing an email AS Suman from Apprend Technologies. Apprend builds custom manufacturing software — quoting tools, ERP integrations, shop floor dashboards, quality tracking systems.
+            prompt = f"""You're Suman from Apprend Technologies. You build manufacturing software — shop floor monitoring, quoting tools, ERP integrations, quality tracking.
 
-Write a cold outreach email to this person:
+Write a cold email to:
 
 Name: {contact_name}
-Title: {contact_title}  
+Title: {contact_title}
 Company: {company_name}
 Industry: {industry}
 {ctx_line}
 
-CRITICAL RULES — your email MUST follow these:
-1. SHORT. Under 100 words for the body. 4-5 sentences max.
-2. Sound like a real person texting a colleague, not a marketing team.
-3. Start with something SPECIFIC about their company or role — show you did homework.
-4. NO buzzwords: no "leverage", "synergy", "cutting-edge", "revolutionary", "transform".
-5. NO generic openers: no "I hope this finds you well", "I came across your company", "I noticed that".
-6. Use conversational language — contractions, casual tone, like you'd talk to someone at a trade show.
-7. One clear ask at the end — suggest a quick 15-min call.
-8. Subject line: short, lowercase-ish, looks like a real person wrote it (not a marketing campaign).
+HOW TO WRITE THIS:
+- You're a person, not a department. Write like you'd talk to someone at a trade show
+- 4-5 sentences. Under 100 words. That's it
+- Open with something about THEIR world — their industry, their role, a real challenge they probably face. Not about you
+- Use contractions. Short sentences. The occasional dash
+- One ask at the end: a 15-min call. Frame it as a question, not a demand
+- Subject line: lowercase, short, like you'd text a colleague
+
+BANNED:
+- "I hope this finds you well", "I came across", "I noticed that", "I wanted to reach out"
+- "leverage", "synergy", "cutting-edge", "revolutionary", "transform", "streamline", "innovative"
+- Exclamation marks
+- Bullet points or lists in the body
 
 GOOD example:
 Subject: quick question about your quoting process
-Body: Hey {{{{first_name}}}}, saw that {{{{company}}}} does [specific thing]. Curious — are you still using spreadsheets or a manual process for quoting? We built a tool for [similar company] that cut their quote turnaround from 2 days to 20 minutes. Would a 15-min call make sense to see if something similar could work for you guys?
-
-BAD example (DO NOT write like this):
-Subject: Transform Your Manufacturing Operations with AI-Powered Solutions  
-Body: Dear {{{{first_name}}}}, I hope this email finds you well. I came across {{{{company}}}} and was impressed by your operations. At Apprend Technologies, we leverage cutting-edge technology to help manufacturers like you streamline their processes...
+Body: Hey {contact_name.split()[0] if contact_name else 'there'}, saw that {company_name} does [specific thing]. Curious — are you still running quotes through spreadsheets? We built a tool for a shop like yours that got their turnaround from 2 days to 20 minutes. Would a 15-min call make sense to see if something similar could work for you guys?
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "follow_up_suggestion": "..."}}"""
 
@@ -140,7 +140,7 @@ Return ONLY valid JSON: {{"subject": "...", "body": "...", "follow_up_suggestion
             if instruction:
                 instr_line = f"Specific instructions: {instruction}"
 
-            prompt = f"""Improve this B2B outreach email. Make it more engaging, concise, and likely to get a response.
+            prompt = f"""Tighten up this outreach email. Make it sound like a real person wrote it quickly, not like a committee drafted it.
 
 Current Subject: {subject}
 Current Body:
@@ -148,12 +148,13 @@ Current Body:
 
 {instr_line}
 
-Requirements:
-- Keep it under 100 words
-- Make the subject line short, lowercase, like a real person wrote it
-- Sound human and genuine — contractions, casual tone
-- No buzzwords, no corporate speak
-- One clear CTA
+What to do:
+- Cut it to under 100 words. Kill any sentence that doesn't earn its spot
+- Subject line: short, lowercase, something you'd actually type — not a headline
+- Read it out loud — if you wouldn't say it to someone at a coffee shop, rewrite it
+- Strip out anything corporate-sounding. Contractions are good. Dashes are fine
+- One clear ask at the end
+- Keep the core message, just make it sound human
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "changes_made": "..."}}"""
 
@@ -274,20 +275,21 @@ Return ONLY valid JSON:
             is_final = step_number >= 3
             final_note = "This is the final follow-up. Make it a graceful breakup email — keep it classy, leave the door open." if is_final else ""
 
-            prompt = f"""Write follow-up #{step_number} for a cold email I sent.
+            prompt = f"""Write follow-up #{step_number} for a cold email I sent {days_since_last} days ago.
 
 Original subject: {original_subject}
 Contact: {contact_name}
-Days since last email: {days_since_last}
+
+THE GOAL: Get a reply. Not annoy them.
 
 RULES:
-1. Under 50 words. Yes, fifty.
-2. Follow-up #1: Bump the thread. "Hey, just floating this back up" energy. Add ONE new thing of value.
-3. Follow-up #2: Different angle entirely. Share something useful (industry trend, case study result, a relevant number).
-4. Follow-up #3: Breakup email. "No worries if the timing isn't right" — keep it classy, leave the door open.
-5. After #3: STOP. Set should_stop_sequence to true.
-6. DO NOT say "just checking in", "circling back", "following up", "touching base".
-7. Sound like a real person, not a drip campaign.
+1. Under 50 words. Seriously — the shorter the follow-up, the higher the reply rate
+2. Follow-up #1: Float the thread back up. Add one new thing — a quick stat, a thought about their industry, or the demo link. Keep it casual. "Hey {contact_name.split()[0] if contact_name else 'there'}, wanted to bump this" energy
+3. Follow-up #2: Completely different angle. Don't reference the old email. Try a specific pain point, a result from a similar shop, or a question about their process
+4. Follow-up #3: Breakup. "Totally fine if the timing's off — just didn't want to keep pinging you without checking." Two sentences. Leave the door open. Done
+5. After #3: Set should_stop_sequence to true
+6. NEVER say: "just checking in", "circling back", "following up on my previous email", "touching base", "wanted to circle back"
+7. Sound like you dashed this off in 30 seconds, because you did
 {final_note}
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "is_final": {str(is_final).lower()}, "should_stop_sequence": {str(is_final).lower()}}}"""
@@ -315,37 +317,36 @@ Return ONLY valid JSON: {{"subject": "...", "body": "...", "is_final": {str(is_f
 IMPORTANT: We have a scheduling link available: {scheduling_link}
 Include this link naturally in your response when suggesting a call or meeting."""
 
-            prompt = f"""You're Suman from Apprend Technologies responding to a lead's reply. Your goal is to get a 15-20 minute call scheduled.
-
-CONTEXT:
-- You sent them a cold email about manufacturing software
-- They just replied
-- You want to schedule a quick call to understand their process and show relevant demos
-
-ORIGINAL EMAIL WE SENT:
-Subject: {original_subject}
+            prompt = f"""You're Suman. Someone replied to your cold email. Read what they said and write back.
 
 THEIR REPLY:
 {reply_body[:1000]}
 
-Contact: {contact_name}
-Company: {company_name}
+YOUR ORIGINAL EMAIL:
+Subject: {original_subject}
+
+Who they are: {contact_name} at {company_name}
 
 {scheduling_instruction}
 
-CLASSIFY their intent: "interested", "not_now", "not_interested", "question", "referral", "auto_reply"
+FIRST: Figure out what they mean:
+- "interested" = they want to learn more or talk
+- "question" = they asked something specific
+- "not_now" = bad timing but not a no
+- "not_interested" = clear no
+- "referral" = pointing you to someone else
+- "auto_reply" = out of office / automated
 
-RESPONSE RULES:
-1. MAX 60 words. Seriously — short replies get more responses.
-2. Match their energy. If they're casual, be casual. If formal, be slightly formal.
-3. Sound like you typed this on your phone between meetings.
-4. NO corporate speak. Write like a human.
-5. For interested/question: propose 2-3 specific time slots or ask when works for them.
-6. For not_now: "totally understand" + leave door open. ONE sentence.
-7. For not_interested: "appreciate you letting me know" + done. TWO sentences max.
-8. For auto_reply: do NOT respond. Set should_auto_send to false.
-9. NEVER say "I appreciate your prompt response" or "Thank you for getting back to me" — just get to the point.
-10. Sign off casually: "- Suman" or just "Suman"
+THEN write your reply:
+
+- MAX 60 words. You're replying from your phone
+- Match their vibe. Casual reply to a casual email. Slightly more polished if they're formal
+- Get to the point immediately. No "thanks for getting back to me" throat-clearing
+- Interested/question: suggest hopping on a quick call. Ask what times work for them, or propose 2-3 slots
+- Not now: "totally get it" + when should you check back? One sentence
+- Not interested: "appreciate you letting me know" and done. Don't grovel
+- Auto-reply: don't respond at all. Set should_auto_send to false
+- Sign off: "- Suman" or just "Suman"
 
 Return ONLY valid JSON:
 {{
@@ -363,10 +364,7 @@ Return ONLY valid JSON:
   "follow_up_days": null
 }}
 
-Auto-send rules:
-- true ONLY for "interested" and "question"
-- false for everything else
-- NEVER true for "auto_reply"
+Auto-send: true ONLY for "interested" and "question". false for everything else. NEVER for "auto_reply".
 """
 
             message = await self.client.messages.create(

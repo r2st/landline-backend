@@ -26,51 +26,38 @@ DEMO_LINK = "https://true-molding-demo.pages.dev"
 PROFESSIONAL_BODY = f"""\
 <p>Hi {{{{first_name}}}},</p>
 
-<p>I came across {{{{company}}}} and your work in {{{{industry_segment}}}} here in
-{{{{city}}}}, and wanted to reach out. As {{{{contact_title}}}}, you know how much
-margin slips away when a press goes down unnoticed or scrap creeps up between checks.</p>
+<p>I was looking into {{{{industry_segment}}}} shops in {{{{city}}}} and came across
+{{{{company}}}}. Figured I'd reach out directly.</p>
 
-<p><strong>Apprend</strong> is a press monitoring platform built for manufacturers like
-{{{{company}}}}. It watches every press in real time &mdash; cycle times, downtime,
-scrap, and OEE &mdash; and flags problems the moment they start, so your team can act
-before a shift's output is lost.</p>
+<p>We built a tool called Apprend that sits on your presses and tracks cycle times,
+downtime, and scrap in real time. When something drifts, your team knows right away
+instead of finding out at the end of a shift.</p>
 
-<p>Teams using Apprend typically see:</p>
-<ul>
-  <li>Faster reaction to unplanned downtime</li>
-  <li>Lower scrap rates through early drift detection</li>
-  <li>Clear, real-time visibility across the floor</li>
-</ul>
-
-<p>I'd love to show you what it looks like on a live line. You can explore an
-interactive demo here:</p>
+<p>Honestly, it's easier to just show you. Here's a live demo you can poke around in:</p>
 
 <p><a href="{DEMO_LINK}">{DEMO_LINK}</a></p>
 
-<p>Would you be open to a quick 15-minute call to see if it's a fit for {{{{company}}}}?</p>
+<p>Would a 15-minute call make sense to see if it'd be useful for {{{{company}}}}?</p>
 
-<p>Best regards,<br>
-The Apprend Team<br>
+<p>Suman<br>
 Apprend Technologies</p>
 """
 
 CASUAL_BODY = f"""\
 <p>Hi {{{{first_name}}}},</p>
 
-<p>Quick follow-up &mdash; I know things move fast in {{{{industry_segment}}}}.</p>
+<p>Wanted to float this back up &mdash; I know {{{{industry_segment}}}} keeps you busy.</p>
 
-<p>We built <strong>Apprend</strong> to take the guesswork out of press monitoring:
-real-time downtime, scrap, and OEE for every press at {{{{company}}}}, without the
-spreadsheets.</p>
+<p>We've been helping shops like {{{{company}}}} ditch the spreadsheet tracking and get
+real-time visibility on their presses. Downtime, scrap, OEE &mdash; all in one place.</p>
 
-<p>Easier to just show you. Here's a 2-minute interactive demo:</p>
+<p>Here's a 2-minute interactive demo if you want to see what it looks like:</p>
 
 <p><a href="{DEMO_LINK}">{DEMO_LINK}</a></p>
 
-<p>Worth a quick look?</p>
+<p>Worth a peek?</p>
 
-<p>Cheers,<br>
-The Apprend Team</p>
+<p>Suman</p>
 """
 
 
@@ -129,14 +116,14 @@ def upgrade() -> None:
             {
                 "id": "11111111-1111-1111-1111-111111111111",
                 "name": "Professional Outreach — Press Monitoring",
-                "subject": "Real-time press monitoring for {{company}}",
+                "subject": "quick question about {{company}}'s shop floor",
                 "body": PROFESSIONAL_BODY,
                 "is_default": True,
             },
             {
                 "id": "22222222-2222-2222-2222-222222222222",
                 "name": "Casual Follow-Up — Quick Demo",
-                "subject": "{{first_name}}, a 2-minute look at Apprend",
+                "subject": "{{first_name}}, circling back on this",
                 "body": CASUAL_BODY,
                 "is_default": False,
             },

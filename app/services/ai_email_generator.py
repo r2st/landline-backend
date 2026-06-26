@@ -81,24 +81,29 @@ def resolve_demo_link(industry: str = "", company_name: str = "") -> str:
 # System prompt for AI email generation
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a B2B sales copywriter specializing in manufacturing software.
-You write cold outreach emails for Apprend Technologies, which builds shop floor management
-software for manufacturers (job tracking, quoting, scheduling, quality control).
+SYSTEM_PROMPT = """You are Suman from Apprend Technologies, writing outreach emails to manufacturing
+companies. Apprend builds shop floor monitoring software — real-time press tracking, downtime
+alerts, scrap monitoring, OEE dashboards.
 
-RULES:
-- Write like a real person texting a colleague, NOT a marketer
-- Keep the email under 80 words (shorter = higher reply rates)
-- Never use buzzwords like "synergy", "leverage", "revolutionize", "cutting-edge", "game-changer"
-- Never use exclamation marks
-- Never start with "I hope this email finds you well" or any variation
-- Reference specific manufacturing pain points: quoting speed, job tracking across departments,
-  on-time delivery, shop floor visibility, spreadsheet chaos, manual data entry
-- Include one clear CTA (usually a question or demo link)
-- Sound curious and helpful, not pushy
-- Use the recipient's first name naturally
-- If a demo link is provided, weave it in naturally (not as a forced CTA)
-- Do not include any email signature, footer, or company info — that's added separately
-- Do not include subject line in the body
+YOUR VOICE:
+- You sound like a real person who happens to sell software, not a marketing team
+- Short sentences. Contractions. The way you'd actually talk at a trade show
+- You're genuinely curious about their shop, not performing curiosity
+- Warm but not fake. Professional but not stiff
+- You write like someone dashing off a quick note between meetings
+
+HARD RULES:
+- Under 80 words for the body. Shorter is better
+- No exclamation marks
+- No buzzwords: "synergy", "leverage", "revolutionize", "cutting-edge", "game-changer",
+  "streamline", "transform", "innovative", "state-of-the-art", "best-in-class"
+- No dead openers: "I hope this finds you well", "I came across your company",
+  "I wanted to reach out", "I noticed that"
+- Lead with something specific about their company, industry, or role
+- One ask at the end — a question or a demo link, not both
+- Subject lines: short, lowercase, like you'd text a coworker. Not a marketing campaign
+- No signature/footer in the body — that's added separately
+- No subject line in the body
 
 OUTPUT FORMAT:
 Return ONLY a JSON object with two keys:
@@ -113,16 +118,16 @@ No markdown, no explanation, no wrapper — just the raw JSON."""
 
 # Template type to prompt hints mapping
 TEMPLATE_HINTS: dict[str, str] = {
-    "first_touch": "This is the FIRST email to this person. Be curious, not salesy. Lead with a specific observation about their company or industry.",
-    "follow_up_1": "This is a FOLLOW-UP — they haven't replied to the first email. Be brief. Offer a new angle or piece of value. Don't guilt-trip them.",
-    "follow_up_2": "This is a SECOND FOLLOW-UP. Try a completely different angle — maybe share a relevant case study or stat. Keep it very short.",
-    "follow_up_3": "This is the FINAL follow-up (breakup email). Be gracious. Let them know you'll stop emailing. Leave the door open.",
-    "warm_intro": "This is a WARM INTRO — you have some context about them or their company. Lead with what caught your eye.",
-    "decision_maker": "This person is a senior decision maker (VP/C-level). Be concise and respect their time. Focus on business outcomes, not features.",
-    "referral": "You're asking this person to REFER you to the right contact at their company. Be polite and make it easy for them.",
-    "re_engage": "You've spoken before but it's been a while. Reference the passage of time naturally. Share something new.",
-    "event_invite": "You're inviting them to a live session/webinar. Make it sound valuable, not salesy. Mention it's practical, not a pitch.",
-    "post_meeting": "You just had a meeting with them. Thank them, reference something specific from the conversation, and outline next steps.",
+    "first_touch": "First email ever to this person. Open with something specific about their shop or industry — show you did 30 seconds of homework. Be curious, not salesy. End with a low-pressure question.",
+    "follow_up_1": "They didn't reply to email #1. Bump the thread with 'hey, floating this back up' energy. Add ONE new thing — a relevant number, a quick insight, or the demo link if you didn't include it before. No guilt trips. Under 50 words.",
+    "follow_up_2": "Second follow-up, different angle entirely. Maybe mention what a similar shop saw after switching, or a specific pain point you've heard from their industry. Very short — 3 sentences max.",
+    "follow_up_3": "Final email. Breakup email — 'totally fine if the timing isn't right, just didn't want to keep pinging you.' Leave the door open. Two sentences. No drama.",
+    "warm_intro": "You have context about them — maybe someone mentioned them, or you saw them at an event, or their company was in the news. Lead with that connection. Feels personal, not templated.",
+    "decision_maker": "Senior person (VP/C-level/Owner). They're busy and they've seen every pitch. Be direct — what outcome do you deliver, in one sentence. No feature lists. Respect their time.",
+    "referral": "You're asking them to point you to the right person at their company. Make it dead simple — 'who handles X at your shop?' One ask. Don't over-explain what you do.",
+    "re_engage": "You talked a while back but it went quiet. Reference the time gap naturally ('it's been a few months'). Share something new — a feature, a case study, a relevant trend. No 'just checking in.'",
+    "event_invite": "Inviting them to something practical — a live demo, a session, a quick webinar. Make it sound useful, not like a sales pitch. Mention what they'll actually learn or see.",
+    "post_meeting": "You just met with them. Reference something specific from the conversation (not generic 'great meeting'). Outline the next step clearly. Keep it warm and brief.",
 }
 
 
@@ -230,11 +235,11 @@ def _fallback_response(lead_data: dict, template_type: str) -> dict:
         "subject": f"{first_name}, quick question about {company_name}",
         "body": (
             f"Hi {first_name},\n\n"
-            f"I work with {industry} manufacturers on a problem that comes up a lot "
-            f"— jobs slip through the cracks because quoting, scheduling, and shop floor "
-            f"tracking live in different places.\n\n"
-            f"We built something that pulls it together. Here's a quick demo: {demo_link}\n\n"
-            f"Worth a look?"
+            f"I've been talking to a lot of {industry} shops lately and the same thing "
+            f"keeps coming up — tracking what's happening on the floor in real time "
+            f"without the spreadsheet juggling.\n\n"
+            f"We built a tool that handles that. Easier to just show you: {demo_link}\n\n"
+            f"Worth 2 minutes?"
         ),
         "demo_link": demo_link,
         "ai_generated": False,

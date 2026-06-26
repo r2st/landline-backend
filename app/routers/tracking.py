@@ -186,17 +186,20 @@ async def unsubscribe(token: str, db: AsyncSession = Depends(get_db)):
                 logger.info("Contact %s unsubscribed", email)
 
         return HTMLResponse(
-            "<html><body style='font-family: sans-serif; text-align: center; padding: 50px;'>"
-            "<h2>You have been unsubscribed.</h2>"
-            "<p>You will no longer receive emails from us.</p>"
+            "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
+            "text-align: center; padding: 60px 20px; color: #333;'>"
+            "<h2 style='font-weight: 500; margin-bottom: 12px;'>You're unsubscribed</h2>"
+            "<p style='color: #666;'>We've removed you from our list. You won't hear from us again.</p>"
             "</body></html>"
         )
     except Exception as e:
         logger.warning("Unsubscribe failed: %s", str(e))
         return HTMLResponse(
-            "<html><body style='font-family: sans-serif; text-align: center; padding: 50px;'>"
-            "<h2>Unsubscribe link expired or invalid.</h2>"
-            "<p>Please reply to any email with UNSUBSCRIBE to be removed.</p>"
+            "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
+            "text-align: center; padding: 60px 20px; color: #333;'>"
+            "<h2 style='font-weight: 500; margin-bottom: 12px;'>That link didn't work</h2>"
+            "<p style='color: #666;'>It may have expired. Just reply to any of our emails "
+            "with the word UNSUBSCRIBE and we'll take care of it.</p>"
             "</body></html>",
             status_code=400,
         )
