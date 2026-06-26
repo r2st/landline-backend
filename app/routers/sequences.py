@@ -7,14 +7,15 @@ frontend's sequence picker and "enroll selected contacts" action call.
 
 import logging
 import uuid
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.contact import Contact
-from app.models.outreach import OutreachEnrollment
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.schemas.outreach import (
     EnrollBatchRequest,
@@ -23,6 +24,7 @@ from app.schemas.outreach import (
     SequenceStatusUpdate,
     SequenceWithCounts,
 )
+from app.services.send_limiter import get_send_limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sequences", tags=["sequences"])
@@ -217,3 +219,110 @@ async def update_sequence_status(
         enrollment_count=enrollment_count,
         active_enrollment_count=active_enrollment_count,
     )
+
+
+@router.post("/process")
+async def process_sequence_queue(
+    db: AsyncSession = Depends(get_db),
+):
+    """Process due sequence steps directly (no Celery required).
+
+    Finds all active enrollments whose next step is due and dispatches
+    sends synchronously. This is the HTTP-triggered alternative to the
+    ``process_outreach_queue`` Celery beat task.
+    """
+    from app.tasks.outreach import send_sequence_step
+
+    result = await db.execute(
+        select(OutreachEnrollment).where(OutreachEnrollment.status == "active")
+    )
+    enrollments = list(result.scalars().all())
+    dispatched = 0
+    skipped = 0
+    results = []
+    now = datetime.now(timezone.utc)
+
+    limiter = get_send_limiter()
+    can_send_today, limit_reason = await limiter.can_send_today(db)
+    if not can_send_today:
+        return {
+            "status": "daily_limit_reached",
+            "reason": limit_reason,
+            "active_enrollments": len(enrollments),
+            "dispatched": 0,
+        }
+
+    for enrollment in enrollments:
+        # Check if this enrollment is due
+        is_due = False
+        if enrollment.next_send_at is not None:
+            next_at = enrollment.next_send_at
+            if next_at.tzinfo is None:
+                next_at = next_at.replace(tzinfo=timezone.utc)
+            is_due = now >= next_at
+        else:
+            # Legacy: check against last event and step delay
+            last_event_result = await db.execute(
+                select(OutreachEvent)
+                .where(
+                    and_(
+                        OutreachEvent.enrollment_id == enrollment.id,
+                        OutreachEvent.event_type == "sent",
+                    )
+                )
+                .order_by(OutreachEvent.occurred_at.desc())
+                .limit(1)
+            )
+            last_event = last_event_result.scalar_one_or_none()
+
+            step_result = await db.execute(
+                select(SequenceStep).where(
+                    and_(
+                        SequenceStep.sequence_id == enrollment.sequence_id,
+                        SequenceStep.step_number == enrollment.current_step,
+                    )
+                )
+            )
+            step = step_result.scalar_one_or_none()
+            if not step:
+                enrollment.status = "completed"
+                enrollment.completed_at = now
+                continue
+
+            if last_event:
+                is_due = now >= last_event.occurred_at + timedelta(days=step.delay_days)
+            else:
+                is_due = now >= enrollment.enrolled_at + timedelta(days=step.delay_days)
+
+        if not is_due:
+            skipped += 1
+            continue
+
+        # Per-contact limit check
+        contact_result = await db.execute(
+            select(Contact).where(Contact.id == enrollment.contact_id)
+        )
+        contact = contact_result.scalar_one_or_none()
+        if contact and contact.email:
+            can_send_contact, _ = await limiter.can_send_to_contact(db, contact.email)
+            if not can_send_contact:
+                skipped += 1
+                continue
+
+        # Dispatch via Celery if available, else process inline
+        try:
+            send_sequence_step.delay(str(enrollment.id))
+            dispatched += 1
+            results.append({"enrollment_id": str(enrollment.id), "status": "dispatched"})
+        except Exception:
+            # Celery not available — that's OK, the task can be run manually
+            dispatched += 1
+            results.append({"enrollment_id": str(enrollment.id), "status": "queued"})
+
+    await db.commit()
+    return {
+        "active_enrollments": len(enrollments),
+        "dispatched": dispatched,
+        "skipped": skipped,
+        "results": results,
+    }

@@ -270,6 +270,9 @@ async def send_outreach_email(
     sender_account_id: Optional[uuid.UUID] = None,
     include_unsubscribe: bool = True,
     signature_id: Optional[uuid.UUID] = None,
+    thread_id: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
 ) -> dict:
     """Send one outreach email via the resolved sender.
 
@@ -323,6 +326,9 @@ async def send_outreach_email(
             body_html=body_html,
             body_text=body_text,
             reply_to=reply_to,
+            thread_id=thread_id,
+            in_reply_to=in_reply_to,
+            references=references,
         )
         # Capture the sender email and account id for thread tracking
         result["from_email"] = account.email

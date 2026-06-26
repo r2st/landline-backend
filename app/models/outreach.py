@@ -35,6 +35,14 @@ class OutreachEnrollment(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
+    # Threading: chain follow-up emails into the same Gmail thread
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255))
+    gmail_message_id: Mapped[str | None] = mapped_column(String(255))
+    sender_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("gmail_accounts.id", ondelete="SET NULL")
+    )
+    next_send_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
     # Relationships
     contact: Mapped["Contact"] = relationship("Contact", back_populates="enrollments")
     sequence: Mapped["OutreachSequence"] = relationship("OutreachSequence", back_populates="enrollments")

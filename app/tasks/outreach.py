@@ -120,12 +120,38 @@ def send_sequence_step(self, enrollment_id: str):
                 # here; the dispatcher appends the CAN-SPAM footer.
                 subject = render(step.subject_template, template_context)
                 body = render(step.body_template, template_context)
+
+                # Thread-linking: for steps after the first, chain into the
+                # same Gmail thread so the prospect sees a single conversation.
+                thread_id = None
+                in_reply_to = None
+                references = None
+                send_account_id = None
+
+                if enrollment.current_step > 1 and enrollment.gmail_thread_id:
+                    thread_id = enrollment.gmail_thread_id
+                    if enrollment.gmail_message_id:
+                        # Gmail message IDs need angle brackets for RFC 2822
+                        msg_ref = f"<{enrollment.gmail_message_id}@mail.gmail.com>"
+                        in_reply_to = msg_ref
+                        references = msg_ref
+                    # Prefix "Re: " to match Gmail threading convention
+                    if not subject.lower().startswith("re:"):
+                        subject = f"Re: {subject}"
+
+                if enrollment.sender_account_id:
+                    send_account_id = enrollment.sender_account_id
+
                 send_result = await send_outreach_email(
                     db,
                     to_email=contact.email,
                     subject=subject,
                     body_html=body,
                     body_text=body,
+                    sender_account_id=send_account_id,
+                    thread_id=thread_id,
+                    in_reply_to=in_reply_to,
+                    references=references,
                 )
 
                 # Record event
@@ -139,20 +165,50 @@ def send_sequence_step(self, enrollment_id: str):
                 db.add(event)
 
                 if event_type == "sent":
+                    # Store threading info for subsequent steps
+                    if send_result.get("gmail_thread_id"):
+                        enrollment.gmail_thread_id = send_result["gmail_thread_id"]
+                    if send_result.get("gmail_message_id"):
+                        enrollment.gmail_message_id = send_result["gmail_message_id"]
+                    if send_result.get("sender_account_id"):
+                        from uuid import UUID as _UUID
+                        enrollment.sender_account_id = _UUID(send_result["sender_account_id"])
+
+                    # Advance to next step and calculate next_send_at
                     enrollment.current_step += 1
+
+                    # Look ahead to see if there's a next step and set next_send_at
+                    next_step_result = await db.execute(
+                        select(SequenceStep).where(
+                            and_(
+                                SequenceStep.sequence_id == enrollment.sequence_id,
+                                SequenceStep.step_number == enrollment.current_step,
+                            )
+                        )
+                    )
+                    next_step = next_step_result.scalar_one_or_none()
+                    if next_step:
+                        enrollment.next_send_at = datetime.now(timezone.utc) + timedelta(
+                            days=next_step.delay_days
+                        )
+                    else:
+                        enrollment.status = "completed"
+                        enrollment.completed_at = datetime.now(timezone.utc)
                 elif event_type == "bounced":
                     enrollment.status = "bounced"
 
                 await db.commit()
                 logger.info(
-                    "Sent step %d to %s — result: %s",
-                    step.step_number, contact.email, send_result["status"],
+                    "Sent step %d to %s (thread=%s) — result: %s",
+                    step.step_number, contact.email,
+                    enrollment.gmail_thread_id, send_result["status"],
                 )
                 return {
                     "status": event_type,
                     "contact_email": contact.email,
                     "step": step.step_number,
                     "send_result": send_result,
+                    "gmail_thread_id": enrollment.gmail_thread_id,
                 }
 
             except Exception as e:
@@ -184,48 +240,56 @@ def process_outreach_queue():
             enrollments = list(result.scalars().all())
             dispatched = 0
 
+            now = datetime.now(timezone.utc)
             for enrollment in enrollments:
-                # Check if enough time has passed since last send
-                last_event_result = await db.execute(
-                    select(OutreachEvent)
-                    .where(
-                        and_(
-                            OutreachEvent.enrollment_id == enrollment.id,
-                            OutreachEvent.event_type == "sent",
-                        )
-                    )
-                    .order_by(OutreachEvent.occurred_at.desc())
-                    .limit(1)
-                )
-                last_event = last_event_result.scalar_one_or_none()
-
-                # Load current step to check delay
-                step_result = await db.execute(
-                    select(SequenceStep).where(
-                        and_(
-                            SequenceStep.sequence_id == enrollment.sequence_id,
-                            SequenceStep.step_number == enrollment.current_step,
-                        )
-                    )
-                )
-                step = step_result.scalar_one_or_none()
-
-                if not step:
-                    enrollment.status = "completed"
-                    enrollment.completed_at = datetime.now(timezone.utc)
-                    continue
-
-                # Check delay
-                now = datetime.now(timezone.utc)
-                if last_event:
-                    due_date = last_event.occurred_at + timedelta(days=step.delay_days)
-                    if now < due_date:
+                # Fast path: if next_send_at is set, use it directly
+                if enrollment.next_send_at is not None:
+                    next_at = enrollment.next_send_at
+                    if next_at.tzinfo is None:
+                        next_at = next_at.replace(tzinfo=timezone.utc)
+                    if now < next_at:
                         continue  # Not yet due
                 else:
-                    # First step — check against enrollment date
-                    due_date = enrollment.enrolled_at + timedelta(days=step.delay_days)
-                    if now < due_date:
+                    # Legacy path: check delay from last event
+                    last_event_result = await db.execute(
+                        select(OutreachEvent)
+                        .where(
+                            and_(
+                                OutreachEvent.enrollment_id == enrollment.id,
+                                OutreachEvent.event_type == "sent",
+                            )
+                        )
+                        .order_by(OutreachEvent.occurred_at.desc())
+                        .limit(1)
+                    )
+                    last_event = last_event_result.scalar_one_or_none()
+
+                    # Load current step to check delay
+                    step_result = await db.execute(
+                        select(SequenceStep).where(
+                            and_(
+                                SequenceStep.sequence_id == enrollment.sequence_id,
+                                SequenceStep.step_number == enrollment.current_step,
+                            )
+                        )
+                    )
+                    step = step_result.scalar_one_or_none()
+
+                    if not step:
+                        enrollment.status = "completed"
+                        enrollment.completed_at = now
                         continue
+
+                    # Check delay
+                    if last_event:
+                        due_date = last_event.occurred_at + timedelta(days=step.delay_days)
+                        if now < due_date:
+                            continue  # Not yet due
+                    else:
+                        # First step — check against enrollment date
+                        due_date = enrollment.enrolled_at + timedelta(days=step.delay_days)
+                        if now < due_date:
+                            continue
 
                 # --- Anti-spam checks ---
                 limiter = get_send_limiter()
