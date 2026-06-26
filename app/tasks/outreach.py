@@ -104,6 +104,61 @@ def send_sequence_step(self, enrollment_id: str):
                     await db.commit()
                     return {"status": "completed", "reason": "no_more_steps"}
 
+                # Delay guard: verify enough time has passed since the last
+                # send before firing the next step. This prevents premature
+                # sends when the task is dispatched by both enroll and the
+                # periodic processor (double-dispatch race).
+                if enrollment.current_step > 1 and step.delay_days > 0:
+                    now = datetime.now(timezone.utc)
+
+                    # Prefer next_send_at (set by previous step completion)
+                    if enrollment.next_send_at is not None:
+                        due_at = enrollment.next_send_at
+                        if due_at.tzinfo is None:
+                            due_at = due_at.replace(tzinfo=timezone.utc)
+                        if now < due_at:
+                            logger.info(
+                                "Enrollment %s step %d not yet due (due %s)",
+                                enrollment_id, enrollment.current_step, due_at,
+                            )
+                            return {
+                                "status": "deferred",
+                                "reason": f"step not due until {due_at.isoformat()}",
+                                "step": enrollment.current_step,
+                            }
+                    else:
+                        # Fallback: check last sent event timestamp
+                        last_sent = await db.execute(
+                            select(OutreachEvent)
+                            .where(
+                                and_(
+                                    OutreachEvent.enrollment_id == enrollment.id,
+                                    OutreachEvent.event_type == "sent",
+                                )
+                            )
+                            .order_by(OutreachEvent.occurred_at.desc())
+                            .limit(1)
+                        )
+                        last_event = last_sent.scalar_one_or_none()
+                        if last_event:
+                            occurred = last_event.occurred_at
+                            if occurred.tzinfo is None:
+                                occurred = occurred.replace(tzinfo=timezone.utc)
+                            due_at = occurred + timedelta(days=step.delay_days)
+                            if now < due_at:
+                                # Set next_send_at for efficiency on next check
+                                enrollment.next_send_at = due_at
+                                await db.commit()
+                                logger.info(
+                                    "Enrollment %s step %d not yet due (due %s, from last event)",
+                                    enrollment_id, enrollment.current_step, due_at,
+                                )
+                                return {
+                                    "status": "deferred",
+                                    "reason": f"step not due until {due_at.isoformat()}",
+                                    "step": enrollment.current_step,
+                                }
+
                 # Build template context
                 template_context = {
                     "first_name": contact.first_name or "",

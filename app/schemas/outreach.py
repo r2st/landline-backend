@@ -109,6 +109,10 @@ class EnrollmentRead(BaseModel):
     status: str
     enrolled_at: datetime
     completed_at: Optional[datetime] = None
+    gmail_thread_id: Optional[str] = None
+    gmail_message_id: Optional[str] = None
+    sender_account_id: Optional[uuid.UUID] = None
+    next_send_at: Optional[datetime] = None
 
 
 # --- Events ---
