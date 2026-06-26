@@ -1,9 +1,6 @@
 """Notification service — sends alerts on important lead engagement events."""
 
 import logging
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 from app.config import get_settings
 
@@ -18,18 +15,12 @@ class NotificationService:
 
     async def notify_reply(self, contact_name: str, company_name: str, contact_email: str):
         """Notify the user when a lead replies."""
-        subject = f"Reply received from {contact_name} at {company_name}"
-        body = f"""
-A lead has replied to your outreach!
+        subject = f"{contact_name} from {company_name} replied"
+        body = f"""Hey — {contact_name} at {company_name} just replied to your email.
 
-Contact: {contact_name}
-Company: {company_name}
-Email: {contact_email}
+Their follow-up sequence is paused and the company's been moved to Engaged.
 
-The follow-up sequence has been automatically paused.
-Company stage has been advanced to "Engaged".
-
-Log in to Landline to review and respond.
+Jump into Landline to read it and respond: {contact_email}
 """
         await self._send_notification(subject, body)
 
@@ -38,30 +29,20 @@ Log in to Landline to review and respond.
         if opens < 3:
             return  # Only notify on 3+ opens (shows real interest)
 
-        subject = f"{contact_name} at {company_name} opened your email {opens} times"
-        body = f"""
-High engagement detected!
+        subject = f"{contact_name} at {company_name} keeps opening your email"
+        body = f"""{contact_name} at {company_name} has opened your email {opens} times now. That's a good sign — they're clearly interested.
 
-{contact_name} at {company_name} has opened your email {opens} times.
-This suggests strong interest — consider following up soon.
-
-Log in to Landline to take action.
+Might be worth reaching out while it's fresh on their mind. Check Landline for details.
 """
         await self._send_notification(subject, body)
 
     async def notify_click(self, contact_name: str, company_name: str, url: str):
         """Notify when a lead clicks a link."""
-        subject = f"{contact_name} at {company_name} clicked a link"
-        body = f"""
-A lead clicked a link in your email!
+        subject = f"{contact_name} at {company_name} clicked your link"
+        body = f"""{contact_name} at {company_name} just clicked a link in your email:
+{url}
 
-Contact: {contact_name}
-Company: {company_name}
-Link clicked: {url}
-
-This is a strong buying signal. Consider reaching out directly.
-
-Log in to Landline to take action.
+That's a strong signal. Good time to follow up while they're actively looking. Check Landline for the full picture.
 """
         await self._send_notification(subject, body)
 
@@ -72,23 +53,10 @@ Log in to Landline to take action.
             logger.debug("No notification_email configured, skipping notification")
             return
 
-        try:
-            # Use the Gmail dispatch if available, otherwise log
-            from app.services.email_dispatch import get_dispatch_service
-            dispatch = get_dispatch_service()
-
-            # Simple email send
-            msg = MIMEMultipart()
-            msg["Subject"] = f"[Landline] {subject}"
-            msg["To"] = notify_email
-            msg.attach(MIMEText(body, "plain"))
-
-            # Try to send via the existing dispatch mechanism
-            # For now, just log it — the full implementation would use Gmail API
-            logger.info("NOTIFICATION: %s — %s", subject, notify_email)
-
-        except Exception as e:
-            logger.error("Failed to send notification: %s", str(e))
+        logger.warning(
+            "NOTIFICATION (not yet delivered): [%s] to %s — configure email dispatch to enable delivery",
+            subject, notify_email,
+        )
 
 
 def get_notification_service() -> NotificationService:

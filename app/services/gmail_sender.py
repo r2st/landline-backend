@@ -86,21 +86,44 @@ class GmailSender:
         body_html: str,
         body_text: Optional[str] = None,
         reply_to: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
     ) -> dict:
-        """Send a single email. Mirrors EmailSender.send_email's return shape."""
+        """Send a single email. Mirrors EmailSender.send_email's return shape.
+
+        When ``thread_id``, ``in_reply_to``, and ``references`` are provided the
+        message is sent as a reply within the existing Gmail thread.
+        """
         try:
             creds = self._credentials()
             service = build("gmail", "v1", credentials=creds, cache_discovery=False)
             body = self._build_mime(to_email, subject, body_html, body_text, reply_to)
+
+            # Add threading headers for replies
+            if in_reply_to or references:
+                # Re-build MIME with threading headers
+                body = self._build_mime_threaded(
+                    to_email, subject, body_html, body_text, reply_to,
+                    in_reply_to=in_reply_to, references=references,
+                )
+
+            # Attach threadId so Gmail groups the message into the right thread
+            if thread_id:
+                body["threadId"] = thread_id
+
             sent = service.users().messages().send(userId="me", body=body).execute()
-            message_id = sent.get("id")
+            gmail_message_id = sent.get("id")
+            gmail_thread_id = sent.get("threadId")
             logger.info(
-                "Gmail email sent to %s as %s — id: %s",
-                to_email, self.sender_email, message_id,
+                "Gmail email sent to %s as %s — id: %s thread: %s",
+                to_email, self.sender_email, gmail_message_id, gmail_thread_id,
             )
             return {
                 "status": "sent",
-                "message_id": message_id,
+                "message_id": gmail_message_id,
+                "gmail_message_id": gmail_message_id,
+                "gmail_thread_id": gmail_thread_id,
                 "transport": "gmail",
                 "sender": self.sender_email,
             }
@@ -111,3 +134,30 @@ class GmailSender:
         except Exception as e:
             logger.error("Failed to send Gmail email to %s: %s", to_email, str(e))
             return {"status": "error", "transport": "gmail", "detail": str(e)}
+
+    def _build_mime_threaded(
+        self,
+        to_email: str,
+        subject: str,
+        body_html: str,
+        body_text: Optional[str],
+        reply_to: Optional[str],
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
+    ) -> dict:
+        """Build MIME message with In-Reply-To and References headers for threading."""
+        message = MIMEMultipart("alternative")
+        message["To"] = to_email
+        message["From"] = formataddr((self.display_name or "", self.sender_email))
+        message["Subject"] = subject
+        if reply_to:
+            message["Reply-To"] = reply_to
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+        if references:
+            message["References"] = references
+        if body_text:
+            message.attach(MIMEText(body_text, "plain", "utf-8"))
+        message.attach(MIMEText(body_html, "html", "utf-8"))
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        return {"raw": raw}

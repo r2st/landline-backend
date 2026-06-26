@@ -1,6 +1,7 @@
 """Email open and click tracking endpoints."""
 
 import logging
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -16,6 +17,11 @@ from app.models.email_template import EmailSend
 from app.models.contact import Contact
 
 logger = logging.getLogger(__name__)
+
+# Random per-process fallback key — used only when secret_key is not configured.
+# Tokens signed with this key will NOT survive a process restart, but that is
+# preferable to using a hardcoded, guessable secret.
+_FALLBACK_KEY = secrets.token_urlsafe(32)
 router = APIRouter(prefix="/track", tags=["tracking"])
 
 # Status hierarchy — higher number = more advanced state; never downgrade
@@ -40,26 +46,38 @@ PIXEL_GIF = bytes([
 
 def _get_serializer():
     settings = get_settings()
-    return URLSafeTimedSerializer(settings.secret_key or "landline-tracking-secret")
+    key = settings.secret_key
+    if not key:
+        logger.warning("secret_key not set — tracking tokens will use a random per-process key")
+        key = _FALLBACK_KEY
+    return URLSafeTimedSerializer(key)
 
 
 def _get_unsubscribe_serializer():
     settings = get_settings()
-    return URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
+    key = settings.secret_key
+    if not key:
+        logger.warning("secret_key not set — unsubscribe tokens will use a random per-process key")
+        key = _FALLBACK_KEY
+    return URLSafeTimedSerializer(key)
 
 
 def generate_tracking_pixel_url(send_id: str) -> str:
     """Generate a tracking pixel URL for an email send."""
     serializer = _get_serializer()
     token = serializer.dumps(send_id, salt="open-track")
-    return f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/open/{token}"
+    settings = get_settings()
+    base = settings.tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/open/{token}"
 
 
 def generate_click_url(send_id: str, original_url: str) -> str:
     """Wrap a URL for click tracking."""
     serializer = _get_serializer()
     token = serializer.dumps({"send_id": send_id, "url": original_url}, salt="click-track")
-    return f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/click/{token}"
+    settings = get_settings()
+    base = settings.tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/click/{token}"
 
 
 @router.get("/open/{token}")
@@ -168,17 +186,20 @@ async def unsubscribe(token: str, db: AsyncSession = Depends(get_db)):
                 logger.info("Contact %s unsubscribed", email)
 
         return HTMLResponse(
-            "<html><body style='font-family: sans-serif; text-align: center; padding: 50px;'>"
-            "<h2>You have been unsubscribed.</h2>"
-            "<p>You will no longer receive emails from us.</p>"
+            "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
+            "text-align: center; padding: 60px 20px; color: #333;'>"
+            "<h2 style='font-weight: 500; margin-bottom: 12px;'>You're unsubscribed</h2>"
+            "<p style='color: #666;'>We've removed you from our list. You won't hear from us again.</p>"
             "</body></html>"
         )
     except Exception as e:
         logger.warning("Unsubscribe failed: %s", str(e))
         return HTMLResponse(
-            "<html><body style='font-family: sans-serif; text-align: center; padding: 50px;'>"
-            "<h2>Unsubscribe link expired or invalid.</h2>"
-            "<p>Please reply to any email with UNSUBSCRIBE to be removed.</p>"
+            "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
+            "text-align: center; padding: 60px 20px; color: #333;'>"
+            "<h2 style='font-weight: 500; margin-bottom: 12px;'>That link didn't work</h2>"
+            "<p style='color: #666;'>It may have expired. Just reply to any of our emails "
+            "with the word UNSUBSCRIBE and we'll take care of it.</p>"
             "</body></html>",
             status_code=400,
         )

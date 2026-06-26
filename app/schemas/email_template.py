@@ -65,6 +65,8 @@ class EmailComposeRequest(BaseModel):
     # Connected Gmail account to send as. Defaults to the active account, then
     # falls back to SES when no Gmail account is connected.
     sender_account_id: Optional[uuid.UUID] = None
+    subject_b: Optional[str] = Field(None, max_length=500, description="Variant B subject for A/B testing")
+    scheduled_at: Optional[datetime] = Field(None, description="Schedule send for later")
 
 
 class EmailComposeResult(BaseModel):
@@ -99,8 +101,47 @@ class EmailSendRead(BaseModel):
     sent_at: datetime
     opened_at: Optional[datetime] = None
     clicked_at: Optional[datetime] = None
+    ab_variant: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
 
-# Intentional empty line above for readability
+# --- Paginated Send History ---
+
+class EmailSendPaginatedResponse(BaseModel):
+    """Paginated email send history response."""
+    items: list[EmailSendRead]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+
+
+# --- A/B Testing ---
+
+class ABStats(BaseModel):
+    variant: str
+    total: int
+    opened: int
+    clicked: int
+    open_rate: float
+    click_rate: float
+
+
+class ABStatsResponse(BaseModel):
+    template_id: uuid.UUID
+    stats: list[ABStats]
+
+
+# --- Campaign Analytics ---
+
+class CampaignAnalytics(BaseModel):
+    total_sent_7d: int = 0
+    total_sent_30d: int = 0
+    total_sent_all: int = 0
+    open_rate: float = 0.0
+    click_rate: float = 0.0
+    reply_rate: float = 0.0
+    bounce_rate: float = 0.0
+    daily_sends: list[dict] = Field(default_factory=list)
 
 
 # --- Send Test ---

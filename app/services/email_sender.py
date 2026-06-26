@@ -48,11 +48,11 @@ class EmailSender:
         token = serializer.dumps(contact_email, salt="unsubscribe")
         unsubscribe_url = f"https://landline.apprendtechnologies.com/unsubscribe?token={token}"
         return (
-            "\n\n---\n"
-            "Apprend Technologies | Manufacturing Software Solutions\n"
-            f"To unsubscribe, reply with UNSUBSCRIBE or click: "
+            "\n\n—\n"
+            "Apprend Technologies\n"
+            f"Don't want these emails? Reply UNSUBSCRIBE or click: "
             f"{unsubscribe_url}\n"
-            "Apprend Technologies, Toronto, ON, Canada"
+            "Toronto, ON, Canada"
         )
 
     def send_email(

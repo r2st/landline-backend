@@ -59,11 +59,11 @@ class EmailSend(Base):
         UUID(as_uuid=True), ForeignKey("email_templates.id", ondelete="SET NULL"), nullable=True
     )
     contact_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True), ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    to_email: Mapped[str | None] = mapped_column(String(255))
+    to_email: Mapped[str | None] = mapped_column(String(255), index=True)
     subject: Mapped[str | None] = mapped_column(String(500))
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="sent")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="sent", index=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(255))
     error: Mapped[str | None] = mapped_column(Text)
     sent_at: Mapped[datetime] = mapped_column(
@@ -72,10 +72,22 @@ class EmailSend(Base):
     opened_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     clicked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     replied_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    ab_variant: Mapped[str | None] = mapped_column(String(1), nullable=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    # Gmail thread tracking for conversation view
+    gmail_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    from_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    sender_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("gmail_accounts.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Relationships
     template: Mapped["EmailTemplate | None"] = relationship("EmailTemplate", back_populates="sends")
     contact: Mapped["Contact | None"] = relationship("Contact")
+    sender_account: Mapped["GmailAccount | None"] = relationship("GmailAccount")
 
     def __repr__(self) -> str:
         return f"<EmailSend to={self.to_email} status={self.status}>"

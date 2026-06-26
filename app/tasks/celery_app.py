@@ -60,6 +60,10 @@ celery_app.conf.update(
             "task": "app.tasks.followups.rescore_active_leads",
             "schedule": 43200.0,  # twice a day
         },
+        "sync-email-replies": {
+            "task": "app.tasks.outreach.sync_email_replies",
+            "schedule": 300.0,  # every 5 minutes
+        },
     },
 )
 

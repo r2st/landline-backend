@@ -296,3 +296,22 @@ def check_email_replies():
     except Exception as exc:
         logger.error("check_email_replies failed: %s", str(exc))
         return {"status": "error", "error": str(exc)}
+
+
+@celery_app.task(name="app.tasks.outreach.sync_email_replies")
+def sync_email_replies():
+    """Periodic task: sync email replies from Gmail to local DB."""
+
+    async def _run():
+        from app.services.email_history import EmailHistoryService
+
+        service = EmailHistoryService()
+        async with celery_session() as db:
+            result = await service.sync_all_accounts(db)
+            return result
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("sync_email_replies failed: %s", str(exc))
+        return {"status": "error", "error": str(exc)}

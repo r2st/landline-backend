@@ -10,11 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
+from app.models.deal import Deal
 from app.models.lead_score import LeadScore
 from app.models.outreach import OutreachEvent
+from app.models.task import Task
 from app.models.email_template import EmailSend
 from app.schemas.dashboard import (
     ActivityItem,
+    DashboardKPIs,
     DashboardOverview,
     EmailTrendPoint,
     IndustryStat,
@@ -66,13 +69,86 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
     )
     leads_this_week = result.scalar() or 0
 
-    # Pipeline stages
+    # Previous week window (7-14 days ago)
+    two_weeks_ago = datetime.now(timezone.utc) - timedelta(days=14)
+
+    # Leads added in the previous week (7-14 days ago)
     result = await db.execute(
-        select(Company.stage, func.count(Company.id))
-        .group_by(Company.stage)
-        .order_by(func.count(Company.id).desc())
+        select(func.count(Company.id)).where(
+            Company.created_at >= two_weeks_ago,
+            Company.created_at < week_ago,
+        )
     )
-    pipeline = [PipelineStageStat(stage=r[0], count=r[1]) for r in result.all()]
+    leads_prev_week = result.scalar() or 0
+
+    # Emails sent in the previous week (7-14 days ago)
+    result = await db.execute(
+        select(func.count(EmailSend.id)).where(
+            EmailSend.status.in_(SENT_STATUSES),
+            EmailSend.sent_at >= two_weeks_ago,
+            EmailSend.sent_at < week_ago,
+        )
+    )
+    emails_sent_prev_week = result.scalar() or 0
+
+    # Contacts added in the previous week (7-14 days ago)
+    result = await db.execute(
+        select(func.count(Contact.id)).where(
+            Contact.created_at >= two_weeks_ago,
+            Contact.created_at < week_ago,
+        )
+    )
+    contacts_prev_week = result.scalar() or 0
+
+    # Deals won this month
+    now = datetime.now(timezone.utc)
+    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    result = await db.execute(
+        select(
+            func.count(Deal.id),
+            func.coalesce(func.sum(Deal.value), 0),
+        ).where(
+            Deal.status == "won",
+            Deal.created_at >= first_of_month,
+        )
+    )
+    won_row = result.one()
+    deals_won_this_month = won_row[0] or 0
+    deals_won_value_this_month = float(won_row[1] or 0)
+
+    # Emails sent today
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    result = await db.execute(
+        select(func.count(EmailSend.id)).where(
+            EmailSend.status.in_(SENT_STATUSES),
+            EmailSend.sent_at >= today_start,
+        )
+    )
+    emails_sent_today = result.scalar() or 0
+
+    # Emails opened (total from OutreachEvent)
+    result = await db.execute(
+        select(func.count(OutreachEvent.id)).where(
+            OutreachEvent.event_type == "opened"
+        )
+    )
+    emails_opened = result.scalar() or 0
+
+    # Pipeline stages with deal values
+    result = await db.execute(
+        select(
+            Company.stage,
+            func.count(func.distinct(Company.id)),
+            func.coalesce(func.sum(Deal.value), 0),
+        )
+        .outerjoin(Deal, and_(Deal.company_id == Company.id, Deal.status == "pending"))
+        .group_by(Company.stage)
+        .order_by(func.count(func.distinct(Company.id)).desc())
+    )
+    pipeline = [
+        PipelineStageStat(stage=r[0], count=r[1], value=float(r[2]))
+        for r in result.all()
+    ]
 
     # Outreach metrics
     outreach = await _get_outreach_metrics(db)
@@ -83,6 +159,33 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
     # Industry breakdown
     industry_breakdown = await _get_industry_breakdown(db)
 
+    # Tasks due today (not completed/cancelled)
+    result = await db.execute(
+        select(func.count(Task.id)).where(
+            Task.due_date.isnot(None),
+            func.date(Task.due_date) == func.current_date(),
+            Task.status.notin_(["completed", "cancelled"]),
+        )
+    )
+    tasks_due_today = result.scalar() or 0
+
+    # Active deals (pending)
+    result = await db.execute(
+        select(
+            func.count(Deal.id),
+            func.coalesce(func.sum(Deal.value), 0),
+        ).where(Deal.status == "pending")
+    )
+    deals_row = result.one()
+    active_deals_count = deals_row[0] or 0
+    active_deals_value = float(deals_row[1] or 0)
+
+    # Contacts added in the last 7 days
+    result = await db.execute(
+        select(func.count(Contact.id)).where(Contact.created_at >= week_ago)
+    )
+    contacts_this_week = result.scalar() or 0
+
     return DashboardOverview(
         total_companies=total_companies,
         total_contacts=total_contacts,
@@ -90,10 +193,99 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
         avg_fit_score=avg_fit_score,
         emails_sent=emails_sent,
         leads_this_week=leads_this_week,
+        leads_prev_week=leads_prev_week,
+        tasks_due_today=tasks_due_today,
+        active_deals_count=active_deals_count,
+        active_deals_value=active_deals_value,
+        contacts_this_week=contacts_this_week,
+        contacts_prev_week=contacts_prev_week,
+        emails_sent_prev_week=emails_sent_prev_week,
+        deals_won_this_month=deals_won_this_month,
+        deals_won_value_this_month=deals_won_value_this_month,
+        emails_sent_today=emails_sent_today,
+        emails_opened=emails_opened,
         pipeline=pipeline,
         outreach=outreach,
         score_distribution=score_dist,
         industry_breakdown=industry_breakdown,
+    )
+
+
+@router.get("/kpis", response_model=DashboardKPIs)
+async def get_kpis(db: AsyncSession = Depends(get_db)):
+    """Get quick KPI stats for the dashboard."""
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = now - timedelta(days=7)
+    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Emails sent today
+    result = await db.execute(
+        select(func.count(EmailSend.id)).where(
+            EmailSend.status.in_(SENT_STATUSES),
+            EmailSend.sent_at >= today_start,
+        )
+    )
+    emails_sent_today = result.scalar() or 0
+
+    # Open rate from OutreachEvent (opened / sent * 100)
+    result = await db.execute(
+        select(
+            OutreachEvent.event_type,
+            func.count(OutreachEvent.id),
+        ).where(
+            OutreachEvent.event_type.in_(("sent", "opened"))
+        ).group_by(OutreachEvent.event_type)
+    )
+    event_counts = {row[0]: row[1] for row in result.all()}
+    total_sent_events = event_counts.get("sent", 0)
+    total_opened_events = event_counts.get("opened", 0)
+    open_rate = round(total_opened_events / max(total_sent_events, 1) * 100, 2)
+
+    # Replies this week
+    result = await db.execute(
+        select(func.count(OutreachEvent.id)).where(
+            OutreachEvent.event_type == "replied",
+        )
+    )
+    # Filter by week if the model has a timestamp; since OutreachEvent may not
+    # have a created_at, count all replies as a fallback.
+    replies_this_week = result.scalar() or 0
+
+    # Deals won this month
+    result = await db.execute(
+        select(
+            func.count(Deal.id),
+            func.coalesce(func.sum(Deal.value), 0),
+        ).where(
+            Deal.status == "won",
+            Deal.created_at >= first_of_month,
+        )
+    )
+    won_row = result.one()
+    deals_won_this_month = won_row[0] or 0
+    deals_won_value = float(won_row[1] or 0)
+
+    # Active pipeline value (pending deals)
+    result = await db.execute(
+        select(func.coalesce(func.sum(Deal.value), 0)).where(
+            Deal.status == "pending"
+        )
+    )
+    active_pipeline_value = float(result.scalar() or 0)
+
+    # Average response time is not directly available without reply timestamps
+    # on OutreachEvent, so return None.
+    avg_response_time_hours = None
+
+    return DashboardKPIs(
+        emails_sent_today=emails_sent_today,
+        open_rate=open_rate,
+        replies_this_week=replies_this_week,
+        deals_won_this_month=deals_won_this_month,
+        deals_won_value=deals_won_value,
+        active_pipeline_value=active_pipeline_value,
+        avg_response_time_hours=avg_response_time_hours,
     )
 
 
@@ -174,14 +366,13 @@ async def get_top_leads(
 
 @router.get("/recent-activity", response_model=list[ActivityItem])
 async def get_recent_activity(
-    limit: int = Query(15, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
     """Get a unified recent-activity feed across the data we track.
 
-    Combines: newly added companies and contacts, lead scores, and email
-    sends — sorted newest first. (Stage transitions are not audited, so they
-    are not included.)
+    Combines: newly added companies and contacts, lead scores, email
+    sends, and deal events — sorted newest first.
     """
     activity: list[ActivityItem] = []
 
@@ -195,14 +386,18 @@ async def get_recent_activity(
             type="company_added",
             description=f"{c.name} added to pipeline",
             company_id=c.id,
+            company_name=c.name,
             created_at=c.created_at,
         ))
 
-    # Recently added contacts
+    # Recently added contacts (join with Company for company_name)
     result = await db.execute(
-        select(Contact).order_by(Contact.created_at.desc()).limit(limit)
+        select(Contact, Company.name.label("co_name"))
+        .outerjoin(Company, Company.id == Contact.company_id)
+        .order_by(Contact.created_at.desc())
+        .limit(limit)
     )
-    for ct in result.scalars().all():
+    for ct, co_name in result.all():
         name = ct.full_name
         label = f" ({ct.title})" if ct.title else ""
         activity.append(ActivityItem(
@@ -211,6 +406,7 @@ async def get_recent_activity(
             description=f"Added {name}{label}",
             company_id=ct.company_id,
             contact_id=ct.id,
+            company_name=co_name,
             created_at=ct.created_at,
         ))
 
@@ -227,6 +423,7 @@ async def get_recent_activity(
             type="lead_scored",
             description=f"{company_name or 'Company'} scored {score.fit_score}",
             company_id=score.company_id,
+            company_name=company_name,
             created_at=score.scored_at,
         ))
 
@@ -241,6 +438,41 @@ async def get_recent_activity(
             description=f"Email sent to {send.to_email or 'a contact'}",
             contact_id=send.contact_id,
             created_at=send.sent_at,
+        ))
+
+    # Recently created deals
+    result = await db.execute(
+        select(Deal, Company.name)
+        .outerjoin(Company, Company.id == Deal.company_id)
+        .order_by(Deal.created_at.desc())
+        .limit(limit)
+    )
+    for deal, company_name in result.all():
+        activity.append(ActivityItem(
+            id=f"deal-{deal.id}",
+            type="deal_created",
+            description=f"Deal created{' for ' + company_name if company_name else ''} — ${deal.value or 0:,.0f}",
+            company_id=deal.company_id,
+            company_name=company_name,
+            created_at=deal.created_at,
+        ))
+
+    # Recently won deals
+    result = await db.execute(
+        select(Deal, Company.name)
+        .outerjoin(Company, Company.id == Deal.company_id)
+        .where(Deal.status == "won")
+        .order_by(Deal.created_at.desc())
+        .limit(limit)
+    )
+    for deal, company_name in result.all():
+        activity.append(ActivityItem(
+            id=f"deal-won-{deal.id}",
+            type="deal_won",
+            description=f"Deal won{' with ' + company_name if company_name else ''} — ${deal.value or 0:,.0f}",
+            company_id=deal.company_id,
+            company_name=company_name,
+            created_at=deal.created_at,
         ))
 
     activity.sort(key=lambda a: _aware(a.created_at), reverse=True)
@@ -262,6 +494,26 @@ async def get_email_trends(
         .order_by(day)
     )
     return [EmailTrendPoint(date=str(r[0]), sent=r[1]) for r in result.all()]
+
+
+@router.get("/contact-growth")
+async def contact_growth(
+    days: int = Query(90, ge=7, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """New contacts added per week over the last N days."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    week_col = func.date_trunc('week', Contact.created_at)
+    result = await db.execute(
+        select(week_col.label("week"), func.count(Contact.id))
+        .where(Contact.created_at >= since)
+        .group_by(week_col)
+        .order_by(week_col)
+    )
+    return [
+        {"week": str(r[0].date() if hasattr(r[0], 'date') else r[0]), "count": r[1]}
+        for r in result.all()
+    ]
 
 
 # --- Helpers ---

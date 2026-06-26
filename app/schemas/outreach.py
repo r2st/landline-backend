@@ -58,10 +58,15 @@ class SequenceWithCounts(BaseModel):
     name: str
     description: Optional[str] = None
     is_active: bool
+    status: str = "active"
     created_at: datetime
     step_count: int
     enrollment_count: int
     active_enrollment_count: int
+
+
+class SequenceStatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(active|paused)$")
 
 
 # --- Batch enrollment ---

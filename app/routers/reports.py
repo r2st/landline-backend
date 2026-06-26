@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -361,3 +361,124 @@ async def retention(
         }
         for month in sorted(by_month_total)
     ]
+
+
+@router.get("/email-performance")
+async def email_performance(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Email send stats grouped by day over the last N days.
+
+    Returns per-day counts of total sends, opened, replied, and bounced.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    day_col = func.date(EmailSend.sent_at)
+    result = await db.execute(
+        select(
+            day_col.label("day"),
+            func.count(EmailSend.id).label("sent"),
+            func.count(case((EmailSend.status == "opened", 1))).label("opened"),
+            func.count(case((EmailSend.status == "replied", 1))).label("replied"),
+            func.count(case((EmailSend.status == "bounced", 1))).label("bounced"),
+        )
+        .where(EmailSend.sent_at >= since)
+        .group_by(day_col)
+        .order_by(day_col)
+    )
+    return [
+        {
+            "date": str(r.day),
+            "sent": r.sent,
+            "opened": r.opened,
+            "replied": r.replied,
+            "bounced": r.bounced,
+        }
+        for r in result.all()
+    ]
+
+
+@router.get("/pipeline-analytics")
+async def pipeline_analytics(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pipeline conversion metrics: stage counts, conversion rates, deal cycle
+    time, win/loss rates, and total pipeline value."""
+    lo, hi = _parse_bound(start), _parse_bound(end)
+
+    # --- Stage counts + deal value per stage ---
+    companies = list(
+        (await db.execute(select(Company.id, Company.stage))).all()
+    )
+    stage_company_ids: dict[str, list] = defaultdict(list)
+    stage_counts: Counter = Counter()
+    for cid, stage in companies:
+        stage_counts[stage] += 1
+        stage_company_ids[stage].append(cid)
+
+    deals = list((await db.execute(select(Deal))).scalars().all())
+    value_by_stage: dict[str, float] = defaultdict(float)
+    for d in deals:
+        if not _in_window(d.created_at, lo, hi):
+            continue
+        for stage, cids in stage_company_ids.items():
+            if d.company_id in cids:
+                value_by_stage[stage] += _f(d.value)
+                break
+
+    stages = [
+        {
+            "stage": stage,
+            "count": stage_counts.get(stage, 0),
+            "value": round(value_by_stage.get(stage, 0.0), 2),
+        }
+        for stage in VALID_STAGES
+    ]
+
+    # --- Sequential conversion rates ---
+    conversion_rates = []
+    stage_list = list(VALID_STAGES)
+    for i in range(len(stage_list) - 1):
+        from_stage = stage_list[i]
+        to_stage = stage_list[i + 1]
+        from_count = stage_counts.get(from_stage, 0)
+        to_count = stage_counts.get(to_stage, 0)
+        rate = round(to_count / from_count * 100, 1) if from_count > 0 else 0.0
+        conversion_rates.append(
+            {"from_stage": from_stage, "to_stage": to_stage, "rate": rate}
+        )
+
+    # --- Deal metrics ---
+    won_deals = [d for d in deals if d.status == "won"]
+    lost_deals = [d for d in deals if d.status == "lost"]
+    pending_deals = [d for d in deals if d.status == "pending"]
+
+    # Average deal cycle (won deals with a close_date)
+    cycle_days = []
+    for d in won_deals:
+        if d.close_date and d.created_at:
+            created = _aware(d.created_at)
+            closed = _aware(d.close_date)
+            if created and closed:
+                delta = (closed - created).total_seconds() / 86400
+                cycle_days.append(delta)
+    avg_deal_cycle_days = round(sum(cycle_days) / len(cycle_days), 1) if cycle_days else 0.0
+
+    # Win / loss rates
+    total_decided = len(won_deals) + len(lost_deals) + len(pending_deals)
+    win_rate = round(len(won_deals) / total_decided * 100, 1) if total_decided > 0 else 0.0
+    loss_rate = round(len(lost_deals) / total_decided * 100, 1) if total_decided > 0 else 0.0
+
+    # Total pipeline value (pending deals)
+    total_pipeline_value = round(sum(_f(d.value) for d in pending_deals), 2)
+
+    return {
+        "stages": stages,
+        "conversion_rates": conversion_rates,
+        "avg_deal_cycle_days": avg_deal_cycle_days,
+        "win_rate": win_rate,
+        "loss_rate": loss_rate,
+        "total_pipeline_value": total_pipeline_value,
+    }
