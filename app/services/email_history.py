@@ -6,6 +6,7 @@ allows sending threaded replies through the Gmail API.
 """
 
 import base64
+import html as html_mod
 import logging
 import uuid
 from collections import defaultdict
@@ -83,6 +84,12 @@ class EmailHistoryService:
         try:
             service = self._build_gmail_service(account)
 
+            # Get all connected account emails to skip internal messages
+            connected_result = await db.execute(
+                select(GmailAccount.email).where(GmailAccount.status == "connected")
+            )
+            connected_emails = {e.lower() for e in connected_result.scalars().all()}
+
             query = "in:inbox newer_than:1d -from:me"
             results = (
                 service.users()
@@ -126,13 +133,17 @@ class EmailHistoryService:
                         from_email = from_email.split("<")[1].split(">")[0].strip()
                     from_email = from_email.strip().lower()
 
+                    # Skip emails from other connected accounts (already tracked as sent)
+                    if from_email in connected_emails:
+                        continue
+
                     if "<" in to_email and ">" in to_email:
                         to_email = to_email.split("<")[1].split(">")[0].strip()
                     to_email = to_email.strip().lower()
 
                     # Extract body content
                     body_text, body_html = self._extract_body(msg.get("payload", {}))
-                    snippet = msg.get("snippet", "")[:500]
+                    snippet = html_mod.unescape(msg.get("snippet", ""))[:500]
 
                     # Parse received timestamp
                     internal_date = msg.get("internalDate")
@@ -371,6 +382,12 @@ class EmailHistoryService:
         filter_type: all | sent | received | opened | needs_reply
         search: optional text search on subject/from_email
         """
+        # Load connected account emails for direction detection
+        connected_result = await db.execute(
+            select(GmailAccount.email).where(GmailAccount.status == "connected")
+        )
+        connected_emails = {e.lower() for e in connected_result.scalars().all()}
+
         # Build sent messages query
         sends_query = select(EmailSend).where(EmailSend.status != "skipped")
         replies_query = select(EmailReply)
@@ -379,8 +396,12 @@ class EmailHistoryService:
             # Only sent emails
             replies_query = None
         elif filter_type == "received":
-            # Only received
+            # Only received — exclude replies from our own connected accounts
             sends_query = None
+            if connected_emails:
+                replies_query = replies_query.where(
+                    ~func.lower(EmailReply.from_email).in_(connected_emails)
+                )
         elif filter_type == "opened":
             sends_query = sends_query.where(EmailSend.opened_at.isnot(None))
             replies_query = None
@@ -433,7 +454,7 @@ class EmailHistoryService:
                         await db.execute(select(Company.name).where(Company.id == cid))
                     ).scalar_one_or_none()
                     company_name = company
-                messages.append(self._reply_to_message(r, contact, company_name, cid))
+                messages.append(self._reply_to_message(r, contact, company_name, cid, connected_emails))
 
         # Group into threads
         threads = self._group_into_threads(messages)
@@ -727,7 +748,7 @@ class EmailHistoryService:
                     "subject": headers.get("subject"),
                     "body_html": body_html,
                     "body_text": body_text,
-                    "snippet": msg.get("snippet", "")[:500],
+                    "snippet": html_mod.unescape(msg.get("snippet", ""))[:500],
                     "status": "sent" if is_from_us else "received",
                     "gmail_thread_id": gmail_thread_id,
                     "gmail_message_id": msg["id"],
@@ -791,22 +812,28 @@ class EmailHistoryService:
         contact: Optional[Contact],
         company_name: Optional[str],
         company_id: Optional[uuid.UUID],
+        connected_emails: Optional[set] = None,
     ) -> dict:
         """Convert an EmailReply to a unified message dict."""
         contact_name = None
         if contact:
             contact_name = contact.full_name
 
+        # Determine direction: if sender is one of our connected accounts, it's "sent"
+        direction = "received"
+        if connected_emails and reply.from_email and reply.from_email.lower() in connected_emails:
+            direction = "sent"
+
         return {
             "id": reply.id,
-            "direction": "received",
+            "direction": direction,
             "from_email": reply.from_email,
             "to_email": reply.to_email or "",
             "subject": reply.subject,
             "body_html": reply.body_html,
             "body_text": reply.body_text,
             "snippet": reply.snippet,
-            "status": "received",
+            "status": direction,
             "gmail_thread_id": reply.gmail_thread_id,
             "gmail_message_id": reply.gmail_message_id,
             "timestamp": reply.received_at,
@@ -830,9 +857,18 @@ class EmailHistoryService:
         Messages without a gmail_thread_id are each treated as their own thread.
         """
         thread_map: dict[str, list[dict]] = defaultdict(list)
+        seen_message_ids: set[str] = set()
         solo_counter = 0
 
         for msg in messages:
+            # Deduplicate: skip if gmail_message_id already seen (e.g. same
+            # email exists as both EmailSend and synced EmailReply)
+            msg_id = msg.get("gmail_message_id")
+            if msg_id:
+                if msg_id in seen_message_ids:
+                    continue
+                seen_message_ids.add(msg_id)
+
             thread_id = msg.get("gmail_thread_id")
             if not thread_id:
                 # Each message without a thread_id becomes its own thread

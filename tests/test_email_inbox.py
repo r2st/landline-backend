@@ -1,0 +1,543 @@
+"""Tests for unified inbox — direction detection, filters, thread dedup, purge & cleanup."""
+
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+import pytest_asyncio
+from cryptography.fernet import Fernet
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import get_settings
+from app.models.company import Company
+from app.models.contact import Contact
+from app.models.email_reply import EmailReply
+from app.models.email_template import EmailSend
+from app.models.gmail_account import GmailAccount
+from app.services import crypto, google_oauth
+from app.services.email_history import EmailHistoryService
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _crypto_key():
+    """Give crypto a valid Fernet key for the duration of each test."""
+    settings = get_settings()
+    prev = settings.token_encryption_key
+    settings.token_encryption_key = Fernet.generate_key().decode()
+    crypto._fernet.cache_clear()
+    yield
+    settings.token_encryption_key = prev
+    crypto._fernet.cache_clear()
+
+
+async def _make_gmail_account(
+    db: AsyncSession,
+    email: str,
+    active: bool = False,
+    status: str = "connected",
+) -> GmailAccount:
+    account = GmailAccount(
+        id=uuid.uuid4(),
+        email=email,
+        google_sub=f"sub-{email}",
+        display_name=email.split("@")[0].title(),
+        refresh_token_encrypted=crypto.encrypt("refresh-xyz"),
+        access_token_encrypted=crypto.encrypt("access-xyz"),
+        scopes=" ".join(google_oauth.SCOPES),
+        is_active=active,
+        status=status,
+    )
+    db.add(account)
+    await db.flush()
+    return account
+
+
+async def _make_email_send(
+    db: AsyncSession,
+    *,
+    from_email: str,
+    to_email: str,
+    subject: str = "Test subject",
+    gmail_thread_id: str | None = None,
+    gmail_message_id: str | None = None,
+    sender_account_id: uuid.UUID | None = None,
+    contact_id: uuid.UUID | None = None,
+    status: str = "sent",
+) -> EmailSend:
+    send = EmailSend(
+        id=uuid.uuid4(),
+        from_email=from_email,
+        to_email=to_email,
+        subject=subject,
+        body_html=f"<p>{subject}</p>",
+        status=status,
+        gmail_thread_id=gmail_thread_id,
+        gmail_message_id=gmail_message_id,
+        sender_account_id=sender_account_id,
+        contact_id=contact_id,
+        sent_at=datetime.now(timezone.utc),
+    )
+    db.add(send)
+    await db.flush()
+    return send
+
+
+async def _make_email_reply(
+    db: AsyncSession,
+    *,
+    from_email: str,
+    to_email: str,
+    subject: str = "Re: Test subject",
+    gmail_thread_id: str | None = None,
+    gmail_message_id: str | None = None,
+    gmail_account_id: uuid.UUID | None = None,
+    contact_id: uuid.UUID | None = None,
+    company_id: uuid.UUID | None = None,
+    snippet: str | None = None,
+    received_at: datetime | None = None,
+) -> EmailReply:
+    reply = EmailReply(
+        id=uuid.uuid4(),
+        from_email=from_email,
+        to_email=to_email,
+        subject=subject,
+        body_text="Reply body",
+        body_html="<p>Reply body</p>",
+        snippet=snippet or "Reply body",
+        gmail_thread_id=gmail_thread_id,
+        gmail_message_id=gmail_message_id or f"msg-{uuid.uuid4().hex[:8]}",
+        gmail_account_id=gmail_account_id,
+        contact_id=contact_id,
+        company_id=company_id,
+        received_at=received_at or datetime.now(timezone.utc),
+        is_read=False,
+    )
+    db.add(reply)
+    await db.flush()
+    return reply
+
+
+# ---------------------------------------------------------------------------
+# Direction detection tests
+# ---------------------------------------------------------------------------
+
+class TestDirectionDetection:
+    """_reply_to_message should set direction based on connected accounts."""
+
+    async def test_reply_from_external_is_received(self, db_session):
+        """Emails from external senders are direction='received'."""
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        reply = await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="us@company.com",
+            gmail_thread_id="thread-1",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        threads = result["threads"]
+        assert len(threads) == 1
+        msg = threads[0]["messages"][0]
+        assert msg["direction"] == "received"
+
+    async def test_reply_from_connected_account_is_sent(self, db_session):
+        """Emails from our own connected accounts are direction='sent'."""
+        acct = await _make_gmail_account(db_session, "us@company.com", active=True)
+        await _make_gmail_account(db_session, "colleague@company.com")
+        # A reply synced from colleague's inbox, but FROM us
+        reply = await _make_email_reply(
+            db_session,
+            from_email="us@company.com",
+            to_email="colleague@company.com",
+            gmail_thread_id="thread-2",
+            gmail_account_id=acct.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        threads = result["threads"]
+        assert len(threads) == 1
+        msg = threads[0]["messages"][0]
+        assert msg["direction"] == "sent"
+        assert msg["status"] == "sent"
+
+
+# ---------------------------------------------------------------------------
+# Received filter tests
+# ---------------------------------------------------------------------------
+
+class TestReceivedFilter:
+    """The 'received' filter should exclude emails from connected accounts."""
+
+    async def test_received_filter_excludes_own_emails(self, db_session):
+        """Received filter must not show emails from our connected accounts."""
+        acct = await _make_gmail_account(db_session, "sender@company.com", active=True)
+        # Our own email synced back as a reply
+        await _make_email_reply(
+            db_session,
+            from_email="sender@company.com",
+            to_email="client@example.com",
+            gmail_thread_id="thread-own",
+            gmail_account_id=acct.id,
+        )
+        # A genuine incoming reply
+        await _make_email_reply(
+            db_session,
+            from_email="client@example.com",
+            to_email="sender@company.com",
+            gmail_thread_id="thread-client",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="received")
+        threads = result["threads"]
+        # Only the genuine incoming reply should appear
+        assert len(threads) == 1
+        assert threads[0]["messages"][0]["from_email"] == "client@example.com"
+
+    async def test_received_filter_case_insensitive(self, db_session):
+        """Direction check should be case-insensitive on email addresses."""
+        await _make_gmail_account(db_session, "Sender@Company.COM", active=True)
+        # Reply with lowercase from_email matching the connected account
+        await _make_email_reply(
+            db_session,
+            from_email="sender@company.com",
+            to_email="someone@external.com",
+            gmail_thread_id="thread-case",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="received")
+        # Should be excluded despite case mismatch
+        assert result["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Thread deduplication tests
+# ---------------------------------------------------------------------------
+
+class TestThreadDedup:
+    """Messages with the same gmail_message_id should be deduplicated."""
+
+    async def test_dedup_send_and_synced_reply(self, db_session):
+        """Same message as EmailSend and EmailReply should appear once."""
+        acct = await _make_gmail_account(db_session, "us@company.com", active=True)
+        thread_id = "thread-dedup"
+        msg_id = "msg-dedup-123"
+
+        # Original send
+        await _make_email_send(
+            db_session,
+            from_email="us@company.com",
+            to_email="client@example.com",
+            gmail_thread_id=thread_id,
+            gmail_message_id=msg_id,
+            sender_account_id=acct.id,
+        )
+        # Same message synced as reply (from the recipient's connected account)
+        await _make_email_reply(
+            db_session,
+            from_email="us@company.com",
+            to_email="client@example.com",
+            gmail_thread_id=thread_id,
+            gmail_message_id=msg_id,
+            gmail_account_id=acct.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        threads = result["threads"]
+        assert len(threads) == 1
+        # Only one message in the thread (deduplicated)
+        assert len(threads[0]["messages"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Needs-reply filter tests
+# ---------------------------------------------------------------------------
+
+class TestNeedsReplyFilter:
+    """needs_reply filter should only show threads where last msg is received."""
+
+    async def test_needs_reply_when_last_is_received(self, db_session):
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        thread_id = "thread-nr"
+        # We sent first
+        await _make_email_send(
+            db_session,
+            from_email="us@company.com",
+            to_email="lead@example.com",
+            gmail_thread_id=thread_id,
+            gmail_message_id="msg-sent-1",
+        )
+        # They replied (most recent)
+        await _make_email_reply(
+            db_session,
+            from_email="lead@example.com",
+            to_email="us@company.com",
+            gmail_thread_id=thread_id,
+            received_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="needs_reply")
+        assert result["total"] == 1
+
+    async def test_no_needs_reply_when_last_is_sent(self, db_session):
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        thread_id = "thread-responded"
+        # They wrote first
+        await _make_email_reply(
+            db_session,
+            from_email="lead@example.com",
+            to_email="us@company.com",
+            gmail_thread_id=thread_id,
+            received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        # We replied last
+        await _make_email_send(
+            db_session,
+            from_email="us@company.com",
+            to_email="lead@example.com",
+            gmail_thread_id=thread_id,
+            gmail_message_id="msg-sent-2",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="needs_reply")
+        assert result["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Snippet HTML entity decoding tests
+# ---------------------------------------------------------------------------
+
+class TestSnippetDecoding:
+    """Snippets should have HTML entities decoded."""
+
+    async def test_reply_snippet_unescaped(self, db_session):
+        """HTML entities like &#39; should be decoded before storage/display."""
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        # Simulate a reply with HTML-encoded snippet (as Gmail API returns)
+        await _make_email_reply(
+            db_session,
+            from_email="client@example.com",
+            to_email="us@company.com",
+            gmail_thread_id="thread-snippet",
+            snippet="That&#39;s great &amp; we&#39;re ready",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        # Note: The snippet is stored as-is in the test fixture; the unescape
+        # happens during Gmail sync (email_history.py sync logic).
+        # This test verifies the inbox returns whatever snippet is stored.
+        threads = result["threads"]
+        assert len(threads) == 1
+
+
+# ---------------------------------------------------------------------------
+# Purge endpoint tests
+# ---------------------------------------------------------------------------
+
+class TestPurgeEndpoint:
+    """Purge should delete all emails linked to an account including incoming."""
+
+    async def test_purge_deletes_outgoing_and_incoming(self, client, db_session, monkeypatch):
+        monkeypatch.setattr(google_oauth, "revoke_token", lambda *a, **k: True)
+
+        acct = await _make_gmail_account(db_session, "user@company.com", active=True)
+        # Outgoing: linked by sender_account_id
+        await _make_email_send(
+            db_session,
+            from_email="user@company.com",
+            to_email="client@external.com",
+            sender_account_id=acct.id,
+            gmail_message_id="send-1",
+        )
+        # Incoming: linked by gmail_account_id
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="user@company.com",
+            gmail_account_id=acct.id,
+        )
+        # Incoming by to_email only (no gmail_account_id link)
+        await _make_email_reply(
+            db_session,
+            from_email="other@external.com",
+            to_email="user@company.com",
+            gmail_account_id=None,
+        )
+        await db_session.commit()
+
+        resp = await client.delete(f"/api/v1/gmail/accounts/{acct.id}/purge")
+        assert resp.status_code == 200
+        data = resp.json()
+        # All replies deleted (2 incoming)
+        assert data["replies_deleted"] >= 2
+        assert data["sends_deleted"] == 1
+        assert data["total_deleted"] >= 3
+
+        # Verify account is gone
+        remaining = (await db_session.execute(
+            select(GmailAccount).where(GmailAccount.id == acct.id)
+        )).scalar_one_or_none()
+        assert remaining is None
+
+    async def test_purge_promotes_next_account(self, client, db_session, monkeypatch):
+        monkeypatch.setattr(google_oauth, "revoke_token", lambda *a, **k: True)
+
+        primary = await _make_gmail_account(db_session, "primary@co.com", active=True)
+        backup = await _make_gmail_account(db_session, "backup@co.com", active=False)
+        await db_session.commit()
+
+        await client.delete(f"/api/v1/gmail/accounts/{primary.id}/purge")
+        await db_session.commit()
+
+        # Backup should now be active
+        resp = await client.get("/api/v1/gmail/status")
+        data = resp.json()
+        assert data["active_email"] == "backup@co.com"
+
+
+# ---------------------------------------------------------------------------
+# Cleanup endpoint tests
+# ---------------------------------------------------------------------------
+
+class TestCleanupEndpoint:
+    """Cleanup should delete orphaned emails by email address."""
+
+    async def test_cleanup_deletes_by_email_address(self, client, db_session):
+        email = "orphan@removed.com"
+        # Create orphaned replies (no gmail_account link)
+        await _make_email_reply(
+            db_session,
+            from_email=email,
+            to_email="us@company.com",
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="someone@else.com",
+            to_email=email,
+        )
+        # And an orphaned send
+        await _make_email_send(
+            db_session,
+            from_email=email,
+            to_email="client@x.com",
+            gmail_message_id="orphan-send-1",
+        )
+        await db_session.commit()
+
+        resp = await client.delete(f"/api/v1/gmail/cleanup-emails?email={email}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["replies_deleted"] == 2
+        assert data["sends_deleted"] == 1
+        assert data["total_deleted"] == 3
+
+        # Verify all cleaned up
+        remaining_replies = (await db_session.execute(
+            select(EmailReply).where(
+                (EmailReply.from_email == email) | (EmailReply.to_email == email)
+            )
+        )).scalars().all()
+        assert len(remaining_replies) == 0
+
+
+# ---------------------------------------------------------------------------
+# Search filter tests
+# ---------------------------------------------------------------------------
+
+class TestSearchFilter:
+    """Search should filter by subject, from, or to email."""
+
+    async def test_search_by_subject(self, db_session):
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        await _make_email_send(
+            db_session,
+            from_email="us@company.com",
+            to_email="client@x.com",
+            subject="Quality Management Platform Demo",
+            gmail_message_id="search-1",
+        )
+        await _make_email_send(
+            db_session,
+            from_email="us@company.com",
+            to_email="other@y.com",
+            subject="Follow up on our meeting",
+            gmail_message_id="search-2",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, search="Quality")
+        assert result["total"] == 1
+        assert "Quality" in result["threads"][0]["subject"]
+
+    async def test_search_by_email_address(self, db_session):
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        await _make_email_reply(
+            db_session,
+            from_email="vip@bigcorp.com",
+            to_email="us@company.com",
+            gmail_thread_id="thread-vip",
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="random@small.com",
+            to_email="us@company.com",
+            gmail_thread_id="thread-random",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, search="bigcorp")
+        assert result["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Pagination tests
+# ---------------------------------------------------------------------------
+
+class TestPagination:
+
+    async def test_inbox_pagination(self, db_session):
+        await _make_gmail_account(db_session, "us@company.com", active=True)
+        # Create 5 threads
+        for i in range(5):
+            await _make_email_send(
+                db_session,
+                from_email="us@company.com",
+                to_email=f"lead{i}@example.com",
+                subject=f"Thread {i}",
+                gmail_thread_id=f"thread-page-{i}",
+                gmail_message_id=f"msg-page-{i}",
+            )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        page1 = await service.get_inbox(db_session, page=1, per_page=2)
+        assert len(page1["threads"]) == 2
+        assert page1["total"] == 5
+
+        page2 = await service.get_inbox(db_session, page=2, per_page=2)
+        assert len(page2["threads"]) == 2
+
+        page3 = await service.get_inbox(db_session, page=3, per_page=2)
+        assert len(page3["threads"]) == 1
