@@ -13,20 +13,23 @@ depends_on = None
 
 
 def upgrade():
-    # Add deal_stage column to deals
+    # Add deal_stage column to deals (IF NOT EXISTS for idempotency)
     op.execute("""
         ALTER TABLE deals
-        ADD COLUMN deal_stage VARCHAR(20) NOT NULL DEFAULT 'qualification'
+        ADD COLUMN IF NOT EXISTS deal_stage VARCHAR(20) NOT NULL DEFAULT 'qualification'
     """)
     op.execute("""
-        ALTER TABLE deals
-        ADD CONSTRAINT ck_deals_deal_stage
-        CHECK (deal_stage IN ('qualification','discovery','proposal','negotiation','closing'))
+        DO $$ BEGIN
+            ALTER TABLE deals
+            ADD CONSTRAINT ck_deals_deal_stage
+            CHECK (deal_stage IN ('qualification','discovery','proposal','negotiation','closing'));
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
     """)
 
     # Create deal_activities table
     op.execute("""
-        CREATE TABLE deal_activities (
+        CREATE TABLE IF NOT EXISTS deal_activities (
             id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             deal_id     UUID NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
             activity_type VARCHAR(50) NOT NULL,
@@ -39,7 +42,7 @@ def upgrade():
 
     # Create deal_notes table
     op.execute("""
-        CREATE TABLE deal_notes (
+        CREATE TABLE IF NOT EXISTS deal_notes (
             id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             deal_id     UUID NOT NULL REFERENCES deals(id) ON DELETE CASCADE,
             content     TEXT NOT NULL,

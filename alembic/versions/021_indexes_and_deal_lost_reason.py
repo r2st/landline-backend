@@ -18,16 +18,16 @@ depends_on = None
 
 
 def upgrade():
-    # Contact indexes
-    op.create_index("ix_contacts_first_name", "contacts", ["first_name"])
-    op.create_index("ix_contacts_last_name", "contacts", ["last_name"])
-    op.create_index("ix_contacts_source", "contacts", ["source"])
+    # Contact indexes (IF NOT EXISTS for idempotency)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_contacts_first_name ON contacts (first_name)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_contacts_last_name ON contacts (last_name)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_contacts_source ON contacts (source)")
 
-    # Company indexes
-    op.create_index("ix_companies_name", "companies", ["name"])
-    op.create_index("ix_companies_stage", "companies", ["stage"])
-    op.create_index("ix_companies_country", "companies", ["country"])
-    op.create_index("ix_companies_industry_segment", "companies", ["industry_segment"])
+    # Company indexes (IF NOT EXISTS for idempotency)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_companies_name ON companies (name)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_companies_stage ON companies (stage)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_companies_country ON companies (country)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_companies_industry_segment ON companies (industry_segment)")
 
     # Deal lost_reason column
     op.add_column("deals", sa.Column("lost_reason", sa.String(255), nullable=True))
