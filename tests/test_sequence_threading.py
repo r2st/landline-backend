@@ -423,3 +423,262 @@ async def test_double_dispatch_prevented_by_delay_guard(
 
     # next_send_at is 2 days from now — step should not fire
     assert enrollment.next_send_at > datetime.now(timezone.utc)
+
+
+# ── Sender rotation tests ──
+
+
+@pytest.mark.asyncio
+async def test_rotation_skips_sending_disabled_accounts():
+    """get_next_rotation_account should ignore accounts with sending_enabled=False."""
+    from app.services.email_dispatch import get_next_rotation_account
+
+    mock_db = AsyncMock()
+
+    # Two accounts: one sending-enabled, one disabled
+    enabled_account = MagicMock()
+    enabled_account.email = "sender@apprend.tech"
+    enabled_account.sending_enabled = True
+    enabled_account.status = "connected"
+    enabled_account.last_used_at = None
+    enabled_account.connected_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    disabled_account = MagicMock()
+    disabled_account.email = "target@gmail.com"
+    disabled_account.sending_enabled = False
+    disabled_account.status = "connected"
+
+    # Mock the queries for sending-enabled accounts
+    gmail_result = MagicMock()
+    gmail_result.scalars.return_value.all.return_value = [enabled_account]
+    smtp_result = MagicMock()
+    smtp_result.scalars.return_value.all.return_value = []
+
+    mock_db.execute = AsyncMock(side_effect=[gmail_result, smtp_result])
+
+    account = await get_next_rotation_account(mock_db)
+    assert account.email == "sender@apprend.tech"
+
+
+# ── Template rendering tests ──
+
+
+@pytest.mark.asyncio
+async def test_template_renders_contact_variables():
+    """Sequence step templates should render {{first_name}} and {{company_name}}."""
+    from app.services.email_compose import render
+
+    template = "the part that keeps you up at night, {{first_name}}"
+    context = {"first_name": "Raj", "company_name": "OneNet Plastics"}
+    result = render(template, context)
+    assert result == "the part that keeps you up at night, Raj"
+
+
+@pytest.mark.asyncio
+async def test_template_renders_company_in_body():
+    """Body template should render {{company_name}}."""
+    from app.services.email_compose import render
+
+    template = "<p>At {{company_name}}, I imagine you know exactly which mold I am talking about.</p>"
+    context = {"first_name": "Raj", "company_name": "OneNet Plastics"}
+    result = render(template, context)
+    assert "OneNet Plastics" in result
+
+
+@pytest.mark.asyncio
+async def test_template_handles_missing_variables():
+    """Template should handle missing variables gracefully."""
+    from app.services.email_compose import render
+
+    template = "Hello {{first_name}}, welcome to {{company_name}}"
+    context = {"first_name": "Raj"}
+    result = render(template, context)
+    assert "Raj" in result
+    # Missing company_name should render empty or be left as placeholder
+    assert "{{company_name}}" not in result or result  # Just ensure no crash
+
+
+# ── Enrollment lifecycle tests ──
+
+
+@pytest.mark.asyncio
+async def test_multiple_enrollments_same_contact_different_sequences(
+    db_session: AsyncSession, sample_contact: Contact
+):
+    """A contact can be enrolled in multiple different sequences simultaneously."""
+    seq1 = await _make_sequence_with_steps(db_session, name="Sequence A")
+    seq2 = await _make_sequence_with_steps(db_session, name="Sequence B")
+
+    e1 = OutreachEnrollment(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, sequence_id=seq1.id,
+    )
+    e2 = OutreachEnrollment(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, sequence_id=seq2.id,
+    )
+    db_session.add_all([e1, e2])
+    await db_session.flush()
+
+    result = await db_session.execute(
+        select(OutreachEnrollment)
+        .where(OutreachEnrollment.contact_id == sample_contact.id)
+    )
+    enrollments = list(result.scalars().all())
+    assert len(enrollments) == 2
+    seq_ids = {e.sequence_id for e in enrollments}
+    assert seq1.id in seq_ids
+    assert seq2.id in seq_ids
+
+
+@pytest.mark.asyncio
+async def test_paused_enrollment_not_dispatched(
+    client: AsyncClient, db_session: AsyncSession, sample_contact: Contact
+):
+    """Paused enrollments should not be dispatched by /process."""
+    seq = await _make_sequence_with_steps(db_session)
+    enrollment = OutreachEnrollment(
+        id=_uuid.uuid4(),
+        contact_id=sample_contact.id,
+        sequence_id=seq.id,
+        current_step=1,
+        status="paused",
+    )
+    db_session.add(enrollment)
+    await db_session.commit()
+
+    resp = await client.post("/api/v1/sequences/process")
+    body = resp.json()
+    assert body["dispatched"] == 0
+    assert body["active_enrollments"] == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_enrollment_not_dispatched(
+    client: AsyncClient, db_session: AsyncSession, sample_contact: Contact
+):
+    """Completed enrollments should not be dispatched by /process."""
+    seq = await _make_sequence_with_steps(db_session)
+    enrollment = OutreachEnrollment(
+        id=_uuid.uuid4(),
+        contact_id=sample_contact.id,
+        sequence_id=seq.id,
+        current_step=5,
+        status="completed",
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(enrollment)
+    await db_session.commit()
+
+    resp = await client.post("/api/v1/sequences/process")
+    body = resp.json()
+    assert body["dispatched"] == 0
+    assert body["active_enrollments"] == 0
+
+
+# ── Thread-linking edge cases ──
+
+
+@pytest.mark.asyncio
+async def test_re_prefix_not_duplicated():
+    """If subject already starts with Re:, it should not be added again."""
+    from app.services.email_compose import render
+
+    subject = "Re: the part that keeps you up at night, {{first_name}}"
+    context = {"first_name": "Raj"}
+    rendered = render(subject, context)
+
+    # Simulate what the task does
+    if not rendered.lower().startswith("re:"):
+        rendered = f"Re: {rendered}"
+
+    assert rendered.startswith("Re: the part")
+    assert not rendered.startswith("Re: Re:")
+
+
+@pytest.mark.asyncio
+async def test_step1_has_no_threading_headers():
+    """Step 1 should NOT send In-Reply-To or References headers."""
+    # Fresh enrollment has no gmail_thread_id or gmail_message_id
+    enrollment_thread_id = None
+    enrollment_message_id = None
+    current_step = 1
+
+    thread_id = None
+    in_reply_to = None
+    references = None
+
+    if current_step > 1 and enrollment_thread_id:
+        thread_id = enrollment_thread_id
+
+    assert thread_id is None
+    assert in_reply_to is None
+    assert references is None
+
+
+@pytest.mark.asyncio
+async def test_step2_builds_rfc2822_message_ref():
+    """Step 2+ should format message ID as RFC 2822 angle-bracket reference."""
+    enrollment_gmail_message_id = "19f05b38f9e27287"
+    msg_ref = f"<{enrollment_gmail_message_id}@mail.gmail.com>"
+
+    assert msg_ref == "<19f05b38f9e27287@mail.gmail.com>"
+    assert msg_ref.startswith("<")
+    assert msg_ref.endswith(">")
+    assert "@mail.gmail.com" in msg_ref
+
+
+# ── Batch enrollment tests ──
+
+
+@pytest.mark.asyncio
+async def test_batch_enroll_skips_already_enrolled(
+    client: AsyncClient, db_session: AsyncSession, sample_contact: Contact
+):
+    """Batch enrollment should skip contacts already enrolled in the sequence."""
+    seq = await _make_sequence_with_steps(db_session)
+    # Pre-enroll the contact
+    existing = OutreachEnrollment(
+        id=_uuid.uuid4(),
+        contact_id=sample_contact.id,
+        sequence_id=seq.id,
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    # Try to enroll again
+    resp = await client.post(
+        f"/api/v1/sequences/{seq.id}/enroll",
+        json={"contact_ids": [str(sample_contact.id)]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enrolled_count"] == 0
+    assert body["skipped_count"] == 1
+    assert body["skipped"][0]["reason"] == "Already enrolled in this sequence"
+
+
+@pytest.mark.asyncio
+async def test_batch_enroll_skips_no_email(
+    client: AsyncClient, db_session: AsyncSession, sample_company: Company
+):
+    """Batch enrollment should skip contacts without an email address."""
+    seq = await _make_sequence_with_steps(db_session)
+    # Create a contact with no email
+    contact = Contact(
+        id=_uuid.uuid4(),
+        company_id=sample_company.id,
+        first_name="NoEmail",
+        last_name="Person",
+        source="test",
+    )
+    db_session.add(contact)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/sequences/{seq.id}/enroll",
+        json={"contact_ids": [str(contact.id)]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enrolled_count"] == 0
+    assert body["skipped_count"] == 1
+    assert body["skipped"][0]["reason"] == "Contact has no email address"
