@@ -290,9 +290,15 @@ async def process_sequence_queue(
                 continue
 
             if last_event:
-                is_due = now >= last_event.occurred_at + timedelta(days=step.delay_days)
+                occurred = last_event.occurred_at
+                if occurred.tzinfo is None:
+                    occurred = occurred.replace(tzinfo=timezone.utc)
+                is_due = now >= occurred + timedelta(days=step.delay_days)
             else:
-                is_due = now >= enrollment.enrolled_at + timedelta(days=step.delay_days)
+                enrolled = enrollment.enrolled_at
+                if enrolled.tzinfo is None:
+                    enrolled = enrolled.replace(tzinfo=timezone.utc)
+                is_due = now >= enrolled + timedelta(days=step.delay_days)
 
         if not is_due:
             skipped += 1
