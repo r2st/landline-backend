@@ -565,8 +565,10 @@ class EmailHistoryService:
             contact_id = original_reply.contact_id
             sender_account_id = original_reply.gmail_account_id
 
+        # If no gmail_thread_id, we can still send as a new email (unthreaded reply)
+        # This handles outreach emails that were sent without Gmail API tracking.
         if not gmail_thread_id:
-            return {"status": "error", "detail": "No Gmail thread ID found on original email"}
+            logger.info("No Gmail thread ID for email %s — sending as new email", email_id)
 
         # Find the Gmail account to send from
         account = None
@@ -602,6 +604,9 @@ class EmailHistoryService:
         in_reply_to = f"<{gmail_message_id}>" if gmail_message_id else None
         references = in_reply_to
 
+        # Don't pass synthetic or empty thread IDs to Gmail API
+        effective_thread_id = gmail_thread_id if (gmail_thread_id and not gmail_thread_id.startswith("__solo_")) else None
+
         # Send via Gmail
         sender = GmailSender(account)
         send_result = sender.send_email(
@@ -609,7 +614,7 @@ class EmailHistoryService:
             subject=reply_subject,
             body_html=body_html,
             body_text=body_text,
-            thread_id=gmail_thread_id,
+            thread_id=effective_thread_id,
             in_reply_to=in_reply_to,
             references=references,
         )

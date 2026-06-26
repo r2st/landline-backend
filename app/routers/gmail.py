@@ -21,11 +21,13 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from sqlalchemy import select, update
+from sqlalchemy import delete, func as sa_func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
+from app.models.email_reply import EmailReply
+from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.schemas.gmail import (
@@ -264,6 +266,94 @@ async def disconnect(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
             replacement.is_active = True
             await db.flush()
     logger.info("Disconnected Gmail account %s", account.email)
+
+
+@router.delete("/accounts/{account_id}/purge")
+async def purge_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Delete all synced emails for an account, then disconnect it.
+
+    This removes every email_reply and email_send linked to this Gmail account,
+    revokes the Google token, and deletes the account record.
+    Returns counts of what was deleted.
+    """
+    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
+    account = result.scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    email_address = account.email
+
+    # Count before deleting
+    replies_count = (await db.execute(
+        select(sa_func.count()).select_from(EmailReply).where(EmailReply.gmail_account_id == account_id)
+    )).scalar() or 0
+
+    sends_count = (await db.execute(
+        select(sa_func.count()).select_from(EmailSend).where(EmailSend.sender_account_id == account_id)
+    )).scalar() or 0
+
+    # Also count replies matched by from_email (for replies not linked by account_id)
+    extra_replies = (await db.execute(
+        select(sa_func.count()).select_from(EmailReply).where(
+            EmailReply.from_email == email_address,
+            EmailReply.gmail_account_id.is_(None),
+        )
+    )).scalar() or 0
+
+    # Delete email_replies linked to this account
+    await db.execute(
+        delete(EmailReply).where(EmailReply.gmail_account_id == account_id)
+    )
+    # Delete unlinked replies from this email address
+    if extra_replies:
+        await db.execute(
+            delete(EmailReply).where(
+                EmailReply.from_email == email_address,
+                EmailReply.gmail_account_id.is_(None),
+            )
+        )
+
+    # Null out sender_account_id on email_sends before deleting
+    # (FK constraint — SET NULL first, then delete matching sends)
+    await db.execute(
+        delete(EmailSend).where(EmailSend.sender_account_id == account_id)
+    )
+
+    # Revoke token at Google
+    was_active = account.is_active
+    try:
+        refresh_token = crypto.decrypt(account.refresh_token_encrypted)
+        google_oauth.revoke_token(refresh_token)
+    except Exception as exc:
+        logger.warning("Could not revoke token for %s: %s", account.email, exc)
+
+    await db.delete(account)
+    await db.flush()
+
+    # Promote next account if needed
+    if was_active:
+        result = await db.execute(
+            select(GmailAccount)
+            .where(GmailAccount.status == "connected")
+            .order_by(GmailAccount.connected_at.desc())
+            .limit(1)
+        )
+        replacement = result.scalar_one_or_none()
+        if replacement is not None:
+            replacement.is_active = True
+            await db.flush()
+
+    total_replies = replies_count + extra_replies
+    logger.info(
+        "Purged Gmail account %s: %d replies, %d sends deleted",
+        email_address, total_replies, sends_count,
+    )
+    return {
+        "email": email_address,
+        "replies_deleted": total_replies,
+        "sends_deleted": sends_count,
+        "total_deleted": total_replies + sends_count,
+    }
 
 
 @router.post("/accounts/{account_id}/test", response_model=TestSendResult)

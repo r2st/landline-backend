@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 
+# Minimal scopes needed for sending — avoids invalid_scope errors when
+# the stored refresh token was authorized before gmail.readonly was added.
+_SEND_SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
 
 class GmailSender:
     """Sends email through the Gmail API for a single connected account.
@@ -56,7 +65,7 @@ class GmailSender:
             token_uri=_TOKEN_URI,
             client_id=settings.google_client_id,
             client_secret=settings.google_client_secret,
-            scopes=google_oauth.SCOPES,
+            scopes=_SEND_SCOPES,
         )
 
     def _build_mime(
