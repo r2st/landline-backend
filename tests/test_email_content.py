@@ -15,8 +15,9 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
-from app.services.email_compose import render
+from app.services.email_compose import render, build_merge_context
 from app.services.email_dispatch import wrap_html_email
+from app.services.ai_email_generator import resolve_demo_link, DEMO_LINKS
 
 
 @pytest.fixture(autouse=True)
@@ -443,6 +444,74 @@ class TestUnsubscribeCompliance:
         footer = _unsubscribe_footer_text("test@example.com")
         assert "unsubscribe" in footer.lower()
         assert "http" in footer
+
+
+# ── Demo link resolution ──
+
+
+class TestDemoLinkResolution:
+    """Verify demo links resolve to the correct industry-specific URLs."""
+
+    def test_injection_molding_resolves_to_true_molding(self):
+        link = resolve_demo_link("Plastic Injection Molding", "Apex Mold Industries")
+        assert "true-molding" in link
+
+    def test_cnc_resolves_to_cnc_optimizer(self):
+        link = resolve_demo_link("CNC Machining", "Precision Metal Works")
+        assert "cnc-process-optimizer" in link
+
+    def test_stamping_resolves_to_stamping_predictor(self):
+        link = resolve_demo_link("Metal Stamping", "Valley Stamping")
+        assert "stamping" in link
+
+    def test_pcb_resolves_to_pcb_analyzer(self):
+        link = resolve_demo_link("PCB Assembly", "Bayshore Electronics")
+        assert "pcb-quality-analyzer" in link
+
+    def test_food_resolves_to_food_monitor(self):
+        link = resolve_demo_link("Dairy Processing", "FreshMilk Inc")
+        assert "food-safety-monitor" in link
+
+    def test_automotive_resolves_to_automotive_quality(self):
+        link = resolve_demo_link("Automotive Parts", "Thunderbird Composites")
+        assert "automotive-quality-assistant" in link
+
+    def test_pharma_resolves_to_pharma_predictor(self):
+        link = resolve_demo_link("Pharmaceutical", "PharmaCorp")
+        assert "pharma-batch-predictor" in link
+
+    def test_textile_resolves_to_textile_optimizer(self):
+        link = resolve_demo_link("Textile Dyehouse", "FiberWorks")
+        assert "textile-quality-optimizer" in link
+
+    def test_aerospace_resolves_to_compliance(self):
+        link = resolve_demo_link("Aerospace Parts", "Crosswind Aerospace")
+        assert "compliance-traceability" in link
+
+    def test_unknown_industry_falls_back_to_default(self):
+        link = resolve_demo_link("Artisanal Candle Pouring", "Serenity Scents LLC")
+        assert "true-molding" in link
+
+    def test_company_name_used_as_fallback_match(self):
+        """If industry is blank, company name keywords should still match."""
+        link = resolve_demo_link("", "Great Lakes Plastics")
+        assert "true-molding" in link
+
+    def test_demo_link_renders_in_template(self):
+        """{{demo_link}} should render as a clickable URL in the template."""
+        template = '<a href="{{demo_link}}">See the dashboard</a>'
+        ctx = {"demo_link": "https://true-molding.pages.dev"}
+        result = render(template, ctx)
+        assert 'href="https://true-molding.pages.dev"' in result
+
+    def test_all_demo_links_are_valid_urls(self):
+        """Every URL in the DEMO_LINKS map should be a valid https URL."""
+        seen = set()
+        for keyword, url in DEMO_LINKS.items():
+            if url not in seen:
+                assert url.startswith("https://"), f"Bad URL for '{keyword}': {url}"
+                assert ".pages.dev" in url, f"URL not on Cloudflare Pages: {url}"
+                seen.add(url)
 
 
 # ── Sequence step ordering ──

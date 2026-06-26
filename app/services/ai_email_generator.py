@@ -29,39 +29,90 @@ logger = logging.getLogger(__name__)
 # Keys are lowercased substrings matched against the lead's industry field.
 
 DEMO_LINKS: dict[str, str] = {
-    # Molding & plastics
-    "mold": "https://true-molding-demo.pages.dev",
-    "molding": "https://true-molding-demo.pages.dev",
-    "injection": "https://true-molding-demo.pages.dev",
-    "plastic": "https://true-molding-demo.pages.dev",
-    "polymer": "https://true-molding-demo.pages.dev",
-    # CNC & machining
-    "cnc": "https://true-molding-demo.pages.dev",
-    "machin": "https://true-molding-demo.pages.dev",
-    "precision": "https://true-molding-demo.pages.dev",
-    "turning": "https://true-molding-demo.pages.dev",
-    "milling": "https://true-molding-demo.pages.dev",
-    # Fabrication & metalwork
-    "fabricat": "https://true-molding-demo.pages.dev",
-    "metal": "https://true-molding-demo.pages.dev",
-    "weld": "https://true-molding-demo.pages.dev",
-    "sheet metal": "https://true-molding-demo.pages.dev",
-    "stamping": "https://true-molding-demo.pages.dev",
-    # Aerospace & automotive
-    "aerospace": "https://true-molding-demo.pages.dev",
-    "automotive": "https://true-molding-demo.pages.dev",
-    "defense": "https://true-molding-demo.pages.dev",
-    # Electronics & assembly
-    "electron": "https://true-molding-demo.pages.dev",
-    "assembly": "https://true-molding-demo.pages.dev",
-    "pcb": "https://true-molding-demo.pages.dev",
-    # General manufacturing
-    "manufactur": "https://true-molding-demo.pages.dev",
-    "production": "https://true-molding-demo.pages.dev",
-    "industrial": "https://true-molding-demo.pages.dev",
+    # Molding & plastics → True Molding dashboard
+    "mold": "https://true-molding.pages.dev",
+    "molding": "https://true-molding.pages.dev",
+    "injection": "https://true-molding.pages.dev",
+    "plastic": "https://true-molding.pages.dev",
+    "polymer": "https://true-molding.pages.dev",
+    "resin": "https://true-molding.pages.dev",
+    # CNC & machining → CNC Process Optimizer + TrueQuote
+    "cnc": "https://cnc-process-optimizer.pages.dev",
+    "machin": "https://cnc-process-optimizer.pages.dev",
+    "precision part": "https://cnc-process-optimizer.pages.dev",
+    "turning": "https://cnc-process-optimizer.pages.dev",
+    "milling": "https://cnc-process-optimizer.pages.dev",
+    "swiss machin": "https://cnc-process-optimizer.pages.dev",
+    # Metal stamping → StampRight AI + Stamping Defect Predictor
+    "stamping": "https://stamping-defect-predictor.pages.dev",
+    "stamp": "https://stampright-ai.pages.dev",
+    # Fabrication & metalwork → NestFlow (sheet metal)
+    "fabricat": "https://nestflow-bvf.pages.dev",
+    "sheet metal": "https://nestflow-bvf.pages.dev",
+    "metal fabri": "https://nestflow-bvf.pages.dev",
+    "steel": "https://nestflow-bvf.pages.dev",
+    # Welding & automotive → Weld & Paint Quality
+    "weld": "https://automotive-quality-assistant.pages.dev",
+    "automotive": "https://automotive-quality-assistant.pages.dev",
+    "auto part": "https://automotive-quality-assistant.pages.dev",
+    # Aerospace
+    "aerospace": "https://compliance-traceability-checker.pages.dev",
+    "aircraft": "https://compliance-traceability-checker.pages.dev",
+    "defense": "https://compliance-traceability-checker.pages.dev",
+    # Electronics & PCB → PCB Quality Analyzer
+    "electron": "https://pcb-quality-analyzer.pages.dev",
+    "pcb": "https://pcb-quality-analyzer.pages.dev",
+    "smt": "https://pcb-quality-analyzer.pages.dev",
+    "circuit": "https://pcb-quality-analyzer.pages.dev",
+    # Packaging → Packaging Line Optimizer + PackForm AI
+    "packag": "https://packaging-line-optimizer.pages.dev",
+    "packform": "https://packform-ai.pages.dev",
+    # Food & beverage → Food Safety Monitor
+    "food": "https://food-safety-monitor.pages.dev",
+    "dairy": "https://food-safety-monitor.pages.dev",
+    "beverage": "https://food-safety-monitor.pages.dev",
+    # Pharmaceutical & chemical → Pharma Batch Predictor / BatchWise
+    "pharma": "https://pharma-batch-predictor.pages.dev",
+    "chemical": "https://chemical-process-optimizer.pages.dev",
+    "reactor": "https://chemical-process-optimizer.pages.dev",
+    "batch": "https://batchwise-4qn.pages.dev",
+    # Textile → FiberVision AI
+    "textile": "https://textile-quality-optimizer.pages.dev",
+    "weaving": "https://textile-quality-optimizer.pages.dev",
+    "dyehouse": "https://textile-quality-optimizer.pages.dev",
+    "fiber": "https://textile-quality-optimizer.pages.dev",
+    # Tool & die → Smart Quote Generator
+    "tool & die": "https://smart-quote-generator.pages.dev",
+    "tool and die": "https://smart-quote-generator.pages.dev",
+    "tooling": "https://smart-quote-generator.pages.dev",
+    # Forging
+    "forg": "https://equipment-health-predictor.pages.dev",
+    # Medical devices → Compliance Traceability
+    "medical": "https://compliance-traceability-checker.pages.dev",
+    # Marine / petrochemical → Equipment Health
+    "marine": "https://equipment-health-predictor.pages.dev",
+    "petrochem": "https://equipment-health-predictor.pages.dev",
+    # Solar / energy → Manufacturing Energy Optimizer
+    "solar": "https://manufacturing-energy-optimizer.pages.dev",
+    "energy": "https://manufacturing-energy-optimizer.pages.dev",
+    # Safety / EHS → SafetyNet AI
+    "safety": "https://workplace-safety-analyzer.pages.dev",
+    "ehs": "https://workplace-safety-analyzer.pages.dev",
+    # Supply chain
+    "supply chain": "https://supply-chain-risk-monitor.pages.dev",
+    "supplier": "https://supply-chain-risk-monitor.pages.dev",
+    # Inventory
+    "inventory": "https://inventory-intelligence-demo.pages.dev",
+    # Root cause (cross-industry)
+    "root cause": "https://ai-root-cause-investigator.pages.dev",
+    "quality": "https://ai-root-cause-investigator.pages.dev",
+    # General manufacturing fallback
+    "manufactur": "https://smart-production-scheduler.pages.dev",
+    "production": "https://smart-production-scheduler.pages.dev",
+    "industrial": "https://equipment-health-predictor.pages.dev",
 }
 
-DEFAULT_DEMO_LINK = "https://true-molding-demo.pages.dev"
+DEFAULT_DEMO_LINK = "https://true-molding.pages.dev"
 
 
 def resolve_demo_link(industry: str = "", company_name: str = "") -> str:

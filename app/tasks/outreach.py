@@ -15,7 +15,7 @@ from app.models.consent import ConsentRecord
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.services.consent import check_consent
-from app.services.email_compose import render
+from app.services.email_compose import render, build_merge_context
 from app.services.email_dispatch import send_outreach_email
 from app.tasks.celery_app import celery_app
 from app.services.send_limiter import get_send_limiter
@@ -159,16 +159,11 @@ def send_sequence_step(self, enrollment_id: str):
                                     "step": enrollment.current_step,
                                 }
 
-                # Build template context
-                template_context = {
-                    "first_name": contact.first_name or "",
-                    "last_name": contact.last_name or "",
-                    "full_name": contact.full_name,
-                    "title": contact.title or "",
-                    "company_name": company.name,
-                    "company_domain": company.domain or "",
-                    "company_industry": company.industry_segment or "",
-                }
+                # Build template context (includes demo_link resolved by industry)
+                template_context = build_merge_context(contact, company)
+                # Keep backward compat fields used by older sequences
+                template_context["company_domain"] = company.domain or ""
+                template_context["company_industry"] = company.industry_segment or ""
 
                 # Send email via the active connected Gmail account (falls back
                 # to SES when no account is connected). Templates are rendered
