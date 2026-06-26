@@ -458,3 +458,134 @@ class TestEmailReadability:
         )
         for bw in buzzwords:
             assert bw not in body.lower(), f"Marketing buzzword found: {bw}"
+
+
+# ── V4 deliverability and conversion checks ──
+
+
+class TestV4Deliverability:
+    """Verify the v4 deal-cracker sequence passes deliverability gates."""
+
+    V4_FULL_BODIES = [
+        # Step 1
+        "Hi Vikram, I want to ask you something that nobody in your position likes to think about. "
+        "When a mold goes sideways at 2 AM and your night-shift operator does not catch it "
+        "who gets the phone call? When 8,000 parts ship to your biggest customer and 400 of them "
+        "have sink marks that slipped past visual inspection whose name is on the corrective action report? "
+        "I already know the answer. It is yours. You carry that weight every single day. "
+        "Here is what I want you to imagine for 30 seconds: your phone buzzes at 10:14 AM. "
+        "Not a crisis an alert. Press 7, cavity 4: pressure curve drifting 3.2% from baseline. "
+        "Possible core pin wear. Review recommended. You walk out to the floor, pull the mold, "
+        "and find early-stage wear that would have caused flash in another 200 cycles. "
+        "That is not a fantasy. That is what our AI does, right now, for shops like Apex Mold Industries. "
+        "I am not selling you software. I am offering you something you cannot put a price on: peace of mind. "
+        "15 minutes. I will show you the dashboard. If it is not for you, I will never bother you again.",
+        # Step 2
+        "Hi Vikram, I did something that might make you uncomfortable. I ran the numbers on what "
+        "scrap and rework probably cost Apex Mold Industries last year. "
+        "Annual resin spend times scrap rate times 1 plus rework multiplier. "
+        "For a typical injection molder running 8-15 presses, the number lands between "
+        "$220K and $480K per year. And that is just the direct cost. "
+        "The overtime your team works to remake parts that should have been right the first time. "
+        "The air freight you pay when a scrap run blows your delivery schedule. "
+        "The margin you give back on the next quote because the customer remembers the last quality issue. "
+        "One of our customers a 12-press shop in Michigan told me: "
+        "I knew scrap was a problem. I did not know it was a $340,000 problem. "
+        "When I showed the board that number, and then showed them it dropped to $87,000 in six months "
+        "with your system, nobody asked about the subscription cost. "
+        "Vikram, I am not asking you to commit to anything. I am asking you to see your own numbers.",
+        # Step 3
+        "Hi Vikram, Let me tell you about the conversation I have had with every injection molding "
+        "shop owner I have met this year. We have one guy Mike, or Steve, or Dave who has been here "
+        "22 years. He can listen to a press and tell you if something is off. He knows every mold, "
+        "every material, every trick. And he is going to retire in a few years, and I have no idea "
+        "what we are going to do. Does that sound familiar? "
+        "Your best operator's knowledge is not documented anywhere. It lives in his head, "
+        "in his hands, in the way he adjusts pack pressure by feel. "
+        "Our AI learns what a good cycle looks like on every mold not from a textbook, "
+        "but from your actual production data. It becomes the institutional memory that never retires. "
+        "The shops that figure this out first will hire the best people, because the best people "
+        "want to work somewhere that invests in getting better.",
+        # Step 4
+        "Hi Vikram, I have sent you three emails now, and I know that is a lot from someone you "
+        "have never met. So I want to be honest with you about why I keep writing. "
+        "It is not because I need another sale. It is because I have seen what happens to shops that wait. "
+        "I watched a 15-press operation in Indiana lose their largest customer a $2.1M account "
+        "because of two quality escapes in six months. "
+        "Too busy running parts to protect the business that runs the parts. "
+        "Free 48-hour process audit on one press. We connect our sensors, run for two days, "
+        "and hand you a report showing every anomaly, drift pattern, and hidden inefficiency. "
+        "Most shops discover at least one issue they did not know they had. "
+        "One found a check ring at 40% wear that was adding 1.8 seconds to every cycle "
+        "14 hours of wasted press time per week. "
+        "If you are interested, just reply audit and I will set it up.",
+    ]
+
+    def test_v4_no_all_caps(self):
+        """V4 bodies should have no ALL-CAPS words (except short abbreviations)."""
+        for body in self.V4_FULL_BODIES:
+            words = body.split()
+            all_caps = [w for w in words if len(w) > 3 and w.isupper() and w.isalpha()]
+            assert not all_caps, f"ALL CAPS in v4 body: {all_caps}"
+
+    def test_v4_word_count_under_300(self):
+        """Each v4 step should be under 300 words."""
+        for i, body in enumerate(self.V4_FULL_BODIES, 1):
+            words = body.split()
+            assert len(words) < 300, f"V4 step {i} too long: {len(words)} words"
+
+    def test_v4_no_raw_urls(self):
+        """V4 bodies should not contain raw URLs."""
+        url_pattern = re.compile(r'https?://\S+')
+        for body in self.V4_FULL_BODIES:
+            urls = url_pattern.findall(body)
+            assert not urls, f"Raw URL in v4 body: {urls}"
+
+    def test_v4_no_images(self):
+        """V4 emails should have no image tags."""
+        for body in self.V4_FULL_BODIES:
+            assert "<img" not in body.lower()
+
+    def test_v4_no_marketing_buzzwords(self):
+        """V4 should avoid marketing buzzwords."""
+        buzzwords = ["synergy", "leverage", "paradigm", "disruptive", "game-changing",
+                     "revolutionary", "cutting-edge", "best-in-class", "world-class",
+                     "state-of-the-art", "next-generation", "scalable", "ecosystem"]
+        for body in self.V4_FULL_BODIES:
+            for bw in buzzwords:
+                assert bw not in body.lower(), f"Buzzword '{bw}' in v4 body"
+
+    def test_v4_uses_concrete_numbers(self):
+        """V4 should use specific numbers, not vague claims."""
+        all_text = " ".join(self.V4_FULL_BODIES)
+        numbers = re.findall(r'\$[\d,.]+[KkMm]?|\d+%|\d+[\s-](?:press|year|hour|cycle|day)', all_text)
+        assert len(numbers) >= 8, f"Not enough concrete numbers in v4: found {len(numbers)}"
+
+    def test_v4_mentions_injection_molding_terms(self):
+        """V4 should use industry-specific vocabulary."""
+        terms = ["cavity", "mold", "press", "scrap", "resin", "cycle",
+                 "core pin", "flash", "sink marks", "pack pressure", "check ring"]
+        all_text = " ".join(self.V4_FULL_BODIES).lower()
+        found = [t for t in terms if t in all_text]
+        assert len(found) >= 8, f"Missing injection molding terms. Found: {found}"
+
+    def test_v4_step4_has_single_word_reply_cta(self):
+        """Step 4 should request a one-word reply for maximum conversion."""
+        step4 = self.V4_FULL_BODIES[3]
+        assert "reply" in step4.lower()
+        assert "audit" in step4.lower()
+
+    def test_v4_progressive_emotional_intensity(self):
+        """V4 emotional arc: personal fear → financial → knowledge loss → breakup."""
+        # Step 1 should have fear/guilt words
+        step1 = self.V4_FULL_BODIES[0].lower()
+        assert any(w in step1 for w in ["blame", "phone call", "anxiety", "stomach"])
+        # Step 2 should have money words
+        step2 = self.V4_FULL_BODIES[1].lower()
+        assert "$" in step2 and any(w in step2 for w in ["cost", "resin", "margin", "overtime"])
+        # Step 3 should have loss words
+        step3 = self.V4_FULL_BODIES[2].lower()
+        assert any(w in step3 for w in ["retire", "walks out", "documented", "head"])
+        # Step 4 should have finality words
+        step4 = self.V4_FULL_BODIES[3].lower()
+        assert any(w in step4 for w in ["last", "leave you alone", "final", "honest"])

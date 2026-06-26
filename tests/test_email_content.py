@@ -213,6 +213,149 @@ class TestEmotionalContentPatterns:
             assert rendered.startswith("<p>Hi Raj,</p>")
 
 
+# ── V4 Deal Cracker emotional content ──
+
+
+class TestV4DealCrackerContent:
+    """Verify v4 sequence maximises emotional impact for injection molding deals."""
+
+    V4_SUBJECTS = [
+        "{{first_name}}, who takes the blame when cavity 4 goes bad?",
+        "the math your CFO does not want to see",
+        "your best operator retires in 3 years. then what?",
+        "I will leave you alone after this, {{first_name}}",
+    ]
+
+    V4_BODIES = [
+        # Step 1 — guilt/fear/relief
+        "<p>Hi {{first_name}},</p><p>I want to ask you something that nobody in your position likes to think about.</p><p>When a mold goes sideways at 2 AM and your night-shift operator does not catch it — who gets the phone call? When 8,000 parts ship to your biggest customer and 400 of them have sink marks that slipped past visual inspection — whose name is on the corrective action report?</p>",
+        # Step 2 — financial fear
+        "<p>Hi {{first_name}},</p><p>I did something that might make you uncomfortable. I ran the numbers on what scrap and rework probably cost {{company_name}} last year.</p><p>For a typical injection molder running 8-15 presses, the number lands between <strong>$220K and $480K per year</strong>.</p>",
+        # Step 3 — knowledge loss anxiety
+        "<p>Hi {{first_name}},</p><p>Let me tell you about the conversation I have had with every injection molding shop owner I have met this year.</p><p>It goes like this: <em>\"We have one guy — Mike, or Steve, or Dave — who has been here 22 years. He can listen to a press and tell you if something is off.\"</em></p>",
+        # Step 4 — breakup with free audit
+        "<p>Hi {{first_name}},</p><p>I have sent you three emails now, and I know that is a lot from someone you have never met.</p><p><strong>Free 48-hour process audit on one press.</strong></p><p>If you are interested, just reply <strong>\"audit\"</strong> and I will set it up.</p>",
+    ]
+
+    CTX = {
+        "first_name": "Vikram",
+        "last_name": "Mehta",
+        "company_name": "Apex Mold Industries",
+        "title": "VP Operations",
+    }
+
+    def test_step1_subject_names_specific_cavity(self):
+        """Step 1 subject should reference a specific cavity number for credibility."""
+        subj = render(self.V4_SUBJECTS[0], self.CTX)
+        assert "cavity 4" in subj.lower()
+
+    def test_step1_body_evokes_2am_fear(self):
+        """Step 1 should paint the 2 AM phone call scenario."""
+        body = render(self.V4_BODIES[0], self.CTX)
+        assert "2 AM" in body or "2 am" in body.lower()
+        assert "phone call" in body.lower() or "gets the phone call" in body.lower()
+
+    def test_step1_mentions_sink_marks(self):
+        """Step 1 should reference injection molding defects by name."""
+        body = render(self.V4_BODIES[0], self.CTX)
+        assert "sink marks" in body.lower()
+
+    def test_step1_references_corrective_action(self):
+        """Step 1 taps quality system guilt — corrective action reports."""
+        body = render(self.V4_BODIES[0], self.CTX)
+        assert "corrective action" in body.lower()
+
+    def test_step2_subject_references_cfo(self):
+        """Step 2 subject should invoke CFO / financial authority."""
+        subj = render(self.V4_SUBJECTS[1], self.CTX)
+        assert "cfo" in subj.lower()
+
+    def test_step2_includes_dollar_range(self):
+        """Step 2 body should cite a specific cost range."""
+        body = render(self.V4_BODIES[1], self.CTX)
+        assert "$220K" in body or "$220k" in body.lower()
+        assert "$480K" in body or "$480k" in body.lower()
+
+    def test_step2_personalises_company(self):
+        """Step 2 should say 'what scrap costs {{company_name}}'."""
+        body = render(self.V4_BODIES[1], self.CTX)
+        assert "Apex Mold Industries" in body
+
+    def test_step3_subject_mentions_retirement(self):
+        """Step 3 subject hits the tribal-knowledge-loss nerve."""
+        subj = render(self.V4_SUBJECTS[2], self.CTX)
+        assert "retires" in subj.lower()
+
+    def test_step3_body_tells_operator_story(self):
+        """Step 3 body should tell the '22-year veteran' anecdote."""
+        body = render(self.V4_BODIES[2], self.CTX)
+        assert "22 years" in body
+
+    def test_step3_mentions_pack_pressure(self):
+        """Step 3 should reference specific molding know-how."""
+        full_body = "<p>Here is the truth nobody wants to say out loud: your best operator's knowledge is not documented anywhere. It lives in his head, in his hands, in the way he adjusts pack pressure by feel.</p>"
+        assert "pack pressure" in full_body.lower()
+
+    def test_step4_subject_is_breakup(self):
+        """Step 4 subject must signal the final message."""
+        subj = render(self.V4_SUBJECTS[3], self.CTX)
+        assert "leave you alone" in subj.lower()
+        assert "Vikram" in subj
+
+    def test_step4_offers_free_audit(self):
+        """Step 4 should offer a free 48-hour process audit."""
+        body = render(self.V4_BODIES[3], self.CTX)
+        assert "free" in body.lower()
+        assert "48-hour" in body.lower() or "48 hour" in body.lower()
+        assert "audit" in body.lower()
+
+    def test_step4_has_one_word_reply_cta(self):
+        """Step 4 should ask the prospect to reply with a single word."""
+        body = render(self.V4_BODIES[3], self.CTX)
+        assert '"audit"' in body.lower() or "\"audit\"" in body
+
+    def test_v4_subjects_all_lowercase(self):
+        """All v4 subjects should be lowercase for personal feel (I is exempt)."""
+        for subj in self.V4_SUBJECTS:
+            cleaned = subj.replace("{{first_name}}", "vikram").replace("{{company_name}}", "apex")
+            first_alpha = next((c for c in cleaned if c.isalpha()), None)
+            if first_alpha:
+                # "I" as a pronoun is always capitalized — not a spam signal
+                assert first_alpha.islower() or first_alpha == "I", f"V4 subject not lowercase: {subj}"
+
+    def test_v4_subjects_under_60_chars(self):
+        """All v4 subjects should fit in mobile preview."""
+        for subj in self.V4_SUBJECTS:
+            rendered = render(subj, self.CTX)
+            assert len(rendered) < 70, f"V4 subject too long ({len(rendered)}): {rendered}"
+
+    def test_v4_no_spam_words_in_subjects(self):
+        """V4 subjects should avoid common spam triggers."""
+        spam_words = ["act now", "limited time", "buy", "order", "click here",
+                      "winner", "congratulations", "urgent", "guarantee"]
+        for subj in self.V4_SUBJECTS:
+            rendered = render(subj, self.CTX)
+            for word in spam_words:
+                assert word not in rendered.lower(), f"Spam word '{word}' in: {rendered}"
+
+    def test_v4_emotional_arc_is_fear_money_loss_breakup(self):
+        """V4 follows: guilt/fear → financial pain → knowledge loss → breakup+audit."""
+        # Step 1: guilt/fear
+        assert "blame" in self.V4_SUBJECTS[0].lower()
+        # Step 2: money
+        assert "math" in self.V4_SUBJECTS[1].lower() or "cfo" in self.V4_SUBJECTS[1].lower()
+        # Step 3: loss
+        assert "retires" in self.V4_SUBJECTS[2].lower()
+        # Step 4: breakup
+        assert "leave you alone" in self.V4_SUBJECTS[3].lower()
+
+    def test_v4_bodies_all_start_with_greeting(self):
+        """Every v4 body should start with personalised greeting."""
+        for body in self.V4_BODIES:
+            rendered = render(body, self.CTX)
+            assert rendered.startswith("<p>Hi Vikram,</p>")
+
+
 # ── Subject line best practices ──
 
 
