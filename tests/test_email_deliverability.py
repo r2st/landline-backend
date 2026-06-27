@@ -22,7 +22,12 @@ from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.services.email_compose import render
-from app.services.email_dispatch import wrap_html_email, _unsubscribe_footer_html
+from app.services.email_dispatch import (
+    wrap_html_email,
+    _unsubscribe_footer_html,
+    _html_to_plain_text,
+    _make_unsubscribe_url,
+)
 
 
 # ── Spam filter avoidance ──
@@ -589,3 +594,179 @@ class TestV4Deliverability:
         # Step 4 should have finality words
         step4 = self.V4_FULL_BODIES[3].lower()
         assert any(w in step4 for w in ["last", "leave you alone", "final", "honest"])
+
+
+# ── Anti-spam header and plain text tests ──
+
+
+class TestAntiSpamHeaders:
+    """Verify RFC 2369 List-Unsubscribe and RFC 8058 one-click headers."""
+
+    def test_list_unsubscribe_url_generated(self):
+        """Unsubscribe URL should be generated for any contact email."""
+        url = _make_unsubscribe_url("test@example.com")
+        assert url.startswith("https://")
+        assert "unsubscribe" in url
+        assert "token=" in url
+
+    def test_list_unsubscribe_url_unique_per_contact(self):
+        """Different contacts get different unsubscribe URLs."""
+        url1 = _make_unsubscribe_url("alice@example.com")
+        url2 = _make_unsubscribe_url("bob@example.com")
+        assert url1 != url2
+
+    def test_gmail_sender_accepts_list_unsubscribe_param(self):
+        """GmailSender.send_email should accept list_unsubscribe_url."""
+        import inspect
+        from app.services.gmail_sender import GmailSender
+        sig = inspect.signature(GmailSender.send_email)
+        assert "list_unsubscribe_url" in sig.parameters
+
+    def test_mime_includes_list_unsubscribe_header(self):
+        """MIME message should include List-Unsubscribe header when URL provided."""
+        import base64
+        from unittest.mock import MagicMock
+        from app.services.gmail_sender import GmailSender
+
+        account = MagicMock()
+        account.email = "sender@example.com"
+        account.display_name = "Test Sender"
+        sender = GmailSender(account)
+
+        unsub_url = "https://example.com/unsubscribe?token=abc123"
+        result = sender._build_mime(
+            to_email="prospect@example.com",
+            subject="test subject",
+            body_html="<p>Hello</p>",
+            body_text="Hello",
+            reply_to=None,
+            list_unsubscribe_url=unsub_url,
+        )
+        # Decode the raw MIME to verify headers
+        raw_bytes = base64.urlsafe_b64decode(result["raw"])
+        raw_str = raw_bytes.decode("utf-8")
+        assert "List-Unsubscribe:" in raw_str
+        assert unsub_url in raw_str
+        assert "List-Unsubscribe-Post: List-Unsubscribe=One-Click" in raw_str
+
+    def test_mime_threaded_includes_list_unsubscribe_header(self):
+        """Threaded MIME message should also include List-Unsubscribe header."""
+        import base64
+        from unittest.mock import MagicMock
+        from app.services.gmail_sender import GmailSender
+
+        account = MagicMock()
+        account.email = "sender@example.com"
+        account.display_name = "Test Sender"
+        sender = GmailSender(account)
+
+        unsub_url = "https://example.com/unsubscribe?token=abc123"
+        result = sender._build_mime_threaded(
+            to_email="prospect@example.com",
+            subject="Re: test subject",
+            body_html="<p>Follow up</p>",
+            body_text="Follow up",
+            reply_to=None,
+            in_reply_to="<msg123@mail.gmail.com>",
+            references="<msg123@mail.gmail.com>",
+            list_unsubscribe_url=unsub_url,
+        )
+        raw_bytes = base64.urlsafe_b64decode(result["raw"])
+        raw_str = raw_bytes.decode("utf-8")
+        assert "List-Unsubscribe:" in raw_str
+        assert "List-Unsubscribe-Post:" in raw_str
+
+    def test_no_list_unsubscribe_when_url_is_none(self):
+        """MIME should not include List-Unsubscribe when no URL provided."""
+        import base64
+        from unittest.mock import MagicMock
+        from app.services.gmail_sender import GmailSender
+
+        account = MagicMock()
+        account.email = "sender@example.com"
+        account.display_name = "Test Sender"
+        sender = GmailSender(account)
+
+        result = sender._build_mime(
+            to_email="prospect@example.com",
+            subject="test subject",
+            body_html="<p>Hello</p>",
+            body_text="Hello",
+            reply_to=None,
+            list_unsubscribe_url=None,
+        )
+        raw_bytes = base64.urlsafe_b64decode(result["raw"])
+        raw_str = raw_bytes.decode("utf-8")
+        assert "List-Unsubscribe:" not in raw_str
+
+
+class TestPlainTextGeneration:
+    """Verify HTML-to-plain-text conversion for the text/plain MIME part."""
+
+    def test_strips_html_tags(self):
+        """Plain text should contain no HTML tags."""
+        html = "<p>Hi <strong>Raj</strong>,</p><p>Check this out.</p>"
+        plain = _html_to_plain_text(html)
+        assert "<" not in plain
+        assert ">" not in plain
+
+    def test_preserves_readable_text(self):
+        """Core text content should survive conversion."""
+        html = "<p>Hi Raj,</p><p>Every injection molder I talk to has one.</p>"
+        plain = _html_to_plain_text(html)
+        assert "Hi Raj" in plain
+        assert "injection molder" in plain
+
+    def test_converts_links_to_text_with_url(self):
+        """Links should show both text and URL in plain text."""
+        html = '<p>See <a href="https://example.com/demo">the demo</a> here.</p>'
+        plain = _html_to_plain_text(html)
+        assert "the demo" in plain
+        assert "https://example.com/demo" in plain
+
+    def test_converts_br_to_newlines(self):
+        """<br> tags should become newlines."""
+        html = "Line one<br>Line two<br/>Line three"
+        plain = _html_to_plain_text(html)
+        assert "Line one\nLine two\nLine three" in plain
+
+    def test_converts_p_to_double_newlines(self):
+        """</p> should produce paragraph breaks."""
+        html = "<p>First paragraph.</p><p>Second paragraph.</p>"
+        plain = _html_to_plain_text(html)
+        assert "First paragraph." in plain
+        assert "Second paragraph." in plain
+        # Should have some separation
+        lines = plain.split("\n")
+        assert len(lines) >= 2
+
+    def test_decodes_html_entities(self):
+        """HTML entities like &middot; should be decoded."""
+        html = "<p>Apprend &middot; Toronto</p>"
+        plain = _html_to_plain_text(html)
+        assert "Apprend" in plain
+        assert "Toronto" in plain
+        assert "&middot;" not in plain
+
+    def test_no_excessive_whitespace(self):
+        """Converted text should not have runs of 3+ blank lines."""
+        html = "<p>One</p><p></p><p></p><p></p><p>Two</p>"
+        plain = _html_to_plain_text(html)
+        assert "\n\n\n" not in plain
+
+    def test_v6_body_produces_clean_plain_text(self):
+        """V6 email body should produce readable plain text with no HTML."""
+        v6_step1 = (
+            '<p>Hi Raj,</p><p>I know what keeps people in your position awake.</p>'
+            '<p>It is not the press going down — you can fix a press. It is the '
+            '<em>silent</em> failure.</p>'
+            '<p><a href="https://true-molding.pages.dev" '
+            'style="color:#2563eb;font-weight:bold;">'
+            'See how AI catches defects before they happen →</a></p>'
+        )
+        plain = _html_to_plain_text(v6_step1)
+        assert "<" not in plain
+        assert ">" not in plain or "→" in plain  # arrow char is OK
+        assert "Hi Raj" in plain
+        assert "true-molding.pages.dev" in plain
+        assert "silent" in plain

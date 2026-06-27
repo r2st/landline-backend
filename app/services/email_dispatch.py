@@ -11,6 +11,7 @@ same compliant body.
 """
 
 import asyncio
+import html as html_mod
 import logging
 import re
 import uuid
@@ -32,6 +33,43 @@ from app.services.gmail_sender import GmailSender
 from app.services.smtp_sender import SmtpSender
 
 logger = logging.getLogger(__name__)
+
+
+def _html_to_plain_text(html_body: str) -> str:
+    """Convert HTML email body to clean plain text.
+
+    Strips tags, converts common HTML elements to readable text equivalents,
+    and collapses excessive whitespace.  Used to generate the ``text/plain``
+    MIME alternative so that the plain-text part never contains raw HTML tags
+    — a well-known spam signal.
+    """
+    text = html_body
+
+    # Block-level breaks
+    text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</div>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<hr[^>]*>', '\n---\n', text, flags=re.IGNORECASE)
+
+    # Links: keep the text and URL
+    text = re.sub(
+        r'<a\s[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>',
+        r'\2 (\1)',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Strip all remaining tags
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # Decode HTML entities
+    text = html_mod.unescape(text)
+
+    # Collapse runs of whitespace (but preserve intentional double-newlines)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
 
 
 def _is_html(text: str) -> bool:
@@ -229,12 +267,17 @@ async def resolve_sender_info(
     )
 
 
-def _unsubscribe_footer_text(contact_email: str) -> str:
-    """Plain-text unsubscribe footer for the text/plain part."""
+def _make_unsubscribe_url(contact_email: str) -> str:
+    """Generate the signed unsubscribe URL for a contact."""
     settings = get_settings()
     serializer = URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
     token = serializer.dumps(contact_email, salt="unsubscribe")
-    unsubscribe_url = f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
+    return f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
+
+
+def _unsubscribe_footer_text(contact_email: str) -> str:
+    """Plain-text unsubscribe footer for the text/plain part."""
+    unsubscribe_url = _make_unsubscribe_url(contact_email)
     return (
         "\n\n—\n"
         "Apprend Technologies\n"
@@ -246,10 +289,7 @@ def _unsubscribe_footer_text(contact_email: str) -> str:
 
 def _unsubscribe_footer_html(contact_email: str) -> str:
     """HTML unsubscribe footer with proper inline styles."""
-    settings = get_settings()
-    serializer = URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
-    token = serializer.dumps(contact_email, salt="unsubscribe")
-    unsubscribe_url = f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
+    unsubscribe_url = _make_unsubscribe_url(contact_email)
     return (
         '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0 12px 0">'
         '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
@@ -308,11 +348,17 @@ async def send_outreach_email(
     if signature is not None and signature.content_html:
         body_html = body_html + "<br><br>" + signature.content_html
 
+    # Build the unsubscribe URL once — used for both footer and headers
+    unsubscribe_url = None
     if include_unsubscribe:
+        unsubscribe_url = _make_unsubscribe_url(to_email)
         footer_html = _unsubscribe_footer_html(to_email)
         body_html = body_html + footer_html
-        if body_text:
-            body_text = body_text + _unsubscribe_footer_text(to_email)
+
+    # Auto-generate clean plain text from HTML (never send HTML in text/plain)
+    body_text = _html_to_plain_text(body_html)
+    if include_unsubscribe:
+        body_text = body_text + _unsubscribe_footer_text(to_email)
 
     # Wrap in a complete HTML email document with inline styles
     body_html = wrap_html_email(body_html)
@@ -329,6 +375,7 @@ async def send_outreach_email(
             thread_id=thread_id,
             in_reply_to=in_reply_to,
             references=references,
+            list_unsubscribe_url=unsubscribe_url,
         )
         # Capture the sender email and account id for thread tracking
         result["from_email"] = account.email

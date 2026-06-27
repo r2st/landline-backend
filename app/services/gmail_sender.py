@@ -75,6 +75,7 @@ class GmailSender:
         body_html: str,
         body_text: Optional[str],
         reply_to: Optional[str],
+        list_unsubscribe_url: Optional[str] = None,
     ) -> dict:
         message = MIMEMultipart("alternative")
         message["To"] = to_email
@@ -82,6 +83,11 @@ class GmailSender:
         message["Subject"] = subject
         if reply_to:
             message["Reply-To"] = reply_to
+        # RFC 2369 List-Unsubscribe + RFC 8058 one-click unsubscribe
+        # Gmail requires these headers for bulk senders since June 2024
+        if list_unsubscribe_url:
+            message["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
+            message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
         if body_text:
             message.attach(MIMEText(body_text, "plain", "utf-8"))
         message.attach(MIMEText(body_html, "html", "utf-8"))
@@ -98,6 +104,7 @@ class GmailSender:
         thread_id: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> dict:
         """Send a single email. Mirrors EmailSender.send_email's return shape.
 
@@ -107,7 +114,10 @@ class GmailSender:
         try:
             creds = self._credentials()
             service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-            body = self._build_mime(to_email, subject, body_html, body_text, reply_to)
+            body = self._build_mime(
+                to_email, subject, body_html, body_text, reply_to,
+                list_unsubscribe_url=list_unsubscribe_url,
+            )
 
             # Add threading headers for replies
             if in_reply_to or references:
@@ -115,6 +125,7 @@ class GmailSender:
                 body = self._build_mime_threaded(
                     to_email, subject, body_html, body_text, reply_to,
                     in_reply_to=in_reply_to, references=references,
+                    list_unsubscribe_url=list_unsubscribe_url,
                 )
 
             # Attach threadId so Gmail groups the message into the right thread
@@ -153,6 +164,7 @@ class GmailSender:
         reply_to: Optional[str],
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> dict:
         """Build MIME message with In-Reply-To and References headers for threading."""
         message = MIMEMultipart("alternative")
@@ -165,6 +177,10 @@ class GmailSender:
             message["In-Reply-To"] = in_reply_to
         if references:
             message["References"] = references
+        # RFC 2369 List-Unsubscribe + RFC 8058 one-click unsubscribe
+        if list_unsubscribe_url:
+            message["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
+            message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
         if body_text:
             message.attach(MIMEText(body_text, "plain", "utf-8"))
         message.attach(MIMEText(body_html, "html", "utf-8"))

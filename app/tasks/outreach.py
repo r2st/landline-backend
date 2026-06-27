@@ -197,7 +197,6 @@ def send_sequence_step(self, enrollment_id: str):
                     to_email=contact.email,
                     subject=subject,
                     body_html=body,
-                    body_text=body,
                     sender_account_id=send_account_id,
                     thread_id=thread_id,
                     in_reply_to=in_reply_to,
