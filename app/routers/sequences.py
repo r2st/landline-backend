@@ -8,21 +8,31 @@ frontend's sequence picker and "enroll selected contacts" action call.
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models.company import Company
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.schemas.outreach import (
     EnrollBatchRequest,
     EnrollBatchResult,
+    EnrollByIndustryRequest,
     EnrollSkip,
+    IndustryVerticalRead,
     SequenceStatusUpdate,
     SequenceWithCounts,
+    SuggestIndustryResult,
+)
+from app.services.industry_verticals import (
+    all_verticals,
+    get_vertical,
+    resolve_vertical,
 )
 from app.services.send_limiter import get_send_limiter
 
@@ -77,6 +87,7 @@ async def list_sequences_with_counts(
             id=s.id,
             name=s.name,
             description=s.description,
+            industry=s.industry,
             is_active=s.is_active,
             status=s.status,
             created_at=s.created_at,
@@ -88,30 +99,22 @@ async def list_sequences_with_counts(
     ]
 
 
-@router.post("/{sequence_id}/enroll", response_model=EnrollBatchResult)
-async def enroll_contacts(
-    sequence_id: uuid.UUID,
-    payload: EnrollBatchRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """Enroll a batch of contacts into a sequence.
+async def _enroll_into_sequence(
+    db: AsyncSession,
+    sequence: OutreachSequence,
+    contact_ids: list[uuid.UUID],
+) -> EnrollBatchResult:
+    """Enroll a batch of contacts into an already-resolved, active sequence.
 
     Each contact is validated individually; contacts that can't be enrolled
-    (missing, no email, already actively enrolled) are reported in ``skipped``
-    rather than failing the whole batch.
+    (missing, no email, unsubscribed, already actively enrolled) are reported in
+    ``skipped`` rather than failing the whole batch. Shared by the enroll and
+    enroll-by-industry endpoints.
     """
-    sequence = (
-        await db.execute(
-            select(OutreachSequence).where(OutreachSequence.id == sequence_id)
-        )
-    ).scalar_one_or_none()
-    if not sequence:
-        raise HTTPException(status_code=404, detail="Sequence not found")
-    if not sequence.is_active:
-        raise HTTPException(status_code=400, detail="Sequence is not active")
+    sequence_id = sequence.id
 
     # De-duplicate requested ids while preserving order.
-    requested: list[uuid.UUID] = list(dict.fromkeys(payload.contact_ids))
+    requested: list[uuid.UUID] = list(dict.fromkeys(contact_ids))
 
     contacts = {
         c.id: c
@@ -182,6 +185,133 @@ async def enroll_contacts(
     )
 
 
+@router.post("/{sequence_id}/enroll", response_model=EnrollBatchResult)
+async def enroll_contacts(
+    sequence_id: uuid.UUID,
+    payload: EnrollBatchRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Enroll a batch of contacts into a sequence by id."""
+    sequence = (
+        await db.execute(
+            select(OutreachSequence).where(OutreachSequence.id == sequence_id)
+        )
+    ).scalar_one_or_none()
+    if not sequence:
+        raise HTTPException(status_code=404, detail="Sequence not found")
+    if not sequence.is_active:
+        raise HTTPException(status_code=400, detail="Sequence is not active")
+    return await _enroll_into_sequence(db, sequence, payload.contact_ids)
+
+
+# ── Industry verticals ──────────────────────────────────────────────────────
+
+
+async def _vertical_sequence_ids(db: AsyncSession) -> dict[str, OutreachSequence]:
+    """Map each seeded sequence by its industry key (most-recently-created wins)."""
+    rows = (
+        await db.execute(
+            select(OutreachSequence)
+            .where(OutreachSequence.industry.isnot(None))
+            .order_by(OutreachSequence.created_at.asc())
+        )
+    ).scalars().all()
+    return {s.industry: s for s in rows}
+
+
+@router.get("/industries", response_model=list[IndustryVerticalRead])
+async def list_industries(db: AsyncSession = Depends(get_db)):
+    """List supported industry verticals and their seeded sequences.
+
+    Powers the industry picker: each entry carries the vertical's pain-point
+    language, demo link, and the id of the sequence to enroll contacts into.
+    """
+    seq_by_industry = await _vertical_sequence_ids(db)
+    result = []
+    for v in all_verticals():
+        seq = seq_by_industry.get(v.key)
+        result.append(
+            IndustryVerticalRead(
+                key=v.key,
+                name=v.name,
+                description=v.description,
+                demo_link=v.demo_link,
+                pain_points=list(v.pain_points),
+                keywords=list(v.keywords),
+                step_count=len(v.steps),
+                sequence_id=seq.id if seq else None,
+                sequence_name=v.sequence_name,
+            )
+        )
+    return result
+
+
+@router.post("/enroll-by-industry", response_model=EnrollBatchResult)
+async def enroll_by_industry(
+    payload: EnrollByIndustryRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Enroll contacts into the sequence for a given industry vertical.
+
+    Resolves the industry key to its seeded sequence, then enrolls — so callers
+    pick an industry instead of needing to know sequence ids.
+    """
+    vertical = get_vertical(payload.industry)
+    if vertical is None:
+        known = ", ".join(v.key for v in all_verticals())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown industry '{payload.industry}'. Known: {known}",
+        )
+    seq_by_industry = await _vertical_sequence_ids(db)
+    sequence = seq_by_industry.get(vertical.key)
+    if sequence is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No seeded sequence for industry '{vertical.key}' yet — run migrations",
+        )
+    if not sequence.is_active:
+        raise HTTPException(status_code=400, detail="Sequence is not active")
+    return await _enroll_into_sequence(db, sequence, payload.contact_ids)
+
+
+@router.get("/suggest-industry", response_model=SuggestIndustryResult)
+async def suggest_industry(
+    company_id: Optional[uuid.UUID] = Query(None, description="Resolve from this company"),
+    industry: Optional[str] = Query(None, description="Or pass raw industry text"),
+    company_name: Optional[str] = Query(None, description="Optional company name hint"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Suggest the best industry vertical (and its sequence) for a company.
+
+    Pass a ``company_id`` to resolve from its stored industry/name, or pass raw
+    ``industry``/``company_name`` text directly. Used to auto-select the right
+    templates when enrolling a contact.
+    """
+    if company_id is not None:
+        company = (
+            await db.execute(select(Company).where(Company.id == company_id))
+        ).scalar_one_or_none()
+        if company is None:
+            raise HTTPException(status_code=404, detail="Company not found")
+        industry = industry or company.industry_segment or ""
+        company_name = company_name or company.name or ""
+
+    vertical = resolve_vertical(industry or "", company_name or "")
+    if vertical is None:
+        return SuggestIndustryResult(matched=False)
+
+    seq = (await _vertical_sequence_ids(db)).get(vertical.key)
+    return SuggestIndustryResult(
+        industry=vertical.key,
+        name=vertical.name,
+        matched=True,
+        sequence_id=seq.id if seq else None,
+        sequence_name=vertical.sequence_name,
+        demo_link=vertical.demo_link,
+    )
+
+
 @router.patch("/{sequence_id}/status", response_model=SequenceWithCounts)
 async def update_sequence_status(
     sequence_id: uuid.UUID,
@@ -212,6 +342,7 @@ async def update_sequence_status(
         id=sequence.id,
         name=sequence.name,
         description=sequence.description,
+        industry=sequence.industry,
         is_active=sequence.is_active,
         status=sequence.status,
         created_at=sequence.created_at,

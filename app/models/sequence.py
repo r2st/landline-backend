@@ -24,6 +24,9 @@ class OutreachSequence(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
+    # Industry vertical key (see app.services.industry_verticals), e.g.
+    # "injection_molding". NULL for general/custom sequences.
+    industry: Mapped[str | None] = mapped_column(String(80))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(

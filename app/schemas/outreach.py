@@ -57,6 +57,7 @@ class SequenceWithCounts(BaseModel):
     id: uuid.UUID
     name: str
     description: Optional[str] = None
+    industry: Optional[str] = None
     is_active: bool
     status: str = "active"
     created_at: datetime
@@ -67,6 +68,38 @@ class SequenceWithCounts(BaseModel):
 
 class SequenceStatusUpdate(BaseModel):
     status: str = Field(..., pattern="^(active|paused)$")
+
+
+# --- Industry verticals ---
+
+class IndustryVerticalRead(BaseModel):
+    """An industry vertical for the picker: copy metadata + the seeded sequence."""
+
+    key: str
+    name: str
+    description: str
+    demo_link: str
+    pain_points: list[str]
+    keywords: list[str]
+    step_count: int
+    sequence_id: Optional[uuid.UUID] = None  # None until seeded
+    sequence_name: str
+
+
+class EnrollByIndustryRequest(BaseModel):
+    industry: str = Field(..., description="Industry vertical key, e.g. 'cnc_machining'")
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1)
+
+
+class SuggestIndustryResult(BaseModel):
+    """Suggested vertical for a company/contact, with the resolved sequence."""
+
+    industry: Optional[str] = None       # None when nothing matched a vertical
+    name: Optional[str] = None
+    matched: bool
+    sequence_id: Optional[uuid.UUID] = None
+    sequence_name: Optional[str] = None
+    demo_link: Optional[str] = None
 
 
 # --- Batch enrollment ---

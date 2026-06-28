@@ -26,6 +26,22 @@ Merge fields available (rendered by app.services.email_compose.render):
 
 from __future__ import annotations
 
+# Vertical metadata (consumed by app.services.industry_verticals).
+INDUSTRY_KEY = "injection_molding"
+INDUSTRY_NAME = "Plastic Injection Molding"
+DEMO_LINK = "https://true-molding.pages.dev"
+# Substrings matched (case-insensitive) against a company's industry/name to
+# auto-route it to this vertical.
+KEYWORDS = (
+    "injection molding", "injection mold", "injection moulding", "molding",
+    "moulding", "molder", "plastic", "polymer", "resin", "thermoplastic",
+)
+PAIN_POINTS = (
+    "short shots", "flash", "sink marks", "warpage", "core-pin wear",
+    "check-ring wear", "cavity-to-cavity variation", "scrap and rework",
+    "PPAP rejections", "the retiring veteran operator",
+)
+
 SEQUENCE_NAME = "Plastic Injection Molding — Deal Cracker"
 SEQUENCE_DESCRIPTION = (
     "4-step emotionally-targeted cold sequence for plastic injection molders. "
