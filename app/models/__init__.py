@@ -20,6 +20,7 @@ from app.models.client_health import ClientHealthSnapshot
 from app.models.email_reply import EmailReply
 from app.models.email_signature import EmailSignature
 from app.models.knowledge import IndustryContact, KnowledgeDocument
+from app.models.call import CallTask, CallScript, CallNotification
 
 __all__ = [
     "Company",
@@ -46,4 +47,7 @@ __all__ = [
     "EmailReply",
     "IndustryContact",
     "KnowledgeDocument",
+    "CallTask",
+    "CallScript",
+    "CallNotification",
 ]

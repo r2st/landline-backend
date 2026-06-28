@@ -1,6 +1,7 @@
 """Celery application configuration."""
 
 from celery import Celery
+from celery.schedules import crontab
 
 from app.config import get_settings
 
@@ -30,6 +31,7 @@ celery_app.conf.update(
         "app.tasks.outreach.*": {"queue": "outreach"},
         "app.tasks.news.*": {"queue": "enrichment"},
         "app.tasks.followups.*": {"queue": "enrichment"},
+        "app.tasks.calls.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -64,6 +66,27 @@ celery_app.conf.update(
             "task": "app.tasks.outreach.sync_email_replies",
             "schedule": 300.0,  # every 5 minutes
         },
+        # --- Cold-call notification system ---
+        "generate-morning-call-queue": {
+            "task": "app.tasks.calls.generate_morning_call_queue",
+            "schedule": crontab(hour=8, minute=0),  # daily at 8 AM UTC
+        },
+        "send-precall-reminders": {
+            "task": "app.tasks.calls.send_precall_reminders",
+            "schedule": 300.0,  # every 5 minutes (15-min look-ahead window)
+        },
+        "send-call-followup-reminders": {
+            "task": "app.tasks.calls.send_followup_reminders",
+            "schedule": 900.0,  # every 15 minutes
+        },
+        "detect-hot-leads": {
+            "task": "app.tasks.calls.detect_hot_leads",
+            "schedule": 1800.0,  # every 30 minutes
+        },
+        "flag-missed-calls": {
+            "task": "app.tasks.calls.flag_missed_calls",
+            "schedule": crontab(hour=18, minute=0),  # end of day, 6 PM UTC
+        },
     },
 )
 
@@ -76,3 +99,4 @@ import app.tasks.news  # noqa: F401
 import app.tasks.scraping  # noqa: F401
 import app.tasks.enrichment  # noqa: F401
 import app.tasks.followups  # noqa: F401
+import app.tasks.calls  # noqa: F401
