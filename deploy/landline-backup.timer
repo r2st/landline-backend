@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Landline PostgreSQL backup daily at 02:00 UTC
+
+[Timer]
+# 02:00 UTC every day. Persistent=true runs a missed backup after downtime.
+OnCalendar=*-*-* 02:00:00 UTC
+Persistent=true
+Unit=landline-backup.service
+
+[Install]
+WantedBy=timers.target

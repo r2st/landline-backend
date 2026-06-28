@@ -1,0 +1,14 @@
+[Unit]
+Description=Landline PostgreSQL backup to S3
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/landline
+# Backup settings; override the bucket here if it ever changes.
+Environment=LANDLINE_DIR=/opt/landline
+Environment=COMPOSE_FILE=docker-compose.prod.yml
+Environment=LANDLINE_BACKUP_BUCKET=landline-backups-235494810658
+ExecStart=/opt/landline/deploy/backup-db.sh
+# AWS creds come from the EC2 instance role; no static keys needed.

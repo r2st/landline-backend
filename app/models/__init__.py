@@ -19,6 +19,7 @@ from app.models.task import Task
 from app.models.client_health import ClientHealthSnapshot
 from app.models.email_reply import EmailReply
 from app.models.email_signature import EmailSignature
+from app.models.knowledge import IndustryContact, KnowledgeDocument
 
 __all__ = [
     "Company",
@@ -43,4 +44,6 @@ __all__ = [
     "ClientHealthSnapshot",
     "EmailSignature",
     "EmailReply",
+    "IndustryContact",
+    "KnowledgeDocument",
 ]
