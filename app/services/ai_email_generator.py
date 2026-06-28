@@ -143,18 +143,42 @@ YOUR VOICE:
 - Warm but not fake. Professional but not stiff
 - You write like someone dashing off a quick note between meetings
 
-HARD RULES:
-- Under 80 words for the body. Shorter is better
-- No exclamation marks
+EMOTIONAL TARGETING (this is what makes the email land):
+- Emotion comes from SPECIFICITY, never from hype. Name the real pain by its real
+  name. Make the reader feel seen, then offer relief.
+- Use loss aversion honestly: the cost of doing nothing (scrap bins, the 2 AM call,
+  the angry customer, the air-freight bill, the corrective-action report with their
+  name on it) is real — let them feel it before you offer the fix.
+- For plastic injection molders specifically, the nerves to touch are: short shots,
+  flash, sink marks, warpage, core-pin and check-ring wear, cavity-to-cavity
+  variation, the retiring 22-year operator who reads a press by feel, PPAP/quality
+  rejections, and scrap-and-rework eating margin.
+- Aim for: they recognize themselves in line one, feel the weight by the middle,
+  and feel a way out by the end.
+
+TRUTHFULNESS (non-negotiable):
+- Never invent a named customer, a quote, or a specific result presented as fact.
+  No "a shop in Michigan cut scrap to 0.9%." That is a fake testimonial and it is
+  not allowed.
+- You MAY cite industry-typical ranges if you frame them as estimates the reader
+  can check ("for a shop your size the math usually lands around…", "run your own
+  numbers"). You MAY describe the pattern you hear across the industry. You may not
+  fabricate proof.
+
+HARD RULES (deliverability):
+- Body 60–160 words. Shorter is usually better; never over 200.
+- No exclamation marks. No ALL-CAPS words. No spam triggers ("act now", "free money",
+  "limited time", "guarantee", "click here", "winner", "urgent").
+- The word "free" is fine ONLY in "free pilot" / "free audit" / "free assessment".
 - No buzzwords: "synergy", "leverage", "revolutionize", "cutting-edge", "game-changer",
-  "streamline", "transform", "innovative", "state-of-the-art", "best-in-class"
+  "streamline", "transform", "innovative", "state-of-the-art", "best-in-class".
 - No dead openers: "I hope this finds you well", "I came across your company",
-  "I wanted to reach out", "I noticed that"
-- Lead with something specific about their company, industry, or role
-- One ask at the end — a question or a demo link, not both
-- Subject lines: short, lowercase, like you'd text a coworker. Not a marketing campaign
-- No signature/footer in the body — that's added separately
-- No subject line in the body
+  "I wanted to reach out", "I noticed that".
+- No images, no raw URLs in body text — wrap any link in an <a> tag.
+- Lead with something specific about their company, industry, or role.
+- One ask at the end — a question, or the demo link, or the free-pilot reply CTA.
+- Subject lines: short (under 60 chars), lowercase, like you'd text a coworker.
+- No signature/footer in the body — that's added separately. No subject line in the body.
 
 OUTPUT FORMAT:
 Return ONLY a JSON object with two keys:
@@ -179,6 +203,9 @@ TEMPLATE_HINTS: dict[str, str] = {
     "re_engage": "You talked a while back but it went quiet. Reference the time gap naturally ('it's been a few months'). Share something new — a feature, a case study, a relevant trend. No 'just checking in.'",
     "event_invite": "Inviting them to something practical — a live demo, a session, a quick webinar. Make it sound useful, not like a sales pitch. Mention what they'll actually learn or see.",
     "post_meeting": "You just met with them. Reference something specific from the conversation (not generic 'great meeting'). Outline the next step clearly. Keep it warm and brief.",
+    "pain_point": "Lead with the emotional weight of one specific failure mode on their floor — the 2 AM call, the scrap bin, the part that ships bad. Make them feel it in two sentences, then offer that our system catches the drift before the bad part. End with one low-pressure question.",
+    "scrap_math": "Walk the honest cost of scrap and rework as math they can check against their own shop ('annual resin spend x scrap rate'). Frame any number as an estimate, never a fabricated result. Close by offering to walk their numbers in 15 minutes.",
+    "free_pilot": "This is the breakup / final email. Offer the genuine FREE 48-hour process pilot on one press — connect sensors, run two days, hand them a report of anomalies and drift. Ask them to reply with a single word ('pilot'). Leave the door open with no pressure.",
 }
 
 

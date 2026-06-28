@@ -289,6 +289,14 @@ def process_outreach_queue():
             enrollments = list(result.scalars().all())
             dispatched = 0
 
+            # Anti-spam: don't send outside business hours / on weekends. Cold
+            # mail that lands at 3 AM reads as a bot and tanks reply rates.
+            limiter = get_send_limiter()
+            in_window, window_reason = limiter.within_send_window()
+            if not in_window:
+                logger.info("Skipping outreach queue: %s", window_reason)
+                return {"active_enrollments": len(enrollments), "dispatched": 0, "reason": window_reason}
+
             now = datetime.now(timezone.utc)
             for enrollment in enrollments:
                 # Fast path: if next_send_at is set, use it directly
@@ -341,8 +349,6 @@ def process_outreach_queue():
                             continue
 
                 # --- Anti-spam checks ---
-                limiter = get_send_limiter()
-
                 # Check daily limit — if hit, stop processing entirely
                 can_send, reason = await limiter.can_send_today(db)
                 if not can_send:

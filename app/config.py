@@ -64,6 +64,20 @@ class Settings(BaseSettings):
 
     # Secret key for signing tokens (unsubscribe links, etc.)
     secret_key: str = ""
+    # Mailbox that receives RFC 2369 mailto: unsubscribe requests. When set, it is
+    # added to the List-Unsubscribe header alongside the one-click https URL —
+    # Gmail/Yahoo bulk-sender guidelines recommend offering both methods. Leave
+    # empty to use the sending account's own (monitored, reply-synced) address;
+    # only set this to a mailbox that can actually receive mail (has MX records).
+    unsubscribe_mailto: str = ""
+    # Only send during these hours (sender-local) on weekdays — outreach that lands
+    # at 3 AM reads as a bot and hurts reply rates. 24h clock; set send_window_enabled
+    # False to send around the clock.
+    send_window_enabled: bool = True
+    send_window_start_hour: int = 8       # inclusive, e.g. 8 = 8:00am
+    send_window_end_hour: int = 18        # exclusive, e.g. 18 = 6:00pm
+    send_window_timezone: str = "America/Toronto"
+    send_window_weekdays_only: bool = True
     notification_email: str = ""
     log_level: str = "INFO"
     api_prefix: str = "/api/v1"

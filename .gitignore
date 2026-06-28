@@ -11,6 +11,8 @@ build/
 # Virtual environments
 .env
 .venv/
+.venv-test/
+.venv-test2/
 venv/
 
 # Alembic

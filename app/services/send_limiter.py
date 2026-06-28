@@ -55,6 +55,36 @@ class SendLimiter:
 
         return True, "OK"
 
+    def within_send_window(self) -> tuple[bool, str]:
+        """Whether the current time is inside the configured send window.
+
+        Cold email that arrives at 3 AM (or Sunday) reads as a bot and depresses
+        reply rates. We restrict sends to business hours on weekdays in the
+        configured timezone. Returns (allowed, reason).
+        """
+        if not self.settings.send_window_enabled:
+            return True, "send window disabled"
+
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(self.settings.send_window_timezone)
+        except Exception:
+            # Unknown tz name → fail open rather than block all sending.
+            return True, "send window tz unavailable"
+
+        now_local = datetime.now(tz)
+        if self.settings.send_window_weekdays_only and now_local.weekday() >= 5:
+            return False, f"outside send window (weekend, {now_local:%a %H:%M} {self.settings.send_window_timezone})"
+
+        start = self.settings.send_window_start_hour
+        end = self.settings.send_window_end_hour
+        if not (start <= now_local.hour < end):
+            return False, (
+                f"outside send window ({now_local:%H:%M} not in "
+                f"{start:02d}:00–{end:02d}:00 {self.settings.send_window_timezone})"
+            )
+        return True, f"within send window ({now_local:%a %H:%M})"
+
     async def can_send_today(self, db: AsyncSession) -> tuple[bool, str]:
         """Check if we have hit the daily sending limit."""
         now = datetime.now(timezone.utc)

@@ -37,6 +37,28 @@ _SEND_SCOPES = [
 ]
 
 
+def _apply_unsubscribe_headers(
+    message, list_unsubscribe_url: Optional[str], sender_email: Optional[str] = None
+) -> None:
+    """Add RFC 2369 List-Unsubscribe + RFC 8058 one-click headers.
+
+    Offers both a one-click https URL and a mailto: address — Gmail/Yahoo
+    bulk-sender guidelines since June 2024 recommend supporting both so mailbox
+    providers can present a native "unsubscribe" affordance. The mailto defaults
+    to the sending account's own address (a real, monitored, reply-synced
+    mailbox) unless ``unsubscribe_mailto`` is explicitly configured.
+    """
+    if not list_unsubscribe_url:
+        return
+    methods = []
+    mailto = get_settings().unsubscribe_mailto or sender_email
+    if mailto:
+        methods.append(f"<mailto:{mailto}?subject=unsubscribe>")
+    methods.append(f"<{list_unsubscribe_url}>")
+    message["List-Unsubscribe"] = ", ".join(methods)
+    message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+
+
 class GmailSender:
     """Sends email through the Gmail API for a single connected account.
 
@@ -83,11 +105,7 @@ class GmailSender:
         message["Subject"] = subject
         if reply_to:
             message["Reply-To"] = reply_to
-        # RFC 2369 List-Unsubscribe + RFC 8058 one-click unsubscribe
-        # Gmail requires these headers for bulk senders since June 2024
-        if list_unsubscribe_url:
-            message["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
-            message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
         if body_text:
             message.attach(MIMEText(body_text, "plain", "utf-8"))
         message.attach(MIMEText(body_html, "html", "utf-8"))
@@ -177,10 +195,7 @@ class GmailSender:
             message["In-Reply-To"] = in_reply_to
         if references:
             message["References"] = references
-        # RFC 2369 List-Unsubscribe + RFC 8058 one-click unsubscribe
-        if list_unsubscribe_url:
-            message["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
-            message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
         if body_text:
             message.attach(MIMEText(body_text, "plain", "utf-8"))
         message.attach(MIMEText(body_html, "html", "utf-8"))
