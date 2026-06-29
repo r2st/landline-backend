@@ -201,3 +201,58 @@ class CallBriefing(BaseModel):
     talking_points: list[str] = Field(default_factory=list)
     recent_interactions: list[dict] = Field(default_factory=list)
     script: Optional[CallScriptRead] = None
+
+
+# --------------------------------------------------------------------------- #
+# AI-generated custom scripts
+# --------------------------------------------------------------------------- #
+
+# Call types accepted by the generate endpoint. Aliases map onto the canonical
+# call_scripts ``script_type`` values.
+CUSTOM_SCRIPT_CALL_TYPES = ("initial", "follow_up", "voicemail")
+
+
+class CustomScriptRequest(BaseModel):
+    contact_id: Optional[uuid.UUID] = None
+    company_id: uuid.UUID
+    call_type: str = "initial"
+    # Optional: cache the generated script onto a specific open call task.
+    call_task_id: Optional[uuid.UUID] = None
+    # Force a fresh generation even if a cached script already exists.
+    force: bool = False
+
+    @field_validator("call_type")
+    @classmethod
+    def _vct(cls, v):
+        return _check(v, CUSTOM_SCRIPT_CALL_TYPES, "call_type")
+
+
+class CustomScript(BaseModel):
+    """The structured, personalised script the AI produces for one call."""
+
+    opening_hook: str
+    personalization_notes: Optional[str] = None
+    talking_points: list[str] = Field(default_factory=list)
+    qualifying_questions: list[str] = Field(default_factory=list)
+    pain_points: list[str] = Field(default_factory=list)
+    objection_handling: list[dict] = Field(default_factory=list)
+    call_to_action: Optional[str] = None
+    voicemail: Optional[str] = None
+
+
+class CustomScriptResponse(BaseModel):
+    call_task_id: Optional[uuid.UUID] = None
+    company_id: uuid.UUID
+    company_name: Optional[str] = None
+    contact_id: Optional[uuid.UUID] = None
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    industry: str
+    call_type: str
+    # "ai" when Claude generated it, "template" when we fell back to the
+    # canonical industry script (no API key, or generation failed/timed out).
+    source: str
+    ai_available: bool = True
+    note: Optional[str] = None
+    generated_at: Optional[datetime] = None
+    script: CustomScript

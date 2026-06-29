@@ -76,6 +76,13 @@ async def _existing_notification_task_ids(db, notification_type: str, task_ids: 
 async def generate_morning_call_queue_for_session(db, limit: int = 25) -> dict:
     """Build the day's prioritised call queue and announce it."""
     result = await generate_call_queue_for_session(db, limit=limit)
+    # Pre-warm AI custom scripts for the day's hot/warm leads so the rep's
+    # briefing has a personalised script ready before they start dialling.
+    try:
+        from app.services import ai_script_generator
+        await ai_script_generator.pregenerate_for_tasks(db, result["tasks"])
+    except Exception as e:  # noqa: BLE001 - never fail the morning queue
+        logger.warning("Pre-generating morning call scripts failed: %s", e)
     if result["generated"]:
         db.add(
             CallNotification(

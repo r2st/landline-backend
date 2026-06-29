@@ -35,10 +35,12 @@ from app.schemas.call import (
     CallTaskCreate,
     CallTaskRead,
     CallTaskUpdate,
+    CustomScriptRequest,
+    CustomScriptResponse,
     QueueGenerateRequest,
     QueueGenerateResponse,
 )
-from app.services import call_scripts_data
+from app.services import ai_script_generator, call_scripts_data
 from app.services.call_briefing import build_briefing
 from app.services.call_queue import generate_call_queue_for_session
 
@@ -237,6 +239,29 @@ async def call_task_briefing(
     return await build_briefing(db, call_task=task, script_type=script_type)
 
 
+@router.get("/tasks/{task_id}/custom-script", response_model=CustomScriptResponse)
+async def get_task_custom_script(
+    task_id: uuid.UUID,
+    call_type: str = Query("initial", pattern="^(initial|follow_up|voicemail)$"),
+    regenerate: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the AI-generated custom script for a call task.
+
+    Returns the cached script if one was already generated; otherwise generates
+    one on the fly and caches it on the task. Pass ``regenerate=true`` to force a
+    fresh generation. Falls back to the industry template when AI is unavailable.
+    """
+    task = (
+        await db.execute(select(CallTask).where(CallTask.id == task_id))
+    ).scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="Call task not found")
+    return await ai_script_generator.get_or_generate_for_task(
+        db, task, call_type=call_type, force=regenerate
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Call scripts
 # --------------------------------------------------------------------------- #
@@ -294,6 +319,60 @@ async def get_script_for_industry(
     if tpl is None:
         raise HTTPException(status_code=404, detail="No script for that industry")
     return CallScriptRead(**tpl.as_row())
+
+
+@router.post("/scripts/generate", response_model=CustomScriptResponse)
+async def generate_custom_script(
+    payload: CustomScriptRequest, db: AsyncSession = Depends(get_db)
+):
+    """Generate a personalised AI cold-call script for a specific contact/company.
+
+    Validates the company (and contact, if given), then generates a custom script
+    tailored to the lead's industry, the contact's role, email engagement, and
+    any recent company news. If a ``call_task_id`` is supplied — or an open call
+    task exists for the contact — the script is cached on that task so the rep's
+    briefing doesn't regenerate it on every load. Falls back to the industry
+    template when AI is unavailable.
+    """
+    await _validate_refs(db, payload.company_id, payload.contact_id)
+
+    # Prefer caching onto a call task when we can find one.
+    task = None
+    if payload.call_task_id is not None:
+        task = (
+            await db.execute(select(CallTask).where(CallTask.id == payload.call_task_id))
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=404, detail="Call task not found")
+    elif payload.contact_id is not None:
+        task = (
+            await db.execute(
+                select(CallTask)
+                .where(
+                    CallTask.contact_id == payload.contact_id,
+                    CallTask.status.in_(_OPEN_CALL_STATUSES),
+                )
+                .order_by(CallTask.created_at.desc())
+            )
+        ).scalars().first()
+
+    if task is not None:
+        # Treat the explicit generate endpoint as a (re)generate action.
+        return await ai_script_generator.get_or_generate_for_task(
+            db, task, call_type=payload.call_type, force=True
+        )
+
+    company = (
+        await db.execute(select(Company).where(Company.id == payload.company_id))
+    ).scalar_one_or_none()
+    contact = None
+    if payload.contact_id is not None:
+        contact = (
+            await db.execute(select(Contact).where(Contact.id == payload.contact_id))
+        ).scalar_one_or_none()
+    return await ai_script_generator.generate_for_contact(
+        db, company=company, contact=contact, call_type=payload.call_type
+    )
 
 
 @router.post("/scripts", response_model=CallScriptRead, status_code=201)
@@ -390,6 +469,9 @@ async def generate_queue(
         limit=payload.limit,
         stages=payload.stages,
     )
+    # Pre-generate custom scripts for the day's top (hot/warm) leads so they're
+    # ready before the rep starts dialling. Best-effort — won't fail the queue.
+    await ai_script_generator.pregenerate_for_tasks(db, result["tasks"])
     return QueueGenerateResponse(
         generated=result["generated"],
         hot=result["hot"],

@@ -79,6 +79,14 @@ class CallTask(Base):
     outcome: Mapped[str | None] = mapped_column(String(30))
     notes: Mapped[str | None] = mapped_column(Text)
     call_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    # AI-generated personalised call script (a JSON blob of the structured script
+    # — opening, talking points, questions, objections, CTA). Cached here so the
+    # rep's briefing doesn't regenerate it on every page load. ``script_context``
+    # records the signals the script was built from, so it can be regenerated when
+    # the lead's situation changes.
+    custom_script: Mapped[dict | None] = mapped_column(JSONB)
+    script_generated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    script_context: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
