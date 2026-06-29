@@ -36,6 +36,30 @@ DOCUMENT_SOURCES = [
         "Manufacturing Lead Contact & Approach Strategy",
         "strategy",
     ),
+    (
+        "cold-calling-strategy",
+        "cold-calling-strategy.md",
+        "Cold Calling Strategy",
+        "strategy",
+    ),
+    (
+        "digital-sales-strategy",
+        "digital-sales-strategy.md",
+        "Digital Sales Strategy",
+        "strategy",
+    ),
+    (
+        "cold-call-scripts-by-industry",
+        "cold-call-scripts-by-industry.md",
+        "Cold Call Scripts by Industry",
+        "scripts",
+    ),
+    (
+        "ai-cold-calling-guidelines",
+        "ai-cold-calling-guidelines.md",
+        "AI Cold Calling Guidelines",
+        "guidelines",
+    ),
 ]
 
 

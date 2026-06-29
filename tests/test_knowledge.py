@@ -31,7 +31,18 @@ def test_load_industry_contacts_parses_csv():
 def test_load_documents_reads_markdown():
     docs = knowledge_data.load_documents()
     keys = {d["key"] for d in docs}
-    assert keys == {"sales-psychology-guidelines", "contact-approach-strategy"}
+    assert keys == {
+        "sales-psychology-guidelines",
+        "contact-approach-strategy",
+        "cold-calling-strategy",
+        "digital-sales-strategy",
+        "cold-call-scripts-by-industry",
+        "ai-cold-calling-guidelines",
+    }
+    # Every registered doc resolves to a real file with substantive content.
+    by_key = {d["key"]: d for d in docs}
+    assert by_key["ai-cold-calling-guidelines"]["category"] == "guidelines"
+    assert by_key["cold-call-scripts-by-industry"]["category"] == "scripts"
     for d in docs:
         assert d["format"] == "markdown"
         assert len(d["content"]) > 500
