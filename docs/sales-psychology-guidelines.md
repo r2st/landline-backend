@@ -777,3 +777,5 @@ When the AI tactics engine generates outreach, it should populate these fields:
 ---
 
 *This document is a living reference. Update it as we gather data on what's actually working in Landline's outreach campaigns.*
+
+*This document is part of the Landline sales methodology. See also: `sales-books-research.md` (book summaries), `cold-calling-strategy.md` (phone frameworks), `cold-call-scripts-by-industry.md` (industry-specific scripts), `digital-sales-strategy.md` (social selling & ABM).*
