@@ -32,6 +32,9 @@ class ContactBase(BaseModel):
     country: Optional[str] = Field(None, max_length=100)
     notes: Optional[str] = None
     is_primary: bool = False
+    # 'genuine' or 'test' — see app.services.contact_grouping. Omit to let the
+    # server auto-classify from the email/source/name.
+    contact_group: Optional[str] = Field(None, max_length=20)
 
 
 class ContactCreate(ContactBase):
@@ -59,6 +62,7 @@ class ContactUpdate(BaseModel):
     notes: Optional[str] = None
     is_primary: Optional[bool] = None
     source: Optional[str] = Field(None, max_length=50)
+    contact_group: Optional[str] = Field(None, max_length=20)
 
 
 class ContactRead(ContactBase):
@@ -126,6 +130,8 @@ class QuickAddRequest(BaseModel):
     # Where the contact came from ('manual', 'card_scan', …). Drives the
     # frontend "Scanned" filter, so it must round-trip unchanged.
     source: Optional[str] = Field(None, max_length=50)
+    # 'genuine' or 'test'. Omit to let the server auto-classify.
+    contact_group: Optional[str] = Field(None, max_length=20)
 
 
 class QuickAddResponse(BaseModel):

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
+from app.services.contact_grouping import classify_group
 from app.schemas.contact import (
     ContactCreate,
     ContactDetailRead,
@@ -40,7 +41,15 @@ async def create_contact(
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Company not found")
 
-    contact = Contact(**payload.model_dump())
+    data = payload.model_dump()
+    # Auto-classify genuine vs test when the caller didn't set a group.
+    if not data.get("contact_group"):
+        data["contact_group"] = classify_group(
+            email=str(data.get("email") or "") or None,
+            source=data.get("source"),
+            name=" ".join(p for p in (data.get("first_name"), data.get("last_name")) if p),
+        )
+    contact = Contact(**data)
     db.add(contact)
     await db.flush()
     await db.refresh(contact)
@@ -60,6 +69,7 @@ async def list_contacts(
     status: Optional[str] = Query(None, description="subscribed, unsubscribed, or no_email"),
     city: Optional[str] = Query(None, description="Filter by city"),
     source: Optional[str] = Query(None, description="Filter by source"),
+    group: Optional[str] = Query(None, description="Filter by contact group: 'genuine' or 'test'"),
     company_name: Optional[str] = Query(None, description="Filter by company name"),
     sort_by: str = Query("created_at", description="created_at, first_name, last_name, email, title, company_name"),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
@@ -110,6 +120,10 @@ async def list_contacts(
     # Source filter (exact match)
     if source:
         conditions.append(Contact.source == source)
+
+    # Contact group filter (genuine / test, exact match)
+    if group:
+        conditions.append(Contact.contact_group == group)
 
     # Company name filter (case-insensitive partial match, requires Company join)
     if company_name:
@@ -509,13 +523,21 @@ async def quick_add_contact(
     # Preserve every phone number the scan found, labelled, with no duplicates.
     extra_phones = _collect_phones(payload)
 
+    valid_email = _valid_email(payload.email)
+    # Classify genuine vs test from the email/source/name unless told explicitly.
+    contact_group = payload.contact_group or classify_group(
+        email=valid_email,
+        source=source,
+        name=" ".join(p for p in (payload.first_name, payload.last_name) if p),
+    )
+
     contact = Contact(
         company_id=company.id,
         first_name=(payload.first_name or None),
         last_name=(payload.last_name or None),
         title=(payload.title or None),
         department=(payload.department or None),
-        email=_valid_email(payload.email),
+        email=valid_email,
         phone=(payload.phone or None),
         mobile=(payload.mobile or None),
         fax=(payload.fax or None),
@@ -532,6 +554,7 @@ async def quick_add_contact(
         notes=(payload.notes or None),
         card_image=(payload.card_image or None),
         source=source,
+        contact_group=contact_group,
     )
     db.add(contact)
     await db.flush()

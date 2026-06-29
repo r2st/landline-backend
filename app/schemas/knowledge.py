@@ -19,6 +19,9 @@ class IndustryContactBase(BaseModel):
     contact_title: Optional[str] = Field(None, max_length=255)
     contact_email: Optional[str] = Field(None, max_length=320)
     notes: Optional[str] = None
+    # 'genuine' or 'test'. Seeded leads are all 'genuine'; defaults to 'genuine'
+    # on create when omitted.
+    contact_group: Optional[str] = Field(None, max_length=20)
 
 
 class IndustryContactCreate(IndustryContactBase):
@@ -35,6 +38,7 @@ class IndustryContactUpdate(BaseModel):
     contact_title: Optional[str] = Field(None, max_length=255)
     contact_email: Optional[str] = Field(None, max_length=320)
     notes: Optional[str] = None
+    contact_group: Optional[str] = Field(None, max_length=20)
 
 
 class IndustryContactRead(IndustryContactBase):

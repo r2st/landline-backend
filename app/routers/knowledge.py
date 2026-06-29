@@ -46,6 +46,7 @@ async def list_contacts(
     industry: Optional[str] = Query(None, description="Filter by exact industry"),
     company: Optional[str] = Query(None, description="Case-insensitive company name match"),
     search: Optional[str] = Query(None, description="Search name/title/email/company"),
+    group: Optional[str] = Query(None, description="Filter by contact group: 'genuine' or 'test'"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
@@ -56,6 +57,8 @@ async def list_contacts(
         query = query.where(IndustryContact.industry == industry)
     if company:
         query = query.where(IndustryContact.company_name.ilike(f"%{company}%"))
+    if group:
+        query = query.where(IndustryContact.contact_group == group)
     if search:
         term = f"%{search}%"
         query = query.where(
@@ -102,7 +105,10 @@ async def create_contact(
     payload: IndustryContactCreate, db: AsyncSession = Depends(get_db)
 ):
     """Add a new industry contact."""
-    contact = IndustryContact(**payload.model_dump())
+    data = payload.model_dump()
+    # Seeded leads are all real; default manually-added ones to 'genuine' too.
+    data["contact_group"] = data.get("contact_group") or "genuine"
+    contact = IndustryContact(**data)
     db.add(contact)
     await db.flush()
     await db.refresh(contact)

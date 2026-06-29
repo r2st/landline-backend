@@ -48,6 +48,9 @@ class Contact(Base):
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
     unsubscribed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     source: Mapped[str | None] = mapped_column(String(50), index=True)
+    # 'genuine' (real business lead) or 'test' (internal/test data), or NULL if
+    # unclassified. Lets the UI and outreach keep test contacts out of the way.
+    contact_group: Mapped[str | None] = mapped_column(String(20), index=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

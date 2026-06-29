@@ -38,6 +38,9 @@ class IndustryContact(Base):
     contact_title: Mapped[str | None] = mapped_column(String(255))
     contact_email: Mapped[str | None] = mapped_column(String(320), index=True)
     notes: Mapped[str | None] = mapped_column(Text)
+    # 'genuine' or 'test' (see app.services.contact_grouping). Seeded leads are
+    # all 'genuine'; the column exists so the knowledge UI can filter by group.
+    contact_group: Mapped[str | None] = mapped_column(String(20), index=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
