@@ -18,6 +18,11 @@ from app.services.contact_grouping import GENUINE, TEST, classify_group
         ("mtorres@precisionmetalworks.com", None, "Michael Torres", GENUINE),
         ("amra@amraplastic.ca", "quick-add", None, GENUINE),
         ("bao.nguyen@atmachining.us", "card_scan", "Bao Nguyen", GENUINE),
+        # "test" only as a substring of a real domain must NOT flag (granite-STATE).
+        ("rhart@granitestateprecision.com", None, "Rebecca Hart", GENUINE),
+        # "test" as a delimited token in the email -> test.
+        ("test@acme.com", None, "QA Bot", TEST),
+        ("john+test@acme.com", "manual", "John Doe", TEST),
         # Developer's own / test addresses -> test.
         ("suman.onenet@gmail.com", None, "Raj Patel", TEST),
         ("sumaninster7@gmail.com", "quick-add", "Subhendu Das", TEST),
