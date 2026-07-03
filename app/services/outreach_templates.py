@@ -20,6 +20,21 @@ Copy philosophy — emotionally compelling through SPECIFICITY, not hype:
 - Every step ends in ONE low-friction ask. The sequence closes with a genuine
   FREE PILOT (48-hour, one-press process audit) as the primary CTA.
 
+Research-backed design principles (2025-2026 benchmarks):
+- Optimal sequence: 4-7 emails; first email captures 58% of replies (Instantly
+  2026 Benchmark Report). We use 4 steps for SMB manufacturing.
+- Cadence: Days 0, 3, 7, 14 — start tight (2-4 days) then widen. The first
+  couple of follow-ups come quickly while the initial email is still in the
+  prospect's recent memory.
+- Each email under 125 words; subject lines under 7 words; single clear CTA.
+- Zero images/links in step 1 body (except demo link) — fewer images and links
+  in a first cold email, the better the placement.
+- Best send window: Tuesday-Thursday, 9:30-11:30 AM recipient local time.
+- Signal-based timing: an email sent within 24-48h of a buying trigger (funding,
+  executive hire, technology change) achieves 3-5x higher response rates.
+- Deliverability > copy: proper SPF/DKIM/DMARC, 35-40 emails/day/address max,
+  warmup over 4-8 weeks.
+
 Merge fields available (rendered by app.services.email_compose.render):
     {{first_name}} {{company_name}} {{title}} {{demo_link}}
 """
@@ -50,9 +65,14 @@ SEQUENCE_DESCRIPTION = (
     "compliant, no fabricated claims."
 )
 
-# Standard cadence (days to wait before sending each step). Non-decreasing so the
-# pressure tapers, not escalates.
-STEP_DELAYS = [0, 2, 5, 9]
+# Standard cadence (days to wait before sending each step). Research-backed:
+# start tight (3 days) while the first email is still in memory, then widen
+# the gaps (7 days, then 14). Non-decreasing so the pressure tapers.
+#   Day 0:  Initial outreach (personal stakes)
+#   Day 3:  Financial pain + social proof (still in recent memory)
+#   Day 7:  Knowledge-loss anxiety (new angle, wider gap)
+#   Day 14: Breakup + free pilot (final offer, respectful close)
+STEP_DELAYS = [0, 3, 7, 14]
 
 # ---------------------------------------------------------------------------
 # The four steps. Bodies are HTML so they render cleanly; the dispatcher adds
@@ -183,3 +203,70 @@ def get_molding_sequence() -> dict:
             for (n, d, s, b) in MOLDING_SEQUENCE_STEPS
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Research-backed outreach best practices (2025-2026)
+# ---------------------------------------------------------------------------
+
+COLD_EMAIL_BEST_PRACTICES = {
+    "deliverability": {
+        "spf_dkim_dmarc": "Required since Feb 2024 (Google/Yahoo), May 2025 (Microsoft)",
+        "max_emails_per_inbox_per_day": 35,
+        "warmup_weeks": "4-8 weeks minimum for new domains",
+        "warmup_ramp": "Start at 5/day, increase by 5-10/week, cap at 25-40/day",
+        "bounce_threshold": "Keep under 2%",
+        "complaint_threshold": "Keep under 0.1%",
+        "target_inbox_placement": "95%+ (global avg is only 84%)",
+    },
+    "content": {
+        "max_words": 125,
+        "max_subject_words": 7,
+        "subject_case": "lowercase (no title case)",
+        "cta_count": 1,
+        "links_in_first_email": "Minimize — fewer is better for placement",
+        "images_in_first_email": "Zero — images hurt cold email placement",
+        "tone": "Conversational, specific, no hype",
+    },
+    "timing": {
+        "best_days": ["Tuesday", "Wednesday", "Thursday"],
+        "best_hours": "9:30-11:30 AM recipient local time",
+        "signal_timing": "Within 24-48h of buying trigger for 3-5x response lift",
+        "avoid": "Monday (flooded inbox), Friday afternoon (attention drops)",
+    },
+    "sequence": {
+        "optimal_length": "4-7 emails",
+        "first_email_reply_share": "58% of all replies",
+        "smb_cadence_days": [0, 3, 7, 14],
+        "enterprise_cadence": "7-10 touches over 45-60 days",
+        "multi_channel": "No more than 50% email; mix LinkedIn + phone",
+    },
+    "benchmarks": {
+        "avg_reply_rate": "3.43%",
+        "top_10_pct_reply_rate": "10.7%+",
+        "personalized_reply_rate": "15-30%",
+        "generic_reply_rate": "< 3%",
+        "signal_based_reply_rate": "18% average",
+    },
+    "personalization": {
+        "ai_personalization_lift": "Reply rates from 9% to 21%",
+        "video_personalization": "15-35% reply rate",
+        "multi_channel_lift": "280%+ vs single channel",
+        "buyer_response_to_relevant": "74% of B2B buyers respond to relevant emails",
+    },
+}
+
+
+# Recommended cadences by segment (days between steps)
+CADENCE_PRESETS: dict[str, list[int]] = {
+    "smb_manufacturing": [0, 3, 7, 14],       # Default: tight then widen
+    "enterprise": [0, 5, 12, 21, 35, 50],     # Longer gaps, more touches
+    "warm_lead": [0, 2, 5, 10],               # Faster follow-up for warm leads
+    "re_engagement": [0, 7, 21, 45],           # Wider gaps for dormant leads
+    "event_follow_up": [0, 1, 4, 10],          # Very fast after events/triggers
+}
+
+
+def get_recommended_cadence(segment: str = "smb_manufacturing") -> list[int]:
+    """Get the research-backed cadence for a given segment."""
+    return CADENCE_PRESETS.get(segment, CADENCE_PRESETS["smb_manufacturing"])

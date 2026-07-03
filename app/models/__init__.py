@@ -22,6 +22,7 @@ from app.models.email_signature import EmailSignature
 from app.models.knowledge import IndustryContact, KnowledgeDocument
 from app.models.call import CallTask, CallScript, CallNotification
 from app.models.investor import Investor, InvestorInteraction, InvestorDocument
+from app.models.email_sentiment import EmailSentimentScore, ABTestExperiment, EmailTestExchange
 
 __all__ = [
     "Company",
@@ -54,4 +55,7 @@ __all__ = [
     "Investor",
     "InvestorInteraction",
     "InvestorDocument",
+    "EmailSentimentScore",
+    "ABTestExperiment",
+    "EmailTestExchange",
 ]
