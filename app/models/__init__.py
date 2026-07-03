@@ -21,6 +21,7 @@ from app.models.email_reply import EmailReply
 from app.models.email_signature import EmailSignature
 from app.models.knowledge import IndustryContact, KnowledgeDocument
 from app.models.call import CallTask, CallScript, CallNotification
+from app.models.investor import Investor, InvestorInteraction, InvestorDocument
 
 __all__ = [
     "Company",
@@ -50,4 +51,7 @@ __all__ = [
     "CallTask",
     "CallScript",
     "CallNotification",
+    "Investor",
+    "InvestorInteraction",
+    "InvestorDocument",
 ]
