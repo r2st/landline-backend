@@ -31,6 +31,9 @@ class EmailMessageRead(BaseModel):
     contact_name: Optional[str] = None
     company_id: Optional[uuid.UUID] = None
     company_name: Optional[str] = None
+    # The connected Gmail account this message was sent from / received on.
+    gmail_account_id: Optional[uuid.UUID] = None
+    gmail_account_email: Optional[str] = None
 
 
 class EmailThreadRead(BaseModel):

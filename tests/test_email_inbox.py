@@ -512,6 +512,185 @@ class TestSearchFilter:
 
 
 # ---------------------------------------------------------------------------
+# Email-account attribution & filtering tests
+# ---------------------------------------------------------------------------
+
+class TestEmailAccountAttribution:
+    """Each message should carry the connected account it belongs to, and the
+    inbox should be filterable by that account."""
+
+    async def test_sent_message_carries_sender_account(self, db_session):
+        """A sent email exposes its sender account id + email."""
+        acct = await _make_gmail_account(db_session, "sales@company.com", active=True)
+        await _make_email_send(
+            db_session,
+            from_email="sales@company.com",
+            to_email="lead@example.com",
+            gmail_message_id="attr-sent-1",
+            sender_account_id=acct.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        msg = result["threads"][0]["messages"][0]
+        assert msg["gmail_account_id"] == acct.id
+        assert msg["gmail_account_email"] == "sales@company.com"
+
+    async def test_received_message_carries_receiving_account(self, db_session):
+        """A received email exposes the account it landed in."""
+        acct = await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="support@company.com",
+            gmail_thread_id="attr-recv-1",
+            gmail_account_id=acct.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        msg = result["threads"][0]["messages"][0]
+        assert msg["gmail_account_id"] == acct.id
+        assert msg["gmail_account_email"] == "support@company.com"
+
+    async def test_received_account_email_falls_back_to_to_email(self, db_session):
+        """When a reply has no gmail_account_id link, the received-on address
+        (to_email) is used for display."""
+        await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="support@company.com",
+            gmail_thread_id="attr-recv-2",
+            gmail_account_id=None,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all")
+        msg = result["threads"][0]["messages"][0]
+        assert msg["gmail_account_id"] is None
+        assert msg["gmail_account_email"] == "support@company.com"
+
+    async def test_filter_by_account_scopes_sends_and_replies(self, db_session):
+        """gmail_account_id should return only mail tied to that account."""
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        sales = await _make_gmail_account(db_session, "sales@company.com")
+
+        # Sent from support
+        await _make_email_send(
+            db_session,
+            from_email="support@company.com",
+            to_email="a@x.com",
+            gmail_thread_id="t-support-sent",
+            gmail_message_id="acc-1",
+            sender_account_id=support.id,
+        )
+        # Received on support
+        await _make_email_reply(
+            db_session,
+            from_email="a@x.com",
+            to_email="support@company.com",
+            gmail_thread_id="t-support-recv",
+            gmail_account_id=support.id,
+        )
+        # Sent from sales
+        await _make_email_send(
+            db_session,
+            from_email="sales@company.com",
+            to_email="b@y.com",
+            gmail_thread_id="t-sales-sent",
+            gmail_message_id="acc-2",
+            sender_account_id=sales.id,
+        )
+        # Received on sales
+        await _make_email_reply(
+            db_session,
+            from_email="b@y.com",
+            to_email="sales@company.com",
+            gmail_thread_id="t-sales-recv",
+            gmail_account_id=sales.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="all", gmail_account_id=support.id
+        )
+        thread_ids = {t["gmail_thread_id"] for t in result["threads"]}
+        assert thread_ids == {"t-support-sent", "t-support-recv"}
+        for t in result["threads"]:
+            for m in t["messages"]:
+                assert m["gmail_account_email"] == "support@company.com"
+
+    async def test_filter_by_account_combines_with_sent_filter(self, db_session):
+        """Account filter composes with filter_type."""
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_email_send(
+            db_session,
+            from_email="support@company.com",
+            to_email="a@x.com",
+            gmail_thread_id="t-combo-sent",
+            gmail_message_id="combo-1",
+            sender_account_id=support.id,
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="a@x.com",
+            to_email="support@company.com",
+            gmail_thread_id="t-combo-recv",
+            gmail_account_id=support.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="sent", gmail_account_id=support.id
+        )
+        assert result["total"] == 1
+        assert result["threads"][0]["gmail_thread_id"] == "t-combo-sent"
+
+
+class TestInboxAccountFilterEndpoint:
+    """HTTP-level coverage for the gmail_account_id query parameter."""
+
+    async def test_endpoint_filters_by_account(self, client, db_session):
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        sales = await _make_gmail_account(db_session, "sales@company.com")
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="support@company.com",
+            gmail_thread_id="ep-support",
+            gmail_account_id=support.id,
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="sales@company.com",
+            gmail_thread_id="ep-sales",
+            gmail_account_id=sales.id,
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/v1/emails/inbox?gmail_account_id={support.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["threads"][0]["gmail_thread_id"] == "ep-support"
+        assert data["threads"][0]["messages"][0]["gmail_account_email"] == "support@company.com"
+
+    async def test_endpoint_unknown_account_returns_404(self, client, db_session):
+        await _make_gmail_account(db_session, "support@company.com", active=True)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/v1/emails/inbox?gmail_account_id={uuid.uuid4()}")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Pagination tests
 # ---------------------------------------------------------------------------
 

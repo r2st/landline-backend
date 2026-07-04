@@ -326,6 +326,9 @@ class EmailHistoryService:
         if not contact_ids:
             return {"threads": [], "total_messages": 0}
 
+        # Map account id -> email so each message carries its owning address.
+        account_email_map = await self._load_account_email_map(db)
+
         # Query sent emails for these contacts
         sends = (
             await db.execute(
@@ -347,11 +350,17 @@ class EmailHistoryService:
         messages = []
         for s in sends:
             contact = contact_map.get(s.contact_id)
-            messages.append(self._send_to_message(s, contact, company_name, company_id))
+            messages.append(
+                self._send_to_message(s, contact, company_name, company_id, account_email_map)
+            )
 
         for r in replies:
             contact = contact_map.get(r.contact_id)
-            messages.append(self._reply_to_message(r, contact, company_name, company_id))
+            messages.append(
+                self._reply_to_message(
+                    r, contact, company_name, company_id, None, account_email_map
+                )
+            )
 
         # Group into threads
         threads = self._group_into_threads(messages, company_name, company_id)
@@ -379,11 +388,14 @@ class EmailHistoryService:
         filter_type: str = "all",
         search: Optional[str] = None,
         user_gmail_emails: Optional[set[str]] = None,
+        gmail_account_id: Optional[uuid.UUID] = None,
     ) -> dict:
         """Unified inbox query with filters.
 
         filter_type: all | sent | received | opened | needs_reply
         user_gmail_emails: when provided, scope to only these email addresses
+        gmail_account_id: when provided, scope to a single connected account
+            (sends from it and replies received on it)
         search: optional text search on subject/from_email
         """
         # Load connected account emails for direction detection
@@ -394,6 +406,9 @@ class EmailHistoryService:
                 select(GmailAccount.email).where(GmailAccount.status == "connected")
             )
             connected_emails = {e.lower() for e in connected_result.scalars().all()}
+
+        # Map account id -> email so each message carries its owning address.
+        account_email_map = await self._load_account_email_map(db)
 
         # Build sent messages query
         sends_query = select(EmailSend).where(EmailSend.status != "skipped")
@@ -406,6 +421,16 @@ class EmailHistoryService:
             )
             replies_query = replies_query.where(
                 func.lower(EmailReply.to_email).in_(user_gmail_emails)
+            )
+
+        # Scope to a single email account when requested. Sends are matched by
+        # their sender account, replies by the account they were received on.
+        if gmail_account_id is not None:
+            sends_query = sends_query.where(
+                EmailSend.sender_account_id == gmail_account_id
+            )
+            replies_query = replies_query.where(
+                EmailReply.gmail_account_id == gmail_account_id
             )
 
         if filter_type == "sent":
@@ -451,7 +476,9 @@ class EmailHistoryService:
             for s in sends:
                 contact = await self._load_contact(db, s.contact_id)
                 company_name, cid = await self._load_company_for_contact(db, contact)
-                messages.append(self._send_to_message(s, contact, company_name, cid))
+                messages.append(
+                    self._send_to_message(s, contact, company_name, cid, account_email_map)
+                )
 
         if replies_query is not None:
             replies = (await db.execute(replies_query)).scalars().all()
@@ -470,7 +497,11 @@ class EmailHistoryService:
                         await db.execute(select(Company.name).where(Company.id == cid))
                     ).scalar_one_or_none()
                     company_name = company
-                messages.append(self._reply_to_message(r, contact, company_name, cid, connected_emails))
+                messages.append(
+                    self._reply_to_message(
+                        r, contact, company_name, cid, connected_emails, account_email_map
+                    )
+                )
 
         # Group into threads
         threads = self._group_into_threads(messages)
@@ -516,13 +547,18 @@ class EmailHistoryService:
         lead_name = None
         lead_id = None
 
+        # Map account id -> email so each message carries its owning address.
+        account_email_map = await self._load_account_email_map(db)
+
         for s in sends:
             contact = await self._load_contact(db, s.contact_id)
             company_name, cid = await self._load_company_for_contact(db, contact)
             if company_name and not lead_name:
                 lead_name = company_name
                 lead_id = cid
-            messages.append(self._send_to_message(s, contact, company_name, cid))
+            messages.append(
+                self._send_to_message(s, contact, company_name, cid, account_email_map)
+            )
 
         for r in replies:
             contact = await self._load_contact(db, r.contact_id)
@@ -536,7 +572,11 @@ class EmailHistoryService:
             if company_name and not lead_name:
                 lead_name = company_name
                 lead_id = cid
-            messages.append(self._reply_to_message(r, contact, company_name, cid))
+            messages.append(
+                self._reply_to_message(
+                    r, contact, company_name, cid, None, account_email_map
+                )
+            )
 
         # Sort by timestamp
         messages.sort(key=lambda m: m["timestamp"])
@@ -776,6 +816,8 @@ class EmailHistoryService:
                     "contact_name": None,
                     "company_id": None,
                     "company_name": None,
+                    "gmail_account_id": account.id,
+                    "gmail_account_email": account.email,
                 })
 
             return messages
@@ -788,17 +830,38 @@ class EmailHistoryService:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _load_account_email_map(
+        self, db: AsyncSession
+    ) -> dict[uuid.UUID, str]:
+        """Map every Gmail account id to its email address.
+
+        Used to attach the owning account's email to each message so the
+        frontend can label and filter the inbox by email account. Includes
+        revoked accounts so historical messages still resolve an address.
+        """
+        result = await db.execute(select(GmailAccount.id, GmailAccount.email))
+        return {row[0]: row[1] for row in result.all()}
+
     def _send_to_message(
         self,
         send: EmailSend,
         contact: Optional[Contact],
         company_name: Optional[str],
         company_id: Optional[uuid.UUID],
+        account_email_map: Optional[dict[uuid.UUID, str]] = None,
     ) -> dict:
         """Convert an EmailSend to a unified message dict."""
         contact_name = None
         if contact:
             contact_name = contact.full_name
+
+        # Sent messages belong to the sender's connected account.
+        account_id = send.sender_account_id
+        account_email = None
+        if account_email_map and account_id:
+            account_email = account_email_map.get(account_id)
+        if not account_email:
+            account_email = send.from_email or None
 
         return {
             "id": send.id,
@@ -820,6 +883,8 @@ class EmailHistoryService:
             "contact_name": contact_name,
             "company_id": company_id,
             "company_name": company_name,
+            "gmail_account_id": account_id,
+            "gmail_account_email": account_email,
         }
 
     def _reply_to_message(
@@ -829,6 +894,7 @@ class EmailHistoryService:
         company_name: Optional[str],
         company_id: Optional[uuid.UUID],
         connected_emails: Optional[set] = None,
+        account_email_map: Optional[dict[uuid.UUID, str]] = None,
     ) -> dict:
         """Convert an EmailReply to a unified message dict."""
         contact_name = None
@@ -839,6 +905,14 @@ class EmailHistoryService:
         direction = "received"
         if connected_emails and reply.from_email and reply.from_email.lower() in connected_emails:
             direction = "sent"
+
+        # Received messages belong to the connected account they landed in.
+        account_id = reply.gmail_account_id
+        account_email = None
+        if account_email_map and account_id:
+            account_email = account_email_map.get(account_id)
+        if not account_email:
+            account_email = reply.to_email or None
 
         return {
             "id": reply.id,
@@ -860,6 +934,8 @@ class EmailHistoryService:
             "contact_name": contact_name,
             "company_id": company_id or reply.company_id,
             "company_name": company_name,
+            "gmail_account_id": account_id,
+            "gmail_account_email": account_email,
         }
 
     def _group_into_threads(

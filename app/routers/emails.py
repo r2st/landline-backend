@@ -59,6 +59,9 @@ async def get_inbox(
     per_page: int = Query(20, ge=1, le=100),
     filter: str = Query("all", alias="filter"),
     search: Optional[str] = Query(None),
+    gmail_account_id: Optional[uuid.UUID] = Query(
+        None, description="Filter to a single connected email account by its id"
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -68,6 +71,11 @@ async def get_inbox(
 
     When called with a JWT Bearer token, scopes the inbox to the
     current user's connected Gmail accounts.
+
+    Pass ``gmail_account_id`` to filter to a single connected email account
+    (e.g. only mail sent from / received on support@company.com). Each returned
+    message includes ``gmail_account_id`` and ``gmail_account_email`` so the
+    frontend can label and group mail by the email address it belongs to.
     """
     valid_filters = ("all", "sent", "received", "opened", "needs_reply")
     if filter not in valid_filters:
@@ -85,10 +93,20 @@ async def get_inbox(
         if emails:
             user_gmail_emails = {e.lower() for e in emails}
 
+    # When filtering by a specific account, make sure it exists — and, when
+    # authenticated, that it belongs to the current user (no cross-user peeking).
+    if gmail_account_id is not None:
+        owner_query = select(GmailAccount.id).where(GmailAccount.id == gmail_account_id)
+        if current_user is not None:
+            owner_query = owner_query.where(GmailAccount.user_id == current_user.id)
+        account_exists = (await db.execute(owner_query)).scalar_one_or_none()
+        if account_exists is None:
+            raise HTTPException(status_code=404, detail="Email account not found")
+
     service = _get_service()
     result = await service.get_inbox(
         db, page=page, per_page=per_page, filter_type=filter, search=search,
-        user_gmail_emails=user_gmail_emails,
+        user_gmail_emails=user_gmail_emails, gmail_account_id=gmail_account_id,
     )
     return result
 
