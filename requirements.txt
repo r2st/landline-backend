@@ -12,6 +12,9 @@ anthropic>=0.45.0
 google-auth==2.37.0
 google-api-python-client==2.157.0
 cryptography==44.0.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+PyJWT==2.10.1
 httpx==0.28.1
 beautifulsoup4==4.12.3
 python-multipart==0.0.19

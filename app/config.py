@@ -56,8 +56,21 @@ class Settings(BaseSettings):
     app_name: str = "Landline"
     app_env: str = "development"
 
-    # API key authentication (empty = disabled for backward compat)
+    # API key authentication (empty = disabled for backward compat).
+    # When set, requests may authenticate with EITHER this key (X-API-Key) or a
+    # JWT bearer token — see app/auth.py.
     api_key: str = ""
+
+    # JWT auth. jwt_secret_key falls back to secret_key when empty.
+    jwt_secret_key: str = ""
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+
+    # Default admin seeded by migration 036 / scripts/seed_admin.py.
+    default_admin_email: str = "admin@landline.app"
+    default_admin_password: str = "admin123"
+    default_admin_name: str = "Landline Admin"
 
     # Base URL for email tracking pixel / click-redirect endpoints
     tracking_base_url: str = "http://localhost:8000"

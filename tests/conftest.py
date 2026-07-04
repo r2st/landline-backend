@@ -17,6 +17,8 @@ from app.main import app
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.consent import ConsentRecord
+from app.models.user import User, UserRole
+from app.security import create_access_token, hash_password
 
 
 # Use SQLite for tests (async via aiosqlite)
@@ -233,3 +235,72 @@ async def canadian_contact(
     db_session.add(contact)
     await db_session.flush()
     return contact
+
+
+# ─── Auth / user fixtures ────────────────────────────────────────────────────
+
+@pytest_asyncio.fixture
+async def make_user(db_session: AsyncSession):
+    """Factory to create a User with a real bcrypt-hashed password."""
+
+    async def _make(
+        email: str,
+        *,
+        password: str = "password123",
+        role: str = UserRole.AGENT.value,
+        name: str = "Test User",
+        is_active: bool = True,
+        must_change_password: bool = False,
+        created_by=None,
+    ) -> User:
+        user = User(
+            id=uuid.uuid4(),
+            email=email.lower(),
+            name=name,
+            role=role,
+            password_hash=hash_password(password),
+            is_active=is_active,
+            must_change_password=must_change_password,
+            created_by=created_by,
+        )
+        db_session.add(user)
+        # Commit (not just flush): a request that raises (e.g. a 403 from a role
+        # guard) rolls back the shared in-memory connection, which would wipe a
+        # merely-flushed row. Committing keeps seeded users durable across
+        # multiple requests within one test.
+        await db_session.commit()
+        return user
+
+    return _make
+
+
+@pytest_asyncio.fixture
+async def admin_user(make_user) -> User:
+    return await make_user(
+        "admin@landline.app", role=UserRole.ADMIN.value, name="Admin", password="adminpass123"
+    )
+
+
+@pytest_asyncio.fixture
+async def manager_user(make_user) -> User:
+    return await make_user(
+        "manager@landline.app", role=UserRole.MANAGER.value, name="Manager", password="managerpass123"
+    )
+
+
+@pytest_asyncio.fixture
+async def agent_user(make_user) -> User:
+    return await make_user(
+        "agent@landline.app", role=UserRole.AGENT.value, name="Agent", password="agentpass123"
+    )
+
+
+@pytest.fixture
+def auth_headers():
+    """Return a helper that builds an Authorization header for a given user."""
+
+    def _headers(user: User) -> dict:
+        token = create_access_token(user.id, user.role)
+        return {"Authorization": f"Bearer {token}"}
+
+    return _headers
