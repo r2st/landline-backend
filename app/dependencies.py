@@ -69,9 +69,11 @@ async def get_current_user(
             detail="User not found",
         )
     if not user.is_active:
+        # A deactivated user's token is no longer valid credentials → 401.
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Account is deactivated",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     return user
 

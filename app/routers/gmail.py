@@ -24,12 +24,16 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import delete, func as sa_func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from typing import Optional
+
 from app.config import get_settings
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
+from app.models.user import User
 from app.schemas.gmail import (
     AuthorizeResponse,
     GmailAccountRead,
@@ -180,13 +184,21 @@ async def status(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/accounts", response_model=list[GmailAccountRead])
-async def list_accounts(db: AsyncSession = Depends(get_db)):
-    """List all connected Gmail accounts."""
-    result = await db.execute(
-        select(GmailAccount).order_by(
-            GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
-        )
+async def list_accounts(
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """List connected Gmail accounts.
+
+    When called with a Bearer token, only the current user's own linked
+    accounts are returned (sender email IDs are scoped per user login).
+    """
+    query = select(GmailAccount).order_by(
+        GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
     )
+    if current_user is not None:
+        query = query.where(GmailAccount.user_id == current_user.id)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 

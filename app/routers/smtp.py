@@ -25,9 +25,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from typing import Optional
+
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
+from app.models.user import User
 from app.schemas.smtp import (
     SmtpAccountCreate,
     SmtpAccountRead,
@@ -62,13 +66,21 @@ async def _get(db: AsyncSession, account_id: uuid.UUID) -> SmtpAccount:
 
 
 @router.get("/accounts", response_model=list[SmtpAccountRead])
-async def list_accounts(db: AsyncSession = Depends(get_db)):
-    """List all configured SMTP sender accounts."""
-    result = await db.execute(
-        select(SmtpAccount).order_by(
-            SmtpAccount.is_active.desc(), SmtpAccount.connected_at.desc()
-        )
+async def list_accounts(
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """List configured SMTP sender accounts.
+
+    When called with a Bearer token, only the current user's own accounts are
+    returned (sender email IDs are scoped per user login).
+    """
+    query = select(SmtpAccount).order_by(
+        SmtpAccount.is_active.desc(), SmtpAccount.connected_at.desc()
     )
+    if current_user is not None:
+        query = query.where(SmtpAccount.user_id == current_user.id)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 

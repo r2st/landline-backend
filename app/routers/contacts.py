@@ -11,8 +11,12 @@ from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.company import Company
 from app.models.contact import Contact
+from app.models.user import User
+from app.schemas.communication import CommunicationHistoryResponse
+from app.services.communication_history import get_contact_communications
 from app.services.contact_grouping import classify_group
 from app.schemas.contact import (
     ContactCreate,
@@ -318,6 +322,29 @@ async def get_contact_timeline(
     timeline.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
 
     return {"contact_id": str(contact_id), "timeline": timeline}
+
+
+@router.get("/{contact_id}/communications", response_model=CommunicationHistoryResponse)
+async def get_contact_communications_endpoint(
+    contact_id: uuid.UUID,
+    mine_only: bool = Query(
+        False, description="When authenticated, return only your own communications"
+    ),
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Full communication history for a contact — who contacted them, when, and
+    via which email account.
+
+    Aggregates outbound emails, inbound replies, calls, and logged interactions,
+    each attributed to the acting user. Pass ``mine_only=true`` (with a Bearer
+    token) to scope the history to the authenticated user's own touchpoints.
+    """
+    scope_user_id = current_user.id if (mine_only and current_user is not None) else None
+    result = await get_contact_communications(db, contact_id, user_id=scope_user_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return result
 
 
 @router.get("/{contact_id}/card-image")

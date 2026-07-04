@@ -18,6 +18,8 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    # Surfaced so the client can force a password-change flow on first login.
+    must_change_password: bool = False
 
 
 class RefreshRequest(BaseModel):
@@ -27,6 +29,20 @@ class RefreshRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=6)
+
+
+class ProfileUpdateRequest(BaseModel):
+    """Self-service profile update — a user editing their own details."""
+
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    email: Optional[EmailStr] = None
+
+
+class AdminResetPasswordRequest(BaseModel):
+    """Admin resetting another user's password."""
+
+    new_password: str = Field(..., min_length=6)
+    must_change_password: bool = True
 
 
 # --- User CRUD (admin) -------------------------------------------------------
@@ -39,7 +55,9 @@ class UserCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     role: str = "agent"
     password: str = Field(..., min_length=6)
-    must_change_password: bool = False
+    # Admin-created accounts get a temporary password by default, so the user
+    # is required to change it on first login.
+    must_change_password: bool = True
 
     @field_validator("role")
     @classmethod
@@ -74,5 +92,6 @@ class UserRead(BaseModel):
     role: str
     is_active: bool
     must_change_password: bool
+    created_by: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime

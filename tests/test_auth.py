@@ -335,11 +335,13 @@ async def test_admin_reset_password(client: AsyncClient, admin_user: User, agent
 
 @pytest.mark.asyncio
 async def test_admin_delete_user(client: AsyncClient, admin_user: User, agent_user: User):
+    # DELETE is a soft-delete (deactivate) so attribution history is preserved.
     resp = await client.delete(
         f"/api/v1/admin/users/{agent_user.id}",
         headers=_auth_header(admin_user),
     )
-    assert resp.status_code == 204
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is False
 
 
 @pytest.mark.asyncio

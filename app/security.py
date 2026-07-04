@@ -39,7 +39,14 @@ REFRESH_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
 def _secret_key() -> str:
     settings = get_settings()
-    key = settings.secret_key or settings.token_encryption_key or "landline-dev-secret-change-me"
+    # Accept any of the configured secrets, in priority order. ``getattr`` keeps
+    # this resilient to settings objects that omit some of these attributes.
+    key = (
+        getattr(settings, "secret_key", "")
+        or getattr(settings, "jwt_secret_key", "")
+        or getattr(settings, "token_encryption_key", "")
+        or "landline-dev-secret-change-me"
+    )
     return key
 
 

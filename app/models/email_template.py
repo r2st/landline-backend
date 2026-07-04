@@ -83,11 +83,17 @@ class EmailSend(Base):
     sender_account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("gmail_accounts.id", ondelete="SET NULL"), nullable=True
     )
+    # Which user sent this email (communication-history attribution). May be
+    # null for system/automated sends; can also be derived via sender_account.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     # Relationships
     template: Mapped["EmailTemplate | None"] = relationship("EmailTemplate", back_populates="sends")
     contact: Mapped["Contact | None"] = relationship("Contact")
     sender_account: Mapped["GmailAccount | None"] = relationship("GmailAccount")
+    user: Mapped["User | None"] = relationship("User")
 
     def __repr__(self) -> str:
         return f"<EmailSend to={self.to_email} status={self.status}>"

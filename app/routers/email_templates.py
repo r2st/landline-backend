@@ -18,10 +18,12 @@ from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend, EmailTemplate
 from app.models.interaction import Interaction
+from app.models.user import User
 from app.schemas.email_template import (
     ABStats,
     ABStatsResponse,
@@ -43,7 +45,7 @@ from app.schemas.email_template import (
 )
 from app.services.email_compose import SAMPLE_CONTEXT, build_merge_context, render
 from app.services.ai_email_generator import generate_email as ai_generate_email
-from app.services.email_dispatch import resolve_sender_info, send_outreach_email
+from app.services.email_dispatch import get_account, resolve_sender_info, send_outreach_email
 from app.routers.tracking import generate_tracking_pixel_url
 
 logger = logging.getLogger(__name__)
@@ -304,12 +306,18 @@ async def send_test_email(
 async def compose_and_send(
     payload: EmailComposeRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Compose and send an outreach email to the selected contacts.
 
     Uses the specified template, or the default template if none is given.
     Records each send in ``email_sends`` (and logs an interaction) for tracking.
+    When authenticated, each send is attributed to the current user so the
+    per-client communication history shows who sent what.
     """
+    # Attribute sends to the acting user, falling back to the sender Gmail
+    # account's owner (for automated/API-key batches sent from a user's inbox).
+    sender_user_id = current_user.id if current_user is not None else None
     if payload.template_id is not None:
         template = await _get_template_or_404(db, payload.template_id)
     else:
@@ -325,6 +333,13 @@ async def compose_and_send(
 
     # Resolve who this batch is sent as (selected/active Gmail account, else SES).
     sender_info = await resolve_sender_info(db, payload.sender_account_id)
+
+    # If we don't have an authenticated user, attribute the send to the owner
+    # of the sending account (so history still shows who the mailbox belongs to).
+    if sender_user_id is None and sender_info.account_id is not None:
+        acct = await get_account(db, sender_info.account_id)
+        sender_user_id = getattr(acct, "user_id", None) if acct else None
+
     results: list[EmailComposeResult] = []
     sent = skipped = errors = 0
 
@@ -389,6 +404,7 @@ async def compose_and_send(
                 subject=subject,
                 status="pending",
                 ab_variant=variant,
+                user_id=sender_user_id,
             )
             db.add(email_send)
             await db.flush()

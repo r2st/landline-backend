@@ -13,6 +13,7 @@ from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
+    ProfileUpdateRequest,
     RefreshRequest,
     TokenResponse,
     UserRead,
@@ -51,7 +52,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     access = create_access_token(user.id, user.role)
     refresh = create_refresh_token(user.id)
     logger.info("User %s logged in", user.email)
-    return TokenResponse(access_token=access, refresh_token=refresh)
+    return TokenResponse(
+        access_token=access,
+        refresh_token=refresh,
+        must_change_password=user.must_change_password,
+    )
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -92,6 +97,41 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
 @router.get("/me", response_model=UserRead)
 async def me(user: User = Depends(get_current_user)):
     """Return the currently authenticated user's profile."""
+    return user
+
+
+@router.patch("/me", response_model=UserRead)
+async def update_profile(
+    payload: ProfileUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the current user's own profile (name and/or email).
+
+    Role and active status are intentionally NOT editable here — those are
+    admin-only via the admin API.
+    """
+    data = payload.model_dump(exclude_unset=True)
+
+    if "email" in data and data["email"] and data["email"] != user.email:
+        clash = (
+            await db.execute(
+                select(User).where(User.email == data["email"], User.id != user.id)
+            )
+        ).scalar_one_or_none()
+        if clash:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A user with this email already exists",
+            )
+        user.email = data["email"]
+
+    if "name" in data and data["name"]:
+        user.name = data["name"]
+
+    await db.flush()
+    await db.refresh(user)
+    logger.info("User %s updated their profile", user.email)
     return user
 
 

@@ -85,3 +85,8 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
             status_code=401,
             content={"detail": "Invalid or missing API key / Bearer token"},
         )
+
+
+# Preferred name — this middleware accepts an API key OR a JWT Bearer token.
+# ``ApiKeyMiddleware`` is kept as a backward-compatible alias.
+AuthMiddleware = ApiKeyMiddleware

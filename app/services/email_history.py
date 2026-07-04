@@ -712,7 +712,7 @@ class EmailHistoryService:
             ).scalar_one_or_none()
             company_id = contact
 
-        # Record the sent reply as an EmailSend
+        # Record the sent reply as an EmailSend, attributed to the mailbox owner.
         email_send = EmailSend(
             contact_id=contact_id,
             to_email=to_email,
@@ -723,6 +723,7 @@ class EmailHistoryService:
             body_html=body_html,
             from_email=account.email,
             sender_account_id=account.id,
+            user_id=account.user_id,
         )
         db.add(email_send)
         await db.commit()
