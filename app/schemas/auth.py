@@ -6,85 +6,73 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.models.user import UserRole
 
-# Minimum length for any password the app sets or accepts.
-MIN_PASSWORD_LENGTH = 8
-
-
-def _validate_role(value: str) -> str:
-    if value not in UserRole.values():
-        raise ValueError(f"role must be one of {UserRole.values()}")
-    return value
-
-
-# ─── Auth ────────────────────────────────────────────────────────────────────
+# --- Auth request / response --------------------------------------------------
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=1)
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str = Field(min_length=1)
+    password: str = Field(..., min_length=1)
 
 
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
-    # Signals the frontend to route to the forced password-change screen.
-    must_change_password: bool = False
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(min_length=1)
-    new_password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=128)
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
 
 
-class MessageResponse(BaseModel):
-    detail: str
+# --- User CRUD (admin) -------------------------------------------------------
+
+VALID_ROLES = ("admin", "manager", "agent")
 
 
-# ─── Users ───────────────────────────────────────────────────────────────────
+class UserCreate(BaseModel):
+    email: EmailStr
+    name: str = Field(..., min_length=1, max_length=255)
+    role: str = "agent"
+    password: str = Field(..., min_length=6)
+    must_change_password: bool = False
+
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, v: str) -> str:
+        if v not in VALID_ROLES:
+            raise ValueError(f"role must be one of {VALID_ROLES}")
+        return v
+
+
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = Field(None, min_length=6)
+    must_change_password: Optional[bool] = None
+
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_ROLES:
+            raise ValueError(f"role must be one of {VALID_ROLES}")
+        return v
+
 
 class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    email: EmailStr
+    email: str
     name: str
     role: str
     is_active: bool
     must_change_password: bool
-    created_by: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
-
-
-class UserCreate(BaseModel):
-    """Admin creates a user with an initial password."""
-
-    email: EmailStr
-    name: str = Field(min_length=1, max_length=255)
-    role: str = UserRole.AGENT.value
-    password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=128)
-    # New accounts are forced to change their password on first login by default.
-    must_change_password: bool = True
-
-    _check_role = field_validator("role")(_validate_role)
-
-
-class UserUpdate(BaseModel):
-    """Admin updates a user's role / active status / name."""
-
-    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    role: Optional[str] = None
-    is_active: Optional[bool] = None
-
-    @field_validator("role")
-    @classmethod
-    def _role(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return value
-        return _validate_role(value)

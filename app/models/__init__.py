@@ -1,5 +1,6 @@
 """SQLAlchemy models package."""
 
+from app.models.user import User
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
@@ -23,11 +24,9 @@ from app.models.knowledge import IndustryContact, KnowledgeDocument
 from app.models.call import CallTask, CallScript, CallNotification
 from app.models.investor import Investor, InvestorInteraction, InvestorDocument
 from app.models.email_sentiment import EmailSentimentScore, ABTestExperiment, EmailTestExchange
-from app.models.user import User, UserRole
 
 __all__ = [
     "User",
-    "UserRole",
     "Company",
     "Contact",
     "LeadScore",

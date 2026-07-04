@@ -1,4 +1,13 @@
-"""Outreach sequence and step models."""
+"""Outreach sequence and step models.
+
+Enhanced with multi-channel cadence support from *Combo Prospecting* (Tony Hughes):
+- **Triple**: Call + Voicemail + Email in under 2 minutes
+- **Quad**: Triple + LinkedIn InMail
+- **Quint**: Quad + Twitter/social DM
+
+Sequence steps now carry a ``channel`` attribute so the cadence orchestrator
+can coordinate cross-channel timing and enforce collision rules.
+"""
 
 import uuid
 from datetime import datetime
@@ -8,6 +17,11 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+# Channel types for multi-channel cadence (from combo-prospecting research)
+STEP_CHANNELS = ("email", "call", "linkedin", "video", "direct_mail")
+# Cadence patterns from Combo Prospecting (Tony Hughes)
+CADENCE_PATTERNS = ("single_channel", "triple", "quad", "quint")
 
 
 class OutreachSequence(Base):
@@ -29,6 +43,9 @@ class OutreachSequence(Base):
     industry: Mapped[str | None] = mapped_column(String(80))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    # Multi-channel cadence pattern (from Combo Prospecting by Tony Hughes).
+    # "triple" = Call + VM + Email; "quad" = + LinkedIn; "quint" = + social DM.
+    cadence_pattern: Mapped[str | None] = mapped_column(String(20), default="single_channel")
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -62,6 +79,9 @@ class SequenceStep(Base):
     delay_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     subject_template: Mapped[str] = mapped_column(Text, nullable=False)
     body_template: Mapped[str] = mapped_column(Text, nullable=False)
+    # Channel for this step — enables multi-channel cadence orchestration.
+    # "email" (default), "call", "linkedin", "video", "direct_mail"
+    channel: Mapped[str] = mapped_column(String(20), nullable=False, default="email")
 
     # Relationships
     sequence: Mapped["OutreachSequence"] = relationship("OutreachSequence", back_populates="steps")

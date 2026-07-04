@@ -10,8 +10,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.auth import AuthMiddleware
-from app.routers import companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, auth, admin_users
+from app.auth import ApiKeyMiddleware
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing
 
 settings = get_settings()
 
@@ -54,11 +54,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Authentication gate — accepts API key OR JWT bearer token (only when configured)
+# API key authentication (only when configured)
 if settings.api_key:
-    app.add_middleware(AuthMiddleware)
+    app.add_middleware(ApiKeyMiddleware)
 
 # Mount routers under the API prefix
+app.include_router(auth.router, prefix=settings.api_prefix)
+app.include_router(admin.router, prefix=settings.api_prefix)
 app.include_router(companies.router, prefix=settings.api_prefix)
 app.include_router(contacts.router, prefix=settings.api_prefix)
 app.include_router(leads.router, prefix=settings.api_prefix)
@@ -92,8 +94,6 @@ app.include_router(calls.router, prefix=settings.api_prefix)
 app.include_router(investors.router, prefix=settings.api_prefix)
 app.include_router(sentiment.router, prefix=settings.api_prefix)
 app.include_router(email_testing.router, prefix=settings.api_prefix)
-app.include_router(auth.router, prefix=settings.api_prefix)
-app.include_router(admin_users.router, prefix=settings.api_prefix)
 
 
 @app.get("/health")

@@ -214,13 +214,15 @@ class EmailHistoryService:
 
         return {"synced": synced, "errors": errors, "account": account.email}
 
-    async def sync_all_accounts(self, db: AsyncSession) -> dict:
-        """Sync replies for all active, connected Gmail accounts."""
-        result = await db.execute(
-            select(GmailAccount).where(
-                GmailAccount.status == "connected",
-            )
-        )
+    async def sync_all_accounts(self, db: AsyncSession, user_id=None) -> dict:
+        """Sync replies for all active, connected Gmail accounts.
+
+        When *user_id* is provided, only syncs accounts owned by that user.
+        """
+        query = select(GmailAccount).where(GmailAccount.status == "connected")
+        if user_id is not None:
+            query = query.where(GmailAccount.user_id == user_id)
+        result = await db.execute(query)
         accounts = result.scalars().all()
 
         total_synced = 0
@@ -376,21 +378,35 @@ class EmailHistoryService:
         per_page: int = 20,
         filter_type: str = "all",
         search: Optional[str] = None,
+        user_gmail_emails: Optional[set[str]] = None,
     ) -> dict:
         """Unified inbox query with filters.
 
         filter_type: all | sent | received | opened | needs_reply
+        user_gmail_emails: when provided, scope to only these email addresses
         search: optional text search on subject/from_email
         """
         # Load connected account emails for direction detection
-        connected_result = await db.execute(
-            select(GmailAccount.email).where(GmailAccount.status == "connected")
-        )
-        connected_emails = {e.lower() for e in connected_result.scalars().all()}
+        if user_gmail_emails is not None:
+            connected_emails = user_gmail_emails
+        else:
+            connected_result = await db.execute(
+                select(GmailAccount.email).where(GmailAccount.status == "connected")
+            )
+            connected_emails = {e.lower() for e in connected_result.scalars().all()}
 
         # Build sent messages query
         sends_query = select(EmailSend).where(EmailSend.status != "skipped")
         replies_query = select(EmailReply)
+
+        # Scope to user's accounts when authenticated
+        if user_gmail_emails is not None and user_gmail_emails:
+            sends_query = sends_query.where(
+                func.lower(EmailSend.from_email).in_(user_gmail_emails)
+            )
+            replies_query = replies_query.where(
+                func.lower(EmailReply.to_email).in_(user_gmail_emails)
+            )
 
         if filter_type == "sent":
             # Only sent emails

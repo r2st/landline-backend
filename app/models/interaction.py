@@ -16,6 +16,9 @@ class Interaction(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     company_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("companies.id", ondelete="SET NULL"), nullable=True
     )
@@ -38,6 +41,7 @@ class Interaction(Base):
     )
 
     # Relationships
+    user: Mapped["User | None"] = relationship("User")
     company: Mapped["Company | None"] = relationship("Company", back_populates="interactions")
     contact: Mapped["Contact | None"] = relationship("Contact", back_populates="interactions")
 

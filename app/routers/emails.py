@@ -5,9 +5,13 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user_optional
+from app.models.gmail_account import GmailAccount
+from app.models.user import User
 from app.schemas.email_history import (
     EmailInboxResponse,
     EmailLeadResponse,
@@ -24,6 +28,16 @@ router = APIRouter(prefix="/emails", tags=["emails"])
 
 def _get_service() -> EmailHistoryService:
     return EmailHistoryService()
+
+
+async def _user_gmail_ids(db: AsyncSession, user: Optional[User]) -> Optional[set[uuid.UUID]]:
+    """Return the set of GmailAccount IDs owned by the user, or None if no user."""
+    if user is None:
+        return None
+    result = await db.execute(
+        select(GmailAccount.id).where(GmailAccount.user_id == user.id)
+    )
+    return {row[0] for row in result.all()}
 
 
 @router.get("/lead/{company_id}", response_model=EmailLeadResponse)
@@ -46,10 +60,14 @@ async def get_inbox(
     filter: str = Query("all", alias="filter"),
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Unified inbox with filtering and search.
 
     Filter values: all, sent, received, opened, needs_reply
+
+    When called with a JWT Bearer token, scopes the inbox to the
+    current user's connected Gmail accounts.
     """
     valid_filters = ("all", "sent", "received", "opened", "needs_reply")
     if filter not in valid_filters:
@@ -57,9 +75,20 @@ async def get_inbox(
             status_code=400,
             detail=f"Invalid filter. Must be one of: {', '.join(valid_filters)}",
         )
+    # Collect user's gmail account emails for scoping
+    user_gmail_emails = None
+    if current_user is not None:
+        result = await db.execute(
+            select(GmailAccount.email).where(GmailAccount.user_id == current_user.id)
+        )
+        emails = list(result.scalars().all())
+        if emails:
+            user_gmail_emails = {e.lower() for e in emails}
+
     service = _get_service()
     result = await service.get_inbox(
-        db, page=page, per_page=per_page, filter_type=filter, search=search
+        db, page=page, per_page=per_page, filter_type=filter, search=search,
+        user_gmail_emails=user_gmail_emails,
     )
     return result
 
@@ -94,10 +123,18 @@ async def send_reply(
 
 
 @router.post("/sync", response_model=SyncStatusResponse)
-async def trigger_sync(db: AsyncSession = Depends(get_db)):
-    """Trigger a manual sync of email replies from Gmail."""
+async def trigger_sync(
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Trigger a manual sync of email replies from Gmail.
+
+    When called with a JWT Bearer token, syncs only the current user's
+    connected Gmail accounts.
+    """
     service = _get_service()
-    result = await service.sync_all_accounts(db)
+    user_id = current_user.id if current_user else None
+    result = await service.sync_all_accounts(db, user_id=user_id)
     return {
         "synced": result.get("synced", 0),
         "errors": result.get("errors", 0),

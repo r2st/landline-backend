@@ -30,6 +30,9 @@ class Task(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     company_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False
     )
@@ -51,6 +54,7 @@ class Task(Base):
     )
 
     # Relationships
+    user: Mapped["User | None"] = relationship("User")
     company: Mapped["Company"] = relationship("Company")
     contact: Mapped["Contact | None"] = relationship("Contact")
 

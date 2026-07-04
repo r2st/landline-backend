@@ -1,62 +1,55 @@
-#!/usr/bin/env python
-"""Seed (or re-seed) the default admin user.
-
-The 036 migration seeds the default admin automatically on ``alembic upgrade
-head``. This script is a manual, idempotent alternative — handy for a database
-that predates the migration seed, or to (re)create the admin without running
-migrations.
-
-It reads the default admin email / password / name from settings
-(``DEFAULT_ADMIN_EMAIL``, ``DEFAULT_ADMIN_PASSWORD``, ``DEFAULT_ADMIN_NAME``),
-falling back to ``admin@landline.app`` / ``admin123``.
+#!/usr/bin/env python3
+"""Seed the default admin user.
 
 Usage:
-    python -m scripts.seed_admin
-    DEFAULT_ADMIN_PASSWORD=s3cret python -m scripts.seed_admin
+    python scripts/seed_admin.py
+
+Creates an admin user (admin@landline.ai / admin123) if one doesn't exist.
 """
 
 import asyncio
-import logging
+import sys
+from pathlib import Path
+
+# Ensure the project root is on sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
-from app.database import async_session_factory
-from app.models.user import User, UserRole
+from app.database import async_session_factory, engine, Base
+from app.models.user import User
 from app.security import hash_password
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-logger = logging.getLogger("seed_admin")
+DEFAULT_EMAIL = "admin@landline.ai"
+DEFAULT_PASSWORD = "admin123"
+DEFAULT_NAME = "Admin"
 
 
-async def seed_admin() -> None:
-    settings = get_settings()
-    email = settings.default_admin_email.lower()
-
+async def seed():
     async with async_session_factory() as session:
         existing = (
-            await session.execute(select(User).where(User.email == email))
+            await session.execute(select(User).where(User.email == DEFAULT_EMAIL))
         ).scalar_one_or_none()
 
-        if existing is not None:
-            logger.info("Admin %s already exists (id=%s) — nothing to do.", email, existing.id)
+        if existing:
+            print(f"Admin user already exists: {existing.email} (id={existing.id})")
             return
 
         admin = User(
-            email=email,
-            name=settings.default_admin_name,
-            role=UserRole.ADMIN.value,
-            password_hash=hash_password(settings.default_admin_password),
+            email=DEFAULT_EMAIL,
+            name=DEFAULT_NAME,
+            role="admin",
+            password_hash=hash_password(DEFAULT_PASSWORD),
+            is_active=True,
             must_change_password=True,
         )
         session.add(admin)
         await session.commit()
-        logger.info(
-            "Created default admin %s (must_change_password=True). "
-            "Log in and change the password immediately.",
-            email,
-        )
+        print(f"Created admin user: {admin.email} (id={admin.id})")
+        print(f"  Password: {DEFAULT_PASSWORD}")
+        print("  ⚠  must_change_password is set — user will be prompted on first login.")
 
 
 if __name__ == "__main__":
-    asyncio.run(seed_admin())
+    asyncio.run(seed())

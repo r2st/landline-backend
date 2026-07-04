@@ -10,9 +10,11 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.task import Task
+from app.models.user import User
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
 
 logger = logging.getLogger(__name__)
@@ -42,10 +44,16 @@ async def _validate_refs(db: AsyncSession, company_id: uuid.UUID, contact_id: Op
 
 
 @router.post("", response_model=TaskRead, status_code=201)
-async def create_task(payload: TaskCreate, db: AsyncSession = Depends(get_db)):
+async def create_task(
+    payload: TaskCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Create a task for a company (optionally tied to a contact)."""
     await _validate_refs(db, payload.company_id, payload.contact_id)
     task = Task(**payload.model_dump())
+    if current_user is not None:
+        task.user_id = current_user.id
     db.add(task)
     await db.flush()
     await db.refresh(task)
@@ -64,10 +72,16 @@ async def list_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """List tasks with optional filters, soonest due first (nulls last)."""
+    """List tasks with optional filters, soonest due first (nulls last).
+
+    When called with a JWT Bearer token, scopes to the current user's tasks.
+    """
     query = select(Task)
     conditions = []
+    if current_user is not None:
+        conditions.append(Task.user_id == current_user.id)
     if company_id:
         conditions.append(Task.company_id == company_id)
     if contact_id:
@@ -94,12 +108,16 @@ async def upcoming_tasks(
     assigned_to: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Open tasks due within ``days`` (optionally including overdue ones).
 
     Powers the dashboard's "what's next" panel; sorted soonest-due first.
+    When called with a JWT Bearer token, scopes to the current user's tasks.
     """
     query = select(Task).where(Task.status.in_(_OPEN_STATUSES), Task.due_date.isnot(None))
+    if current_user is not None:
+        query = query.where(Task.user_id == current_user.id)
     if assigned_to:
         query = query.where(Task.assigned_to == assigned_to)
     tasks = list((await db.execute(query)).scalars().all())

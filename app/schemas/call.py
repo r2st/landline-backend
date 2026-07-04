@@ -87,6 +87,11 @@ class CallTaskRead(BaseModel):
     outcome: Optional[str] = None
     notes: Optional[str] = None
     call_duration_seconds: Optional[int] = None
+    # Sales-book enhancements
+    sales_framework: Optional[str] = None
+    discovery_scorecard: Optional[dict] = None
+    objections_encountered: Optional[list[str]] = None
+    optimal_call_window: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -211,6 +216,18 @@ class CallBriefing(BaseModel):
 # call_scripts ``script_type`` values.
 CUSTOM_SCRIPT_CALL_TYPES = ("initial", "follow_up", "voicemail")
 
+# Sales methodology frameworks from the research docs (15+ books distilled).
+# Each framework structures the AI-generated script differently.
+SALES_FRAMEWORKS = (
+    "challenger",       # Challenger Sale 6-Step Commercial Teaching Pitch
+    "gap_selling",      # Gap Selling Discovery Model (Keenan)
+    "spin",             # SPIN Selling Question Flow (Rackham)
+    "voss_tactical",    # Never Split the Difference Tactical Empathy (Voss)
+    "blount_fanatical", # Fanatical Prospecting 5-Step (Blount)
+    "weinberg_story",   # New Sales Simplified Power Statement (Weinberg)
+    "sobczak_smart",    # Smart Calling Pre-Call Intelligence (Sobczak)
+)
+
 
 class CustomScriptRequest(BaseModel):
     contact_id: Optional[uuid.UUID] = None
@@ -220,11 +237,18 @@ class CustomScriptRequest(BaseModel):
     call_task_id: Optional[uuid.UUID] = None
     # Force a fresh generation even if a cached script already exists.
     force: bool = False
+    # Sales methodology framework — when None the AI picks the best fit.
+    sales_framework: Optional[str] = None
 
     @field_validator("call_type")
     @classmethod
     def _vct(cls, v):
         return _check(v, CUSTOM_SCRIPT_CALL_TYPES, "call_type")
+
+    @field_validator("sales_framework")
+    @classmethod
+    def _vsf(cls, v):
+        return _check(v, SALES_FRAMEWORKS, "sales_framework") if v else v
 
 
 class CustomScript(BaseModel):
@@ -255,4 +279,48 @@ class CustomScriptResponse(BaseModel):
     ai_available: bool = True
     note: Optional[str] = None
     generated_at: Optional[datetime] = None
+    # The sales framework used for script generation (None = auto-selected).
+    sales_framework: Optional[str] = None
     script: CustomScript
+
+
+# --------------------------------------------------------------------------- #
+# Discovery call scorecard (Gap Selling + Challenger Sale best practices)
+# --------------------------------------------------------------------------- #
+
+
+class DiscoveryScorecard(BaseModel):
+    """Seven-element scorecard from Gap Selling's discovery architecture.
+
+    Reps self-assess each element 1-5 after a discovery call. The aggregate
+    score predicts deal progression.
+    """
+    current_state_identified: int = Field(0, ge=0, le=5)
+    root_cause_uncovered: int = Field(0, ge=0, le=5)
+    impact_quantified: int = Field(0, ge=0, le=5)
+    emotion_surfaced: int = Field(0, ge=0, le=5)
+    future_state_defined: int = Field(0, ge=0, le=5)
+    next_steps_agreed: int = Field(0, ge=0, le=5)
+    champion_identified: int = Field(0, ge=0, le=5)
+
+    @property
+    def total_score(self) -> int:
+        return (
+            self.current_state_identified + self.root_cause_uncovered
+            + self.impact_quantified + self.emotion_surfaced
+            + self.future_state_defined + self.next_steps_agreed
+            + self.champion_identified
+        )
+
+
+class CallTaskUpdateEnhanced(CallTaskUpdate):
+    """Extended update payload that includes discovery scorecard and objection
+    tracking from sales-book best practices."""
+    discovery_scorecard: Optional[DiscoveryScorecard] = None
+    objections_encountered: Optional[list[str]] = None
+    sales_framework_used: Optional[str] = None
+
+    @field_validator("sales_framework_used")
+    @classmethod
+    def _vsfu(cls, v):
+        return _check(v, SALES_FRAMEWORKS, "sales_framework_used") if v else v

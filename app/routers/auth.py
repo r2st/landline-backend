@@ -1,32 +1,23 @@
-"""Authentication router — login, token refresh, password change, and profile.
-
-Endpoints (mounted under the API prefix, e.g. ``/api/v1/auth``):
-    POST /auth/login            — email + password → access + refresh tokens
-    POST /auth/refresh          — refresh token → new access + refresh tokens
-    POST /auth/change-password  — change own password (clears must_change_password)
-    GET  /auth/me               — current user's profile
-"""
+"""Authentication endpoints — login, token refresh, current user, password change."""
 
 import logging
 
-import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
+from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
-    MessageResponse,
     RefreshRequest,
     TokenResponse,
     UserRead,
 )
 from app.security import (
-    REFRESH_TOKEN_TYPE,
     create_access_token,
     create_refresh_token,
     decode_token,
@@ -40,97 +31,85 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login", response_model=TokenResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
-    """Authenticate with email + password and return a token pair."""
+    """Authenticate with email + password. Returns access and refresh tokens."""
     user = (
-        await db.execute(select(User).where(User.email == payload.email.lower()))
+        await db.execute(select(User).where(User.email == payload.email))
     ).scalar_one_or_none()
 
-    # Verify a hash even when the user is missing to keep timing uniform, then
-    # return the same generic error for missing / wrong password / inactive.
-    valid = user is not None and verify_password(payload.password, user.password_hash)
-    if not valid or user is None:
-        logger.info("Failed login for %s", payload.email)
+    if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+            detail="Invalid email or password",
         )
+
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This account has been deactivated",
+            detail="Account is deactivated",
         )
 
-    return TokenResponse(
-        access_token=create_access_token(user.id, user.role),
-        refresh_token=create_refresh_token(user.id, user.role),
-        must_change_password=user.must_change_password,
-    )
+    access = create_access_token(user.id, user.role)
+    refresh = create_refresh_token(user.id)
+    logger.info("User %s logged in", user.email)
+    return TokenResponse(access_token=access, refresh_token=refresh)
 
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
-    """Exchange a valid refresh token for a fresh access + refresh token pair."""
+    """Exchange a valid refresh token for a new access + refresh pair."""
     try:
-        claims = decode_token(payload.refresh_token)
-    except jwt.PyJWTError:
+        data = decode_token(payload.refresh_token)
+    except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token",
         )
 
-    if claims.get("type") != REFRESH_TOKEN_TYPE:
+    if data.get("type") != "refresh":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
+            detail="Token is not a refresh token",
         )
 
+    from uuid import UUID
+
+    user_id = data.get("sub")
     user = (
-        await db.execute(select(User).where(User.id == claims.get("sub")))
+        await db.execute(select(User).where(User.id == UUID(user_id)))
     ).scalar_one_or_none()
+
     if user is None or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
+            detail="User not found or deactivated",
         )
 
-    return TokenResponse(
-        access_token=create_access_token(user.id, user.role),
-        refresh_token=create_refresh_token(user.id, user.role),
-        must_change_password=user.must_change_password,
-    )
+    access = create_access_token(user.id, user.role)
+    new_refresh = create_refresh_token(user.id)
+    return TokenResponse(access_token=access, refresh_token=new_refresh)
 
 
-@router.post("/change-password", response_model=MessageResponse)
+@router.get("/me", response_model=UserRead)
+async def me(user: User = Depends(get_current_user)):
+    """Return the currently authenticated user's profile."""
+    return user
+
+
+@router.post("/change-password", status_code=200)
 async def change_password(
     payload: ChangePasswordRequest,
-    current_user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Change the logged-in user's password.
-
-    Requires the current password. Clears ``must_change_password`` so a
-    first-login forced change completes.
-    """
-    if not verify_password(payload.current_password, current_user.password_hash):
+    """Change the current user's password."""
+    if not verify_password(payload.current_password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Current password is incorrect",
         )
-    if payload.new_password == payload.current_password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password must be different from the current password",
-        )
 
-    current_user.password_hash = hash_password(payload.new_password)
-    current_user.must_change_password = False
-    db.add(current_user)
+    user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = False
     await db.flush()
-
-    return MessageResponse(detail="Password changed successfully")
-
-
-@router.get("/me", response_model=UserRead)
-async def me(current_user: User = Depends(get_current_user)):
-    """Return the current user's profile."""
-    return current_user
+    logger.info("User %s changed their password", user.email)
+    return {"detail": "Password changed successfully"}

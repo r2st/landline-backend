@@ -11,10 +11,12 @@ from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
 from app.models.follow_up import FollowUp
+from app.models.user import User
 from app.schemas.follow_up import (
     FollowUpCreate,
     FollowUpRead,
@@ -79,6 +81,7 @@ async def _serialize(db: AsyncSession, fu: FollowUp, now: datetime) -> FollowUpR
 async def create_follow_up(
     payload: FollowUpCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Create a follow-up reminder for a contact and/or company."""
     if payload.contact_id is None and payload.company_id is None:
@@ -106,6 +109,7 @@ async def create_follow_up(
         due_date=payload.due_date,
         reason=payload.reason,
         notes=payload.notes,
+        user_id=current_user.id if current_user else None,
     )
     db.add(follow_up)
     await db.flush()
@@ -124,10 +128,16 @@ async def list_follow_ups(
         None, ge=0, le=365, description="Only pending follow-ups due within N days"
     ),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """List follow-ups, newest due first, with optional filters."""
+    """List follow-ups, newest due first, with optional filters.
+
+    When called with a JWT Bearer token, scopes to the current user's follow-ups.
+    """
     query = select(FollowUp)
     conditions = []
+    if current_user is not None:
+        conditions.append(FollowUp.user_id == current_user.id)
     if status:
         conditions.append(FollowUp.status == status)
     if contact_id:

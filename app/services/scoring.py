@@ -1,9 +1,21 @@
-"""Lead scoring service — rule-based scoring and AI scoring via Claude API."""
+"""Lead scoring service — rule-based scoring and AI scoring via Claude API.
+
+Enhanced with sales-book recommendations:
+- **Signal Recency Decay** (ai-cold-calling-guidelines.md): Recent engagement
+  signals are weighted higher — a click 30 minutes ago is worth 20× more than
+  one from two days ago.
+- **Engagement Velocity Bonus** (ai-cold-calling-guidelines.md): Clustered
+  signals (2+ events in 24 hours) indicate active buying behaviour.
+- **Account Tier Classification** (digital-sales-strategy.md ABM model):
+  Tier 1 (Strategic) / Tier 2 (Target) / Tier 3 (Prospect) classification for
+  prioritised resource allocation.
+"""
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.company import Company
@@ -17,6 +29,124 @@ logger = logging.getLogger(__name__)
 _ENGAGEMENT_WEIGHTS = {"replied": 12, "clicked": 7, "opened": 3}
 _NEWS_ACTIONABLE_BONUS = 5
 _MAX_ENGAGEMENT_BONUS = 25
+
+
+# ---------------------------------------------------------------------------
+# Signal Recency Decay (from ai-cold-calling-guidelines.md)
+# ---------------------------------------------------------------------------
+_RECENCY_BRACKETS: list[tuple[float, float]] = [
+    (0.5, 1.0),    # within 30 min
+    (1.0, 0.85),   # within 1 hour
+    (2.0, 0.70),   # within 2 hours
+    (4.0, 0.50),   # within 4 hours
+    (8.0, 0.30),   # within 8 hours
+    (24.0, 0.15),  # within 24 hours
+    (48.0, 0.05),  # within 48 hours
+]
+_RECENCY_FLOOR = 0.02
+
+
+def signal_recency_weight(
+    last_event_at: Optional[datetime], now: Optional[datetime] = None
+) -> float:
+    """Return a 0.0-1.0 weight reflecting how recently the lead engaged.
+
+    Uses the decay curve from *ai-cold-calling-guidelines.md*: a signal within
+    30 minutes scores 1.0 and decays through seven brackets down to 0.02 for
+    anything older than 48 hours.
+    """
+    if last_event_at is None:
+        return 0.0
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if last_event_at.tzinfo is None:
+        last_event_at = last_event_at.replace(tzinfo=timezone.utc)
+    hours_ago = max(0, (now - last_event_at).total_seconds() / 3600.0)
+    for threshold_hours, weight in _RECENCY_BRACKETS:
+        if hours_ago <= threshold_hours:
+            return weight
+    return _RECENCY_FLOOR
+
+
+# ---------------------------------------------------------------------------
+# Engagement Velocity Bonus (from ai-cold-calling-guidelines.md)
+# ---------------------------------------------------------------------------
+_VELOCITY_BONUSES: list[tuple[int, float]] = [
+    (4, 0.30),   # 4+ distinct events in 24h
+    (3, 0.20),   # 3 events
+    (2, 0.10),   # 2 events
+]
+
+
+async def _engagement_velocity(
+    db: AsyncSession, company: Company, now: Optional[datetime] = None
+) -> tuple[float, int]:
+    """Count distinct engagement events in the last 24 hours and return
+    ``(bonus, signal_count)``.
+
+    Events counted: email opens, clicks, and replies from any contact at
+    this company.  Each non-null timestamp within the window counts as one
+    signal.
+    """
+    from app.models.email_template import EmailSend
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=24)
+
+    rows = await db.execute(
+        select(
+            EmailSend.opened_at,
+            EmailSend.clicked_at,
+            EmailSend.replied_at,
+        )
+        .join(Contact, Contact.id == EmailSend.contact_id)
+        .where(
+            Contact.company_id == company.id,
+            or_(
+                EmailSend.opened_at >= window_start,
+                EmailSend.clicked_at >= window_start,
+                EmailSend.replied_at >= window_start,
+            ),
+        )
+    )
+    signal_count = 0
+    most_recent: Optional[datetime] = None
+    for opened, clicked, replied in rows.all():
+        for ts in (opened, clicked, replied):
+            if ts and ts >= window_start:
+                signal_count += 1
+                if most_recent is None or ts > most_recent:
+                    most_recent = ts
+
+    bonus = 0.0
+    for threshold, b in _VELOCITY_BONUSES:
+        if signal_count >= threshold:
+            bonus = b
+            break
+    return bonus, signal_count, most_recent
+
+
+# ---------------------------------------------------------------------------
+# Account Tier Classification (from digital-sales-strategy.md ABM model)
+# ---------------------------------------------------------------------------
+
+def classify_account_tier(
+    industry_pts: int, size_pts: int, location_pts: int, engagement_pts: int
+) -> tuple[str, float]:
+    """Classify an account into ABM tiers based on its sub-scores.
+
+    Returns ``(tier_name, tier_value)`` where tier_value is the account value
+    multiplier from *ai-cold-calling-guidelines.md*.
+    """
+    total = industry_pts + size_pts + location_pts + engagement_pts
+    if industry_pts >= 35 and size_pts >= 20 and location_pts >= 15 and total >= 70:
+        return "tier_1_strategic", 1.0
+    if industry_pts >= 20 and total >= 45:
+        return "tier_2_target", 0.75
+    if total >= 25:
+        return "tier_3_prospect", 0.50
+    return "non_target", 0.25
 
 
 def _industry_score(naics_code: Optional[str]) -> tuple[int, str]:
@@ -155,11 +285,12 @@ async def score_company_rule_based(
 ) -> LeadScore:
     """Apply rule-based scoring to a company. Returns the new LeadScore.
 
-    Combines firmographic fit (industry, size, location), data completeness, and
-    real engagement signals (email opens/clicks/replies, actionable news). The
-    ``engagement_score`` column holds completeness + engagement so that
-    fit = industry + size + location + engagement_score, capped at 100.
+    Combines firmographic fit (industry, size, location), data completeness,
+    real engagement signals, **signal recency decay**, **engagement velocity**,
+    and **account tier classification** per sales-book recommendations.
     """
+    now = datetime.now(timezone.utc)
+
     # Load contacts
     result = await db.execute(
         select(Contact).where(Contact.company_id == company.id)
@@ -172,9 +303,26 @@ async def score_company_rule_based(
     completeness_pts, completeness_breakdown = _completeness_score(company, contacts)
     engagement_pts, engagement_breakdown = await _engagement_signal(db, company)
 
-    # completeness + live engagement form the non-firmographic bucket.
+    # --- NEW: Signal recency decay ---
+    # Find the most recent engagement event across all contacts at this company.
+    velocity_bonus, velocity_signals, most_recent_event = await _engagement_velocity(
+        db, company, now
+    )
+    recency = signal_recency_weight(most_recent_event, now)
+    recency_bonus = int(recency * 8)  # up to 8 bonus points for fresh signals
+
+    # --- NEW: Engagement velocity bonus ---
+    velocity_bonus_pts = int(velocity_bonus * 100 * 0.07)  # up to 7 bonus points
+
+    # --- NEW: Account tier classification ---
+    tier_name, tier_value = classify_account_tier(
+        industry_pts, size_pts, loc_pts, engagement_pts
+    )
+
+    # completeness + live engagement + recency + velocity bonuses
     other_pts = completeness_pts + engagement_pts
-    fit_score = min(100, industry_pts + size_pts + loc_pts + other_pts)
+    base_score = industry_pts + size_pts + loc_pts + other_pts
+    fit_score = min(100, base_score + recency_bonus + velocity_bonus_pts)
 
     factors = {
         "industry": {"score": industry_pts, "reason": industry_reason},
@@ -182,6 +330,20 @@ async def score_company_rule_based(
         "location": {"score": loc_pts, "reason": loc_reason},
         "completeness": {"score": completeness_pts, "breakdown": completeness_breakdown},
         "engagement": {"score": engagement_pts, "breakdown": engagement_breakdown},
+        "signal_recency": {
+            "weight": recency,
+            "bonus_points": recency_bonus,
+            "most_recent_event": most_recent_event.isoformat() if most_recent_event else None,
+        },
+        "engagement_velocity": {
+            "bonus": velocity_bonus,
+            "bonus_points": velocity_bonus_pts,
+            "signals_in_24h": velocity_signals,
+        },
+        "account_tier": {
+            "tier": tier_name,
+            "value": tier_value,
+        },
     }
 
     lead_score = LeadScore(
@@ -199,9 +361,11 @@ async def score_company_rule_based(
 
     logger.info(
         "Scored company %s (%s): fit=%d [industry=%d, size=%d, location=%d, "
-        "completeness=%d, engagement=%d]",
+        "completeness=%d, engagement=%d, recency_bonus=%d, velocity_bonus=%d, "
+        "tier=%s]",
         company.name, company.id, fit_score,
         industry_pts, size_pts, loc_pts, completeness_pts, engagement_pts,
+        recency_bonus, velocity_bonus_pts, tier_name,
     )
     return lead_score
 

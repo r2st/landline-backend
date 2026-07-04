@@ -65,6 +65,9 @@ class CallTask(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     contact_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -87,6 +90,14 @@ class CallTask(Base):
     custom_script: Mapped[dict | None] = mapped_column(JSONB)
     script_generated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     script_context: Mapped[dict | None] = mapped_column(JSONB)
+    # Sales methodology framework used for this call (from sales-book research).
+    sales_framework: Mapped[str | None] = mapped_column(String(30))
+    # Gap Selling discovery scorecard — 7-element self-assessment (JSONB).
+    discovery_scorecard: Mapped[dict | None] = mapped_column(JSONB)
+    # Objections encountered during the call — for trend analytics.
+    objections_encountered: Mapped[list | None] = mapped_column(JSONB)
+    # Optimal call window set by the queue generator based on contact role.
+    optimal_call_window: Mapped[str | None] = mapped_column(String(30))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -95,6 +106,7 @@ class CallTask(Base):
     )
 
     # Relationships
+    user: Mapped["User | None"] = relationship("User")
     company: Mapped["Company"] = relationship("Company")
     contact: Mapped["Contact | None"] = relationship("Contact")
     notifications: Mapped[list["CallNotification"]] = relationship(
@@ -154,6 +166,9 @@ class CallNotification(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     call_task_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("call_tasks.id", ondelete="CASCADE"), nullable=True, index=True

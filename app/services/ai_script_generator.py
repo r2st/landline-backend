@@ -109,6 +109,98 @@ _DEFAULT_ROLE = (
     "quality escapes, then the value of catching drift in real time.",
 )
 
+# ---------------------------------------------------------------------------
+# Sales Framework Prompts (from 15+ books in sales-books-research.md)
+# ---------------------------------------------------------------------------
+# Each framework structures the AI-generated script differently, based on
+# the methodology from the corresponding sales book.
+
+_FRAMEWORK_PROMPTS: dict[str, str] = {
+    "challenger": """## SALES FRAMEWORK: CHALLENGER SALE (Dixon & Adamson)
+Structure this script using the 6-Step Commercial Teaching Pitch:
+1. WARMER (10 sec): Build credibility with a shared challenge observation
+2. REFRAME (15 sec): Present a surprising insight that challenges their current thinking
+3. RATIONAL DROWNING (20 sec): Stack 2-3 data points that make the status quo feel untenable
+4. EMOTIONAL IMPACT (10 sec): Paint the personal consequence — what happens to THEM if this continues
+5. A NEW WAY (15 sec): Present the alternative approach (not the product yet)
+6. YOUR SOLUTION (10 sec): Only NOW connect to Apprend's platform
+
+Key: 54% of top sales performers are Challengers. Lead with insight, create constructive tension, take control.""",
+
+    "gap_selling": """## SALES FRAMEWORK: GAP SELLING (Keenan)
+Structure around the Three-Component Gap Model:
+
+CURRENT STATE (first half): Ask about Environment, Problem, Root Cause, Impact, Emotion
+FUTURE STATE (bridge): Help define measurable outcomes
+THE GAP (close): Quantify the gap between current and future state
+
+Key: "No problem, no sale." Ask 12-18 questions in 20 minutes. Spend 45% asking, speak only 20%.
+Use 4 question types: Probing, Process, Provoking, Validating.""",
+
+    "spin": """## SALES FRAMEWORK: SPIN SELLING (Rackham)
+Structure questions in the SPIN sequence:
+
+S — SITUATION (1-2 max, from pre-call research — don't ask what you should know)
+P — PROBLEM (2-3, identify pain points in their process)
+I — IMPLICATION (2-3, make the problem feel bigger — THIS is where SPIN's power lives)
+N — NEED-PAYOFF (1-2, let them articulate the value, not you)
+
+Key: Implication questions are the most powerful. Need-Payoff lets the BUYER sell themselves.""",
+
+    "voss_tactical": """## SALES FRAMEWORK: TACTICAL EMPATHY (Chris Voss)
+Apply these techniques throughout:
+
+ACCUSATION AUDIT (opening): List every negative thought the prospect has, say them first
+MIRRORING (throughout): Repeat last 2-3 words with upward inflection, then silence
+LABELING (throughout): "It sounds like..." / "It seems like..."
+"NO"-ORIENTED QUESTIONS: "Is now a bad time?" / "Would you be opposed to..."
+CALIBRATED QUESTIONS: Only "What" and "How", never "Why"
+LATE NIGHT FM DJ VOICE: Speak slowly, warmly, with downward inflection and strategic pauses""",
+
+    "blount_fanatical": """## SALES FRAMEWORK: FANATICAL PROSPECTING (Jeb Blount)
+Use the 5-Step Telephone Prospecting Framework:
+
+1. ATTENTION (3 sec): Use their name with energy
+2. IDENTIFY (3 sec): Say who you are and where you're from
+3. REASON (15 sec): ONE compelling reason — a RESULT, not a product pitch
+4. BRIDGE (5 sec): Connect to THEIR world with "because"
+5. ASK (5 sec): Direct ask with two-option close
+
+For objections, use RBO Turnaround: ANCHOR (agree) → DISRUPT (pivot) → ASK (close again)
+Key: Two-RBO Rule — disengage after two failed turnarounds. 49.5% of objections are knee-jerk.""",
+
+    "weinberg_story": """## SALES FRAMEWORK: NEW SALES SIMPLIFIED (Mike Weinberg)
+Build around the Power Statement (5 components in 30-45 seconds):
+
+1. HEADLINE: One sentence that earns attention
+2. TRANSITIONAL PHRASE: "We've found that many plants like yours..."
+3. CLIENT ISSUES (3 max): Use emotionally charged language, not features
+4. OFFERINGS: How you address those issues
+5. DIFFERENTIATORS: Why you vs. alternatives
+
+Close with "Visit, Fit, Value" and the Three-Ask Rule (first "no" is reflexive).
+Apply the "So What?" filter to everything — if prospect could say "so what?", cut it.""",
+
+    "sobczak_smart": """## SALES FRAMEWORK: SMART CALLING (Art Sobczak)
+Structure around pre-call intelligence:
+
+SMART CALL OPENING (4 parts):
+1. IDENTIFY: Name + company
+2. CONNECT WITH INTELLIGENCE: Reference something you know about them
+3. HINT AT BENEFIT: Connect intelligence to value
+4. SUGGEST SECOND BENEFIT + QUESTION: Lead into discovery
+
+For follow-ups, use the Three R's: REFERENCE (last conversation) → REASON (new info) → RESULT (benefit)
+AVOID: "I know you're busy", "Just calling", leading with product name, "How are you today?" to a stranger""",
+}
+
+
+def _get_framework_prompt(framework: str | None) -> str:
+    """Return the framework-specific prompt section, or empty string if None."""
+    if framework is None:
+        return ""
+    return _FRAMEWORK_PROMPTS.get(framework, "")
+
 
 def _detect_role(title: Optional[str]) -> tuple[str, str]:
     """Return ``(role_level, guidance)`` for a contact's title."""
@@ -290,6 +382,7 @@ def _build_prompt(
     base_script: CallScriptRead,
     context: dict,
     call_type: str,
+    sales_framework: Optional[str] = None,
 ) -> str:
     profile_key = _VERTICAL_TO_PROFILE.get(vertical.key, "")
     profile = guidelines.INDUSTRY_PROFILES.get(profile_key, {})
@@ -379,11 +472,19 @@ def _build_prompt(
         ),
     }.get(call_type, "")
 
+    framework_section = _get_framework_prompt(sales_framework)
+    framework_note = ""
+    if framework_section:
+        framework_note = f"""
+
+{framework_section}
+"""
+
     return f"""You are an elite B2B cold-calling coach writing a CUSTOM call script for a
 sales rep at Apprend Technologies. Apprend builds an AI quality-management
 platform for manufacturers — it watches machine/press/line signals in real time
 and flags quality drift before parts go out of spec, with a free 48-hour pilot
-and a live demo dashboard ({vertical.demo_link}).
+and a live demo dashboard ({vertical.demo_link}).{framework_note}
 
 Write a script the rep will actually say out loud on the phone — natural,
 concrete, conversational (contractions fine). NOT marketing copy. No buzzwords
@@ -616,10 +717,13 @@ async def generate_for_contact(
     company: Company,
     contact: Optional[Contact],
     call_type: str = "initial",
+    sales_framework: Optional[str] = None,
 ) -> CustomScriptResponse:
     """Generate a personalised script for a company/contact (no persistence).
 
     Always returns a response — AI when possible, template fallback otherwise.
+    When ``sales_framework`` is provided, the script is structured around that
+    methodology (Challenger, Gap Selling, SPIN, etc.).
     """
     script_type = _normalize_call_type(call_type)
     vertical = iv.resolve_vertical_or_default(
@@ -643,6 +747,7 @@ async def generate_for_contact(
             ai_available=False,
             note="AI generation unavailable (no API key) — showing industry template.",
             generated_at=now,
+            sales_framework=sales_framework,
             script=_template_to_custom(base_script),
         )
 
@@ -653,6 +758,7 @@ async def generate_for_contact(
         base_script=base_script,
         context=context,
         call_type=script_type,
+        sales_framework=sales_framework,
     )
     result = await generator.generate_script_json(prompt)
 
@@ -672,6 +778,7 @@ async def generate_for_contact(
             ai_available=True,
             note=note,
             generated_at=now,
+            sales_framework=sales_framework,
             script=_template_to_custom(base_script),
         )
 
@@ -687,6 +794,7 @@ async def generate_for_contact(
         ai_available=True,
         note=None,
         generated_at=now,
+        sales_framework=sales_framework,
         script=_parse_ai_script(result, base_script),
     )
 
@@ -717,6 +825,7 @@ async def get_or_generate_for_task(
     *,
     call_type: str = "initial",
     force: bool = False,
+    sales_framework: Optional[str] = None,
 ) -> CustomScriptResponse:
     """Return the task's cached custom script, generating + caching if missing.
 
@@ -744,7 +853,8 @@ async def get_or_generate_for_task(
         ).scalar_one_or_none()
 
     response = await generate_for_contact(
-        db, company=company, contact=contact, call_type=call_type
+        db, company=company, contact=contact, call_type=call_type,
+        sales_framework=sales_framework,
     )
     response.call_task_id = task.id
 

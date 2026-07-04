@@ -24,9 +24,11 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user_optional
 from app.models.call import CallNotification, CallScript, CallTask
 from app.models.company import Company
 from app.models.contact import Contact
+from app.models.user import User
 from app.schemas.call import (
     CallBriefing,
     CallNotificationRead,
@@ -35,10 +37,12 @@ from app.schemas.call import (
     CallTaskCreate,
     CallTaskRead,
     CallTaskUpdate,
+    CallTaskUpdateEnhanced,
     CustomScriptRequest,
     CustomScriptResponse,
     QueueGenerateRequest,
     QueueGenerateResponse,
+    SALES_FRAMEWORKS,
 )
 from app.services import ai_script_generator, call_scripts_data
 from app.services.call_briefing import build_briefing
@@ -78,10 +82,16 @@ async def _validate_refs(
 
 
 @router.post("/tasks", response_model=CallTaskRead, status_code=201)
-async def create_call_task(payload: CallTaskCreate, db: AsyncSession = Depends(get_db)):
+async def create_call_task(
+    payload: CallTaskCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Create a cold-call task for a company (optionally tied to a contact)."""
     await _validate_refs(db, payload.company_id, payload.contact_id)
     task = CallTask(**payload.model_dump())
+    if current_user is not None:
+        task.user_id = current_user.id
     db.add(task)
     await db.flush()
     await db.refresh(task)
@@ -102,9 +112,15 @@ async def list_call_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """List call tasks with optional filters; hottest then soonest-scheduled."""
+    """List call tasks with optional filters; hottest then soonest-scheduled.
+
+    When called with a JWT Bearer token, scopes to the current user's call tasks.
+    """
     conditions = []
+    if current_user is not None:
+        conditions.append(CallTask.user_id == current_user.id)
     if status:
         conditions.append(CallTask.status == status)
     if priority:
@@ -137,14 +153,18 @@ async def todays_call_queue(
     assigned_to: Optional[str] = Query(None),
     include_overdue: bool = Query(True),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Open call tasks for today (plus overdue), hottest first.
 
     "Today" means scheduled today, or unscheduled-but-created-today. With
     ``include_overdue`` (default), still-open tasks scheduled before today are
     included so nothing slips through the cracks.
+    When called with a JWT Bearer token, scopes to the current user's call tasks.
     """
     query = select(CallTask).where(CallTask.status.in_(_OPEN_CALL_STATUSES))
+    if current_user is not None:
+        query = query.where(CallTask.user_id == current_user.id)
     if assigned_to:
         query = query.where(CallTask.assigned_to == assigned_to)
     tasks = list((await db.execute(query)).scalars().all())
@@ -186,9 +206,14 @@ async def get_call_task(task_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 @router.put("/tasks/{task_id}", response_model=CallTaskRead)
 async def update_call_task(
-    task_id: uuid.UUID, payload: CallTaskUpdate, db: AsyncSession = Depends(get_db)
+    task_id: uuid.UUID, payload: CallTaskUpdateEnhanced, db: AsyncSession = Depends(get_db)
 ):
     """Update a call task — mark complete, log an outcome, add notes, reschedule.
+
+    Enhanced with sales-book features:
+    - ``discovery_scorecard``: Gap Selling 7-element self-assessment
+    - ``objections_encountered``: list of objection strings for trend analysis
+    - ``sales_framework_used``: which framework the rep used on this call
 
     Marking ``status=completed`` auto-stamps ``completed_at`` if not supplied.
     """
@@ -207,6 +232,15 @@ async def update_call_task(
         ).scalar_one_or_none()
         if not contact:
             raise HTTPException(status_code=404, detail="Contact not found")
+
+    # Handle discovery scorecard — convert to dict for JSONB storage.
+    if "discovery_scorecard" in update_data and update_data["discovery_scorecard"] is not None:
+        scorecard = update_data.pop("discovery_scorecard")
+        task.discovery_scorecard = scorecard.model_dump() if hasattr(scorecard, "model_dump") else scorecard
+
+    # Handle sales_framework_used → store on the task's sales_framework field.
+    if "sales_framework_used" in update_data:
+        task.sales_framework = update_data.pop("sales_framework_used")
 
     for field, value in update_data.items():
         setattr(task, field, value)
@@ -244,21 +278,27 @@ async def get_task_custom_script(
     task_id: uuid.UUID,
     call_type: str = Query("initial", pattern="^(initial|follow_up|voicemail)$"),
     regenerate: bool = Query(False),
+    framework: Optional[str] = Query(None, description="Sales methodology framework"),
     db: AsyncSession = Depends(get_db),
 ):
     """Get the AI-generated custom script for a call task.
 
     Returns the cached script if one was already generated; otherwise generates
     one on the fly and caches it on the task. Pass ``regenerate=true`` to force a
-    fresh generation. Falls back to the industry template when AI is unavailable.
+    fresh generation. Optionally specify a ``framework`` (challenger, gap_selling,
+    spin, voss_tactical, blount_fanatical, weinberg_story, sobczak_smart) to
+    structure the script around that methodology.
     """
+    if framework and framework not in SALES_FRAMEWORKS:
+        raise HTTPException(status_code=400, detail=f"framework must be one of {SALES_FRAMEWORKS}")
     task = (
         await db.execute(select(CallTask).where(CallTask.id == task_id))
     ).scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Call task not found")
     return await ai_script_generator.get_or_generate_for_task(
-        db, task, call_type=call_type, force=regenerate
+        db, task, call_type=call_type, force=regenerate,
+        sales_framework=framework,
     )
 
 
@@ -359,7 +399,8 @@ async def generate_custom_script(
     if task is not None:
         # Treat the explicit generate endpoint as a (re)generate action.
         return await ai_script_generator.get_or_generate_for_task(
-            db, task, call_type=payload.call_type, force=True
+            db, task, call_type=payload.call_type, force=True,
+            sales_framework=payload.sales_framework,
         )
 
     company = (
@@ -371,7 +412,8 @@ async def generate_custom_script(
             await db.execute(select(Contact).where(Contact.id == payload.contact_id))
         ).scalar_one_or_none()
     return await ai_script_generator.generate_for_contact(
-        db, company=company, contact=contact, call_type=payload.call_type
+        db, company=company, contact=contact, call_type=payload.call_type,
+        sales_framework=payload.sales_framework,
     )
 
 
@@ -417,9 +459,15 @@ async def list_notifications(
     notification_type: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """List call notifications, newest first (unread only by default)."""
+    """List call notifications, newest first (unread only by default).
+
+    When called with a JWT Bearer token, scopes to the current user's notifications.
+    """
     query = select(CallNotification)
+    if current_user is not None:
+        query = query.where(CallNotification.user_id == current_user.id)
     if unread_only:
         query = query.where(CallNotification.read_at.is_(None))
     if notification_type:
@@ -445,6 +493,92 @@ async def mark_notification_read(
     await db.flush()
     await db.refresh(notif)
     return notif
+
+
+# --------------------------------------------------------------------------- #
+# Objection trend analytics (from sales-book best practices)
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/analytics/objections")
+async def objection_trends(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate objection trends from completed calls over the last N days.
+
+    Returns the most common objections and their frequency, following the
+    ai-cold-calling-guidelines.md recommendation to "proactively address most
+    common objections by industry/size/role."
+    """
+    cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)
+    rows = await db.execute(
+        select(CallTask.objections_encountered, Company.industry_segment)
+        .join(Company, Company.id == CallTask.company_id)
+        .where(
+            CallTask.status == "completed",
+            CallTask.objections_encountered.isnot(None),
+            CallTask.completed_at >= cutoff,
+        )
+    )
+    objection_counts: dict[str, int] = {}
+    by_industry: dict[str, dict[str, int]] = {}
+    total_calls = 0
+    for objections, industry in rows.all():
+        if not isinstance(objections, list):
+            continue
+        total_calls += 1
+        ind = industry or "unknown"
+        if ind not in by_industry:
+            by_industry[ind] = {}
+        for obj in objections:
+            obj_str = str(obj).strip()
+            if obj_str:
+                objection_counts[obj_str] = objection_counts.get(obj_str, 0) + 1
+                by_industry[ind][obj_str] = by_industry[ind].get(obj_str, 0) + 1
+
+    ranked = sorted(objection_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    return {
+        "period_days": days,
+        "total_calls_with_objections": total_calls,
+        "top_objections": [{"objection": o, "count": c} for o, c in ranked],
+        "by_industry": {
+            ind: sorted(objs.items(), key=lambda x: x[1], reverse=True)[:10]
+            for ind, objs in by_industry.items()
+        },
+    }
+
+
+@router.get("/analytics/frameworks")
+async def framework_usage(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Analyse which sales frameworks produce the best call outcomes."""
+    cutoff = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)
+    rows = await db.execute(
+        select(
+            CallTask.sales_framework,
+            CallTask.outcome,
+            func.count(CallTask.id),
+        )
+        .where(
+            CallTask.status == "completed",
+            CallTask.sales_framework.isnot(None),
+            CallTask.completed_at >= cutoff,
+        )
+        .group_by(CallTask.sales_framework, CallTask.outcome)
+    )
+    stats: dict[str, dict[str, int]] = {}
+    for framework, outcome, count in rows.all():
+        if framework not in stats:
+            stats[framework] = {"total": 0}
+        stats[framework]["total"] = stats[framework].get("total", 0) + count
+        stats[framework][outcome or "unknown"] = count
+    return {
+        "period_days": days,
+        "frameworks": stats,
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -12,9 +12,9 @@ Amazon SES only when no sending-enabled Gmail account is connected.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Integer, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
@@ -26,6 +26,9 @@ class GmailAccount(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True)
     google_sub: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
@@ -55,6 +58,9 @@ class GmailAccount(Base):
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     last_used_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    # Relationships
+    user: Mapped["User | None"] = relationship("User")
 
     def __repr__(self) -> str:
         return (
