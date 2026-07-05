@@ -27,7 +27,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user_optional
+from app.dependencies import UserScope, get_current_user_optional, get_scope
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.models.user import User
@@ -78,17 +78,19 @@ async def _get(
 @router.get("/accounts", response_model=list[SmtpAccountRead])
 async def list_accounts(
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """List configured SMTP sender accounts.
 
-    When called with a JWT Bearer token, scoped to the current user's accounts.
+    Scoped to the caller's own accounts; admins/managers may pass
+    ``view_as_user_id`` (or ``all``) to list another user's accounts.
     """
-    query = select(SmtpAccount).order_by(
-        SmtpAccount.is_active.desc(), SmtpAccount.connected_at.desc()
+    query = scope.apply(
+        select(SmtpAccount).order_by(
+            SmtpAccount.is_active.desc(), SmtpAccount.connected_at.desc()
+        ),
+        SmtpAccount.user_id,
     )
-    if current_user is not None:
-        query = query.where(SmtpAccount.user_id == current_user.id)
     result = await db.execute(query)
     return list(result.scalars().all())
 

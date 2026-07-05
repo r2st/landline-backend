@@ -11,6 +11,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.interaction import Interaction
@@ -24,8 +25,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/interactions", tags=["interactions"])
 
 
+async def _get_interaction_in_scope(
+    db: AsyncSession, interaction_id: uuid.UUID, scope: UserScope
+) -> Interaction:
+    """Load an interaction, 404-ing if it's outside the caller's scope."""
+    interaction = (
+        await db.execute(select(Interaction).where(Interaction.id == interaction_id))
+    ).scalar_one_or_none()
+    if not interaction or not scope.can_access(interaction.user_id):
+        raise HTTPException(status_code=404, detail="Interaction not found")
+    return interaction
+
+
 @router.post("", response_model=InteractionRead, status_code=201)
-async def create_interaction(payload: InteractionCreate, db: AsyncSession = Depends(get_db)):
+async def create_interaction(
+    payload: InteractionCreate,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
     """Log an interaction with a company (optionally a specific contact)."""
     company = (
         await db.execute(select(Company.id).where(Company.id == payload.company_id))
@@ -44,6 +61,7 @@ async def create_interaction(payload: InteractionCreate, db: AsyncSession = Depe
     if data.get("occurred_at") is None:
         data["occurred_at"] = datetime.now(timezone.utc)
     interaction = Interaction(**data)
+    interaction.user_id = scope.owner_id
     db.add(interaction)
     await db.flush()
     await db.refresh(interaction)
@@ -60,9 +78,13 @@ async def list_interactions(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
-    """List interactions, most recent first, with optional filters."""
-    query = select(Interaction)
+    """List interactions, most recent first, with optional filters.
+
+    Scoped to the caller; admins/managers may pass ``view_as_user_id``.
+    """
+    query = scope.apply(select(Interaction), Interaction.user_id)
     conditions = []
     if company_id:
         conditions.append(Interaction.company_id == company_id)
@@ -78,26 +100,24 @@ async def list_interactions(
 
 
 @router.get("/{interaction_id}", response_model=InteractionRead)
-async def get_interaction(interaction_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Get a single interaction by ID."""
-    interaction = (
-        await db.execute(select(Interaction).where(Interaction.id == interaction_id))
-    ).scalar_one_or_none()
-    if not interaction:
-        raise HTTPException(status_code=404, detail="Interaction not found")
-    return interaction
+async def get_interaction(
+    interaction_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Get a single interaction by ID (must be in the caller's scope)."""
+    return await _get_interaction_in_scope(db, interaction_id, scope)
 
 
 @router.patch("/{interaction_id}", response_model=InteractionRead)
 async def update_interaction(
-    interaction_id: uuid.UUID, payload: InteractionUpdate, db: AsyncSession = Depends(get_db)
+    interaction_id: uuid.UUID,
+    payload: InteractionUpdate,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Update an interaction."""
-    interaction = (
-        await db.execute(select(Interaction).where(Interaction.id == interaction_id))
-    ).scalar_one_or_none()
-    if not interaction:
-        raise HTTPException(status_code=404, detail="Interaction not found")
+    interaction = await _get_interaction_in_scope(db, interaction_id, scope)
     update_data = payload.model_dump(exclude_unset=True)
     if "contact_id" in update_data and update_data["contact_id"] is not None:
         contact = (
@@ -114,13 +134,13 @@ async def update_interaction(
 
 
 @router.delete("/{interaction_id}", status_code=204)
-async def delete_interaction(interaction_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Delete an interaction."""
-    interaction = (
-        await db.execute(select(Interaction).where(Interaction.id == interaction_id))
-    ).scalar_one_or_none()
-    if not interaction:
-        raise HTTPException(status_code=404, detail="Interaction not found")
+async def delete_interaction(
+    interaction_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Delete an interaction (must be in the caller's scope)."""
+    interaction = await _get_interaction_in_scope(db, interaction_id, scope)
     await db.delete(interaction)
     await db.flush()
     logger.info("Deleted interaction %s", interaction_id)

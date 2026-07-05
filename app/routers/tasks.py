@@ -10,11 +10,10 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user_optional
+from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.task import Task
-from app.models.user import User
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
 
 logger = logging.getLogger(__name__)
@@ -47,13 +46,12 @@ async def _validate_refs(db: AsyncSession, company_id: uuid.UUID, contact_id: Op
 async def create_task(
     payload: TaskCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Create a task for a company (optionally tied to a contact)."""
     await _validate_refs(db, payload.company_id, payload.contact_id)
     task = Task(**payload.model_dump())
-    if current_user is not None:
-        task.user_id = current_user.id
+    task.user_id = scope.owner_id
     db.add(task)
     await db.flush()
     await db.refresh(task)
@@ -72,16 +70,15 @@ async def list_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """List tasks with optional filters, soonest due first (nulls last).
 
-    When called with a JWT Bearer token, scopes to the current user's tasks.
+    Scoped to the current user's tasks; admins/managers may pass
+    ``view_as_user_id`` to view another user's (or ``all``) tasks.
     """
-    query = select(Task)
+    query = scope.apply(select(Task), Task.user_id)
     conditions = []
-    if current_user is not None:
-        conditions.append(Task.user_id == current_user.id)
     if company_id:
         conditions.append(Task.company_id == company_id)
     if contact_id:
@@ -108,16 +105,17 @@ async def upcoming_tasks(
     assigned_to: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Open tasks due within ``days`` (optionally including overdue ones).
 
     Powers the dashboard's "what's next" panel; sorted soonest-due first.
-    When called with a JWT Bearer token, scopes to the current user's tasks.
+    Scoped to the current user (admins/managers may use ``view_as_user_id``).
     """
-    query = select(Task).where(Task.status.in_(_OPEN_STATUSES), Task.due_date.isnot(None))
-    if current_user is not None:
-        query = query.where(Task.user_id == current_user.id)
+    query = scope.apply(
+        select(Task).where(Task.status.in_(_OPEN_STATUSES), Task.due_date.isnot(None)),
+        Task.user_id,
+    )
     if assigned_to:
         query = query.where(Task.assigned_to == assigned_to)
     tasks = list((await db.execute(query)).scalars().all())
@@ -139,23 +137,33 @@ async def upcoming_tasks(
     return selected[:limit]
 
 
-@router.get("/{task_id}", response_model=TaskRead)
-async def get_task(task_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Get a single task by ID."""
+async def _get_task_in_scope(db: AsyncSession, task_id: uuid.UUID, scope: UserScope) -> Task:
+    """Load a task, 404-ing if it's outside the caller's scope."""
     task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
-    if not task:
+    if not task or not scope.can_access(task.user_id):
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
 
+@router.get("/{task_id}", response_model=TaskRead)
+async def get_task(
+    task_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Get a single task by ID (must be in the caller's scope)."""
+    return await _get_task_in_scope(db, task_id, scope)
+
+
 @router.patch("/{task_id}", response_model=TaskRead)
 async def update_task(
-    task_id: uuid.UUID, payload: TaskUpdate, db: AsyncSession = Depends(get_db)
+    task_id: uuid.UUID,
+    payload: TaskUpdate,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Update task fields."""
-    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = await _get_task_in_scope(db, task_id, scope)
     update_data = payload.model_dump(exclude_unset=True)
     if "contact_id" in update_data and update_data["contact_id"] is not None:
         contact = (
@@ -172,11 +180,13 @@ async def update_task(
 
 
 @router.delete("/{task_id}", status_code=204)
-async def delete_task(task_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Delete a task."""
-    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
+async def delete_task(
+    task_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Delete a task (must be in the caller's scope)."""
+    task = await _get_task_in_scope(db, task_id, scope)
     await db.delete(task)
     await db.flush()
     logger.info("Deleted task %s", task_id)

@@ -11,12 +11,11 @@ from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user_optional
+from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
 from app.models.follow_up import FollowUp
-from app.models.user import User
 from app.schemas.follow_up import (
     FollowUpCreate,
     FollowUpRead,
@@ -77,11 +76,23 @@ async def _serialize(db: AsyncSession, fu: FollowUp, now: datetime) -> FollowUpR
     )
 
 
+async def _get_follow_up_in_scope(
+    db: AsyncSession, follow_up_id: uuid.UUID, scope: UserScope
+) -> FollowUp:
+    """Load a follow-up, 404-ing if it's outside the caller's scope."""
+    follow_up = (
+        await db.execute(select(FollowUp).where(FollowUp.id == follow_up_id))
+    ).scalar_one_or_none()
+    if not follow_up or not scope.can_access(follow_up.user_id):
+        raise HTTPException(status_code=404, detail="Follow-up not found")
+    return follow_up
+
+
 @router.post("", response_model=FollowUpRead, status_code=201)
 async def create_follow_up(
     payload: FollowUpCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Create a follow-up reminder for a contact and/or company."""
     if payload.contact_id is None and payload.company_id is None:
@@ -109,7 +120,7 @@ async def create_follow_up(
         due_date=payload.due_date,
         reason=payload.reason,
         notes=payload.notes,
-        user_id=current_user.id if current_user else None,
+        user_id=scope.owner_id,
     )
     db.add(follow_up)
     await db.flush()
@@ -128,16 +139,14 @@ async def list_follow_ups(
         None, ge=0, le=365, description="Only pending follow-ups due within N days"
     ),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """List follow-ups, newest due first, with optional filters.
 
-    When called with a JWT Bearer token, scopes to the current user's follow-ups.
+    Scoped to the caller; admins/managers may pass ``view_as_user_id``.
     """
-    query = select(FollowUp)
+    query = scope.apply(select(FollowUp), FollowUp.user_id)
     conditions = []
-    if current_user is not None:
-        conditions.append(FollowUp.user_id == current_user.id)
     if status:
         conditions.append(FollowUp.status == status)
     if contact_id:
@@ -253,12 +262,10 @@ async def update_follow_up(
     follow_up_id: uuid.UUID,
     payload: FollowUpUpdate,
     db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Update a follow-up — reschedule, edit notes, or change status."""
-    result = await db.execute(select(FollowUp).where(FollowUp.id == follow_up_id))
-    follow_up = result.scalar_one_or_none()
-    if not follow_up:
-        raise HTTPException(status_code=404, detail="Follow-up not found")
+    follow_up = await _get_follow_up_in_scope(db, follow_up_id, scope)
 
     update_data = payload.model_dump(exclude_unset=True)
     new_status = update_data.get("status")
@@ -281,12 +288,10 @@ async def update_follow_up(
 async def delete_follow_up(
     follow_up_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
-    """Delete a follow-up reminder."""
-    result = await db.execute(select(FollowUp).where(FollowUp.id == follow_up_id))
-    follow_up = result.scalar_one_or_none()
-    if not follow_up:
-        raise HTTPException(status_code=404, detail="Follow-up not found")
+    """Delete a follow-up reminder (must be in the caller's scope)."""
+    follow_up = await _get_follow_up_in_scope(db, follow_up_id, scope)
     await db.delete(follow_up)
     await db.flush()
     logger.info("Deleted follow-up %s", follow_up_id)

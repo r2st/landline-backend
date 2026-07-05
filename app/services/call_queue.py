@@ -300,6 +300,7 @@ async def generate_call_queue_for_session(
     assigned_to: str | None = None,
     limit: int = 20,
     stages: list[str] | None = None,
+    user_id=None,
 ) -> dict:
     """Build and persist a prioritised call queue. Returns a summary dict.
 
@@ -382,6 +383,7 @@ async def generate_call_queue_for_session(
             contact_id=contact.id,
             company_id=company.id,
             assigned_to=assigned_to,
+            user_id=user_id,
             status="pending",
             priority=priority,
             scheduled_at=now,

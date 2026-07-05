@@ -1,10 +1,10 @@
-"""Shared FastAPI dependencies — current-user extraction, role checks."""
+"""Shared FastAPI dependencies — current-user extraction, role checks, scoping."""
 
 import logging
 from typing import Optional
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy import select
@@ -15,6 +15,9 @@ from app.models.user import User
 from app.security import decode_token
 
 logger = logging.getLogger(__name__)
+
+# Roles allowed to view other users' data via ``?view_as_user_id=``.
+PRIVILEGED_ROLES = ("admin", "manager")
 
 # Optional so endpoints can gracefully handle missing tokens
 _bearer = HTTPBearer(auto_error=False)
@@ -107,3 +110,94 @@ def require_role(*roles: str):
         return user
 
     return _check
+
+
+class UserScope:
+    """Resolved per-request data scope for user-owned tables.
+
+    Encapsulates the "users see their own data; admins/managers see their own
+    by default but can view any user's (or everyone's) via ``?view_as_user_id``"
+    pattern so every router applies it identically.
+
+    Attributes:
+        user: the authenticated user, or ``None`` for API-key (legacy) callers.
+        target_user_id: the user id to scope to, or ``None`` when unscoped.
+        see_all: when True, no ``user_id`` filter is applied (see everything).
+    """
+
+    def __init__(
+        self,
+        user: Optional[User],
+        target_user_id: Optional[UUID],
+        see_all: bool,
+    ) -> None:
+        self.user = user
+        self.target_user_id = target_user_id
+        self.see_all = see_all
+
+    @property
+    def is_privileged(self) -> bool:
+        return self.user is not None and self.user.role in PRIVILEGED_ROLES
+
+    def apply(self, query, column):
+        """Add the ``column == target_user_id`` filter unless seeing all."""
+        if self.see_all:
+            return query
+        return query.where(column == self.target_user_id)
+
+    def can_access(self, owner_id: Optional[UUID]) -> bool:
+        """Whether a single record owned by ``owner_id`` is in scope."""
+        if self.see_all:
+            return True
+        return owner_id == self.target_user_id
+
+    @property
+    def owner_id(self) -> Optional[UUID]:
+        """The user id to stamp on newly-created records.
+
+        For a privileged user acting as someone else, records are attributed to
+        that someone; otherwise to the caller (or ``None`` for API-key callers).
+        """
+        if self.target_user_id is not None:
+            return self.target_user_id
+        return self.user.id if self.user is not None else None
+
+
+async def get_scope(
+    view_as_user_id: Optional[str] = Query(
+        None,
+        description="Admins/managers only: scope to a specific user id, or 'all'.",
+    ),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> UserScope:
+    """Resolve the data scope for the current request.
+
+    - No JWT (API-key / legacy): unscoped (sees everything) for back-compat.
+    - Regular user: always scoped to their own data; ``view_as_user_id`` ignored.
+    - Admin/manager: own data by default; ``view_as_user_id=<uuid>`` views that
+      user's data, ``view_as_user_id=all`` views everyone's.
+    """
+    if current_user is None:
+        return UserScope(None, None, see_all=True)
+
+    privileged = current_user.role in PRIVILEGED_ROLES
+    if privileged and view_as_user_id:
+        if view_as_user_id.lower() == "all":
+            return UserScope(current_user, None, see_all=True)
+        try:
+            target = UUID(view_as_user_id)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid view_as_user_id — expected a user id or 'all'.",
+            )
+        exists = (
+            await db.execute(select(User.id).where(User.id == target))
+        ).scalar_one_or_none()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        return UserScope(current_user, target, see_all=False)
+
+    # Regular users, and privileged users with no view_as override: own data.
+    return UserScope(current_user, current_user.id, see_all=False)

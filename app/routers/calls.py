@@ -20,15 +20,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user_optional
+from app.dependencies import UserScope, get_scope
 from app.models.call import CallNotification, CallScript, CallTask
 from app.models.company import Company
 from app.models.contact import Contact
-from app.models.user import User
 from app.schemas.call import (
     CallBriefing,
     CallNotificationRead,
@@ -81,17 +80,28 @@ async def _validate_refs(
 # --------------------------------------------------------------------------- #
 
 
+async def _get_call_task_in_scope(
+    db: AsyncSession, task_id: uuid.UUID, scope: UserScope
+) -> CallTask:
+    """Load a call task, 404-ing if it's outside the caller's scope."""
+    task = (
+        await db.execute(select(CallTask).where(CallTask.id == task_id))
+    ).scalar_one_or_none()
+    if not task or not scope.can_access(task.user_id):
+        raise HTTPException(status_code=404, detail="Call task not found")
+    return task
+
+
 @router.post("/tasks", response_model=CallTaskRead, status_code=201)
 async def create_call_task(
     payload: CallTaskCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Create a cold-call task for a company (optionally tied to a contact)."""
     await _validate_refs(db, payload.company_id, payload.contact_id)
     task = CallTask(**payload.model_dump())
-    if current_user is not None:
-        task.user_id = current_user.id
+    task.user_id = scope.owner_id
     db.add(task)
     await db.flush()
     await db.refresh(task)
@@ -112,15 +122,13 @@ async def list_call_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """List call tasks with optional filters; hottest then soonest-scheduled.
 
-    When called with a JWT Bearer token, scopes to the current user's call tasks.
+    Scoped to the caller; admins/managers may pass ``view_as_user_id``.
     """
     conditions = []
-    if current_user is not None:
-        conditions.append(CallTask.user_id == current_user.id)
     if status:
         conditions.append(CallTask.status == status)
     if priority:
@@ -138,7 +146,7 @@ async def list_call_tasks(
     if scheduled_to:
         conditions.append(CallTask.scheduled_at <= scheduled_to)
 
-    query = select(CallTask)
+    query = scope.apply(select(CallTask), CallTask.user_id)
     if conditions:
         query = query.where(and_(*conditions))
     query = query.order_by(
@@ -153,18 +161,19 @@ async def todays_call_queue(
     assigned_to: Optional[str] = Query(None),
     include_overdue: bool = Query(True),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Open call tasks for today (plus overdue), hottest first.
 
     "Today" means scheduled today, or unscheduled-but-created-today. With
     ``include_overdue`` (default), still-open tasks scheduled before today are
     included so nothing slips through the cracks.
-    When called with a JWT Bearer token, scopes to the current user's call tasks.
+    Scoped to the caller; admins/managers may pass ``view_as_user_id``.
     """
-    query = select(CallTask).where(CallTask.status.in_(_OPEN_CALL_STATUSES))
-    if current_user is not None:
-        query = query.where(CallTask.user_id == current_user.id)
+    query = scope.apply(
+        select(CallTask).where(CallTask.status.in_(_OPEN_CALL_STATUSES)),
+        CallTask.user_id,
+    )
     if assigned_to:
         query = query.where(CallTask.assigned_to == assigned_to)
     tasks = list((await db.execute(query)).scalars().all())
@@ -194,19 +203,21 @@ async def todays_call_queue(
 
 
 @router.get("/tasks/{task_id}", response_model=CallTaskRead)
-async def get_call_task(task_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Get a single call task."""
-    task = (
-        await db.execute(select(CallTask).where(CallTask.id == task_id))
-    ).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Call task not found")
-    return task
+async def get_call_task(
+    task_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Get a single call task (must be in the caller's scope)."""
+    return await _get_call_task_in_scope(db, task_id, scope)
 
 
 @router.put("/tasks/{task_id}", response_model=CallTaskRead)
 async def update_call_task(
-    task_id: uuid.UUID, payload: CallTaskUpdateEnhanced, db: AsyncSession = Depends(get_db)
+    task_id: uuid.UUID,
+    payload: CallTaskUpdateEnhanced,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Update a call task — mark complete, log an outcome, add notes, reschedule.
 
@@ -217,11 +228,7 @@ async def update_call_task(
 
     Marking ``status=completed`` auto-stamps ``completed_at`` if not supplied.
     """
-    task = (
-        await db.execute(select(CallTask).where(CallTask.id == task_id))
-    ).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Call task not found")
+    task = await _get_call_task_in_scope(db, task_id, scope)
 
     update_data = payload.model_dump(exclude_unset=True)
     if "contact_id" in update_data and update_data["contact_id"] is not None:
@@ -263,13 +270,10 @@ async def call_task_briefing(
     task_id: uuid.UUID,
     script_type: str = Query("initial_cold_call", pattern="^(initial_cold_call|follow_up|voicemail)$"),
     db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Pre-call background brief: company, engagement, pain points, script."""
-    task = (
-        await db.execute(select(CallTask).where(CallTask.id == task_id))
-    ).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Call task not found")
+    task = await _get_call_task_in_scope(db, task_id, scope)
     return await build_briefing(db, call_task=task, script_type=script_type)
 
 
@@ -280,6 +284,7 @@ async def get_task_custom_script(
     regenerate: bool = Query(False),
     framework: Optional[str] = Query(None, description="Sales methodology framework"),
     db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Get the AI-generated custom script for a call task.
 
@@ -291,11 +296,7 @@ async def get_task_custom_script(
     """
     if framework and framework not in SALES_FRAMEWORKS:
         raise HTTPException(status_code=400, detail=f"framework must be one of {SALES_FRAMEWORKS}")
-    task = (
-        await db.execute(select(CallTask).where(CallTask.id == task_id))
-    ).scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="Call task not found")
+    task = await _get_call_task_in_scope(db, task_id, scope)
     return await ai_script_generator.get_or_generate_for_task(
         db, task, call_type=call_type, force=regenerate,
         sales_framework=framework,
@@ -459,15 +460,13 @@ async def list_notifications(
     notification_type: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """List call notifications, newest first (unread only by default).
 
-    When called with a JWT Bearer token, scopes to the current user's notifications.
+    Scoped to the caller; admins/managers may pass ``view_as_user_id``.
     """
-    query = select(CallNotification)
-    if current_user is not None:
-        query = query.where(CallNotification.user_id == current_user.id)
+    query = scope.apply(select(CallNotification), CallNotification.user_id)
     if unread_only:
         query = query.where(CallNotification.read_at.is_(None))
     if notification_type:
@@ -478,15 +477,17 @@ async def list_notifications(
 
 @router.put("/notifications/{notification_id}/read", response_model=CallNotificationRead)
 async def mark_notification_read(
-    notification_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    notification_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
-    """Mark a notification as read."""
+    """Mark a notification as read (must be in the caller's scope)."""
     notif = (
         await db.execute(
             select(CallNotification).where(CallNotification.id == notification_id)
         )
     ).scalar_one_or_none()
-    if not notif:
+    if not notif or not scope.can_access(notif.user_id):
         raise HTTPException(status_code=404, detail="Notification not found")
     if notif.read_at is None:
         notif.read_at = datetime.now(timezone.utc)
@@ -588,13 +589,16 @@ async def framework_usage(
 
 @router.post("/queue/generate", response_model=QueueGenerateResponse)
 async def generate_queue(
-    payload: QueueGenerateRequest | None = None, db: AsyncSession = Depends(get_db)
+    payload: QueueGenerateRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
     """Analyse active leads and generate a prioritised call queue for the day.
 
     Ranks by email engagement (opens/clicks/replies), recency since last
     contact, lead score, and industry priority. Idempotent for the day —
-    contacts with an open call task are skipped.
+    contacts with an open call task are skipped. Generated tasks are owned by
+    the current user (or the ``view_as_user_id`` target for admins).
     """
     payload = payload or QueueGenerateRequest()
     result = await generate_call_queue_for_session(
@@ -602,6 +606,7 @@ async def generate_queue(
         assigned_to=payload.assigned_to,
         limit=payload.limit,
         stages=payload.stages,
+        user_id=scope.owner_id,
     )
     # Pre-generate custom scripts for the day's top (hot/warm) leads so they're
     # ready before the rep starts dialling. Best-effort — won't fail the queue.

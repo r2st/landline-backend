@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
-from app.dependencies import get_current_user_optional
+from app.dependencies import UserScope, get_current_user_optional, get_scope
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
@@ -204,18 +204,20 @@ async def oauth_callback(
 @router.get("/status", response_model=GmailStatusResponse)
 async def status(
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Connection status for the settings UI and compose 'From' line.
 
-    When called with a JWT Bearer token, scoped to the current user's accounts.
+    Scoped to the caller's own accounts; admins/managers may pass
+    ``view_as_user_id`` to inspect another user's connection status.
     """
     settings = get_settings()
-    query = select(GmailAccount).order_by(
-        GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
+    query = scope.apply(
+        select(GmailAccount).order_by(
+            GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
+        ),
+        GmailAccount.user_id,
     )
-    if current_user is not None:
-        query = query.where(GmailAccount.user_id == current_user.id)
     result = await db.execute(query)
     accounts = list(result.scalars().all())
     active = next((a for a in accounts if a.is_active and a.status == "connected"), None)
@@ -236,17 +238,19 @@ async def status(
 @router.get("/accounts", response_model=list[GmailAccountRead])
 async def list_accounts(
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """List connected Gmail accounts.
 
-    When called with a JWT Bearer token, scoped to the current user's accounts.
+    Scoped to the caller's own accounts; admins/managers may pass
+    ``view_as_user_id`` (or ``all``) to list another user's accounts.
     """
-    query = select(GmailAccount).order_by(
-        GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
+    query = scope.apply(
+        select(GmailAccount).order_by(
+            GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
+        ),
+        GmailAccount.user_id,
     )
-    if current_user is not None:
-        query = query.where(GmailAccount.user_id == current_user.id)
     result = await db.execute(query)
     return list(result.scalars().all())
 

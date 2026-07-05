@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import PRIVILEGED_ROLES, get_current_user
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -98,6 +98,28 @@ async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
 async def me(user: User = Depends(get_current_user)):
     """Return the currently authenticated user's profile."""
     return user
+
+
+@router.get("/team-members", response_model=list[UserRead])
+async def team_members(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List active users for the admin/manager "View as" switcher.
+
+    Only admins and managers may enumerate the team; regular users get 403.
+    Returns active users ordered by name so the dropdown can offer per-user
+    inboxes alongside the "All Users" option.
+    """
+    if user.role not in PRIVILEGED_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins and managers can list team members",
+        )
+    result = await db.execute(
+        select(User).where(User.is_active.is_(True)).order_by(User.name.asc())
+    )
+    return list(result.scalars().all())
 
 
 @router.patch("/me", response_model=UserRead)

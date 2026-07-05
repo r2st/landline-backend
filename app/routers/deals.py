@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.deal import Deal
 from app.models.deal_activity import DealActivity
@@ -292,14 +293,17 @@ async def delete_deal(deal_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 @router.post("/{deal_id}/notes", response_model=DealNoteRead, status_code=201)
 async def add_deal_note(
-    deal_id: uuid.UUID, payload: DealNoteCreate, db: AsyncSession = Depends(get_db)
+    deal_id: uuid.UUID,
+    payload: DealNoteCreate,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
 ):
-    """Add a note to a deal."""
+    """Add a note to a deal, attributed to the current user."""
     deal = (await db.execute(select(Deal).where(Deal.id == deal_id))).scalar_one_or_none()
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    note = DealNote(deal_id=deal_id, content=payload.content)
+    note = DealNote(deal_id=deal_id, content=payload.content, user_id=scope.owner_id)
     db.add(note)
     await db.flush()
     await db.refresh(note)
@@ -316,16 +320,23 @@ async def add_deal_note(
 
 
 @router.get("/{deal_id}/notes", response_model=list[DealNoteRead])
-async def list_deal_notes(deal_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """List notes for a deal, newest first."""
+async def list_deal_notes(
+    deal_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """List notes for a deal, newest first.
+
+    Scoped to the caller's own notes; admins/managers may pass
+    ``view_as_user_id`` (or ``all``) to see other users' notes on the deal.
+    """
     deal = (await db.execute(select(Deal).where(Deal.id == deal_id))).scalar_one_or_none()
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-    query = (
-        select(DealNote)
-        .where(DealNote.deal_id == deal_id)
-        .order_by(DealNote.created_at.desc())
-    )
+    query = scope.apply(
+        select(DealNote).where(DealNote.deal_id == deal_id),
+        DealNote.user_id,
+    ).order_by(DealNote.created_at.desc())
     return list((await db.execute(query)).scalars().all())
 
 

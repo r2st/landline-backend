@@ -262,6 +262,9 @@ class SmartReplyService:
                     status="sent",
                     sent_at=datetime.now(timezone.utc),
                     contact_id=contact.id if contact else None,
+                    from_email=gmail_account.email,
+                    sender_account_id=gmail_account.id,
+                    user_id=gmail_account.user_id,
                 )
                 db.add(auto_send)
                 await db.commit()

@@ -9,10 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import get_current_user_optional
+from app.dependencies import UserScope, get_scope
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
-from app.models.user import User
 from app.schemas.email_history import (
     EmailInboxResponse,
     EmailLeadResponse,
@@ -29,6 +28,19 @@ router = APIRouter(prefix="/emails", tags=["emails"])
 
 def _get_service() -> EmailHistoryService:
     return EmailHistoryService()
+
+
+async def _sender_emails_for_user(db: AsyncSession, user_id: uuid.UUID) -> set[str]:
+    """Lowercased set of a user's own Gmail + SMTP sender addresses."""
+    gmail_res = await db.execute(
+        select(GmailAccount.email).where(GmailAccount.user_id == user_id)
+    )
+    smtp_res = await db.execute(
+        select(SmtpAccount.email).where(SmtpAccount.user_id == user_id)
+    )
+    return {e.lower() for e in gmail_res.scalars().all()} | {
+        e.lower() for e in smtp_res.scalars().all()
+    }
 
 
 @router.get("/lead/{company_id}", response_model=EmailLeadResponse)
@@ -54,14 +66,16 @@ async def get_inbox(
         None, description="Filter to a single connected email account by its id"
     ),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Unified inbox with filtering and search.
 
     Filter values: all, sent, received, opened, needs_reply
 
-    When called with a JWT Bearer token, scopes the inbox to the
-    current user's connected Gmail accounts.
+    Scoped to the caller's own connected Gmail/SMTP accounts. Admins/managers
+    may pass ``view_as_user_id`` to view another user's inbox, or
+    ``view_as_user_id=all`` to see everyone's mail. An authenticated user with
+    no connected accounts sees an empty inbox (fail closed).
 
     Pass ``gmail_account_id`` to filter to a single connected email account
     (e.g. only mail sent from / received on support@company.com). Each returned
@@ -74,31 +88,21 @@ async def get_inbox(
             status_code=400,
             detail=f"Invalid filter. Must be one of: {', '.join(valid_filters)}",
         )
-    # Collect the user's own sender addresses (Gmail + SMTP) for scoping. When
-    # authenticated, the inbox is strictly limited to these — and an
-    # authenticated user with no connected accounts sees an empty inbox rather
-    # than everyone's mail (fail closed).
+    # Resolve which sender addresses this request is scoped to. ``see_all``
+    # (API-key legacy, or an admin's "All Users" view) means no address filter.
     user_gmail_emails = None
-    if current_user is not None:
-        gmail_res = await db.execute(
-            select(GmailAccount.email).where(GmailAccount.user_id == current_user.id)
-        )
-        smtp_res = await db.execute(
-            select(SmtpAccount.email).where(SmtpAccount.user_id == current_user.id)
-        )
-        user_gmail_emails = {
-            e.lower() for e in gmail_res.scalars().all()
-        } | {e.lower() for e in smtp_res.scalars().all()}
+    if not scope.see_all:
+        user_gmail_emails = await _sender_emails_for_user(db, scope.target_user_id)
         if not user_gmail_emails:
-            # No connected accounts → nothing to show for this user.
+            # Authenticated but no connected accounts → nothing to show.
             return {"threads": [], "total": 0, "page": page, "per_page": per_page}
 
     # When filtering by a specific account, make sure it exists — and, when
-    # authenticated, that it belongs to the current user (no cross-user peeking).
+    # scoped, that it belongs to the user in view (no cross-user peeking).
     if gmail_account_id is not None:
         owner_query = select(GmailAccount.id).where(GmailAccount.id == gmail_account_id)
-        if current_user is not None:
-            owner_query = owner_query.where(GmailAccount.user_id == current_user.id)
+        if not scope.see_all:
+            owner_query = owner_query.where(GmailAccount.user_id == scope.target_user_id)
         account_exists = (await db.execute(owner_query)).scalar_one_or_none()
         if account_exists is None:
             raise HTTPException(status_code=404, detail="Email account not found")
@@ -143,15 +147,15 @@ async def send_reply(
 @router.post("/sync", response_model=SyncStatusResponse)
 async def trigger_sync(
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    scope: UserScope = Depends(get_scope),
 ):
     """Trigger a manual sync of email replies from Gmail.
 
-    When called with a JWT Bearer token, syncs only the current user's
-    connected Gmail accounts.
+    Syncs the caller's own connected Gmail accounts. Admins/managers may pass
+    ``view_as_user_id`` to sync another user's (or ``all``) accounts.
     """
     service = _get_service()
-    user_id = current_user.id if current_user else None
+    user_id = None if scope.see_all else scope.target_user_id
     result = await service.sync_all_accounts(db, user_id=user_id)
     return {
         "synced": result.get("synced", 0),
