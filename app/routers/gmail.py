@@ -18,13 +18,12 @@ import html
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy import delete, func as sa_func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from typing import Optional
 
 from app.config import get_settings
 from app.database import get_db
@@ -46,6 +45,24 @@ from app.services.gmail_sender import GmailSender
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gmail", tags=["gmail"])
+
+
+async def _get_owned_account(
+    db: AsyncSession, account_id: uuid.UUID, user: Optional[User]
+) -> GmailAccount:
+    """Load a Gmail account, enforcing ownership when a user is authenticated.
+
+    When called with a JWT (``user`` is set) the account must belong to that
+    user — otherwise it's reported as 404 so accounts aren't enumerable across
+    users. Unauthenticated (API-key) callers keep the legacy global access.
+    """
+    query = select(GmailAccount).where(GmailAccount.id == account_id)
+    if user is not None:
+        query = query.where(GmailAccount.user_id == user.id)
+    account = (await db.execute(query)).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
+    return account
 
 
 def _callback_html(ok: bool, message: str) -> str:
@@ -76,14 +93,22 @@ def _callback_html(ok: bool, message: str) -> str:
 
 
 @router.get("/oauth/authorize", response_model=AuthorizeResponse)
-async def authorize():
-    """Return the Google consent-screen URL for connecting a Gmail account."""
+async def authorize(
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Return the Google consent-screen URL for connecting a Gmail account.
+
+    When called with a JWT Bearer token, the user's id is embedded in the
+    signed ``state`` so the (public) callback can link the connected account
+    to the user who started the flow.
+    """
     if not google_oauth.is_configured():
         raise HTTPException(
             status_code=503,
             detail="Google OAuth is not configured on the server.",
         )
-    state = google_oauth.issue_state()
+    user_id = str(current_user.id) if current_user else None
+    state = google_oauth.issue_state(user_id=user_id)
     url = google_oauth.build_authorization_url(state)
     return AuthorizeResponse(authorization_url=url, state=state)
 
@@ -98,8 +123,19 @@ async def oauth_callback(
     """Handle Google's redirect: exchange the code and store the connection."""
     if error:
         return HTMLResponse(_callback_html(False, f"Google returned an error: {error}"))
-    if not code or not google_oauth.verify_state(state or ""):
+    state_payload = google_oauth.read_state(state or "")
+    if not code or state_payload is None:
         return HTMLResponse(_callback_html(False, "Invalid or expired authorization request."))
+
+    # The user who started the flow (embedded in the signed state). Used to
+    # scope the connected account so it only appears in that user's inbox.
+    connecting_user_id: uuid.UUID | None = None
+    raw_user_id = state_payload.get("u")
+    if raw_user_id:
+        try:
+            connecting_user_id = uuid.UUID(str(raw_user_id))
+        except (ValueError, TypeError):
+            connecting_user_id = None
 
     try:
         connected = google_oauth.exchange_code(code)
@@ -125,9 +161,13 @@ async def oauth_callback(
                 "Google did not return a refresh token. Remove Landline's access "
                 "in your Google Account and try connecting again.",
             ))
-        # First account becomes active automatically
-        any_existing = (await db.execute(select(GmailAccount.id).limit(1))).first()
+        # First account for this owner becomes active automatically.
+        owner_scope = select(GmailAccount.id)
+        if connecting_user_id is not None:
+            owner_scope = owner_scope.where(GmailAccount.user_id == connecting_user_id)
+        any_existing = (await db.execute(owner_scope.limit(1))).first()
         account = GmailAccount(
+            user_id=connecting_user_id,
             email=connected.email,
             google_sub=connected.google_sub,
             display_name=connected.display_name,
@@ -147,6 +187,9 @@ async def oauth_callback(
         account.token_expiry = expiry
         account.scopes = connected.scopes
         account.status = "connected"
+        # Re-connecting claims (or re-claims) the account for the current user.
+        if connecting_user_id is not None:
+            account.user_id = connecting_user_id
         if connected.refresh_token:
             account.refresh_token_encrypted = crypto.encrypt(connected.refresh_token)
 
@@ -159,14 +202,21 @@ async def oauth_callback(
 
 
 @router.get("/status", response_model=GmailStatusResponse)
-async def status(db: AsyncSession = Depends(get_db)):
-    """Connection status for the settings UI and compose 'From' line."""
+async def status(
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Connection status for the settings UI and compose 'From' line.
+
+    When called with a JWT Bearer token, scoped to the current user's accounts.
+    """
     settings = get_settings()
-    result = await db.execute(
-        select(GmailAccount).order_by(
-            GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
-        )
+    query = select(GmailAccount).order_by(
+        GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
     )
+    if current_user is not None:
+        query = query.where(GmailAccount.user_id == current_user.id)
+    result = await db.execute(query)
     accounts = list(result.scalars().all())
     active = next((a for a in accounts if a.is_active and a.status == "connected"), None)
     sending_count = sum(
@@ -190,8 +240,7 @@ async def list_accounts(
 ):
     """List connected Gmail accounts.
 
-    When called with a Bearer token, only the current user's own linked
-    accounts are returned (sender email IDs are scoped per user login).
+    When called with a JWT Bearer token, scoped to the current user's accounts.
     """
     query = select(GmailAccount).order_by(
         GmailAccount.is_active.desc(), GmailAccount.connected_at.desc()
@@ -203,20 +252,27 @@ async def list_accounts(
 
 
 @router.post("/accounts/{account_id}/set-active", response_model=GmailAccountRead)
-async def set_active(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def set_active(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Make a connected account the primary sender (clears the flag on others)."""
-    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
-    account = result.scalar_one_or_none()
-    if account is None:
-        raise HTTPException(status_code=404, detail="Gmail account not found")
+    account = await _get_owned_account(db, account_id, current_user)
     if account.status != "connected":
         raise HTTPException(
             status_code=400,
             detail="This account is not connected — reconnect it before making it active.",
         )
-    # The primary sender spans Gmail + SMTP, so demote every other sender.
-    await db.execute(update(GmailAccount).values(is_active=False))
-    await db.execute(update(SmtpAccount).values(is_active=False))
+    # The primary sender spans Gmail + SMTP, so demote every other sender. When
+    # authenticated, only demote the current user's own senders.
+    demote_gmail = update(GmailAccount).values(is_active=False)
+    demote_smtp = update(SmtpAccount).values(is_active=False)
+    if current_user is not None:
+        demote_gmail = demote_gmail.where(GmailAccount.user_id == current_user.id)
+        demote_smtp = demote_smtp.where(SmtpAccount.user_id == current_user.id)
+    await db.execute(demote_gmail)
+    await db.execute(demote_smtp)
     account.is_active = True
     await db.flush()
     await db.refresh(account)
@@ -229,12 +285,10 @@ async def toggle_sending(
     account_id: uuid.UUID,
     body: ToggleSendingRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Enable or disable an account for the sending rotation pool."""
-    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
-    account = result.scalar_one_or_none()
-    if account is None:
-        raise HTTPException(status_code=404, detail="Gmail account not found")
+    account = await _get_owned_account(db, account_id, current_user)
     if account.status != "connected":
         raise HTTPException(
             status_code=400,
@@ -249,12 +303,13 @@ async def toggle_sending(
 
 
 @router.delete("/accounts/{account_id}", status_code=204)
-async def disconnect(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def disconnect(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Disconnect an account: revoke its token at Google and delete it locally."""
-    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
-    account = result.scalar_one_or_none()
-    if account is None:
-        raise HTTPException(status_code=404, detail="Gmail account not found")
+    account = await _get_owned_account(db, account_id, current_user)
 
     was_active = account.is_active
     try:
@@ -281,17 +336,18 @@ async def disconnect(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 
 @router.delete("/accounts/{account_id}/purge")
-async def purge_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def purge_account(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Delete all synced emails for an account, then disconnect it.
 
     This removes every email_reply and email_send linked to this Gmail account,
     revokes the Google token, and deletes the account record.
     Returns counts of what was deleted.
     """
-    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
-    account = result.scalar_one_or_none()
-    if account is None:
-        raise HTTPException(status_code=404, detail="Gmail account not found")
+    account = await _get_owned_account(db, account_id, current_user)
 
     email_address = account.email
 
@@ -443,12 +499,10 @@ async def test_send(
     account_id: uuid.UUID,
     body: TestSendRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Send a real test email from this Gmail account to confirm sending works."""
-    result = await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
-    account = result.scalar_one_or_none()
-    if account is None:
-        raise HTTPException(status_code=404, detail="Gmail account not found")
+    account = await _get_owned_account(db, account_id, current_user)
     if account.status != "connected":
         raise HTTPException(
             status_code=400,

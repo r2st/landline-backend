@@ -80,22 +80,41 @@ def _require_config():
     return s
 
 
-def issue_state() -> str:
-    """Create a signed, time-limited state token for CSRF protection."""
-    payload = json.dumps({"n": uuid.uuid4().hex, "t": int(time.time())})
-    return crypto.encrypt(payload)
+def issue_state(user_id: Optional[str] = None) -> str:
+    """Create a signed, time-limited state token for CSRF protection.
+
+    When *user_id* is provided it is embedded in the (encrypted) state so the
+    public OAuth callback can link the connected account to the user who
+    started the flow — without trusting any client-supplied value.
+    """
+    payload = {"n": uuid.uuid4().hex, "t": int(time.time())}
+    if user_id is not None:
+        payload["u"] = str(user_id)
+    return crypto.encrypt(json.dumps(payload))
+
+
+def read_state(state: str) -> Optional[dict]:
+    """Decode and validate a state token, returning its payload or ``None``.
+
+    Returns ``None`` when the token is missing, tampered with, or expired.
+    The payload's ``u`` key (if present) is the id of the user who started the
+    connection flow.
+    """
+    if not state:
+        return None
+    try:
+        payload = json.loads(crypto.decrypt(state))
+    except Exception:
+        return None
+    issued = payload.get("t", 0)
+    if (time.time() - issued) > _STATE_TTL:
+        return None
+    return payload
 
 
 def verify_state(state: str) -> bool:
     """Validate a state token issued by :func:`issue_state`."""
-    if not state:
-        return False
-    try:
-        payload = json.loads(crypto.decrypt(state))
-    except Exception:
-        return False
-    issued = payload.get("t", 0)
-    return (time.time() - issued) <= _STATE_TTL
+    return read_state(state) is not None
 
 
 def build_authorization_url(state: str) -> str:

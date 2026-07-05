@@ -20,12 +20,11 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from typing import Optional
 
 from app.database import get_db
 from app.dependencies import get_current_user_optional
@@ -47,19 +46,30 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/smtp", tags=["smtp"])
 
 
-async def _clear_primary_sender(db: AsyncSession) -> None:
+async def _clear_primary_sender(db: AsyncSession, user: Optional[User] = None) -> None:
     """Clear the ``is_active`` (primary) flag across every sender type.
 
     The primary sender is a single choice spanning both Gmail and SMTP accounts,
-    so promoting one must demote all others regardless of type.
+    so promoting one must demote all others regardless of type. When *user* is
+    given (authenticated), only that user's own senders are demoted.
     """
-    await db.execute(update(GmailAccount).values(is_active=False))
-    await db.execute(update(SmtpAccount).values(is_active=False))
+    demote_gmail = update(GmailAccount).values(is_active=False)
+    demote_smtp = update(SmtpAccount).values(is_active=False)
+    if user is not None:
+        demote_gmail = demote_gmail.where(GmailAccount.user_id == user.id)
+        demote_smtp = demote_smtp.where(SmtpAccount.user_id == user.id)
+    await db.execute(demote_gmail)
+    await db.execute(demote_smtp)
 
 
-async def _get(db: AsyncSession, account_id: uuid.UUID) -> SmtpAccount:
-    result = await db.execute(select(SmtpAccount).where(SmtpAccount.id == account_id))
-    account = result.scalar_one_or_none()
+async def _get(
+    db: AsyncSession, account_id: uuid.UUID, user: Optional[User] = None
+) -> SmtpAccount:
+    """Load an SMTP account, enforcing ownership when a user is authenticated."""
+    query = select(SmtpAccount).where(SmtpAccount.id == account_id)
+    if user is not None:
+        query = query.where(SmtpAccount.user_id == user.id)
+    account = (await db.execute(query)).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="SMTP account not found")
     return account
@@ -72,8 +82,7 @@ async def list_accounts(
 ):
     """List configured SMTP sender accounts.
 
-    When called with a Bearer token, only the current user's own accounts are
-    returned (sender email IDs are scoped per user login).
+    When called with a JWT Bearer token, scoped to the current user's accounts.
     """
     query = select(SmtpAccount).order_by(
         SmtpAccount.is_active.desc(), SmtpAccount.connected_at.desc()
@@ -85,7 +94,11 @@ async def list_accounts(
 
 
 @router.post("/accounts", response_model=SmtpAccountRead, status_code=201)
-async def add_account(payload: SmtpAccountCreate, db: AsyncSession = Depends(get_db)):
+async def add_account(
+    payload: SmtpAccountCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Add an SMTP sender account after verifying its credentials connect."""
     existing = await db.execute(
         select(SmtpAccount).where(SmtpAccount.email == str(payload.email))
@@ -97,6 +110,7 @@ async def add_account(payload: SmtpAccountCreate, db: AsyncSession = Depends(get
         )
 
     account = SmtpAccount(
+        user_id=current_user.id if current_user else None,
         email=str(payload.email),
         display_name=payload.display_name,
         host=payload.host,
@@ -116,9 +130,15 @@ async def add_account(payload: SmtpAccountCreate, db: AsyncSession = Depends(get
             detail=f"Could not connect to the SMTP server: {verify.get('detail', 'unknown error')}",
         )
 
-    # First sender of any kind becomes the primary automatically.
-    any_gmail = (await db.execute(select(GmailAccount.id).limit(1))).first()
-    any_smtp = (await db.execute(select(SmtpAccount.id).limit(1))).first()
+    # First sender of any kind becomes the primary automatically. Scoped per
+    # user when authenticated so each user gets their own default sender.
+    gmail_scope = select(GmailAccount.id)
+    smtp_scope = select(SmtpAccount.id)
+    if current_user is not None:
+        gmail_scope = gmail_scope.where(GmailAccount.user_id == current_user.id)
+        smtp_scope = smtp_scope.where(SmtpAccount.user_id == current_user.id)
+    any_gmail = (await db.execute(gmail_scope.limit(1))).first()
+    any_smtp = (await db.execute(smtp_scope.limit(1))).first()
     account.is_active = any_gmail is None and any_smtp is None
     account.status = "connected"
     account.last_error = None
@@ -135,9 +155,10 @@ async def update_account(
     account_id: uuid.UUID,
     payload: SmtpAccountUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Edit an SMTP account's settings and re-verify the connection."""
-    account = await _get(db, account_id)
+    account = await _get(db, account_id, current_user)
 
     data = payload.model_dump(exclude_unset=True)
     if "email" in data and data["email"] is not None:
@@ -166,33 +187,40 @@ async def update_account(
 
 
 @router.delete("/accounts/{account_id}", status_code=204)
-async def delete_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def delete_account(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Remove an SMTP sender account."""
-    account = await _get(db, account_id)
+    account = await _get(db, account_id, current_user)
     was_active = account.is_active
+    owner_id = account.user_id
     await db.delete(account)
     await db.flush()
 
     # If we removed the primary, promote another connected sender so outreach
-    # keeps flowing. Prefer another SMTP account, then any Gmail account.
+    # keeps flowing. Prefer another SMTP account, then any Gmail account —
+    # scoped to the same owner when the account was user-owned.
     if was_active:
-        repl = (
-            await db.execute(
-                select(SmtpAccount)
-                .where(SmtpAccount.status == "connected")
-                .order_by(SmtpAccount.connected_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        smtp_repl_q = (
+            select(SmtpAccount)
+            .where(SmtpAccount.status == "connected")
+            .order_by(SmtpAccount.connected_at.desc())
+            .limit(1)
+        )
+        gmail_repl_q = (
+            select(GmailAccount)
+            .where(GmailAccount.status == "connected")
+            .order_by(GmailAccount.connected_at.desc())
+            .limit(1)
+        )
+        if owner_id is not None:
+            smtp_repl_q = smtp_repl_q.where(SmtpAccount.user_id == owner_id)
+            gmail_repl_q = gmail_repl_q.where(GmailAccount.user_id == owner_id)
+        repl = (await db.execute(smtp_repl_q)).scalar_one_or_none()
         if repl is None:
-            repl = (
-                await db.execute(
-                    select(GmailAccount)
-                    .where(GmailAccount.status == "connected")
-                    .order_by(GmailAccount.connected_at.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
+            repl = (await db.execute(gmail_repl_q)).scalar_one_or_none()
         if repl is not None:
             repl.is_active = True
             await db.flush()
@@ -200,15 +228,19 @@ async def delete_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_d
 
 
 @router.post("/accounts/{account_id}/set-active", response_model=SmtpAccountRead)
-async def set_active(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def set_active(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Make this SMTP account the primary sender (demotes all other senders)."""
-    account = await _get(db, account_id)
+    account = await _get(db, account_id, current_user)
     if account.status != "connected":
         raise HTTPException(
             status_code=400,
             detail="This account isn't connected — fix its settings before making it primary.",
         )
-    await _clear_primary_sender(db)
+    await _clear_primary_sender(db, current_user)
     account.is_active = True
     await db.flush()
     await db.refresh(account)
@@ -221,9 +253,10 @@ async def toggle_sending(
     account_id: uuid.UUID,
     body: ToggleSendingRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Enable or disable this account for the sending rotation pool."""
-    account = await _get(db, account_id)
+    account = await _get(db, account_id, current_user)
     if account.status != "connected" and body.sending_enabled:
         raise HTTPException(
             status_code=400,
@@ -238,9 +271,13 @@ async def toggle_sending(
 
 
 @router.post("/accounts/{account_id}/verify", response_model=SmtpAccountRead)
-async def verify_account(account_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def verify_account(
+    account_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     """Re-test the SMTP connection and update the account's status."""
-    account = await _get(db, account_id)
+    account = await _get(db, account_id, current_user)
     result = await asyncio.to_thread(SmtpSender(account).verify)
     if result.get("ok"):
         account.status = "connected"
@@ -258,9 +295,10 @@ async def test_send(
     account_id: uuid.UUID,
     body: TestSendRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """Send a real test email from this account to confirm deliverability."""
-    account = await _get(db, account_id)
+    account = await _get(db, account_id, current_user)
     to_email = str(body.to_email) if body.to_email else account.email
     result = await asyncio.to_thread(
         SmtpSender(account).send_email,
