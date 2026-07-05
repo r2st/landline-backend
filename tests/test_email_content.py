@@ -452,9 +452,9 @@ class TestUnsubscribeCompliance:
 class TestDemoLinkResolution:
     """Verify demo links resolve to the correct industry-specific URLs."""
 
-    def test_injection_molding_resolves_to_true_molding(self):
+    def test_injection_molding_resolves_to_best_molding(self):
         link = resolve_demo_link("Plastic Injection Molding", "Apex Mold Industries")
-        assert "true-molding" in link
+        assert "best-molding-demo" in link
 
     def test_cnc_resolves_to_cnc_optimizer(self):
         link = resolve_demo_link("CNC Machining", "Precision Metal Works")
@@ -490,19 +490,19 @@ class TestDemoLinkResolution:
 
     def test_unknown_industry_falls_back_to_default(self):
         link = resolve_demo_link("Artisanal Candle Pouring", "Serenity Scents LLC")
-        assert "true-molding" in link
+        assert "best-molding-demo" in link
 
     def test_company_name_used_as_fallback_match(self):
         """If industry is blank, company name keywords should still match."""
         link = resolve_demo_link("", "Great Lakes Plastics")
-        assert "true-molding" in link
+        assert "best-molding-demo" in link
 
     def test_demo_link_renders_in_template(self):
         """{{demo_link}} should render as a clickable URL in the template."""
         template = '<a href="{{demo_link}}">See the dashboard</a>'
-        ctx = {"demo_link": "https://true-molding.pages.dev"}
+        ctx = {"demo_link": "https://best-molding-demo.pages.dev"}
         result = render(template, ctx)
-        assert 'href="https://true-molding.pages.dev"' in result
+        assert 'href="https://best-molding-demo.pages.dev"' in result
 
     def test_all_demo_links_are_valid_urls(self):
         """Every URL in the DEMO_LINKS map should be a valid https URL."""

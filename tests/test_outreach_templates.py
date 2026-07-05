@@ -20,7 +20,7 @@ CTX = {
     "first_name": "Raj",
     "company_name": "OneNet Plastics",
     "title": "VP Operations",
-    "demo_link": "https://true-molding.pages.dev",
+    "demo_link": "https://best-molding-demo.pages.dev",
 }
 
 SPAM_WORDS = ["act now", "limited time", "buy now", "click here", "winner",
@@ -97,7 +97,7 @@ class TestMoldingSequenceContent:
     def test_links_use_demo_link(self):
         for _, _, _, body in MOLDING_SEQUENCE_STEPS:
             rendered = render(body, CTX)
-            assert 'href="https://true-molding.pages.dev"' in rendered
+            assert 'href="https://best-molding-demo.pages.dev"' in rendered
 
     def test_mentions_molding_terms(self):
         all_text = " ".join(render(b, CTX) for _, _, _, b in MOLDING_SEQUENCE_STEPS).lower()

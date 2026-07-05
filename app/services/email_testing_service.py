@@ -151,7 +151,7 @@ class EmailTestingService:
             "last_name": persona["name"].split()[-1] if len(persona["name"].split()) > 1 else "",
             "company_name": persona["company"],
             "title": persona["title"],
-            "demo_link": "https://true-molding.pages.dev",
+            "demo_link": "https://best-molding-demo.pages.dev",
         }
 
         # Use custom email or default Step 1
@@ -257,7 +257,7 @@ class EmailTestingService:
             "last_name": persona["name"].split()[-1] if len(persona["name"].split()) > 1 else "",
             "company_name": persona["company"],
             "title": persona["title"],
-            "demo_link": "https://true-molding.pages.dev",
+            "demo_link": "https://best-molding-demo.pages.dev",
         }
 
         # Use custom follow-up or default template

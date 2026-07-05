@@ -267,7 +267,7 @@ async def send_test_email(
         "contact_title": "VP of Marketing",
         "title": "VP of Marketing",
         "email": payload.test_email,
-        "demo_link": "https://true-molding-demo.pages.dev",
+        "demo_link": "https://best-molding-demo.pages.dev",
     }
 
     subject = "[TEST] " + render(template.subject, context)

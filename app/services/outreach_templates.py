@@ -44,7 +44,7 @@ from __future__ import annotations
 # Vertical metadata (consumed by app.services.industry_verticals).
 INDUSTRY_KEY = "injection_molding"
 INDUSTRY_NAME = "Plastic Injection Molding"
-DEMO_LINK = "https://true-molding.pages.dev"
+DEMO_LINK = "https://best-molding-demo.pages.dev"
 # Substrings matched (case-insensitive) against a company's industry/name to
 # auto-route it to this vertical.
 KEYWORDS = (

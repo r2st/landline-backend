@@ -29,13 +29,13 @@ logger = logging.getLogger(__name__)
 # Keys are lowercased substrings matched against the lead's industry field.
 
 DEMO_LINKS: dict[str, str] = {
-    # Molding & plastics → True Molding dashboard
-    "mold": "https://true-molding.pages.dev",
-    "molding": "https://true-molding.pages.dev",
-    "injection": "https://true-molding.pages.dev",
-    "plastic": "https://true-molding.pages.dev",
-    "polymer": "https://true-molding.pages.dev",
-    "resin": "https://true-molding.pages.dev",
+    # Molding & plastics → Best Molding dashboard
+    "mold": "https://best-molding-demo.pages.dev",
+    "molding": "https://best-molding-demo.pages.dev",
+    "injection": "https://best-molding-demo.pages.dev",
+    "plastic": "https://best-molding-demo.pages.dev",
+    "polymer": "https://best-molding-demo.pages.dev",
+    "resin": "https://best-molding-demo.pages.dev",
     # CNC & machining → CNC Process Optimizer + TrueQuote
     "cnc": "https://cnc-process-optimizer.pages.dev",
     "machin": "https://cnc-process-optimizer.pages.dev",
@@ -112,7 +112,7 @@ DEMO_LINKS: dict[str, str] = {
     "industrial": "https://equipment-health-predictor.pages.dev",
 }
 
-DEFAULT_DEMO_LINK = "https://true-molding.pages.dev"
+DEFAULT_DEMO_LINK = "https://best-molding-demo.pages.dev"
 
 
 def resolve_demo_link(industry: str = "", company_name: str = "") -> str:

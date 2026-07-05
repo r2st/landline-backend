@@ -250,7 +250,7 @@ class TestIndustryAPI:
         assert molding["sequence_id"] is not None
         assert molding["step_count"] == 4
         assert len(molding["pain_points"]) >= 4
-        assert "true-molding" in molding["demo_link"]
+        assert "best-molding-demo" in molding["demo_link"]
 
     @pytest.mark.asyncio
     async def test_suggest_industry_by_text(self, client: AsyncClient, db_session: AsyncSession):

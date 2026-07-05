@@ -2,7 +2,7 @@
 
 import pytest
 
-DEMO_LINK = "https://true-molding-demo.pages.dev"
+DEMO_LINK = "https://best-molding-demo.pages.dev"
 
 
 @pytest.mark.asyncio

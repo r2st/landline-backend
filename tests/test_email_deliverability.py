@@ -760,7 +760,7 @@ class TestPlainTextGeneration:
             '<p>Hi Raj,</p><p>I know what keeps people in your position awake.</p>'
             '<p>It is not the press going down — you can fix a press. It is the '
             '<em>silent</em> failure.</p>'
-            '<p><a href="https://true-molding.pages.dev" '
+            '<p><a href="https://best-molding-demo.pages.dev" '
             'style="color:#2563eb;font-weight:bold;">'
             'See how AI catches defects before they happen →</a></p>'
         )
@@ -768,5 +768,5 @@ class TestPlainTextGeneration:
         assert "<" not in plain
         assert ">" not in plain or "→" in plain  # arrow char is OK
         assert "Hi Raj" in plain
-        assert "true-molding.pages.dev" in plain
+        assert "best-molding-demo.pages.dev" in plain
         assert "silent" in plain

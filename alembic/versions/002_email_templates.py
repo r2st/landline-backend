@@ -21,7 +21,7 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-DEMO_LINK = "https://true-molding-demo.pages.dev"
+DEMO_LINK = "https://best-molding-demo.pages.dev"
 
 PROFESSIONAL_BODY = f"""\
 <p>Hi {{{{first_name}}}},</p>

@@ -38,7 +38,7 @@ SAMPLE_CTX = {
     "first_name": "Raj",
     "company_name": "OneNet Plastics",
     "title": "VP Operations",
-    "demo_link": "https://true-molding.pages.dev",
+    "demo_link": "https://best-molding-demo.pages.dev",
 }
 
 
@@ -124,7 +124,7 @@ async def main():
         "text/html part present": "text/html" in raw.lower(),
         "CAN-SPAM footer (Toronto) present": "toronto" in raw.lower(),
         "unsubscribe link present": "unsubscribe" in raw.lower(),
-        "demo link present": "true-molding" in raw.lower(),
+        "demo link present": "best-molding-demo" in raw.lower(),
         "no raw <img> tag": "<img" not in raw.lower(),
     }
     all_ok = True
