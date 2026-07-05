@@ -13,10 +13,12 @@ from app.models.user import User
 from app.schemas.auth import (
     AdminResetPasswordRequest,
     UserCreate,
+    UserCreateResponse,
     UserRead,
     UserUpdate,
 )
 from app.security import hash_password
+from app.services.welcome_email import send_welcome_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -42,13 +44,19 @@ async def list_users(
     return list((await db.execute(query)).scalars().all())
 
 
-@router.post("/users", response_model=UserRead, status_code=201)
+@router.post("/users", response_model=UserCreateResponse, status_code=201)
 async def create_user(
     payload: UserCreate,
     _admin: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new user. Admin only."""
+    """Create a new user and email them their login credentials. Admin only.
+
+    A welcome email with the temporary password is sent from the primary
+    connected sending account. If no account is configured (or the send fails)
+    we log a warning and still create the user — the response's
+    ``welcome_email_sent`` flag tells the caller what happened.
+    """
     existing = (
         await db.execute(select(User).where(User.email == payload.email))
     ).scalar_one_or_none()
@@ -70,7 +78,16 @@ async def create_user(
     await db.flush()
     await db.refresh(user)
     logger.info("Admin %s created user %s (role=%s)", _admin.email, user.email, user.role)
-    return user
+
+    # Best-effort welcome email with the temporary password. Uses the plaintext
+    # password from the request (we only ever store the hash). Never blocks
+    # creation — the flag is surfaced to the client instead.
+    welcome_email_sent = await send_welcome_email(db, user, payload.password)
+
+    return UserCreateResponse(
+        **UserRead.model_validate(user).model_dump(),
+        welcome_email_sent=welcome_email_sent,
+    )
 
 
 @router.get("/users/{user_id}", response_model=UserRead)

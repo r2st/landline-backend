@@ -95,3 +95,15 @@ class UserRead(BaseModel):
     created_by: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
+
+
+class UserCreateResponse(UserRead):
+    """Response for admin user creation.
+
+    Extends :class:`UserRead` with the outcome of the welcome-email attempt so
+    the frontend can tailor its confirmation message. ``welcome_email_sent`` is
+    ``False`` when no sending account is configured or the send failed — user
+    creation still succeeds either way.
+    """
+
+    welcome_email_sent: bool = False
