@@ -47,6 +47,11 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Multi-tenant org membership (feature 4.1). NULL = the default first-party
+    # tenant (Apprend), which keeps every pre-4.1 user working unchanged.
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # Which user (admin) created this account, if any. Self-referential.
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -59,7 +64,9 @@ class User(Base):
     )
 
     # Self-referential relationship to the creating admin.
-    creator: Mapped["User | None"] = relationship("User", remote_side=[id])
+    creator: Mapped["User | None"] = relationship("User", remote_side=[id], foreign_keys=[created_by])
+    # The tenant (organization) this user belongs to (feature 4.1).
+    tenant = relationship("Tenant", back_populates="users", foreign_keys=[org_id])
 
     def __repr__(self) -> str:
         return f"<User {self.email} role={self.role} active={self.is_active}>"
