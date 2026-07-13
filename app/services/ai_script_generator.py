@@ -15,9 +15,15 @@ It is built to never fail a request:
   human-readable ``note``.
 * All AI calls are bounded by a 30-second timeout.
 
-The public entry points are :func:`generate_for_contact` (ad-hoc, no task) and
-:func:`get_or_generate_for_task` (cached on a ``CallTask``). The queue generator
-calls the latter to pre-warm scripts for the day's hot/warm leads.
+Scripts also adapt in real time: after a call outcome is logged (voicemail,
+gatekeeper, connected, no-answer, callback), :func:`generate_followup_after_outcome`
+(and its task wrapper :func:`generate_followup_for_task`) generate the optimal
+*next* script incorporating what happened, instead of a static regenerate.
+
+The public entry points are :func:`generate_for_contact` (ad-hoc, no task),
+:func:`get_or_generate_for_task` (cached on a ``CallTask``), and
+:func:`generate_followup_after_outcome` (adaptive follow-up). The queue generator
+calls ``get_or_generate_for_task`` to pre-warm scripts for the day's hot/warm leads.
 """
 
 from __future__ import annotations
@@ -201,6 +207,49 @@ def _get_framework_prompt(framework: str | None) -> str:
     if framework is None:
         return ""
     return _FRAMEWORK_PROMPTS.get(framework, "")
+
+
+# ---------------------------------------------------------------------------
+# Adaptive follow-up — how to react to what happened on the last call.
+# Keyed by CallTask.outcome values.
+# ---------------------------------------------------------------------------
+_OUTCOME_ADAPTATION: dict[str, str] = {
+    "voicemail": (
+        "Last attempt: you left a VOICEMAIL. Reference it lightly ('left you a "
+        "quick message the other day') without guilt-tripping. Lead with a "
+        "slightly different hook than the voicemail used so it doesn't feel like "
+        "a copy-paste. Assume they did NOT listen to it."
+    ),
+    "no_answer": (
+        "Last attempt: NO ANSWER (no voicemail left). Treat this as a fresh "
+        "attempt at a better time — vary the opening and consider a different "
+        "angle or day-part. Do not reference a prior message that was never left."
+    ),
+    "gatekeeper": (
+        "Last attempt: blocked by a GATEKEEPER. This script is for getting past "
+        "them: be confident and specific, give a real reason tied to the "
+        "prospect's role, offer to be routed or to leave a specific message, and "
+        "make the gatekeeper feel helpful rather than interrogated."
+    ),
+    "connected": (
+        "Last attempt: you CONNECTED and spoke with them. This is a follow-up to "
+        "a real conversation — reference what was discussed (see notes), pick up "
+        "any thread left open, address objections raised, and push for the "
+        "concrete next step you agreed toward (pilot date / demo)."
+    ),
+    "callback_scheduled": (
+        "Last attempt: a CALLBACK was scheduled. Open by honoring the agreed "
+        "time ('you'd asked me to circle back today'), recap briefly where you "
+        "left off, and move straight to the next step. Warm, not cold."
+    ),
+}
+
+
+def _outcome_adaptation(outcome: Optional[str]) -> str:
+    """Guidance for adapting the next script to a logged call outcome."""
+    if not outcome:
+        return ""
+    return _OUTCOME_ADAPTATION.get(outcome, "")
 
 
 def _detect_role(title: Optional[str]) -> tuple[str, str]:
@@ -425,6 +474,7 @@ def _build_prompt(
     context: dict,
     call_type: str,
     sales_framework: Optional[str] = None,
+    previous_call: Optional[dict] = None,
 ) -> str:
     profile_key = _VERTICAL_TO_PROFILE.get(vertical.key, "")
     profile = guidelines.INDUSTRY_PROFILES.get(profile_key, {})
@@ -544,6 +594,27 @@ def _build_prompt(
 {framework_section}
 """
 
+    # Adaptive follow-up: if we're building the NEXT script after a logged call
+    # outcome, tell the AI exactly what happened last time so it adapts.
+    adaptation_note = ""
+    if previous_call:
+        outcome_guidance = _outcome_adaptation(previous_call.get("outcome"))
+        prev_notes = (previous_call.get("notes") or "").strip()
+        prev_objs = previous_call.get("objections") or []
+        obj_line = ""
+        if prev_objs:
+            obj_line = "\nObjections raised last time: " + "; ".join(
+                str(o) for o in prev_objs
+            )
+        notes_line = f"\nRep's notes from last call: {prev_notes[:500]}" if prev_notes else ""
+        if outcome_guidance or notes_line or obj_line:
+            adaptation_note = f"""
+
+## ADAPT TO THE LAST CALL (this is the follow-up attempt)
+{outcome_guidance or 'Adapt the script to continue naturally from the last attempt.'}{notes_line}{obj_line}
+Make the opening clearly reflect that this is a follow-up to that specific
+attempt — do not open as if this is the first time you've reached out."""
+
     return f"""You are an elite B2B cold-calling coach writing a CUSTOM call script for a
 sales rep at Apprend Technologies. Apprend builds an AI quality-management
 platform for manufacturers — it watches machine/press/line signals in real time
@@ -596,7 +667,7 @@ Real pain points: {', '.join(vertical.pain_points)}
 {principles}
 
 ## CALL TYPE
-{call_type_guidance}
+{call_type_guidance}{adaptation_note}
 
 ## BASE INDUSTRY TEMPLATE (a scaffold to personalise — do not copy verbatim)
 {base_json}
@@ -786,12 +857,15 @@ async def generate_for_contact(
     contact: Optional[Contact],
     call_type: str = "initial",
     sales_framework: Optional[str] = None,
+    previous_call: Optional[dict] = None,
 ) -> CustomScriptResponse:
     """Generate a personalised script for a company/contact (no persistence).
 
     Always returns a response — AI when possible, template fallback otherwise.
     When ``sales_framework`` is provided, the script is structured around that
-    methodology (Challenger, Gap Selling, SPIN, etc.).
+    methodology (Challenger, Gap Selling, SPIN, etc.). When ``previous_call`` is
+    given (``{"outcome", "notes", "objections"}``), the script is adapted to
+    what happened on the last attempt — see :func:`generate_followup_after_outcome`.
     """
     script_type = _normalize_call_type(call_type)
     vertical = iv.resolve_vertical_or_default(
@@ -827,6 +901,7 @@ async def generate_for_contact(
         context=context,
         call_type=script_type,
         sales_framework=sales_framework,
+        previous_call=previous_call,
     )
     result = await generator.generate_script_json(prompt)
 
@@ -864,6 +939,83 @@ async def generate_for_contact(
         generated_at=now,
         sales_framework=sales_framework,
         script=_parse_ai_script(result, base_script),
+    )
+
+
+# Outcomes that warrant an adapted follow-up script.
+_FOLLOW_UP_OUTCOMES = frozenset(_OUTCOME_ADAPTATION.keys())
+
+
+async def generate_followup_after_outcome(
+    db: AsyncSession,
+    *,
+    company: Company,
+    contact: Optional[Contact],
+    outcome: str,
+    notes: str = "",
+    objections: Optional[list] = None,
+    sales_framework: Optional[str] = None,
+) -> CustomScriptResponse:
+    """Generate the optimal *next* call script after a logged call outcome.
+
+    ``outcome`` is a ``CallTask.outcome`` value (``voicemail``, ``gatekeeper``,
+    ``connected``, ``no_answer``, ``callback_scheduled``). The generated script
+    is a ``follow_up`` adapted to what happened — referencing the voicemail,
+    navigating the gatekeeper, or building on the conversation and its
+    objections. ``gatekeeper`` maps to the initial-cold-call scaffold (you still
+    need to get past reception) but with adaptation applied; everything else
+    uses the follow-up scaffold.
+    """
+    call_type = "initial" if outcome == "gatekeeper" else "follow_up"
+    previous_call = {
+        "outcome": outcome,
+        "notes": notes,
+        "objections": objections or [],
+    }
+    return await generate_for_contact(
+        db,
+        company=company,
+        contact=contact,
+        call_type=call_type,
+        sales_framework=sales_framework,
+        previous_call=previous_call,
+    )
+
+
+async def generate_followup_for_task(
+    db: AsyncSession,
+    task: CallTask,
+    *,
+    sales_framework: Optional[str] = None,
+) -> CustomScriptResponse:
+    """Convenience wrapper: build the adaptive follow-up for a completed CallTask.
+
+    Reads the task's logged ``outcome``, ``notes`` and ``objections_encountered``
+    and returns the next-attempt script. Raises ``ValueError`` if the task has no
+    logged outcome yet (nothing to adapt to).
+    """
+    if not task.outcome:
+        raise ValueError("CallTask has no logged outcome to adapt from")
+
+    company = (
+        await db.execute(select(Company).where(Company.id == task.company_id))
+    ).scalar_one_or_none()
+    if company is None:
+        raise ValueError("Call task has no company")
+    contact = None
+    if task.contact_id is not None:
+        contact = (
+            await db.execute(select(Contact).where(Contact.id == task.contact_id))
+        ).scalar_one_or_none()
+
+    return await generate_followup_after_outcome(
+        db,
+        company=company,
+        contact=contact,
+        outcome=task.outcome,
+        notes=task.notes or "",
+        objections=task.objections_encountered or [],
+        sales_framework=sales_framework or task.sales_framework,
     )
 
 

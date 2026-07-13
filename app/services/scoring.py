@@ -4,11 +4,16 @@ Enhanced with sales-book recommendations:
 - **Signal Recency Decay** (ai-cold-calling-guidelines.md): Recent engagement
   signals are weighted higher — a click 30 minutes ago is worth 20× more than
   one from two days ago.
-- **Engagement Velocity Bonus** (ai-cold-calling-guidelines.md): Clustered
-  signals (2+ events in 24 hours) indicate active buying behaviour.
+- **Engagement Velocity Multiplier** (ai-cold-calling-guidelines.md): Clustered
+  signals (2+ events in 24 hours) indicate active buying behaviour, so velocity
+  *multiplies* the live-engagement signal rather than adding a flat bonus — a
+  lead going 0→3 opens in a day jumps sharply.
 - **Account Tier Classification** (digital-sales-strategy.md ABM model):
   Tier 1 (Strategic) / Tier 2 (Target) / Tier 3 (Prospect) classification for
   prioritised resource allocation.
+- **Score change history**: every score records its delta versus the previous
+  score, and :func:`score_history` / :func:`score_change_since` expose a lead's
+  score movement over time ("jumped +40 points this week").
 """
 
 import logging
@@ -73,20 +78,43 @@ def signal_recency_weight(
 
 
 # ---------------------------------------------------------------------------
-# Engagement Velocity Bonus (from ai-cold-calling-guidelines.md)
+# Engagement Velocity Multiplier (from ai-cold-calling-guidelines.md)
 # ---------------------------------------------------------------------------
-_VELOCITY_BONUSES: list[tuple[int, float]] = [
-    (4, 0.30),   # 4+ distinct events in 24h
-    (3, 0.20),   # 3 events
-    (2, 0.10),   # 2 events
+# Velocity is a *multiplier* on the live-engagement signal, not a flat bonus.
+# A lead that goes from cold to a burst of activity in 24 hours is behaving very
+# differently from one with a single stale open, so its engagement score should
+# jump — a cluster of 3 events in a day nearly doubles the signal weight, 5+
+# more than doubles it. (Firmographic fit is never multiplied; only the
+# engagement/recency component is, so a hot burst can't inflate a poor-fit lead
+# past a good-fit one on firmographics alone.)
+_VELOCITY_MULTIPLIERS: list[tuple[int, float]] = [
+    (6, 2.5),   # 6+ distinct events in 24h — very active buying behaviour
+    (5, 2.2),   # 5 events
+    (4, 1.9),   # 4 events
+    (3, 1.6),   # 3 events — a clear cluster
+    (2, 1.25),  # 2 events
 ]
+_VELOCITY_NEUTRAL = 1.0
+
+
+def velocity_multiplier(signal_count: int) -> float:
+    """Map a 24-hour engagement signal count to an engagement multiplier.
+
+    Returns ``1.0`` (neutral) for 0-1 signals and rises to ``2.5`` for a burst
+    of 6+ events, so clustered activity multiplies the engagement weight rather
+    than adding a small fixed bonus.
+    """
+    for threshold, mult in _VELOCITY_MULTIPLIERS:
+        if signal_count >= threshold:
+            return mult
+    return _VELOCITY_NEUTRAL
 
 
 async def _engagement_velocity(
     db: AsyncSession, company: Company, now: Optional[datetime] = None
-) -> tuple[float, int]:
+) -> tuple[int, Optional[datetime]]:
     """Count distinct engagement events in the last 24 hours and return
-    ``(bonus, signal_count)``.
+    ``(signal_count, most_recent_event)``.
 
     Events counted: email opens, clicks, and replies from any contact at
     this company.  Each non-null timestamp within the window counts as one
@@ -120,7 +148,8 @@ async def _engagement_velocity(
         for ts in (opened, clicked, replied):
             if ts is None:
                 continue
-            # SQLite (tests) returns naive datetimes; normalize before comparing.
+            # SQLite (and any tz-naive source) hands back naive datetimes;
+            # normalise to UTC so the window comparison never raises.
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             if ts >= window_start:
@@ -128,12 +157,7 @@ async def _engagement_velocity(
                 if most_recent is None or ts > most_recent:
                     most_recent = ts
 
-    bonus = 0.0
-    for threshold, b in _VELOCITY_BONUSES:
-        if signal_count >= threshold:
-            bonus = b
-            break
-    return bonus, signal_count, most_recent
+    return signal_count, most_recent
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +355,106 @@ async def _intent_signal_bonus(
     return points, breakdown
 
 
+# ---------------------------------------------------------------------------
+# Score change history
+# ---------------------------------------------------------------------------
+
+
+async def _latest_score(
+    db: AsyncSession, company_id, before: Optional[datetime] = None
+) -> Optional[LeadScore]:
+    """Return the most recent LeadScore for a company (optionally before a time)."""
+    query = select(LeadScore).where(LeadScore.company_id == company_id)
+    if before is not None:
+        query = query.where(LeadScore.scored_at < before)
+    query = query.order_by(LeadScore.scored_at.desc()).limit(1)
+    return (await db.execute(query)).scalar_one_or_none()
+
+
+async def _score_change(
+    db: AsyncSession, company_id, new_fit: int, now: Optional[datetime] = None
+) -> dict:
+    """Build the ``score_change`` factor comparing ``new_fit`` to the last score.
+
+    Returns a small JSON-serialisable dict recording the previous score, the
+    signed delta, its direction, and the timestamp of the previous score so the
+    UI can render "score jumped +40 since <date>".
+    """
+    prev = await _latest_score(db, company_id, before=now)
+    if prev is None:
+        return {
+            "previous_fit_score": None,
+            "delta": 0,
+            "direction": "initial",
+            "previous_scored_at": None,
+        }
+    delta = new_fit - prev.fit_score
+    direction = "up" if delta > 0 else "down" if delta < 0 else "flat"
+    return {
+        "previous_fit_score": prev.fit_score,
+        "delta": delta,
+        "direction": direction,
+        "previous_scored_at": prev.scored_at.isoformat() if prev.scored_at else None,
+    }
+
+
+async def score_history(
+    db: AsyncSession, company_id, limit: int = 20
+) -> list[dict]:
+    """Return a company's score timeline, newest first.
+
+    Each entry is ``{fit_score, score_type, scored_at, delta}`` where ``delta``
+    is the change from the immediately older score (``None`` for the oldest).
+    Powers the "score over time" view and answers "how has this lead moved".
+    """
+    rows = (
+        await db.execute(
+            select(LeadScore)
+            .where(LeadScore.company_id == company_id)
+            .order_by(LeadScore.scored_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    out: list[dict] = []
+    # rows are newest→oldest; delta is vs the next (older) row.
+    for i, row in enumerate(rows):
+        older = rows[i + 1] if i + 1 < len(rows) else None
+        out.append(
+            {
+                "fit_score": row.fit_score,
+                "score_type": row.score_type,
+                "scored_at": row.scored_at.isoformat() if row.scored_at else None,
+                "delta": (row.fit_score - older.fit_score) if older else None,
+            }
+        )
+    return out
+
+
+async def score_change_since(
+    db: AsyncSession, company_id, since: datetime, now: Optional[datetime] = None
+) -> dict:
+    """How much a company's score moved over a window (e.g. the last 7 days).
+
+    Compares the latest score to the most recent score at or before ``since``.
+    Returns ``{current, baseline, delta, since}``; ``baseline`` is ``None`` when
+    there is no score old enough, in which case ``delta`` is ``0``.
+    """
+    current = await _latest_score(db, company_id, before=now)
+    baseline = await _latest_score(db, company_id, before=since)
+    current_fit = current.fit_score if current else None
+    baseline_fit = baseline.fit_score if baseline else None
+    delta = 0
+    if current_fit is not None and baseline_fit is not None:
+        delta = current_fit - baseline_fit
+    return {
+        "current": current_fit,
+        "baseline": baseline_fit,
+        "delta": delta,
+        "since": since.isoformat(),
+    }
+
+
 async def score_company_rule_based(
     db: AsyncSession,
     company: Company,
@@ -355,29 +479,43 @@ async def score_company_rule_based(
     completeness_pts, completeness_breakdown = _completeness_score(company, contacts)
     engagement_pts, engagement_breakdown = await _engagement_signal(db, company)
 
-    # --- NEW: Signal recency decay ---
+    # --- Signal recency decay ---
     # Find the most recent engagement event across all contacts at this company.
-    velocity_bonus, velocity_signals, most_recent_event = await _engagement_velocity(
-        db, company, now
-    )
+    velocity_signals, most_recent_event = await _engagement_velocity(db, company, now)
     recency = signal_recency_weight(most_recent_event, now)
     recency_bonus = int(recency * 8)  # up to 8 bonus points for fresh signals
 
-    # --- NEW: Engagement velocity bonus ---
-    velocity_bonus_pts = int(velocity_bonus * 100 * 0.07)  # up to 7 bonus points
+    # --- Engagement velocity MULTIPLIER (not additive) ---
+    # The live-engagement signal (real opens/clicks/replies + recency) is scaled
+    # by how *fast* the lead is engaging. A burst of activity in the last 24h
+    # multiplies that signal so a warming lead jumps, while a single stale open
+    # is left untouched.
+    v_mult = velocity_multiplier(velocity_signals)
+    engagement_signal = engagement_pts + recency_bonus
+    boosted_engagement = round(engagement_signal * v_mult)
+    velocity_gain = boosted_engagement - engagement_signal  # points added by velocity
 
-    # --- NEW: Buyer-intent signal bonus (Phase 2.1) ---
+    # --- Buyer-intent signal bonus (Phase 2.1) — additive on top of fit ---
     intent_pts, intent_breakdown = await _intent_signal_bonus(db, company, now)
 
-    # --- NEW: Account tier classification ---
+    # --- Account tier classification ---
     tier_name, tier_value = classify_account_tier(
         industry_pts, size_pts, loc_pts, engagement_pts
     )
 
-    # completeness + live engagement + recency + velocity + intent bonuses
-    other_pts = completeness_pts + engagement_pts
-    base_score = industry_pts + size_pts + loc_pts + other_pts
-    fit_score = min(100, base_score + recency_bonus + velocity_bonus_pts + intent_pts)
+    # firmographic fit + (completeness + velocity-boosted engagement signal) +
+    # buyer-intent bonus. Velocity *multiplies* the live-engagement portion;
+    # intent adds on top. The stored ``engagement_score`` column keeps its
+    # historical meaning of "everything that isn't industry/size/location".
+    non_firmographic_pts = completeness_pts + boosted_engagement
+    fit_score = min(
+        100, industry_pts + size_pts + loc_pts + non_firmographic_pts + intent_pts
+    )
+
+    # --- Score change history ---
+    # Compare against the company's most recent prior score so the UI can show
+    # "this lead's score jumped N points" without re-deriving it from raw rows.
+    change = await _score_change(db, company.id, fit_score, now)
 
     factors = {
         "industry": {"score": industry_pts, "reason": industry_reason},
@@ -391,9 +529,11 @@ async def score_company_rule_based(
             "most_recent_event": most_recent_event.isoformat() if most_recent_event else None,
         },
         "engagement_velocity": {
-            "bonus": velocity_bonus,
-            "bonus_points": velocity_bonus_pts,
             "signals_in_24h": velocity_signals,
+            "multiplier": v_mult,
+            "engagement_signal": engagement_signal,
+            "boosted_signal": boosted_engagement,
+            "points_added": velocity_gain,
         },
         "intent_signals": {
             "bonus_points": intent_pts,
@@ -403,6 +543,7 @@ async def score_company_rule_based(
             "tier": tier_name,
             "value": tier_value,
         },
+        "score_change": change,
     }
 
     lead_score = LeadScore(
@@ -412,7 +553,7 @@ async def score_company_rule_based(
         industry_score=industry_pts,
         size_score=size_pts,
         location_score=loc_pts,
-        engagement_score=other_pts,
+        engagement_score=non_firmographic_pts,
         factors=factors,
     )
     db.add(lead_score)
@@ -420,11 +561,11 @@ async def score_company_rule_based(
 
     logger.info(
         "Scored company %s (%s): fit=%d [industry=%d, size=%d, location=%d, "
-        "completeness=%d, engagement=%d, recency_bonus=%d, velocity_bonus=%d, "
-        "intent_bonus=%d, tier=%s]",
+        "completeness=%d, engagement=%d, recency_bonus=%d, velocity_x%.2f (+%d), "
+        "intent_bonus=%d, tier=%s, delta=%+d]",
         company.name, company.id, fit_score,
         industry_pts, size_pts, loc_pts, completeness_pts, engagement_pts,
-        recency_bonus, velocity_bonus_pts, intent_pts, tier_name,
+        recency_bonus, v_mult, velocity_gain, intent_pts, tier_name, change["delta"],
     )
     return lead_score
 
@@ -491,15 +632,22 @@ Respond with ONLY the JSON object, no markdown fences."""
             response_text = response_text.strip()
         data = json.loads(response_text)
 
+        ai_fit = max(0, min(100, data.get("fit_score", 0)))
+        change = await _score_change(db, company.id, ai_fit)
+
         lead_score = LeadScore(
             company_id=company.id,
             score_type="ai",
-            fit_score=max(0, min(100, data.get("fit_score", 0))),
+            fit_score=ai_fit,
             industry_score=max(0, min(40, data.get("industry_score", 0))),
             size_score=max(0, min(25, data.get("size_score", 0))),
             location_score=max(0, min(20, data.get("location_score", 0))),
             engagement_score=max(0, min(15, data.get("engagement_score", 0))),
-            factors={"ai_reasoning": data.get("reasoning", ""), "raw_response": data},
+            factors={
+                "ai_reasoning": data.get("reasoning", ""),
+                "raw_response": data,
+                "score_change": change,
+            },
         )
         db.add(lead_score)
         await db.flush()

@@ -6,10 +6,20 @@ confidence intervals, following 2025-2026 email marketing best practices:
 - 95% confidence threshold for winner declaration
 - Tracks open, click, and reply rates separately
 - Auto-declares winners when significance is reached
+
+Automation layer (quick win):
+- ``generate_subject_variants`` — AI writes 2-3 subject-line variants for a
+  sequence step (deterministic fallback when the API is unavailable).
+- ``select_next_variant`` / ``select_variant_bandit`` — a UCB1 multi-armed
+  bandit chooses which variant to send next, shifting traffic toward the
+  better performer as data accrues instead of a fixed 50/50 split.
+- ``auto_declare_winner`` — once a variant is statistically significant, it is
+  declared the winner and the experiment is marked complete.
 """
 
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -208,3 +218,212 @@ def calculate_required_sample_size(
 
     n = math.ceil(numerator / denominator)
     return max(n, 200)  # Never go below 200
+
+
+# ---------------------------------------------------------------------------
+# Automation: AI variant generation
+# ---------------------------------------------------------------------------
+
+# The metric each variant is optimised toward, mapped to its EmailSend column
+# roots on the ABTestExperiment model (variant_<a|b>_<metric>).
+_METRIC_ALIASES = {
+    "opened": "opened",
+    "open": "opened",
+    "clicked": "clicked",
+    "click": "clicked",
+    "replied": "replied",
+    "reply": "replied",
+}
+
+
+def _fallback_subject_variants(base_subject: str, count: int) -> list[str]:
+    """Deterministic subject variants used when AI generation is unavailable.
+
+    Applies a few well-worn subject-line transforms (question form, a lowercase
+    "quick" opener) so the caller always gets distinct options to split on.
+    """
+    base = (base_subject or "").strip()
+    candidates = [base]
+    if base:
+        stripped = base.rstrip("?.")
+        candidates.append(f"{stripped}?")
+        first = stripped[0].lower() + stripped[1:] if stripped else stripped
+        candidates.append(f"quick question — {first}")
+        candidates.append(f"{first}, worth a look?")
+    # De-dupe while preserving order, drop empties.
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        c = c.strip()
+        if c and c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out[: max(1, count)]
+
+
+async def generate_subject_variants(
+    base_subject: str,
+    *,
+    industry: Optional[str] = None,
+    body_preview: str = "",
+    count: int = 3,
+    ai=None,
+) -> list[str]:
+    """Generate ``count`` (2-3) subject-line variants for a sequence step.
+
+    Uses Claude to write short, distinct, non-spammy subject lines in the
+    Apprend voice. Never raises: on any failure (no API key, parse error, API
+    error) it falls back to :func:`_fallback_subject_variants` so the caller
+    always gets usable variants to auto-split traffic across.
+    """
+    count = max(2, min(3, count))
+    try:
+        if ai is None:
+            from app.services.ai_service import get_ai_service
+
+            ai = get_ai_service()
+
+        industry_line = f"Industry: {industry}\n" if industry else ""
+        preview_line = f"Email opening: {body_preview[:200]}\n" if body_preview else ""
+        prompt = f"""You run A/B tests on cold-email subject lines for Apprend Technologies
+(manufacturing software). Write {count} DISTINCT subject-line variants to test
+for this sequence step.
+
+{industry_line}{preview_line}Current subject: {base_subject or '(none yet)'}
+
+Rules:
+- Short, lowercase, like something you'd actually type — not a headline.
+- Each variant should take a genuinely different angle (question, curiosity,
+  specific result, pain point) so the test is informative.
+- No spam-trigger words, no exclamation marks, no ALL CAPS.
+
+Return ONLY valid JSON: {{"variants": ["...", "...", "..."]}}"""
+
+        result = await ai._complete_json(prompt, max_tokens=400)
+        variants = result.get("variants") if isinstance(result, dict) else None
+        if isinstance(variants, list):
+            cleaned = [str(v).strip() for v in variants if str(v).strip()]
+            # De-dupe case-insensitively, keep order.
+            seen: set[str] = set()
+            out: list[str] = []
+            for v in cleaned:
+                if v.lower() not in seen:
+                    seen.add(v.lower())
+                    out.append(v)
+            if len(out) >= 2:
+                return out[:count]
+    except Exception as e:  # noqa: BLE001 — never fail the caller
+        logger.warning("AI subject-variant generation failed: %s", e)
+
+    return _fallback_subject_variants(base_subject, count)
+
+
+# ---------------------------------------------------------------------------
+# Automation: multi-armed bandit traffic allocation (UCB1)
+# ---------------------------------------------------------------------------
+
+
+def select_variant_bandit(
+    variants: list[dict], *, exploration: float = 2.0
+) -> int:
+    """Pick the next variant to send using the UCB1 multi-armed bandit.
+
+    ``variants`` is a list of ``{"sent": int, "successes": int}`` dicts. UCB1 is
+    deterministic: any never-sent arm is explored first (lowest index wins ties);
+    otherwise the arm maximising ``mean + sqrt(exploration * ln(total) / sent)``
+    is chosen, so traffic shifts toward the leader while still occasionally
+    probing the other arm. Returns the index of the chosen variant.
+    """
+    if not variants:
+        raise ValueError("variants must be non-empty")
+
+    # Explore any arm that has never been sent (deterministic: first such arm).
+    for i, v in enumerate(variants):
+        if int(v.get("sent", 0)) <= 0:
+            return i
+
+    total = sum(int(v.get("sent", 0)) for v in variants)
+    ln_total = math.log(total) if total > 0 else 0.0
+
+    best_idx = 0
+    best_score = float("-inf")
+    for i, v in enumerate(variants):
+        sent = int(v.get("sent", 0))
+        successes = int(v.get("successes", 0))
+        mean = successes / sent
+        bonus = math.sqrt(exploration * ln_total / sent)
+        score = mean + bonus
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
+
+
+def experiment_variant_stats(experiment, metric: str = "replied") -> list[dict]:
+    """Extract ``[{name, sent, successes}, ...]`` for A and B from an experiment.
+
+    ``metric`` selects which outcome counts as a "success" (opened/clicked/
+    replied); reply rate is the default because a reply is the most valuable
+    signal.
+    """
+    m = _METRIC_ALIASES.get(metric, "replied")
+    return [
+        {
+            "name": "A",
+            "sent": experiment.variant_a_sent,
+            "successes": getattr(experiment, f"variant_a_{m}"),
+        },
+        {
+            "name": "B",
+            "sent": experiment.variant_b_sent,
+            "successes": getattr(experiment, f"variant_b_{m}"),
+        },
+    ]
+
+
+def select_next_variant(experiment, metric: str = "replied") -> str:
+    """Return ``"A"`` or ``"B"`` — the variant the bandit would send next.
+
+    Once a winner has been declared, always route to the winner (exploitation
+    is over). Otherwise use UCB1 over the chosen metric.
+    """
+    if experiment.winner in ("A", "B"):
+        return experiment.winner
+    stats = experiment_variant_stats(experiment, metric)
+    return stats[select_variant_bandit(stats)]["name"]
+
+
+# ---------------------------------------------------------------------------
+# Automation: auto-declare the winner
+# ---------------------------------------------------------------------------
+
+
+def auto_declare_winner(experiment, now: Optional[datetime] = None) -> dict:
+    """Evaluate an experiment and, if a variant is significant, declare it.
+
+    Mutates the experiment in place: sets ``winner``, ``confidence_level``,
+    ``is_significant`` and ``status``, and stamps ``completed_at`` when a winner
+    is reached. Returns the full evaluation dict from :func:`evaluate_experiment`.
+    Idempotent — re-running after a winner is set leaves it unchanged.
+    """
+    evaluation = evaluate_experiment(experiment)
+
+    experiment.confidence_level = evaluation["overall_confidence"]
+    experiment.is_significant = evaluation["overall_significant"]
+
+    if evaluation["overall_significant"] and evaluation["overall_winner"]:
+        if experiment.winner not in ("A", "B"):
+            experiment.winner = evaluation["overall_winner"]
+            experiment.status = "completed"
+            experiment.completed_at = now or datetime.now(timezone.utc)
+            logger.info(
+                "A/B experiment %s auto-declared winner %s (confidence %.3f)",
+                getattr(experiment, "id", "?"),
+                experiment.winner,
+                evaluation["overall_confidence"],
+            )
+    elif experiment.winner not in ("A", "B"):
+        # No winner yet — keep the running/insufficient status in sync.
+        experiment.status = evaluation["status"]
+
+    return evaluation

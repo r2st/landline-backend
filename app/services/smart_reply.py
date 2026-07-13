@@ -3,11 +3,19 @@ analyzes with AI, drafts and sends responses.
 
 Checks every connected Gmail account for incoming replies (not just the active
 one), so replies to any sending identity are captured and processed.
+
+Beyond auto-replying to clearly-positive intent, it also handles the three most
+common objections automatically (see :func:`classify_objection`):
+
+- **"too expensive"** → drafts a value-focused response with a concrete ROI angle.
+- **"not now"** → schedules a follow-up reminder 30 days out.
+- **"talk to <name>"** → creates a referral-outreach task for the named person.
 """
 
 import base64
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from typing import Optional
 
@@ -20,6 +28,7 @@ from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
+from app.models.follow_up import FollowUp
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import crypto, google_oauth
@@ -28,6 +37,203 @@ from app.services.ai_service import get_ai_service
 logger = logging.getLogger(__name__)
 
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+# Number of days to defer a "not now" lead before nudging again.
+NOT_NOW_FOLLOW_UP_DAYS = 30
+
+# Objection detection --------------------------------------------------------
+# Substrings that signal a price/budget objection.
+_PRICE_MARKERS = (
+    "too expensive", "expensive", "too much", "cost too", "out of budget",
+    "no budget", "can't afford", "cannot afford", "pricey", "price is",
+    "too costly", "budget", "cheaper",
+)
+# Substrings that signal a timing objection.
+_TIMING_MARKERS = (
+    "not now", "not right now", "not a good time", "bad time", "next quarter",
+    "next year", "later this year", "circle back", "reach out in", "revisit in",
+    "too busy", "swamped", "reconnect in", "check back",
+)
+# Patterns that point us at another person to contact.
+_REFERRAL_PATTERNS = (
+    re.compile(r"talk to ([A-Z][a-zA-Z.\-]+(?: [A-Z][a-zA-Z.\-]+)?)"),
+    re.compile(r"speak (?:to|with) ([A-Z][a-zA-Z.\-]+(?: [A-Z][a-zA-Z.\-]+)?)"),
+    re.compile(r"reach out to ([A-Z][a-zA-Z.\-]+(?: [A-Z][a-zA-Z.\-]+)?)"),
+    re.compile(r"contact ([A-Z][a-zA-Z.\-]+(?: [A-Z][a-zA-Z.\-]+)?)"),
+    re.compile(r"connect (?:you )?with ([A-Z][a-zA-Z.\-]+(?: [A-Z][a-zA-Z.\-]+)?)"),
+)
+
+
+def _extract_referral_name(reply_text: str) -> Optional[str]:
+    """Pull the name a prospect points us to, if the reply names one."""
+    for pattern in _REFERRAL_PATTERNS:
+        m = pattern.search(reply_text or "")
+        if m:
+            name = m.group(1).strip(" .")
+            # Guard against matching a common word capitalised at sentence start.
+            if name and name.lower() not in {"us", "me", "our", "the", "them", "you"}:
+                return name
+    return None
+
+
+def classify_objection(reply_text: str, analysis: Optional[dict] = None) -> Optional[dict]:
+    """Classify a reply into an actionable objection, or ``None``.
+
+    Combines keyword detection on the raw reply with the AI intent (when
+    provided). Returns a dict ``{"type": "price"|"timing"|"referral", ...}``:
+
+    - ``price``   — the prospect balked at cost.
+    - ``timing``  — bad timing ("not now").
+    - ``referral`` — they pointed us to someone else (``referral_name`` set when
+      a name was extracted).
+
+    Price is checked first (most actionable), then referral, then timing.
+    """
+    text = (reply_text or "").lower()
+    intent = (analysis or {}).get("intent") or ""
+
+    if any(marker in text for marker in _PRICE_MARKERS):
+        return {"type": "price"}
+
+    if intent == "referral" or _extract_referral_name(reply_text):
+        return {"type": "referral", "referral_name": _extract_referral_name(reply_text)}
+
+    if intent == "not_now" or any(marker in text for marker in _TIMING_MARKERS):
+        return {"type": "timing"}
+
+    return None
+
+
+def _fallback_roi_reply(contact_name: str, company_name: str) -> dict:
+    """Deterministic value/ROI response used when AI generation is unavailable."""
+    first = (contact_name or "there").split()[0]
+    at_company = f" at {company_name}" if company_name else ""
+    body = (
+        f"Totally fair, {first} — let me put it in ROI terms instead of cost. "
+        f"Most shops we work with{at_company} recover the spend within a quarter "
+        "by cutting scrap and catching quality drift before parts ship. If I could "
+        "show you the payback math on your own numbers in 15 minutes, worth a look?\n\n"
+        "- Suman"
+    )
+    return {"subject": "Re: quick ROI math", "body": body}
+
+
+async def generate_roi_response(
+    ai, *, contact_name: str, company_name: str, reply_text: str
+) -> dict:
+    """Draft a value-focused reply to a price objection, framed around ROI.
+
+    Never raises: falls back to a deterministic ROI reply when the API is
+    unavailable or the response can't be parsed.
+    """
+    try:
+        prompt = f"""A prospect pushed back on price. Write a short reply that reframes
+cost as ROI for Apprend Technologies (manufacturing quality software — catches
+quality drift in real time, cuts scrap, speeds audits).
+
+Prospect: {contact_name} at {company_name}
+Their reply: {reply_text[:500]}
+
+Rules:
+- Under 70 words, from the phone, sign off "- Suman".
+- Don't argue about price. Reframe around payback: scrap reduction, fewer
+  escapes, faster audits. Offer to run the payback math on THEIR numbers.
+- No buzzwords, no exclamation marks.
+
+Return ONLY valid JSON: {{"subject": "Re: ...", "body": "..."}}"""
+        result = await ai._complete_json(prompt, max_tokens=400)
+        if isinstance(result, dict) and result.get("body"):
+            return {
+                "subject": result.get("subject") or "Re: quick ROI math",
+                "body": result["body"],
+            }
+    except Exception as e:  # noqa: BLE001 — never fail the caller
+        logger.warning("ROI response generation failed: %s", e)
+    return _fallback_roi_reply(contact_name, company_name)
+
+
+async def handle_objection(
+    db: AsyncSession,
+    objection: dict,
+    *,
+    contact: Optional[Contact],
+    company: Optional[Company],
+    reply_text: str,
+    contact_name: str = "",
+    company_name: str = "",
+    analysis: Optional[dict] = None,
+    ai=None,
+    user_id=None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Take the automated action for a classified objection.
+
+    - ``price``    → draft a value/ROI response (returned as ``draft``; not
+      auto-sent, so a human can glance before it goes out).
+    - ``timing``   → schedule a follow-up reminder ``NOT_NOW_FOLLOW_UP_DAYS``
+      days out.
+    - ``referral`` → create a referral-outreach follow-up task for the named
+      person.
+
+    Returns a dict describing what was done. Any DB rows are added to ``db`` and
+    flushed but not committed (the caller owns the transaction).
+    """
+    now = now or datetime.now(timezone.utc)
+    otype = objection.get("type")
+
+    if otype == "price":
+        if ai is None:
+            ai = get_ai_service()
+        draft = await generate_roi_response(
+            ai,
+            contact_name=contact_name or (contact.full_name if contact else ""),
+            company_name=company_name or (company.name if company else ""),
+            reply_text=reply_text,
+        )
+        return {"action": "roi_response", "objection": "price", "draft": draft}
+
+    if otype == "timing":
+        due = now + timedelta(days=NOT_NOW_FOLLOW_UP_DAYS)
+        follow_up = FollowUp(
+            user_id=user_id,
+            contact_id=contact.id if contact else None,
+            company_id=company.id if company else None,
+            due_date=due,
+            reason=f"Lead said 'not now' — nudge again in {NOT_NOW_FOLLOW_UP_DAYS} days",
+            status="pending",
+            notes=(reply_text or "")[:500],
+        )
+        db.add(follow_up)
+        await db.flush()
+        return {
+            "action": "scheduled_follow_up",
+            "objection": "timing",
+            "follow_up_id": str(follow_up.id),
+            "due_date": due.isoformat(),
+        }
+
+    if otype == "referral":
+        name = objection.get("referral_name")
+        who = name or "the referred contact"
+        follow_up = FollowUp(
+            user_id=user_id,
+            contact_id=contact.id if contact else None,
+            company_id=company.id if company else None,
+            due_date=now,
+            reason=f"Referral: reach out to {who} at {company_name or (company.name if company else 'the company')}",
+            status="pending",
+            notes=(reply_text or "")[:500],
+        )
+        db.add(follow_up)
+        await db.flush()
+        return {
+            "action": "referral_task",
+            "objection": "referral",
+            "referral_name": name,
+            "follow_up_id": str(follow_up.id),
+        }
+
+    return {"action": "none"}
 
 
 class SmartReplyService:
@@ -234,6 +440,30 @@ class SmartReplyService:
             company_name=company_name,
         )
 
+        # Handle common objections automatically (price / timing / referral).
+        objection_action = None
+        objection = classify_objection(body_text, analysis)
+        if objection:
+            try:
+                objection_action = await handle_objection(
+                    db,
+                    objection,
+                    contact=contact,
+                    company=company,
+                    reply_text=body_text,
+                    contact_name=contact_name,
+                    company_name=company_name,
+                    analysis=analysis,
+                    ai=ai,
+                    user_id=gmail_account.user_id,
+                )
+                logger.info(
+                    "Objection handled for %s (%s): %s",
+                    contact_name, from_email, objection_action.get("action"),
+                )
+            except Exception as e:  # noqa: BLE001 — objection handling is best-effort
+                logger.error("Objection handling failed for %s: %s", from_email, str(e))
+
         await db.commit()
 
         # Auto-send response if conditions are met
@@ -297,6 +527,7 @@ class SmartReplyService:
             "receiving_account": gmail_account.email,
             "analysis": analysis,
             "auto_sent": auto_sent,
+            "objection_action": objection_action,
         }
 
     def _extract_body(self, payload: dict) -> str:

@@ -32,7 +32,9 @@ from app.schemas.knowledge import (
     KnowledgeDocumentSummary,
     KnowledgeDocumentUpdate,
 )
+from app.models.company import Company
 from app.services import industry_verticals
+from app.services import knowledge as knowledge_service
 from app.services.outreach import ai_sales_guidelines as ai_guidelines
 
 logger = logging.getLogger(__name__)
@@ -244,6 +246,32 @@ async def get_industry(key: str):
     if not vertical:
         raise HTTPException(status_code=404, detail="Industry vertical not found")
     return _serialize_vertical(vertical)
+
+
+@router.get("/surface")
+async def surface_knowledge(
+    industry: Optional[str] = Query(None, description="Industry key or free-text name"),
+    company_name: Optional[str] = Query(None, description="Company name (aids vertical routing)"),
+):
+    """Surface the knowledge relevant to composing outreach for a target industry.
+
+    Returns the industry's pain points, objection handling, and full industry
+    profile so a rep composing an email doesn't have to look them up.
+    """
+    return knowledge_service.surface_for_industry(
+        industry=industry or "", company_name=company_name or ""
+    )
+
+
+@router.get("/surface/company/{company_id}")
+async def surface_knowledge_for_company(
+    company_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+):
+    """Surface contextual knowledge for a specific company's industry."""
+    company = await db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return knowledge_service.surface_for_company(company)
 
 
 @router.get("/ai-guidelines")
