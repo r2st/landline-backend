@@ -36,6 +36,7 @@ from app.config import get_settings
 from app.models.call import CallTask
 from app.models.company import Company
 from app.models.company_news import CompanyNews
+from app.models.competitor import Competitor, CompetitorMention
 from app.models.contact import Contact
 from app.models.interaction import Interaction
 from app.models.lead_score import LeadScore
@@ -344,6 +345,47 @@ async def _gather_context(
         for n in news_rows
     ]
 
+    # AI Company Research brief (feature 1.4), when one is on file. Rendered
+    # into the prompt so the call script is grounded in real pain points/angles.
+    try:
+        from app.services.research_agent import get_active_research, format_research_for_prompt
+
+        research = await get_active_research(db, company.id)
+        ctx["research"] = format_research_for_prompt(research) or None
+    except Exception:  # noqa: BLE001 — research is optional context
+        ctx["research"] = None
+
+    # Competitive intel (feature 2.6) — competitors mentioned at this company
+    # plus their battle-card angles, so the script can position against them.
+    ctx["competitors"] = []
+    mention_rows = (
+        await db.execute(
+            select(CompetitorMention)
+            .where(CompetitorMention.company_id == company.id)
+            .order_by(CompetitorMention.detected_at.desc())
+            .limit(10)
+        )
+    ).scalars().all()
+    if mention_rows:
+        seen_comp: dict = {}
+        for m in mention_rows:
+            seen_comp.setdefault(m.competitor_id, m.sentiment)
+        comp_rows = (
+            await db.execute(
+                select(Competitor).where(Competitor.id.in_(list(seen_comp.keys())))
+            )
+        ).scalars().all()
+        for c in comp_rows:
+            bc = c.battle_card or {}
+            ctx["competitors"].append({
+                "name": c.name,
+                "stance": seen_comp.get(c.id),
+                "weaknesses": list(c.weaknesses or [])[:4],
+                "how_we_win": list(bc.get("how_we_win", []))[:4],
+                "landmine_questions": list(bc.get("landmine_questions", []))[:3],
+                "talk_track": bc.get("talk_track"),
+            })
+
     return ctx
 
 
@@ -422,6 +464,28 @@ def _build_prompt(
         interactions_block = "\n".join(
             f"  - [{it.get('type')}] {it.get('subject') or ''}: {(it.get('notes') or '')[:160]}"
             for it in context["recent_interactions"]
+        )
+
+    # Competitive positioning (feature 2.6). Only rendered when a competitor has
+    # actually surfaced at this account, so cold scripts stay clean.
+    competitive_block = ""
+    if context.get("competitors"):
+        lines = []
+        for c in context["competitors"]:
+            stance = f" (prospect stance: {c['stance']})" if c.get("stance") else ""
+            lines.append(f"  • {c['name']}{stance}")
+            if c.get("weaknesses"):
+                lines.append(f"      Their weaknesses: {'; '.join(c['weaknesses'])}")
+            if c.get("how_we_win"):
+                lines.append(f"      How we win: {'; '.join(c['how_we_win'])}")
+            if c.get("landmine_questions"):
+                lines.append(f"      Landmine questions to ask: {'; '.join(c['landmine_questions'])}")
+            if c.get("talk_track"):
+                lines.append(f"      Talk track: {c['talk_track']}")
+        competitive_block = (
+            "\n## COMPETITIVE POSITIONING (a competitor is in play at this account — "
+            "weave this in naturally if they bring it up; don't volunteer it unprompted)\n"
+            + "\n".join(lines)
         )
 
     score = context.get("lead_score")
@@ -508,11 +572,15 @@ and their callback number is {{rep_phone}} — use those tokens, don't invent th
 ## RECENT COMPANY NEWS (use a real one as the opening hook if relevant)
 {news_block}
 
+## COMPANY RESEARCH BRIEF (AI-synthesized — lean on these pain points and angles)
+{context.get('research') or 'None on file.'}
+
 ## RECENT INTERACTIONS
 {interactions_block}
 
 ## LEAD SCORE
 {score_block}
+{competitive_block}
 
 ## INDUSTRY CONTEXT — {vertical.name}
 Emotional triggers that work:

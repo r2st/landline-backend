@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing
 
 settings = get_settings()
 
@@ -131,6 +131,10 @@ app.include_router(calls.router, prefix=settings.api_prefix)
 app.include_router(investors.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(sentiment.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(email_testing.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(intent.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(coaching.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(competitive.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(routing.router, prefix=settings.api_prefix, dependencies=_auth)
 
 
 @app.get("/health")

@@ -12,11 +12,13 @@ from app.database_celery import celery_session
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.consent import ConsentRecord
+from app.models.follow_up import FollowUp
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.services.consent import check_consent
 from app.services.email_compose import render, build_merge_context
 from app.services.email_dispatch import send_outreach_email
+from app.services.sequence_optimizer import get_sequence_optimizer, record_decision
 from app.tasks.celery_app import celery_app
 from app.services.send_limiter import get_send_limiter
 
@@ -31,6 +33,32 @@ def _run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+async def _advance_step(db: AsyncSession, enrollment: OutreachEnrollment) -> None:
+    """Advance an enrollment to its next step without sending.
+
+    Increments ``current_step`` and either schedules ``next_send_at`` from the
+    upcoming step's delay, or completes the enrollment when no step remains.
+    Used by optimizer skip/switch-channel paths (the send path advances inline).
+    """
+    now = datetime.now(timezone.utc)
+    enrollment.current_step += 1
+    next_step = (
+        await db.execute(
+            select(SequenceStep).where(
+                and_(
+                    SequenceStep.sequence_id == enrollment.sequence_id,
+                    SequenceStep.step_number == enrollment.current_step,
+                )
+            )
+        )
+    ).scalar_one_or_none()
+    if next_step is not None:
+        enrollment.next_send_at = now + timedelta(days=next_step.delay_days)
+    else:
+        enrollment.status = "completed"
+        enrollment.completed_at = now
 
 
 @celery_app.task(name="app.tasks.outreach.send_sequence_step", bind=True, max_retries=3)
@@ -170,6 +198,86 @@ def send_sequence_step(self, enrollment_id: str):
                 # here; the dispatcher appends the CAN-SPAM footer.
                 subject = render(step.subject_template, template_context)
                 body = render(step.body_template, template_context)
+
+                # --- AI-Optimized Sequence Engine (feature 1.2) ---
+                # Ask the optimizer what to do with this step before sending. It
+                # may adjust delay, rewrite content, switch channel, or skip. The
+                # optimizer is fail-safe: it returns a plain "send" on any error
+                # or when disabled, so this never blocks a send.
+                optimizer = get_sequence_optimizer()
+                decision = await optimizer.decide(
+                    db, enrollment, contact, company, step, subject, body
+                )
+                record_decision(enrollment, enrollment.current_step, decision)
+                action = decision.get("action", "send")
+
+                if action == "skip":
+                    # They're in a live conversation — don't pile on a scheduled
+                    # touch. Advance past this step without sending.
+                    await _advance_step(db, enrollment)
+                    await db.commit()
+                    logger.info(
+                        "Optimizer SKIP for enrollment %s step %d: %s",
+                        enrollment_id, step.step_number, decision.get("reasoning"),
+                    )
+                    return {
+                        "status": "skipped_by_optimizer",
+                        "step": step.step_number,
+                        "reasoning": decision.get("reasoning"),
+                    }
+
+                if action == "delay":
+                    delay_days = decision.get("delay_days", 1)
+                    enrollment.next_send_at = datetime.now(timezone.utc) + timedelta(days=delay_days)
+                    await db.commit()
+                    logger.info(
+                        "Optimizer DELAY %dd for enrollment %s step %d: %s",
+                        delay_days, enrollment_id, step.step_number, decision.get("reasoning"),
+                    )
+                    return {
+                        "status": "delayed_by_optimizer",
+                        "step": step.step_number,
+                        "delay_days": delay_days,
+                        "reasoning": decision.get("reasoning"),
+                    }
+
+                if action == "switch_channel":
+                    # Hold the email and surface a human task to reach out on the
+                    # recommended channel. Advance the step so the email sequence
+                    # continues from the next touch.
+                    channel = decision.get("channel", "call")
+                    reminder = FollowUp(
+                        contact_id=contact.id,
+                        company_id=company.id,
+                        due_date=datetime.now(timezone.utc),
+                        reason=f"AI: switch to {channel} — {decision.get('reasoning', '')}"[:500],
+                        status="pending",
+                    )
+                    db.add(reminder)
+                    await _advance_step(db, enrollment)
+                    await db.commit()
+                    logger.info(
+                        "Optimizer SWITCH_CHANNEL→%s for enrollment %s step %d: %s",
+                        channel, enrollment_id, step.step_number, decision.get("reasoning"),
+                    )
+                    return {
+                        "status": "channel_switch_by_optimizer",
+                        "step": step.step_number,
+                        "channel": channel,
+                        "reasoning": decision.get("reasoning"),
+                    }
+
+                if action == "rewrite":
+                    # Send now, but with the AI-adapted copy.
+                    if decision.get("subject"):
+                        subject = decision["subject"]
+                    if decision.get("body"):
+                        body = decision["body"]
+                    logger.info(
+                        "Optimizer REWRITE for enrollment %s step %d: %s",
+                        enrollment_id, step.step_number, decision.get("reasoning"),
+                    )
+                # action == "send" (or anything else): fall through and send as-is.
 
                 # Thread-linking: for steps after the first, chain into the
                 # same Gmail thread so the prospect sees a single conversation.

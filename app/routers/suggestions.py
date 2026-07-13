@@ -19,13 +19,23 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.company_news import CompanyNews
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
 from app.models.follow_up import FollowUp
 from app.models.lead_score import LeadScore
-from app.schemas.suggestions import Suggestion, SuggestionsResponse
+from app.models.suggestion_outcome import SuggestionOutcome
+from app.schemas.suggestions import (
+    AISuggestion,
+    AISuggestionsResponse,
+    Suggestion,
+    SuggestionOutcomeCreate,
+    SuggestionOutcomeRead,
+    SuggestionsResponse,
+)
+from app.services import smart_suggestions
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/suggestions", tags=["suggestions"])
@@ -273,3 +283,78 @@ async def get_suggestions(
         total=len(suggestions),
         counts_by_type=dict(counts),
     )
+
+
+@router.get("/ai", response_model=AISuggestionsResponse)
+async def get_ai_suggestions(
+    limit: int = Query(15, ge=1, le=50),
+    use_ai: bool = Query(True, description="Use Claude to rank; false forces the deterministic ranker"),
+    db: AsyncSession = Depends(get_db),
+):
+    """AI-powered, cross-signal next-best-actions with reasoning and timing.
+
+    Aggregates engagement, sentiment, buying signals, news, deal stage, health,
+    propensity, and overdue follow-ups per active lead, then ranks them (via
+    Claude when an API key is configured, else a transparent fallback). Falls
+    back gracefully so the panel always returns something.
+    """
+    now = datetime.now(timezone.utc)
+    result = await smart_suggestions.generate_ai_suggestions(db, limit=limit, use_ai=use_ai, now=now)
+    return AISuggestionsResponse(
+        suggestions=[AISuggestion(**s) for s in result["suggestions"]],
+        total=result["total"],
+        source=result["source"],
+        generated_at=now,
+    )
+
+
+@router.post("/outcome", response_model=SuggestionOutcomeRead, status_code=201)
+async def record_suggestion_outcome(
+    payload: SuggestionOutcomeCreate,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Record that a suggestion was accepted / dismissed / completed (feedback loop).
+
+    Feeds the priority-calibration model that boosts suggestion types which lead
+    to positive outcomes and suppresses ones that get dismissed.
+    """
+    acted = None
+    if payload.status in ("accepted", "dismissed", "completed"):
+        acted = datetime.now(timezone.utc)
+    outcome = SuggestionOutcome(
+        user_id=scope.owner_id,
+        suggestion_key=payload.suggestion_key,
+        suggestion_type=payload.suggestion_type,
+        status=payload.status,
+        action=payload.action,
+        outcome=payload.outcome,
+        company_id=payload.company_id,
+        contact_id=payload.contact_id,
+        payload=payload.payload,
+        notes=payload.notes,
+        acted_at=acted,
+    )
+    db.add(outcome)
+    await db.flush()
+    await db.refresh(outcome)
+    logger.info("Recorded suggestion outcome %s (%s/%s)", outcome.id, outcome.suggestion_type, outcome.status)
+    return outcome
+
+
+@router.get("/outcomes", response_model=list[SuggestionOutcomeRead])
+async def list_suggestion_outcomes(
+    suggestion_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, pattern="^(suggested|accepted|dismissed|completed)$"),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """List recorded suggestion outcomes (scoped to the caller), newest first."""
+    query = scope.apply(select(SuggestionOutcome), SuggestionOutcome.user_id)
+    if suggestion_type:
+        query = query.where(SuggestionOutcome.suggestion_type == suggestion_type)
+    if status:
+        query = query.where(SuggestionOutcome.status == status)
+    query = query.order_by(SuggestionOutcome.created_at.desc()).limit(limit)
+    return list((await db.execute(query)).scalars().all())

@@ -32,6 +32,14 @@ celery_app.conf.update(
         "app.tasks.news.*": {"queue": "enrichment"},
         "app.tasks.followups.*": {"queue": "enrichment"},
         "app.tasks.calls.*": {"queue": "enrichment"},
+        "app.tasks.research.*": {"queue": "enrichment"},
+        "app.tasks.conversation.*": {"queue": "enrichment"},
+        "app.tasks.intent.*": {"queue": "enrichment"},
+        "app.tasks.coaching.*": {"queue": "enrichment"},
+        "app.tasks.competitive.*": {"queue": "enrichment"},
+        "app.tasks.pipeline_predictions.*": {"queue": "enrichment"},
+        "app.tasks.lead_routing.*": {"queue": "enrichment"},
+        "app.tasks.smart_suggestions_task.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -87,6 +95,52 @@ celery_app.conf.update(
             "task": "app.tasks.calls.flag_missed_calls",
             "schedule": crontab(hour=18, minute=0),  # end of day, 6 PM UTC
         },
+        # --- Phase 1 AI features ---
+        # 1.4: backfill research briefs for active-pipeline companies missing one.
+        "research-stale-companies": {
+            "task": "app.tasks.research.research_stale_companies",
+            "schedule": 21600.0,  # every 6 hours
+        },
+        # 1.5: analyze active email threads for momentum / next-best-message.
+        "analyze-active-threads": {
+            "task": "app.tasks.conversation.analyze_active_threads",
+            "schedule": 3600.0,  # hourly
+        },
+        # 2.1: daily buyer-intent signal scan across active-pipeline companies.
+        "scan-intent-signals": {
+            "task": "app.tasks.intent.scan_intent_signals",
+            "schedule": crontab(hour=7, minute=0),  # daily at 7 AM UTC
+        },
+        # 2.4: weekly per-rep performance + AI coaching snapshots.
+        "generate-weekly-coaching": {
+            "task": "app.tasks.coaching.generate_weekly_coaching",
+            "schedule": crontab(hour=6, minute=0, day_of_week=1),  # Mondays 6 AM UTC
+        },
+        # 2.6: monitor competitor news for battle-card-worthy mentions.
+        "monitor-competitor-news": {
+            "task": "app.tasks.competitive.monitor_competitor_news",
+            "schedule": 43200.0,  # twice a day
+        },
+        # 1.1: weekly retrain + rescore of deal close-probability predictions.
+        "rescore-deal-predictions": {
+            "task": "app.tasks.pipeline_predictions.rescore_deal_predictions",
+            "schedule": crontab(hour=5, minute=0, day_of_week=1),  # Mondays 5 AM UTC
+        },
+        # 1.3: keep propensity / signal-velocity current for active leads.
+        "refresh-propensity-scores": {
+            "task": "app.tasks.lead_routing.refresh_propensity_scores",
+            "schedule": 1800.0,  # every 30 minutes
+        },
+        # 1.3: refresh rep win-rates, velocity, and capacity daily.
+        "recompute-rep-profiles": {
+            "task": "app.tasks.lead_routing.recompute_rep_profiles",
+            "schedule": crontab(hour=4, minute=0),  # daily 4 AM UTC
+        },
+        # 1.6: produce the prioritized daily AI action plan.
+        "generate-daily-suggestions": {
+            "task": "app.tasks.smart_suggestions_task.generate_daily_suggestions",
+            "schedule": crontab(hour=7, minute=30),  # daily 7:30 AM UTC
+        },
     },
 )
 
@@ -100,3 +154,11 @@ import app.tasks.scraping  # noqa: F401
 import app.tasks.enrichment  # noqa: F401
 import app.tasks.followups  # noqa: F401
 import app.tasks.calls  # noqa: F401
+import app.tasks.research  # noqa: F401
+import app.tasks.conversation  # noqa: F401
+import app.tasks.intent  # noqa: F401
+import app.tasks.coaching  # noqa: F401
+import app.tasks.competitive  # noqa: F401
+import app.tasks.pipeline_predictions  # noqa: F401
+import app.tasks.lead_routing  # noqa: F401
+import app.tasks.smart_suggestions_task  # noqa: F401

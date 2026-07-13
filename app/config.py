@@ -113,6 +113,20 @@ class Settings(BaseSettings):
     # Scheduling link (Calendly or similar) — included in auto-replies when set
     scheduling_link: str = ""
 
+    # --- Phase 1 AI features ---
+    # 1.2 AI-Optimized Sequence Engine: when enabled, the optimizer may adjust
+    # timing, rewrite content, switch channel, or skip a step before each send.
+    # Falls back to sending the static step verbatim on any failure.
+    sequence_optimizer_enabled: bool = True
+    # 1.4 AI Company Research Agent: auto-trigger a research brief when a company
+    # is created / before first outreach.
+    auto_research_enabled: bool = True
+    # 1.5 Conversation Intelligence: batch analysis of active threads.
+    conversation_intelligence_enabled: bool = True
+    # Threads with activity in the last N days are considered "active" for the
+    # analyze_active_threads beat task.
+    conversation_active_days: int = 14
+
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173"]
 

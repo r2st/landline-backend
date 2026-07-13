@@ -213,6 +213,7 @@ async def generate_email(
     lead_data: dict,
     template_type: str = "first_touch",
     custom_instructions: Optional[str] = None,
+    research_context: str = "",
 ) -> dict:
     """Generate a personalized outreach email using AI.
 
@@ -221,6 +222,9 @@ async def generate_email(
                    title, city, and any enrichment data.
         template_type: One of the TEMPLATE_HINTS keys (e.g. "first_touch").
         custom_instructions: Optional extra instructions for the AI.
+        research_context: Optional pre-formatted company research brief (from
+            ``research_agent.format_research_for_prompt``). When present, the AI
+            grounds the email in named pain points and outreach angles (1.4).
 
     Returns:
         Dict with "subject", "body", "demo_link", and "ai_generated" keys.
@@ -258,6 +262,9 @@ DEMO LINK TO INCLUDE (if appropriate for this email type): {demo_link}
 EMAIL TYPE: {template_type}
 {hint}
 """
+
+    if research_context:
+        user_prompt += f"\n{research_context}\n"
 
     if custom_instructions:
         user_prompt += f"\nADDITIONAL INSTRUCTIONS: {custom_instructions}\n"

@@ -88,6 +88,7 @@ async def generate_email(
     contact_title = payload.contact_title
     industry = payload.industry
 
+    research_context = ""
     if payload.company_id:
         result = await db.execute(
             select(Company).where(Company.id == _uuid_or_400(payload.company_id, "company_id"))
@@ -96,6 +97,11 @@ async def generate_email(
         if company:
             company_name = company_name or company.name
             industry = industry or company.industry_segment or ""
+            # Feed the AI Company Research brief (feature 1.4) into generation.
+            from app.services.research_agent import get_active_research, format_research_for_prompt
+
+            research = await get_active_research(db, company.id)
+            research_context = format_research_for_prompt(research)
 
     if payload.contact_id:
         result = await db.execute(
@@ -111,6 +117,10 @@ async def generate_email(
     if not company_name:
         raise HTTPException(status_code=400, detail="Company name is required (provide company_id or company_name)")
 
+    additional_context = payload.additional_context or ""
+    if research_context:
+        additional_context = f"{additional_context}\n\n{research_context}".strip()
+
     result = await ai.generate_email(
         company_name=company_name,
         contact_name=contact_name,
@@ -118,7 +128,7 @@ async def generate_email(
         industry=industry,
         purpose=payload.purpose,
         tone=payload.tone,
-        additional_context=payload.additional_context,
+        additional_context=additional_context,
     )
     return result
 

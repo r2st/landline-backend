@@ -134,7 +134,8 @@ Analyze the reply and return a JSON object with these fields:
   "buying_signals": [<list of specific buying signals detected, e.g. "asked about pricing", "mentioned timeline", "requested demo", "mentioned budget approval">],
   "objections": [<list of objections raised, e.g. "budget constraints", "bad timing", "using competitor", "need internal approval", "too small/early stage">],
   "recommended_action": "<one of: schedule_demo, send_case_study, send_pricing, follow_up_later, address_objection, nurture_sequence, connect_referral, mark_not_interested, no_action>",
-  "action_reasoning": "<1-2 sentence explanation of why this action is recommended>"
+  "action_reasoning": "<1-2 sentence explanation of why this action is recommended>",
+  "competitor_mentions": [<names of any competing vendors / software products the prospect names — e.g. an incumbent ERP, MES, or quality-software they use or are evaluating. Empty list if none.>]
 }}
 
 Be precise and calibrated. A polite decline is not_interested (score ~3), not neutral.
@@ -166,6 +167,7 @@ Return ONLY the JSON object."""
                 "objections": result.get("objections", []),
                 "recommended_action": result.get("recommended_action", "no_action"),
                 "action_reasoning": result.get("action_reasoning", ""),
+                "competitor_mentions": result.get("competitor_mentions", []) or [],
                 "model_used": self.model,
             }
         except Exception as e:
@@ -180,6 +182,7 @@ Return ONLY the JSON object."""
                 "objections": [],
                 "recommended_action": "no_action",
                 "action_reasoning": f"Analysis failed: {str(e)}",
+                "competitor_mentions": [],
                 "model_used": self.model,
                 "error": str(e),
             }

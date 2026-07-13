@@ -30,6 +30,10 @@ _ENGAGEMENT_WEIGHTS = {"replied": 12, "clicked": 7, "opened": 3}
 _NEWS_ACTIONABLE_BONUS = 5
 _MAX_ENGAGEMENT_BONUS = 25
 
+# Buyer-intent signals (job postings, funding, expansion, etc.) are strong
+# timing signals — a relevant + urgent one can add up to this many fit points.
+_MAX_INTENT_BONUS = 15
+
 
 # ---------------------------------------------------------------------------
 # Signal Recency Decay (from ai-cold-calling-guidelines.md)
@@ -114,7 +118,12 @@ async def _engagement_velocity(
     most_recent: Optional[datetime] = None
     for opened, clicked, replied in rows.all():
         for ts in (opened, clicked, replied):
-            if ts and ts >= window_start:
+            if ts is None:
+                continue
+            # SQLite (tests) returns naive datetimes; normalize before comparing.
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= window_start:
                 signal_count += 1
                 if most_recent is None or ts > most_recent:
                     most_recent = ts
@@ -279,6 +288,49 @@ async def _engagement_signal(
     return points, breakdown
 
 
+async def _intent_signal_bonus(
+    db: AsyncSession, company: Company, now: Optional[datetime] = None
+) -> tuple[int, dict]:
+    """Score active buyer-intent signals for a company. Returns (points, breakdown).
+
+    Only signals still inside their buying window (``expires_at`` in the future,
+    or null) count. The strongest signal dominates via its relevance-weighted
+    urgency, with a smaller bonus for additional corroborating signals — several
+    independent intent signals at once is a very strong buy indicator. Capped at
+    ``_MAX_INTENT_BONUS`` so intent can't swamp firmographic fit.
+
+    Imported lazily so firmographic-only unit tests (which never create signals)
+    return zero here.
+    """
+    from app.models.intent_signal import IntentSignal
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    rows = await db.execute(
+        select(IntentSignal)
+        .where(IntentSignal.company_id == company.id)
+        .where(or_(IntentSignal.expires_at.is_(None), IntentSignal.expires_at >= now))
+    )
+    signals = list(rows.scalars().all())
+    if not signals:
+        return 0, {}
+
+    scores = sorted((s.combined_score for s in signals), reverse=True)
+    # Top signal contributes most; each extra active signal adds a diminishing tail.
+    top = scores[0]
+    corroboration = sum(scores[1:4]) * 0.15
+    raw = (top / 100.0) * _MAX_INTENT_BONUS + corroboration / 10.0
+    points = int(min(raw, _MAX_INTENT_BONUS))
+
+    breakdown = {
+        "active_signals": len(signals),
+        "top_combined_score": round(top, 1),
+        "types": sorted({s.signal_type for s in signals}),
+    }
+    return points, breakdown
+
+
 async def score_company_rule_based(
     db: AsyncSession,
     company: Company,
@@ -314,15 +366,18 @@ async def score_company_rule_based(
     # --- NEW: Engagement velocity bonus ---
     velocity_bonus_pts = int(velocity_bonus * 100 * 0.07)  # up to 7 bonus points
 
+    # --- NEW: Buyer-intent signal bonus (Phase 2.1) ---
+    intent_pts, intent_breakdown = await _intent_signal_bonus(db, company, now)
+
     # --- NEW: Account tier classification ---
     tier_name, tier_value = classify_account_tier(
         industry_pts, size_pts, loc_pts, engagement_pts
     )
 
-    # completeness + live engagement + recency + velocity bonuses
+    # completeness + live engagement + recency + velocity + intent bonuses
     other_pts = completeness_pts + engagement_pts
     base_score = industry_pts + size_pts + loc_pts + other_pts
-    fit_score = min(100, base_score + recency_bonus + velocity_bonus_pts)
+    fit_score = min(100, base_score + recency_bonus + velocity_bonus_pts + intent_pts)
 
     factors = {
         "industry": {"score": industry_pts, "reason": industry_reason},
@@ -339,6 +394,10 @@ async def score_company_rule_based(
             "bonus": velocity_bonus,
             "bonus_points": velocity_bonus_pts,
             "signals_in_24h": velocity_signals,
+        },
+        "intent_signals": {
+            "bonus_points": intent_pts,
+            **intent_breakdown,
         },
         "account_tier": {
             "tier": tier_name,
@@ -362,10 +421,10 @@ async def score_company_rule_based(
     logger.info(
         "Scored company %s (%s): fit=%d [industry=%d, size=%d, location=%d, "
         "completeness=%d, engagement=%d, recency_bonus=%d, velocity_bonus=%d, "
-        "tier=%s]",
+        "intent_bonus=%d, tier=%s]",
         company.name, company.id, fit_score,
         industry_pts, size_pts, loc_pts, completeness_pts, engagement_pts,
-        recency_bonus, velocity_bonus_pts, tier_name,
+        recency_bonus, velocity_bonus_pts, intent_pts, tier_name,
     )
     return lead_score
 

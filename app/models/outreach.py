@@ -43,6 +43,12 @@ class OutreachEnrollment(Base):
     )
     next_send_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
+    # AI-Optimized Sequence Engine (feature 1.2): per-enrollment record of the
+    # optimizer's decisions and reasoning. Each entry is one decision dict
+    # ({step, action, reasoning, ...}) appended by sequence_optimizer before a
+    # send, so the sequence's AI behaviour is auditable and A/B-comparable.
+    optimization_context: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+
     # Relationships
     contact: Mapped["Contact"] = relationship("Contact", back_populates="enrollments")
     sequence: Mapped["OutreachSequence"] = relationship("OutreachSequence", back_populates="enrollments")

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, or_, and_, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
@@ -85,7 +86,84 @@ async def create_company(
     await db.flush()
     await db.refresh(company)
     logger.info("Created company %s (%s)", company.name, company.id)
+
+    # AI Company Research Agent (feature 1.4): kick off a research brief on
+    # creation. Best-effort — if the broker is unreachable, the periodic
+    # research_stale_companies task backfills it. Gated by a settings flag.
+    if get_settings().auto_research_enabled:
+        try:
+            from app.tasks.research import research_company
+
+            research_company.delay(str(company.id))
+        except Exception as exc:  # pragma: no cover - broker-dependent
+            logger.warning("Could not dispatch research for %s: %s", company.id, exc)
+
     return company
+
+
+def _serialize_research(r) -> dict:
+    """Serialize a CompanyResearch row for the API."""
+    return {
+        "id": str(r.id),
+        "company_id": str(r.company_id),
+        "research_brief": r.research_brief,
+        "pain_points": r.pain_points or [],
+        "outreach_angles": r.outreach_angles or [],
+        "competitive_intel": r.competitive_intel or {},
+        "sources_used": r.sources_used or [],
+        "is_stale": r.is_stale,
+        "model_used": r.model_used,
+        "researched_at": r.researched_at.isoformat() if r.researched_at else None,
+    }
+
+
+@router.get("/{company_id}/research")
+async def get_company_research(
+    company_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the freshest AI research brief for a company (feature 1.4).
+
+    Returns ``{"status": "none"}`` when no brief exists yet — trigger one with
+    ``POST /companies/{id}/research``.
+    """
+    from app.services.research_agent import get_active_research
+
+    company = (
+        await db.execute(select(Company).where(Company.id == company_id))
+    ).scalar_one_or_none()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    research = await get_active_research(db, company_id)
+    if research is None:
+        return {"status": "none", "company_id": str(company_id)}
+    return {"status": "ok", **_serialize_research(research)}
+
+
+@router.post("/{company_id}/research")
+async def generate_company_research(
+    company_id: uuid.UUID,
+    force: bool = Query(False, description="Re-research even if a fresh brief exists"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run the AI Company Research Agent for a company now and return the brief.
+
+    Synchronous — scrapes the site, pulls news/enrichment, and synthesizes with
+    Claude. Use ``force=true`` to supersede an existing non-stale brief.
+    """
+    from app.services.research_agent import get_research_agent
+
+    company = (
+        await db.execute(select(Company).where(Company.id == company_id))
+    ).scalar_one_or_none()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    research = await get_research_agent().research_company(db, company, force=force)
+    if research is None:
+        raise HTTPException(status_code=502, detail="Research synthesis failed")
+    return {"status": "ok", **_serialize_research(research)}
 
 
 @router.get("/", response_model=CompanyListResponse)

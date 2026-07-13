@@ -44,6 +44,19 @@ PIXEL_GIF = bytes([
 ])
 
 
+def _enqueue_signal_rescore(*, contact_id) -> None:
+    """Best-effort trigger for real-time lead re-routing on an engagement signal.
+
+    Lazily imported and fully guarded so the tracking pixel/redirect never fails
+    (and stays fast) when no Celery broker is reachable, e.g. in tests.
+    """
+    try:
+        from app.tasks.lead_routing import enqueue_signal_rescore
+        enqueue_signal_rescore(contact_id=contact_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Signal rescore enqueue skipped: %s", exc)
+
+
 def _get_serializer():
     settings = get_settings()
     key = settings.secret_key
@@ -112,6 +125,10 @@ async def track_open(token: str, db: AsyncSession = Depends(get_db)):
                     .values(**updates)
                 )
                 await db.commit()
+                # Real-time lead prioritization: an open is an engagement signal,
+                # so re-route this lead immediately (best-effort, never blocks).
+                if send_record.contact_id:
+                    _enqueue_signal_rescore(contact_id=send_record.contact_id)
 
         logger.info("Tracked email open for send %s", send_id)
     except Exception as e:
@@ -159,6 +176,9 @@ async def track_click(token: str, db: AsyncSession = Depends(get_db)):
                     .values(**updates)
                 )
                 await db.commit()
+                # A click is a strong buying signal — re-route the lead now.
+                if send_record.contact_id:
+                    _enqueue_signal_rescore(contact_id=send_record.contact_id)
 
         logger.info("Tracked click for send %s -> %s", send_id, original_url)
         return RedirectResponse(url=original_url, status_code=302)

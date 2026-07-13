@@ -14,6 +14,8 @@ from app.models.company import Company
 from app.models.deal import Deal
 from app.models.deal_activity import DealActivity
 from app.models.deal_note import DealNote
+from app.schemas.deal_prediction import DealForecast, DealPredictionRead
+from app.services import pipeline_forecaster
 from app.schemas.deal import (
     DEAL_STAGE_PROBABILITIES,
     DealActivityRead,
@@ -222,6 +224,24 @@ async def list_deal_stages():
     ]
 
 
+@router.get("/forecast", response_model=DealForecast)
+async def deal_forecast(
+    refresh: bool = Query(False, description="Recompute predictions before aggregating"),
+    db: AsyncSession = Depends(get_db),
+):
+    """AI-adjusted revenue forecast: weighted pipeline, by-month breakdown, at-risk deals.
+
+    Aggregates the latest stored ``DealPrediction`` per active deal. Pass
+    ``refresh=true`` to retrain and rescore first (slower; also runs weekly via
+    the ``rescore_deal_predictions`` Celery task).
+    """
+    if refresh:
+        # Skip the (network) AI blend on the synchronous refresh path.
+        await pipeline_forecaster.rescore_active_deals(db, use_ai=False)
+    forecast = await pipeline_forecaster.build_forecast(db)
+    return forecast
+
+
 @router.get("/{deal_id}", response_model=DealRead)
 async def get_deal(deal_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Get a single deal by ID."""
@@ -229,6 +249,37 @@ async def get_deal(deal_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
     return deal
+
+
+@router.get("/{deal_id}/prediction", response_model=DealPredictionRead)
+async def get_deal_prediction(
+    deal_id: uuid.UUID,
+    refresh: bool = Query(False, description="Force a fresh prediction instead of the latest stored one"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Close-probability prediction, risk flags, and predicted close date for one deal.
+
+    Returns the most recent stored prediction; generates one on the fly (without
+    the AI blend, for latency) when none exists or ``refresh=true``.
+    """
+    deal = (await db.execute(select(Deal).where(Deal.id == deal_id))).scalar_one_or_none()
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    prediction = None
+    if not refresh:
+        latest = await pipeline_forecaster.latest_predictions(db, [deal_id])
+        prediction = latest.get(deal_id)
+    if prediction is None:
+        prediction = await pipeline_forecaster.predict_deal(db, deal, use_ai=refresh)
+
+    company_name = (
+        await db.execute(select(Company.name).where(Company.id == deal.company_id))
+    ).scalar_one_or_none()
+    out = DealPredictionRead.model_validate(prediction).model_dump()
+    out["deal_title"] = deal.title
+    out["company_name"] = company_name
+    return out
 
 
 @router.patch("/{deal_id}", response_model=DealRead)

@@ -43,6 +43,15 @@ class AIService:
                 return json.loads(text[start : end + 1])
             raise
 
+    async def complete_json(self, prompt: str, max_tokens: int = 1024) -> dict:
+        """Public single-shot JSON completion.
+
+        Thin wrapper over :meth:`_complete_json` for other services (deal
+        forecasting, smart suggestions) that need a structured Claude reply and
+        want the same fence-tolerant parsing + never-raises contract.
+        """
+        return await self._complete_json(prompt, max_tokens=max_tokens)
+
     async def _complete_json(self, prompt: str, max_tokens: int = 1024) -> dict:
         """Send a single-shot prompt to Claude and parse the JSON reply.
 

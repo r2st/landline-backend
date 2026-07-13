@@ -128,6 +128,56 @@ async def get_thread(
     return result
 
 
+def _serialize_conversation_analysis(a) -> dict:
+    """Serialize a ConversationAnalysis row for the API."""
+    return {
+        "id": str(a.id),
+        "gmail_thread_id": a.gmail_thread_id,
+        "company_id": str(a.company_id) if a.company_id else None,
+        "contact_id": str(a.contact_id) if a.contact_id else None,
+        "momentum_score": a.momentum_score,
+        "momentum_label": a.momentum_label,
+        "stakeholder_map": a.stakeholder_map or [],
+        "unresolved_objections": a.unresolved_objections or [],
+        "recommended_action": a.recommended_action,
+        "next_message": a.next_message or {},
+        "signals": a.signals or {},
+        "message_count": a.message_count,
+        "model_used": a.model_used,
+        "analyzed_at": a.analyzed_at.isoformat() if a.analyzed_at else None,
+    }
+
+
+@router.get("/thread/{gmail_thread_id}/intelligence")
+async def get_thread_intelligence(
+    gmail_thread_id: str,
+    refresh: bool = Query(False, description="Re-run analysis even if a stored one exists"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return Conversation Intelligence for a thread (feature 1.5).
+
+    Returns the latest stored analysis. If none exists (or ``refresh=true``),
+    runs analysis synchronously over the full thread and stores the result.
+    Returns 404 if the thread has no messages to analyze.
+    """
+    from app.services.conversation_intelligence import get_conversation_intelligence_service
+
+    service = get_conversation_intelligence_service()
+
+    if not refresh:
+        existing = await service.get_latest(db, gmail_thread_id)
+        if existing is not None:
+            return {"status": "ok", **_serialize_conversation_analysis(existing)}
+
+    analysis = await service.analyze_thread(db, gmail_thread_id)
+    if analysis is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Thread not found or could not be analyzed",
+        )
+    return {"status": "ok", **_serialize_conversation_analysis(analysis)}
+
+
 @router.post("/reply/{email_id}", response_model=EmailReplyResponse)
 async def send_reply(
     email_id: uuid.UUID,

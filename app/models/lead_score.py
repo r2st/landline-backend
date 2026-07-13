@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, String, func
+from sqlalchemy import CheckConstraint, Float, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -30,6 +30,17 @@ class LeadScore(Base):
     location_score: Mapped[int] = mapped_column(Integer, default=0)
     engagement_score: Mapped[int] = mapped_column(Integer, default=0)
     factors: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # --- Intelligent prioritization & routing (Feature 1.3) ---
+    # Timing-focused "likelihood to convert now" score, distinct from fit.
+    propensity_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Rate of engagement change (signals/day) driving real-time prioritization.
+    signal_velocity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # Timestamp of the most recent engagement signal considered.
+    last_signal_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    # Best-matched rep for this lead (rep-matching output).
+    recommended_rep_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     scored_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

@@ -24,6 +24,14 @@ from app.models.knowledge import IndustryContact, KnowledgeDocument
 from app.models.call import CallTask, CallScript, CallNotification
 from app.models.investor import Investor, InvestorInteraction, InvestorDocument
 from app.models.email_sentiment import EmailSentimentScore, ABTestExperiment, EmailTestExchange
+from app.models.intent_signal import IntentSignal
+from app.models.rep_performance import RepPerformance
+from app.models.competitor import Competitor, CompetitorMention
+from app.models.company_research import CompanyResearch
+from app.models.conversation_analysis import ConversationAnalysis
+from app.models.deal_prediction import DealPrediction
+from app.models.rep_profile import RepProfile
+from app.models.suggestion_outcome import SuggestionOutcome
 
 __all__ = [
     "User",
@@ -60,4 +68,9 @@ __all__ = [
     "EmailSentimentScore",
     "ABTestExperiment",
     "EmailTestExchange",
+    "CompanyResearch",
+    "ConversationAnalysis",
+    "DealPrediction",
+    "RepProfile",
+    "SuggestionOutcome",
 ]
