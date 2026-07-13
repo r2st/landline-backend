@@ -39,6 +39,9 @@ from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
 from app.models.sender_health import SenderHealth
 from app.models.content_embedding import ContentEmbedding
 from app.models.call_recording import CallRecording
+from app.models.orchestration import OrchestrationPolicy
+from app.models.relationship import StakeholderMap, OrgRelationship
+from app.models.meeting import MeetingBrief
 
 __all__ = [
     "User",
@@ -93,4 +96,8 @@ __all__ = [
     "SenderHealth",
     "ContentEmbedding",
     "CallRecording",
+    "OrchestrationPolicy",
+    "StakeholderMap",
+    "OrgRelationship",
+    "MeetingBrief",
 ]

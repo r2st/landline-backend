@@ -26,13 +26,17 @@ from app.services import crypto
 
 logger = logging.getLogger(__name__)
 
-# Gmail send + read-only scopes plus the minimal identity scopes needed to know who
+# Gmail send + read-only scopes plus the minimal identity scopes needed to know who,
+# and Calendar events so Landline can create meeting invites (feature 2.5) on the
+# same OAuth grant. Adding a scope requires re-consent, so existing accounts keep
+# working (calendar calls simply fail until they reconnect).
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 
 _AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"

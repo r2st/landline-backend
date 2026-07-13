@@ -41,6 +41,35 @@ _TOKEN_URI = "https://oauth2.googleapis.com/token"
 # Number of days to defer a "not now" lead before nudging again.
 NOT_NOW_FOLLOW_UP_DAYS = 30
 
+# Intents / actions that signal the prospect is open to a meeting (feature 2.5).
+_MEETING_INTENT_MARKERS = ("interested", "meeting_request", "question")
+_MEETING_ACTION_MARKERS = ("schedule_meeting", "schedule_demo")
+
+
+def apply_scheduling_link(analysis: dict) -> bool:
+    """When a reply shows meeting interest, ensure the draft offers a scheduling link.
+
+    The AI already tries to weave the link in, but this guarantees it: if a
+    ``scheduling_link`` is configured, the intent/action indicates the prospect
+    wants to talk, and the drafted body doesn't already contain the link, append
+    it. Returns True when meeting interest was detected (whether or not a link was
+    added), so callers can surface a ``meeting_interest`` flag.
+    """
+    intent = (analysis or {}).get("intent") or ""
+    action = (analysis or {}).get("suggested_action") or ""
+    meeting_interest = intent in _MEETING_INTENT_MARKERS or action in _MEETING_ACTION_MARKERS
+    if not meeting_interest:
+        return False
+
+    link = getattr(get_settings(), "scheduling_link", "") or ""
+    draft = analysis.get("draft_reply")
+    if link and isinstance(draft, dict):
+        body = draft.get("body") or ""
+        if link not in body:
+            connector = "\n\n" if body and not body.endswith("\n") else ""
+            draft["body"] = f"{body}{connector}Grab a time that works for you here: {link}"
+    return True
+
 # Objection detection --------------------------------------------------------
 # Substrings that signal a price/budget objection.
 _PRICE_MARKERS = (
@@ -440,6 +469,9 @@ class SmartReplyService:
             company_name=company_name,
         )
 
+        # On meeting interest, guarantee the draft offers a scheduling link (2.5).
+        meeting_interest = apply_scheduling_link(analysis)
+
         # Handle common objections automatically (price / timing / referral).
         objection_action = None
         objection = classify_objection(body_text, analysis)
@@ -528,6 +560,7 @@ class SmartReplyService:
             "analysis": analysis,
             "auto_sent": auto_sent,
             "objection_action": objection_action,
+            "meeting_interest": meeting_interest,
         }
 
     def _extract_body(self, payload: dict) -> str:

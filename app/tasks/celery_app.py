@@ -37,6 +37,7 @@ celery_app.conf.update(
         "app.tasks.intent.*": {"queue": "enrichment"},
         "app.tasks.coaching.*": {"queue": "enrichment"},
         "app.tasks.competitive.*": {"queue": "enrichment"},
+        "app.tasks.orchestration.*": {"queue": "outreach"},
         "app.tasks.pipeline_predictions.*": {"queue": "enrichment"},
         "app.tasks.lead_routing.*": {"queue": "enrichment"},
         "app.tasks.smart_suggestions_task.*": {"queue": "enrichment"},
@@ -171,6 +172,12 @@ celery_app.conf.update(
             "task": "app.tasks.rag.index_new_content",
             "schedule": 21600.0,  # every 6 hours
         },
+        # 2.2: autonomous multi-channel orchestration — decide the next touch for
+        # every autonomous-mode enrollment.
+        "run-orchestrator": {
+            "task": "app.tasks.orchestration.run_orchestrator",
+            "schedule": 900.0,  # every 15 minutes
+        },
     },
 )
 
@@ -189,6 +196,7 @@ import app.tasks.conversation  # noqa: F401
 import app.tasks.intent  # noqa: F401
 import app.tasks.coaching  # noqa: F401
 import app.tasks.competitive  # noqa: F401
+import app.tasks.orchestration  # noqa: F401
 import app.tasks.pipeline_predictions  # noqa: F401
 import app.tasks.lead_routing  # noqa: F401
 import app.tasks.smart_suggestions_task  # noqa: F401

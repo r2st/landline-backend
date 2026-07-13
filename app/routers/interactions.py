@@ -67,7 +67,38 @@ async def create_interaction(
     await db.refresh(interaction)
     logger.info("Logged %s interaction %s for company %s",
                 payload.interaction_type, interaction.id, payload.company_id)
+
+    # Feature 2.5: when a meeting is logged with notes, run post-meeting analysis
+    # and attach it to the most recent open brief for the company. Best-effort —
+    # never let it break interaction logging.
+    if payload.interaction_type == "meeting":
+        notes = interaction.content or interaction.notes
+        if notes:
+            try:
+                await _run_post_meeting_analysis(db, interaction.company_id, notes)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Post-meeting analysis hook failed: %s", e)
+
     return interaction
+
+
+async def _run_post_meeting_analysis(db: AsyncSession, company_id, notes: str) -> None:
+    """Attach AI post-meeting analysis to the latest open brief for a company."""
+    if company_id is None:
+        return
+    from app.models.meeting import MeetingBrief
+    from app.services.meeting_intelligence import get_meeting_intelligence
+
+    brief = (
+        await db.execute(
+            select(MeetingBrief)
+            .where(MeetingBrief.company_id == company_id)
+            .where(MeetingBrief.status != "completed")
+            .order_by(MeetingBrief.generated_at.desc())
+        )
+    ).scalars().first()
+    mi = get_meeting_intelligence()
+    await mi.analyze_post_meeting(db, company_id=company_id, notes=notes, brief=brief)
 
 
 @router.get("", response_model=list[InteractionRead])

@@ -49,6 +49,19 @@ class OutreachEnrollment(Base):
     # send, so the sequence's AI behaviour is auditable and A/B-comparable.
     optimization_context: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
 
+    # Autonomous Multi-Channel Orchestration (feature 2.2). ``orchestration_mode``
+    # controls who drives the cadence:
+    #   manual     — the human/sequence runs it (default; no orchestrator touch).
+    #   assisted   — orchestrator proposes the next touch but a human approves it.
+    #   autonomous — orchestrator decides AND executes within policy guardrails.
+    # ``orchestration_log`` is an append-only JSONB array of TouchDecision dicts
+    # ({channel, action, reasoning, requires_human, ...}) so every autonomous
+    # decision is auditable.
+    orchestration_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual", server_default="manual"
+    )
+    orchestration_log: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+
     # Relationships
     contact: Mapped["Contact"] = relationship("Contact", back_populates="enrollments")
     sequence: Mapped["OutreachSequence"] = relationship("OutreachSequence", back_populates="enrollments")

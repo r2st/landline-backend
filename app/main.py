@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings
 
 settings = get_settings()
 
@@ -142,6 +142,10 @@ app.include_router(workflows.router, prefix=settings.api_prefix, dependencies=_a
 # Phase 3 — Advanced AI & Autonomous Operations
 app.include_router(prospecting.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(deliverability.router, prefix=settings.api_prefix, dependencies=_auth)
+# Phase 2 — Orchestration, relationship intelligence, meeting briefings
+app.include_router(orchestration.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(relationships.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(meetings.router, prefix=settings.api_prefix, dependencies=_auth)
 
 
 @app.get("/health")
