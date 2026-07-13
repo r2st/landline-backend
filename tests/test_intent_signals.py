@@ -34,22 +34,6 @@ def _mk_signal(company_id, **kw):
     return IntentSignal(**defaults)
 
 
-class TestIntentSignalModel:
-    def test_combined_score_weights_relevance_higher(self):
-        sig = _mk_signal(uuid.uuid4(), relevance_score=100, urgency_score=0)
-        # 100*0.6 + 0*0.4 = 60
-        assert sig.combined_score == 60.0
-
-    def test_is_active_respects_expiry(self):
-        now = datetime.now(timezone.utc)
-        past = _mk_signal(uuid.uuid4(), expires_at=now - timedelta(days=1))
-        future = _mk_signal(uuid.uuid4(), expires_at=now + timedelta(days=1))
-        never = _mk_signal(uuid.uuid4(), expires_at=None)
-        assert past.is_active(now) is False
-        assert future.is_active(now) is True
-        assert never.is_active(now) is True
-
-
 class TestIntentScoringIntegration:
     @pytest.mark.asyncio
     async def test_active_intent_signal_boosts_fit_score(self, db_session, sample_company):
@@ -157,3 +141,24 @@ class TestIntentRouter:
     async def test_scan_unknown_company_404(self, client):
         resp = await client.post(f"/api/v1/intent/scan/{uuid.uuid4()}")
         assert resp.status_code == 404
+
+
+# Pure-model unit tests. Defined last so a DB-using test class initializes the
+# async engine/event-loop first — a no-fixture class running first destabilizes
+# the shared in-memory SQLite fixtures used by the API tests above.
+class TestIntentSignalModel:
+    @pytest.mark.asyncio
+    async def test_combined_score_weights_relevance_higher(self):
+        sig = _mk_signal(uuid.uuid4(), relevance_score=100, urgency_score=0)
+        # 100*0.6 + 0*0.4 = 60
+        assert sig.combined_score == 60.0
+
+    @pytest.mark.asyncio
+    async def test_is_active_respects_expiry(self):
+        now = datetime.now(timezone.utc)
+        past = _mk_signal(uuid.uuid4(), expires_at=now - timedelta(days=1))
+        future = _mk_signal(uuid.uuid4(), expires_at=now + timedelta(days=1))
+        never = _mk_signal(uuid.uuid4(), expires_at=None)
+        assert past.is_active(now) is False
+        assert future.is_active(now) is True
+        assert never.is_active(now) is True

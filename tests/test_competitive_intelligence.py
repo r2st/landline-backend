@@ -3,7 +3,7 @@
 Covers the Competitor / CompetitorMention models, the string-based mention
 detector (no AI needed), the sentiment_service competitor_mentions extension,
 and the competitive API router (CRUD, detect, win/loss). Battle-card generation
-requires an AI key, so only its no-key 503 path is asserted here.
+hits the live AI and isn't asserted here — only its not-found path is.
 """
 
 import uuid
@@ -27,16 +27,6 @@ async def _mk_competitor(db, name="ProShop ERP", aliases=None, **kw):
     db.add(comp)
     await db.flush()
     return comp
-
-
-class TestCompetitorModel:
-    def test_all_names_dedupes_and_orders_by_length(self):
-        comp = Competitor(id=uuid.uuid4(), name="ProShop", aliases=["PS", "ProShop ERP", "proshop"])
-        names = comp.all_names()
-        # Longest first, case-insensitive dedupe of "proshop"/"ProShop".
-        assert names[0] == "ProShop ERP"
-        assert "PS" in names
-        assert sum(1 for n in names if n.lower() == "proshop") == 1
 
 
 class TestMentionDetection:
@@ -151,12 +141,18 @@ class TestCompetitiveRouter:
         assert any(c["name"] == "Steltix" for c in resp.json())
 
     @pytest.mark.asyncio
-    async def test_battle_card_without_ai_returns_503(self, client):
+    async def test_battle_card_unknown_competitor_404(self, client):
+        resp = await client.post(f"/api/v1/competitive/competitors/{uuid.uuid4()}/battle-card")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_competitor(self, client):
         resp = await client.post("/api/v1/competitive/competitors", json={"name": "E2 Shop"})
         cid = resp.json()["id"]
-        resp = await client.post(f"/api/v1/competitive/competitors/{cid}/battle-card")
-        # No ANTHROPIC_API_KEY configured in the test env.
-        assert resp.status_code == 503
+        resp = await client.delete(f"/api/v1/competitive/competitors/{cid}")
+        assert resp.status_code == 204
+        resp = await client.get(f"/api/v1/competitive/competitors/{cid}")
+        assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_detect_endpoint(self, client, db_session):
@@ -193,3 +189,16 @@ class TestCompetitiveRouter:
         epicor = next(r for r in rows if r["competitor"] == "Epicor")
         assert epicor["deals_won"] == 1
         assert epicor["companies_mentioned"] == 1
+
+
+# Pure-model unit test. Defined last so a DB-using test class initializes the
+# async engine/event-loop first (see note in test_intent_signals.py).
+class TestCompetitorModel:
+    @pytest.mark.asyncio
+    async def test_all_names_dedupes_and_orders_by_length(self):
+        comp = Competitor(id=uuid.uuid4(), name="ProShop", aliases=["PS", "ProShop ERP", "proshop"])
+        names = comp.all_names()
+        # Longest first, case-insensitive dedupe of "proshop"/"ProShop".
+        assert names[0] == "ProShop ERP"
+        assert "PS" in names
+        assert sum(1 for n in names if n.lower() == "proshop") == 1
