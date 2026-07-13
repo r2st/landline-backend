@@ -19,8 +19,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pydantic import BaseModel, Field
+
 from app.database import get_db
 from app.models.knowledge import IndustryContact, KnowledgeDocument
+from app.services.rag_service import get_rag_service
 from app.schemas.knowledge import (
     IndustryContactCreate,
     IndustryContactRead,
@@ -272,6 +275,53 @@ async def surface_knowledge_for_company(
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     return knowledge_service.surface_for_company(company)
+
+
+# --- RAG: knowledge-augmented selling (feature 3.4) ---
+class KnowledgeAskRequest(BaseModel):
+    question: str = Field(..., min_length=3)
+    top_k: Optional[int] = Field(None, ge=1, le=20)
+    source_types: Optional[list[str]] = None
+    company_id: Optional[uuid.UUID] = None
+
+
+@router.post("/ask")
+async def ask_knowledge(payload: KnowledgeAskRequest, db: AsyncSession = Depends(get_db)):
+    """Answer a natural-language question from the indexed sales knowledge base.
+
+    Retrieves the most relevant past emails / notes / interactions and
+    synthesizes a cited answer (feature 3.4).
+    """
+    return await get_rag_service().answer(
+        db,
+        payload.question,
+        top_k=payload.top_k,
+        source_types=payload.source_types,
+        company_id=payload.company_id,
+    )
+
+
+@router.post("/search")
+async def search_knowledge(payload: KnowledgeAskRequest, db: AsyncSession = Depends(get_db)):
+    """Semantic search over the knowledge base — returns ranked chunks, no synthesis."""
+    return await get_rag_service().search(
+        db,
+        payload.question,
+        top_k=payload.top_k,
+        source_types=payload.source_types,
+        company_id=payload.company_id,
+    )
+
+
+@router.post("/index")
+async def reindex_knowledge(
+    since_days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Index recent emails, notes, interactions, and docs into the RAG store."""
+    counts = await get_rag_service().index_new_content(db, since_days=since_days)
+    await db.flush()
+    return counts
 
 
 @router.get("/ai-guidelines")

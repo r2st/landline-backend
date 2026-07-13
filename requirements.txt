@@ -32,3 +32,7 @@ python-jose[cryptography]==3.3.0
 # to a heuristic if these are absent, so they are effectively optional at runtime.
 numpy==1.26.4
 scikit-learn==1.4.2
+# pgvector for the RAG knowledge store (Feature 3.4). Only imported inside the
+# ContentEmbedding column's PostgreSQL dialect path — the model degrades to a
+# JSON-encoded vector when this is absent (e.g. the SQLite test suite).
+pgvector==0.3.6

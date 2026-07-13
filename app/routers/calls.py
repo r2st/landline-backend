@@ -619,3 +619,121 @@ async def generate_queue(
         skipped_existing=result["skipped_existing"],
         tasks=[CallTaskRead.model_validate(t) for t in result["tasks"]],
     )
+
+
+# --------------------------------------------------------------------------- #
+# Voice intelligence — call recording + analysis (feature 3.5)
+# --------------------------------------------------------------------------- #
+
+from pydantic import BaseModel  # noqa: E402
+
+from app.models.call_recording import CallRecording  # noqa: E402
+from app.services.voice_intelligence import get_voice_intelligence  # noqa: E402
+
+
+class RecordingCreate(BaseModel):
+    recording_url: Optional[str] = None
+    transcription: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    context: str = ""
+    analyze: bool = True
+    use_ai: bool = True
+
+
+class RecordingRead(BaseModel):
+    id: uuid.UUID
+    call_task_id: uuid.UUID
+    recording_url: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    status: str
+    transcription: Optional[str] = None
+    transcription_source: Optional[str] = None
+    analysis: Optional[dict] = None
+    talk_listen_ratio: Optional[float] = None
+    model_used: Optional[str] = None
+    error: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+@router.post("/tasks/{task_id}/recording", response_model=RecordingRead, status_code=201)
+async def upload_call_recording(
+    task_id: uuid.UUID,
+    payload: RecordingCreate,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Attach a recording (URL and/or transcript) to a call task and analyze it.
+
+    If a transcript is supplied it is analyzed immediately. If only a URL is
+    given, transcription is attempted via Whisper (when configured). Analysis
+    always produces structured coaching + deal signals (feature 3.5).
+    """
+    task = await _get_call_task_in_scope(db, task_id, scope)
+    if not payload.recording_url and not payload.transcription:
+        raise HTTPException(status_code=400, detail="Provide recording_url or transcription")
+
+    recording = CallRecording(
+        call_task_id=task.id,
+        recording_url=payload.recording_url,
+        duration_seconds=payload.duration_seconds,
+        transcription=payload.transcription,
+        transcription_source="provided" if payload.transcription else None,
+        status="uploaded",
+    )
+    db.add(recording)
+    await db.flush()
+
+    if payload.analyze:
+        await get_voice_intelligence().process_recording(
+            db, recording, context=payload.context, use_ai=payload.use_ai
+        )
+    return recording
+
+
+@router.get("/tasks/{task_id}/recordings", response_model=list[RecordingRead])
+async def list_call_recordings(
+    task_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """All recordings for a call task, newest first."""
+    await _get_call_task_in_scope(db, task_id, scope)
+    rows = (
+        await db.execute(
+            select(CallRecording)
+            .where(CallRecording.call_task_id == task_id)
+            .order_by(CallRecording.created_at.desc())
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+@router.get("/tasks/{task_id}/analysis")
+async def get_call_analysis(
+    task_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """The latest analyzed recording's structured analysis for a call task."""
+    await _get_call_task_in_scope(db, task_id, scope)
+    recording = (
+        await db.execute(
+            select(CallRecording)
+            .where(CallRecording.call_task_id == task_id)
+            .order_by(CallRecording.created_at.desc())
+        )
+    ).scalars().first()
+    if recording is None:
+        raise HTTPException(status_code=404, detail="No recording found for this call task")
+    return {
+        "recording_id": str(recording.id),
+        "status": recording.status,
+        "transcription": recording.transcription,
+        "talk_listen_ratio": recording.talk_listen_ratio,
+        "analysis": recording.analysis,
+        "model_used": recording.model_used,
+        "error": recording.error,
+    }

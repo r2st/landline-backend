@@ -223,17 +223,56 @@ async def get_sending_accounts(db: AsyncSession) -> list:
     return list(gmail) + list(smtp)
 
 
+async def _filter_by_sender_health(db: AsyncSession, accounts: list) -> list:
+    """Drop accounts that deliverability health says should not send right now.
+
+    Feature 3.3: excludes accounts whose reputation is ``critical`` and accounts
+    that have already hit their (health-throttled) daily cap. When no SenderHealth
+    rows exist (e.g. before the first assessment, or in tests), nothing is
+    filtered and rotation behaves exactly as before.
+    """
+    from app.models.sender_health import SenderHealth  # local import avoids a cycle
+
+    if not accounts:
+        return accounts
+    ids = [a.id for a in accounts]
+    rows = (
+        await db.execute(select(SenderHealth).where(SenderHealth.account_id.in_(ids)))
+    ).scalars().all()
+    health = {(r.account_type, r.account_id): r for r in rows}
+    if not health:
+        return accounts
+
+    base_limit = get_settings().max_emails_per_day
+    keep = []
+    for a in accounts:
+        h = health.get((_transport_for(a), a.id))
+        if h is None:
+            keep.append(a)
+            continue
+        if h.status == "critical":
+            continue
+        effective = max(1, round(base_limit * h.throttle_factor))
+        if (a.daily_send_count or 0) >= effective:
+            continue
+        keep.append(a)
+    return keep
+
+
 async def get_next_rotation_account(db: AsyncSession):
     """Pick the least-recently-used sending-enabled sender for round-robin.
 
     Considers every sending-enabled, connected account across Gmail and SMTP so
     volume is spread evenly regardless of transport. Brand-new accounts (never
-    used) are picked first.
+    used) are picked first. Accounts flagged unhealthy by the deliverability
+    optimizer (feature 3.3) are skipped when healthier accounts are available.
     """
     accounts = await get_sending_accounts(db)
     if not accounts:
         return None
-    return min(accounts, key=_rotation_key)
+    # Prefer healthy accounts; never halt sending entirely if all are throttled.
+    pool = await _filter_by_sender_health(db, accounts) or accounts
+    return min(pool, key=_rotation_key)
 
 
 async def resolve_sender_info(

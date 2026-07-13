@@ -40,6 +40,11 @@ celery_app.conf.update(
         "app.tasks.pipeline_predictions.*": {"queue": "enrichment"},
         "app.tasks.lead_routing.*": {"queue": "enrichment"},
         "app.tasks.smart_suggestions_task.*": {"queue": "enrichment"},
+        "app.tasks.prospecting.*": {"queue": "enrichment"},
+        "app.tasks.client_health.*": {"queue": "enrichment"},
+        "app.tasks.deliverability.*": {"queue": "enrichment"},
+        "app.tasks.rag.*": {"queue": "enrichment"},
+        "app.tasks.voice.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -141,6 +146,31 @@ celery_app.conf.update(
             "task": "app.tasks.smart_suggestions_task.generate_daily_suggestions",
             "schedule": crontab(hour=7, minute=30),  # daily 7:30 AM UTC
         },
+        # --- Phase 3 AI features ---
+        # 3.1: autonomous prospecting run (daily) + weekly ICP relearn.
+        "run-prospecting-agent": {
+            "task": "app.tasks.prospecting.run_prospecting_agent",
+            "schedule": crontab(hour=9, minute=0),  # daily 9 AM UTC
+        },
+        "relearn-icp": {
+            "task": "app.tasks.prospecting.relearn_icp",
+            "schedule": crontab(hour=3, minute=30, day_of_week=1),  # Mondays 3:30 AM UTC
+        },
+        # 3.2: weekly predictive churn + expansion pass across clients.
+        "predict-client-health": {
+            "task": "app.tasks.client_health.predict_client_health",
+            "schedule": crontab(hour=6, minute=30, day_of_week=1),  # Mondays 6:30 AM UTC
+        },
+        # 3.3: hourly sender deliverability health assessment.
+        "assess-sender-health": {
+            "task": "app.tasks.deliverability.assess_sender_health",
+            "schedule": 3600.0,  # hourly
+        },
+        # 3.4: index new content into the RAG knowledge base.
+        "index-new-content": {
+            "task": "app.tasks.rag.index_new_content",
+            "schedule": 21600.0,  # every 6 hours
+        },
     },
 )
 
@@ -162,3 +192,8 @@ import app.tasks.competitive  # noqa: F401
 import app.tasks.pipeline_predictions  # noqa: F401
 import app.tasks.lead_routing  # noqa: F401
 import app.tasks.smart_suggestions_task  # noqa: F401
+import app.tasks.prospecting  # noqa: F401
+import app.tasks.client_health  # noqa: F401
+import app.tasks.deliverability  # noqa: F401
+import app.tasks.rag  # noqa: F401
+import app.tasks.voice  # noqa: F401

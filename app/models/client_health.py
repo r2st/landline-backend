@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import CheckConstraint, Float, ForeignKey, Integer, String, func
-from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
+from sqlalchemy.dialects.postgresql import JSONB, UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -41,6 +41,16 @@ class ClientHealthSnapshot(Base):
     meeting_frequency: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Optional manual signal (e.g. CSAT 0-100); not derivable from activity.
     satisfaction_score: Mapped[float | None] = mapped_column(Float)
+    # --- Feature 3.2: predictive churn + expansion intelligence ---
+    # AI/heuristic-predicted probability (0..1) this client churns in the next
+    # ~30-60 days. NULL until predict_client_health has run for the company.
+    predicted_churn_probability: Mapped[float | None] = mapped_column(Float)
+    # Ranked drivers behind the churn risk, e.g.
+    # [{"factor": "response_time_3x", "weight": 0.4, "detail": "..."}].
+    churn_risk_factors: Mapped[dict | None] = mapped_column(JSONB)
+    # Detected upsell / cross-sell / referral signals, e.g.
+    # {"signals": [...], "expansion_score": 0-100, "recommended_play": "..."}.
+    expansion_signals: Mapped[dict | None] = mapped_column(JSONB)
     # When this snapshot was taken (the axis for over-time tracking).
     recorded_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()

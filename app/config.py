@@ -127,6 +127,35 @@ class Settings(BaseSettings):
     # analyze_active_threads beat task.
     conversation_active_days: int = 14
 
+    # --- Phase 3 AI features ---
+    # 3.1 Autonomous Prospecting Agent.
+    prospecting_enabled: bool = True
+    prospecting_target_volume: int = 25            # candidates evaluated per run
+    prospecting_daily_max: int = 25                # hard cap on companies enrolled per day
+    prospecting_auto_enroll_threshold: int = 75    # fit >= → auto-enroll into outreach
+    prospecting_review_threshold: int = 50         # fit >= → human review queue
+    # Auto-pause the agent if the rolling enroll→engaged conversion drops below
+    # this fraction (guardrail against enrolling junk). 0 disables the check.
+    prospecting_min_conversion_rate: float = 0.0
+
+    # 3.3 Deliverability Optimizer.
+    deliverability_optimizer_enabled: bool = True
+    sender_bounce_rate_throttle: float = 0.05      # 7d bounce rate above this → throttle
+    sender_complaint_rate_throttle: float = 0.003  # 7d complaint rate above this → throttle
+    sender_min_reputation: int = 40                # below this the account is 'critical'
+
+    # 3.4 RAG Knowledge System.
+    rag_enabled: bool = True
+    rag_top_k: int = 5                             # retrieved chunks per query
+    rag_min_similarity: float = 0.05               # drop weak matches below this cosine sim
+
+    # 3.5 Voice Intelligence.
+    voice_intelligence_enabled: bool = True
+    # OpenAI key for Whisper transcription (optional — a transcript can also be
+    # supplied directly on upload, and analysis works from any transcript).
+    openai_api_key: str = ""
+    whisper_model: str = "whisper-1"
+
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:5173"]
 

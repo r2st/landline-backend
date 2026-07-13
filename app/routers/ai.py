@@ -121,6 +121,21 @@ async def generate_email(
     if research_context:
         additional_context = f"{additional_context}\n\n{research_context}".strip()
 
+    # Feature 3.4: retrieve relevant institutional knowledge (emails that worked,
+    # objection handling, notes) to ground the generation.
+    rag_context = ""
+    try:
+        from app.config import get_settings
+        from app.services.rag_service import get_rag_service
+
+        if get_settings().rag_enabled:
+            query = f"cold outreach email for {company_name} in {industry}. {payload.purpose}"
+            rag_context = await get_rag_service().assemble_context(
+                db, query, source_types=["email", "interaction", "knowledge_document"], max_chars=1500
+            )
+    except Exception:  # pragma: no cover - RAG is advisory, never blocks generation
+        rag_context = ""
+
     result = await ai.generate_email(
         company_name=company_name,
         contact_name=contact_name,
@@ -129,6 +144,7 @@ async def generate_email(
         purpose=payload.purpose,
         tone=payload.tone,
         additional_context=additional_context,
+        rag_context=rag_context,
     )
     return result
 

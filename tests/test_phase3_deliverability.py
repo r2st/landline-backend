@@ -1,0 +1,133 @@
+"""Tests for feature 3.3 — AI Email Deliverability Optimizer."""
+
+import uuid
+from datetime import datetime, timezone, timedelta
+
+import pytest
+
+from app.models.email_template import EmailSend
+from app.models.gmail_account import GmailAccount
+from app.models.sender_health import SenderHealth
+from app.services.deliverability_optimizer import get_deliverability_optimizer
+
+pytestmark = pytest.mark.asyncio
+
+
+async def _gmail_account(db_session, email="sender@apprend.co", sending=True):
+    acct = GmailAccount(
+        id=uuid.uuid4(), email=email, google_sub=str(uuid.uuid4()),
+        refresh_token_encrypted="x", is_active=True, sending_enabled=sending,
+        status="connected",
+    )
+    db_session.add(acct)
+    await db_session.flush()
+    return acct
+
+
+async def _email(db_session, acct, status="sent", opened=False, days_ago=1):
+    ts = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    db_session.add(EmailSend(
+        id=uuid.uuid4(), to_email="lead@x.com", subject="hi", status=status,
+        sender_account_id=acct.id, from_email=acct.email, sent_at=ts,
+        opened_at=ts if opened else None,
+    ))
+
+
+async def test_content_scan_flags_spam():
+    opt = get_deliverability_optimizer()
+    result = opt.scan_content_heuristic(
+        subject="ACT NOW!!! FREE MONEY",
+        body="CLICK HERE to BUY NOW!!! 100% free guarantee. http://a.com http://b.com http://c.com http://d.com",
+        has_unsubscribe=False,
+    )
+    assert result["spam_score"] >= 50
+    assert result["risk"] == "high"
+    assert result["issues"]
+
+
+async def test_content_scan_clean_email():
+    opt = get_deliverability_optimizer()
+    result = opt.scan_content_heuristic(
+        subject="quick question about your quoting process",
+        body="Hey Dana, saw you run a stamping shop. Are you still quoting in spreadsheets? "
+             "We cut a similar shop's turnaround from 2 days to 20 minutes. Worth a 15-min call?",
+        has_unsubscribe=True,
+    )
+    assert result["spam_score"] < 25
+    assert result["risk"] == "low"
+
+
+async def test_assess_account_healthy(db_session):
+    acct = await _gmail_account(db_session)
+    for _ in range(20):
+        await _email(db_session, acct, status="sent", opened=True)
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.sent_7d == 20
+    assert row.reputation_score >= 80
+    assert row.status == "healthy"
+    assert row.throttle_factor == 1.0
+
+
+async def test_assess_account_high_bounce_throttled(db_session):
+    acct = await _gmail_account(db_session)
+    for _ in range(16):
+        await _email(db_session, acct, status="sent")
+    for _ in range(4):  # 20% bounce rate
+        await _email(db_session, acct, status="bounced")
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.sent_7d == 20
+    assert row.bounce_rate_7d == 0.2
+    assert row.throttle_factor < 1.0
+    assert row.status in ("throttled", "critical")
+
+
+async def test_rotation_skips_critical_account(db_session):
+    from app.services.email_dispatch import get_next_rotation_account
+
+    good = await _gmail_account(db_session, email="good@apprend.co")
+    bad = await _gmail_account(db_session, email="bad@apprend.co")
+    # Mark the "bad" account critical via a SenderHealth row.
+    db_session.add(SenderHealth(
+        id=uuid.uuid4(), account_id=bad.id, account_type="gmail", account_email=bad.email,
+        reputation_score=10, throttle_factor=0.1, status="critical",
+    ))
+    await db_session.flush()
+
+    chosen = await get_next_rotation_account(db_session)
+    assert chosen is not None
+    assert chosen.id == good.id
+
+
+async def test_send_limiter_account_capacity(db_session):
+    from app.services.send_limiter import get_send_limiter
+
+    acct = await _gmail_account(db_session)
+    db_session.add(SenderHealth(
+        id=uuid.uuid4(), account_id=acct.id, account_type="gmail", account_email=acct.email,
+        reputation_score=65, throttle_factor=0.4, status="throttled",
+    ))
+    await db_session.flush()
+
+    cap = await get_send_limiter().account_capacity(db_session, acct)
+    assert cap["throttle_factor"] == 0.4
+    assert cap["effective_daily_limit"] < cap["base_daily_limit"]
+    assert cap["health_status"] == "throttled"
+
+
+async def test_deliverability_api(client):
+    r = await client.post("/api/v1/deliverability/scan-content", json={
+        "subject": "FREE MONEY!!!", "body": "CLICK HERE to BUY NOW", "has_unsubscribe": False,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["spam_score"] > 0
+
+    r = await client.post("/api/v1/deliverability/assess")
+    assert r.status_code == 200
+
+    r = await client.get("/api/v1/deliverability/senders")
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)

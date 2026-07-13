@@ -12,6 +12,8 @@ from app.models.company import Company
 from app.models.deal import Deal
 from app.models.task import Task
 from app.schemas.clients import AtRiskClient, ClientOverview
+from app.services.churn_predictor import get_churn_predictor
+from app.services.expansion_detector import get_expansion_detector
 from app.services.health import compute_company_health
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,84 @@ async def list_clients(
             "upcoming_tasks": open_tasks.get(company.id, 0),
             "industry": company.industry_segment,
         })
+    return out
+
+
+@router.get("/churn-risk")
+async def churn_risk(
+    min_probability: float = Query(0.0, ge=0.0, le=1.0),
+    max_clients: int = Query(500, ge=1, le=2000),
+    db: AsyncSession = Depends(get_db),
+):
+    """Predictive churn risk across clients, highest risk first (feature 3.2).
+
+    Computed live from health trajectory + engagement signals. Filter with
+    ``min_probability`` to see only clients above a risk floor.
+    """
+    clients = list(
+        (
+            await db.execute(
+                select(Company)
+                .where(Company.pipeline_stage == _CLIENT_STAGE)
+                .order_by(Company.name.asc())
+                .limit(max_clients)
+            )
+        ).scalars().all()
+    )
+    predictor = get_churn_predictor()
+    out = []
+    for company in clients:
+        churn = await predictor.predict(db, company, use_ai=False)
+        if churn["probability"] < min_probability:
+            continue
+        out.append({
+            "company_id": str(company.id),
+            "company_name": company.name,
+            "predicted_churn_probability": churn["probability"],
+            "risk_level": churn["risk_level"],
+            "health_score": churn["health_score"],
+            "health_status": churn["health_status"],
+            "risk_factors": churn["risk_factors"],
+            "summary": churn["summary"],
+        })
+    out.sort(key=lambda c: c["predicted_churn_probability"], reverse=True)
+    return out
+
+
+@router.get("/expansion-opportunities")
+async def expansion_opportunities(
+    min_score: int = Query(50, ge=0, le=100),
+    max_clients: int = Query(500, ge=1, le=2000),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clients showing upsell / cross-sell / referral potential (feature 3.2),
+    highest expansion score first."""
+    clients = list(
+        (
+            await db.execute(
+                select(Company)
+                .where(Company.pipeline_stage == _CLIENT_STAGE)
+                .order_by(Company.name.asc())
+                .limit(max_clients)
+            )
+        ).scalars().all()
+    )
+    detector = get_expansion_detector()
+    out = []
+    for company in clients:
+        exp = await detector.detect(db, company, use_ai=False)
+        if exp["expansion_score"] < min_score:
+            continue
+        out.append({
+            "company_id": str(company.id),
+            "company_name": company.name,
+            "expansion_score": exp["expansion_score"],
+            "ready": exp["ready"],
+            "signals": exp["signals"],
+            "recommended_play": exp["recommended_play"],
+            "health_status": exp["health_status"],
+        })
+    out.sort(key=lambda c: c["expansion_score"], reverse=True)
     return out
 
 

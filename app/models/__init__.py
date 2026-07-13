@@ -35,6 +35,10 @@ from app.models.suggestion_outcome import SuggestionOutcome
 from app.models.tenant import Tenant, TenantUsage
 from app.models.integration import Integration, WebhookSubscription, WebhookEvent
 from app.models.workflow import Workflow, WorkflowRun
+from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
+from app.models.sender_health import SenderHealth
+from app.models.content_embedding import ContentEmbedding
+from app.models.call_recording import CallRecording
 
 __all__ = [
     "User",
@@ -83,4 +87,10 @@ __all__ = [
     "WebhookEvent",
     "Workflow",
     "WorkflowRun",
+    "IcpProfile",
+    "ProspectingRun",
+    "ProspectCandidate",
+    "SenderHealth",
+    "ContentEmbedding",
+    "CallRecording",
 ]

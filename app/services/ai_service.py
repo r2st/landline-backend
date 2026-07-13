@@ -75,6 +75,24 @@ class AIService:
             logger.error("AI completion failed: %s", str(e))
             return {"error": str(e)}
 
+    async def complete_text(self, prompt: str, max_tokens: int = 1024, temperature: float | None = None) -> str:
+        """Public single-shot free-text completion.
+
+        Used by features that need prose rather than JSON (RAG natural-language
+        answers, voice-call summaries). Never raises — returns an empty string
+        on failure so callers can degrade gracefully.
+        """
+        try:
+            kwargs = {"model": self.model, "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": prompt}]}
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            message = await self.client.messages.create(**kwargs)
+            return message.content[0].text
+        except Exception as e:
+            logger.error("AI text completion failed: %s", str(e))
+            return ""
+
     async def generate_email(
         self,
         company_name: str,
@@ -84,12 +102,23 @@ class AIService:
         purpose: str = "initial outreach",
         tone: str = "professional but warm",
         additional_context: str = "",
+        rag_context: str = "",
     ) -> dict:
-        """Generate a personalized email using Claude."""
+        """Generate a personalized email using Claude.
+
+        ``rag_context`` (feature 3.4) lets a caller inject retrieved
+        institutional knowledge — e.g. an email that worked for a similar shop —
+        which the model may draw on. It is advisory context, appended after the
+        per-lead ``additional_context``.
+        """
         try:
             ctx_line = ""
             if additional_context:
                 ctx_line = f"Additional Context: {additional_context}"
+            if rag_context:
+                ctx_line += (
+                    f"\n\nRelevant past context (draw on what worked before, do NOT copy verbatim):\n{rag_context}"
+                )
 
             prompt = f"""You're Suman from Apprend Technologies. You build manufacturing software — shop floor monitoring, quoting tools, ERP integrations, quality tracking.
 

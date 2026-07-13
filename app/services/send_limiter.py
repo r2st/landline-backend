@@ -161,6 +161,40 @@ class SendLimiter:
             "min_days_between_followups": self.settings.min_days_between_followups,
         }
 
+    async def account_capacity(self, db: AsyncSession, account) -> dict:
+        """Deliverability-aware daily capacity for a single sending account (feature 3.3).
+
+        The static daily cap is scaled by the account's ``throttle_factor`` from
+        its ``SenderHealth`` row (1.0 when unknown), so a struggling account is
+        allowed fewer sends and volume shifts to healthier accounts.
+        """
+        from app.models.sender_health import SenderHealth
+
+        transport = "smtp" if type(account).__name__ == "SmtpAccount" else "gmail"
+        row = (
+            await db.execute(
+                select(SenderHealth).where(
+                    SenderHealth.account_type == transport,
+                    SenderHealth.account_id == account.id,
+                )
+            )
+        ).scalar_one_or_none()
+        throttle = row.throttle_factor if row is not None else 1.0
+        base = self.settings.max_emails_per_day
+        effective = max(1, round(base * throttle))
+        used = account.daily_send_count or 0
+        remaining = max(0, effective - used)
+        return {
+            "throttle_factor": throttle,
+            "reputation_score": row.reputation_score if row is not None else None,
+            "health_status": row.status if row is not None else "unknown",
+            "base_daily_limit": base,
+            "effective_daily_limit": effective,
+            "used_today": used,
+            "remaining_today": remaining,
+            "can_send": remaining > 0 and (row is None or row.status != "critical"),
+        }
+
     def _get_warmup_week(self) -> int | None:
         if not self.settings.warmup_enabled or not self.settings.warmup_start_date:
             return None
