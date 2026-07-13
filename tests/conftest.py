@@ -1,24 +1,40 @@
 """Shared test fixtures for Landline backend tests."""
 
+import os
+
+# A signing secret must exist before importing app modules — the app now
+# refuses to run without one, and tests mint JWTs. Set it first.
+os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production")
+
 import asyncio
 import json
 import uuid
 import uuid as uuid_mod
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 import pytest
 import pytest_asyncio
+from fastapi import Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Text, String, event, text, TypeDecorator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from httpx import AsyncClient, ASGITransport
 
 from app.database import Base, get_db
+from app.dependencies import get_current_user, get_current_user_optional
 from app.main import app
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.consent import ConsentRecord
 from app.models.user import User, UserRole
+from app.rate_limit import limiter
 from app.security import create_access_token, hash_password
+
+# Rate limiting is opt-in per test — disable globally so unrelated tests that
+# hammer an endpoint don't trip a 429. The dedicated rate-limit test re-enables
+# it. (See tests/test_security_hardening.py.)
+limiter.enabled = False
 
 
 # Use SQLite for tests (async via aiosqlite)
@@ -131,9 +147,11 @@ async def db_session(db_engine):
         yield session
 
 
-@pytest_asyncio.fixture(scope="function")
-async def client(db_engine):
-    """HTTP test client with overridden database dependency."""
+async def _install_test_db(db_engine):
+    """Wire the app to the test engine by overriding get_db.
+
+    Returns the session_factory and a teardown callable.
+    """
     session_factory = async_sessionmaker(
         db_engine, class_=AsyncSession, expire_on_commit=False
     )
@@ -149,11 +167,82 @@ async def client(db_engine):
 
     app.dependency_overrides[get_db] = override_get_db
 
+    def teardown():
+        app.dependency_overrides.clear()
+
+    return session_factory, teardown
+
+
+@pytest_asyncio.fixture(scope="function")
+async def unauth_client(db_engine):
+    """HTTP client that sends NO credentials — for asserting 401 on protected
+    routes and exercising the real auth path."""
+    _, teardown = await _install_test_db(db_engine)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+    teardown()
 
-    app.dependency_overrides.clear()
+
+@pytest_asyncio.fixture(scope="function")
+async def client(db_engine):
+    """HTTP test client, authenticated by default as a seeded admin.
+
+    The API now fails closed (every non-public route needs credentials), so the
+    default client carries an admin Bearer token to keep existing tests working
+    without threading auth through every call. Tests that need a specific
+    role/user pass their own ``Authorization`` header per request (which
+    overrides this default), and ``unauth_client`` sends nothing at all.
+    """
+    session_factory, teardown = await _install_test_db(db_engine)
+
+    # Seed a default admin so the real get_current_user + middleware checks pass.
+    async with session_factory() as session:
+        admin = User(
+            id=uuid.uuid4(),
+            email="_default_test_admin@landline.app",
+            name="Default Test Admin",
+            role=UserRole.ADMIN.value,
+            password_hash=hash_password("defaultpass123"),
+            is_active=True,
+        )
+        session.add(admin)
+        await session.commit()
+
+    # The default client acts as a "back-office" admin that sees ALL data —
+    # matching the legacy unscoped behavior that pre-scoping tests rely on when
+    # they call endpoints without an explicit per-user token. We do this by
+    # overriding get_current_user_optional so the DEFAULT admin resolves to
+    # "no user" (→ get_scope sees_all, and owner-scoped helpers apply no filter),
+    # exactly like the old API-key path. This cascades everywhere the optional
+    # dependency is used (get_scope AND direct per-endpoint owner checks).
+    #
+    # Requests carrying a real user's token (RBAC / scoping tests) still resolve
+    # to that user and get properly scoped. A present-but-invalid/deactivated
+    # token still raises 401 (fail closed preserved).
+    _optional_bearer = HTTPBearer(auto_error=False)
+
+    async def _default_admin_is_unscoped(
+        creds: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+        db: AsyncSession = Depends(get_db),
+    ):
+        if creds is None:
+            return None
+        user = await get_current_user(creds, db)  # raises 401 if invalid/inactive
+        return None if user.id == admin.id else user
+
+    app.dependency_overrides[get_current_user_optional] = _default_admin_is_unscoped
+
+    token = create_access_token(admin.id, admin.role)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as ac:
+        yield ac
+
+    teardown()
 
 
 @pytest_asyncio.fixture

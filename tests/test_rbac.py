@@ -18,8 +18,8 @@ USERS = "/api/v1/admin/users"
 # ─── Dependency-level RBAC on the admin routes ───────────────────────────────
 
 @pytest.mark.asyncio
-async def test_admin_route_requires_token(client: AsyncClient):
-    assert (await client.get(USERS)).status_code == 401
+async def test_admin_route_requires_token(unauth_client: AsyncClient):
+    assert (await unauth_client.get(USERS)).status_code == 401
 
 
 @pytest.mark.asyncio

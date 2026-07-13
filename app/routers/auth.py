@@ -2,13 +2,14 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import PRIVILEGED_ROLES, get_current_user
+from app.rate_limit import AUTH_RATE_LIMIT, limiter
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -31,7 +32,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit(AUTH_RATE_LIMIT)
+async def login(request: Request, payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     """Authenticate with email + password. Returns access and refresh tokens."""
     user = (
         await db.execute(select(User).where(User.email == payload.email))
@@ -60,7 +62,8 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit(AUTH_RATE_LIMIT)
+async def refresh(request: Request, payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
     """Exchange a valid refresh token for a new access + refresh pair."""
     try:
         data = decode_token(payload.refresh_token)

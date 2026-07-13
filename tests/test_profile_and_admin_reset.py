@@ -44,8 +44,8 @@ async def test_update_email_conflict(client: AsyncClient, agent_user, admin_user
 
 
 @pytest.mark.asyncio
-async def test_profile_update_requires_auth(client: AsyncClient):
-    resp = await client.patch(ME, json={"name": "Nobody"})
+async def test_profile_update_requires_auth(unauth_client: AsyncClient):
+    resp = await unauth_client.patch(ME, json={"name": "Nobody"})
     assert resp.status_code == 401
 
 

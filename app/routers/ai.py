@@ -3,7 +3,7 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
+from app.rate_limit import AI_RATE_LIMIT, limiter
 from app.services.ai_service import get_ai_service
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -73,7 +74,9 @@ class SendDraftReplyRequest(BaseModel):
 
 
 @router.post("/generate-email")
+@limiter.limit(AI_RATE_LIMIT)
 async def generate_email(
+    request: Request,
     payload: GenerateEmailRequest,
     db: AsyncSession = Depends(get_db),
 ):
@@ -121,7 +124,8 @@ async def generate_email(
 
 
 @router.post("/improve-email")
-async def improve_email(payload: ImproveEmailRequest):
+@limiter.limit(AI_RATE_LIMIT)
+async def improve_email(request: Request, payload: ImproveEmailRequest):
     """Improve an existing email draft using AI."""
     ai = get_ai_service()
     return await ai.improve_email(
@@ -132,7 +136,9 @@ async def improve_email(payload: ImproveEmailRequest):
 
 
 @router.post("/score-lead")
+@limiter.limit(AI_RATE_LIMIT)
 async def score_lead(
+    request: Request,
     payload: ScoreLeadRequest,
     db: AsyncSession = Depends(get_db),
 ):
@@ -162,7 +168,9 @@ async def score_lead(
 
 
 @router.post("/analyze-company/{company_id}")
+@limiter.limit(AI_RATE_LIMIT)
 async def analyze_company(
+    request: Request,
     company_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
@@ -206,7 +214,8 @@ async def analyze_company(
 
 
 @router.post("/generate-followup")
-async def generate_followup(payload: GenerateFollowupRequest):
+@limiter.limit(AI_RATE_LIMIT)
+async def generate_followup(request: Request, payload: GenerateFollowupRequest):
     """Generate an intelligent follow-up email."""
     ai = get_ai_service()
     result = await ai.generate_followup(
@@ -220,7 +229,8 @@ async def generate_followup(payload: GenerateFollowupRequest):
 
 
 @router.post("/analyze-reply")
-async def analyze_reply(payload: AnalyzeReplyRequest):
+@limiter.limit(AI_RATE_LIMIT)
+async def analyze_reply(request: Request, payload: AnalyzeReplyRequest):
     """Analyze a reply and get AI-drafted response."""
     ai = get_ai_service()
     return await ai.analyze_reply(
@@ -274,7 +284,8 @@ async def get_pending_replies(db: AsyncSession = Depends(get_db)):
     return {"pending_replies": items}
 
 @router.post("/scan-card")
-async def scan_business_card(file: UploadFile = File(...)):
+@limiter.limit(AI_RATE_LIMIT)
+async def scan_business_card(request: Request, file: UploadFile = File(...)):
     """Extract contact info from a business card image."""
     import base64
 

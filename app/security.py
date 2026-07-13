@@ -37,16 +37,36 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60        # 1 hour
 REFRESH_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
 
-def _secret_key() -> str:
+def get_configured_secret() -> str:
+    """Return the configured signing secret, or ``""`` if none is set.
+
+    Accepts any of the configured secrets, in priority order. ``getattr`` keeps
+    this resilient to settings objects that omit some of these attributes. Unlike
+    :func:`_secret_key`, this does not raise — used by the startup check to decide
+    whether the app is allowed to boot.
+    """
     settings = get_settings()
-    # Accept any of the configured secrets, in priority order. ``getattr`` keeps
-    # this resilient to settings objects that omit some of these attributes.
-    key = (
+    return (
         getattr(settings, "secret_key", "")
         or getattr(settings, "jwt_secret_key", "")
         or getattr(settings, "token_encryption_key", "")
-        or "landline-dev-secret-change-me"
     )
+
+
+def _secret_key() -> str:
+    """Return the JWT signing secret, raising if none is configured.
+
+    There is deliberately no hardcoded fallback: signing tokens with a
+    well-known default secret would let anyone mint valid tokens. The app
+    refuses to boot without a secret (see ``main.require_secret_key``), so in a
+    correctly-configured deployment this never raises.
+    """
+    key = get_configured_secret()
+    if not key:
+        raise RuntimeError(
+            "No signing secret configured. Set SECRET_KEY (or JWT_SECRET_KEY / "
+            "TOKEN_ENCRYPTION_KEY) in the environment."
+        )
     return key
 
 

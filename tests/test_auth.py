@@ -175,8 +175,8 @@ async def test_me_authenticated(client: AsyncClient, agent_user: User):
 
 
 @pytest.mark.asyncio
-async def test_me_no_token(client: AsyncClient):
-    resp = await client.get("/api/v1/auth/me")
+async def test_me_no_token(unauth_client: AsyncClient):
+    resp = await unauth_client.get("/api/v1/auth/me")
     assert resp.status_code == 401
 
 
@@ -384,9 +384,14 @@ async def test_admin_get_user(client: AsyncClient, admin_user: User, agent_user:
 
 @pytest.mark.asyncio
 async def test_tasks_scoped_by_user(
-    client: AsyncClient, admin_user: User, agent_user: User, sample_company
+    unauth_client: AsyncClient, admin_user: User, agent_user: User, sample_company
 ):
-    """Tasks created by different users should be scoped correctly."""
+    """Tasks created by different users should be scoped correctly.
+
+    Uses ``unauth_client`` (no default token) so each call's auth is explicit
+    and the final unauthenticated request exercises the fail-closed path.
+    """
+    client = unauth_client
     # Create task as agent
     resp1 = await client.post(
         "/api/v1/tasks",
@@ -425,10 +430,9 @@ async def test_tasks_scoped_by_user(
     assert len(admin_data) == 1
     assert admin_data[0]["title"] == "Admin's task"
 
-    # Without auth (API key mode), should see all tasks
+    # Fail closed: an unauthenticated request (no API key, no token) is rejected.
     all_tasks = await client.get("/api/v1/tasks")
-    assert all_tasks.status_code == 200
-    assert len(all_tasks.json()) == 2
+    assert all_tasks.status_code == 401
 
 
 # ---------------------------------------------------------------------------

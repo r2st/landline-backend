@@ -9,6 +9,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.email_template import EmailSend
@@ -27,7 +28,14 @@ from app.schemas.outreach import (
 from app.tasks.outreach import send_sequence_step
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/outreach", tags=["outreach"])
+# Authenticated router — every route requires a valid, active user.
+router = APIRouter(
+    prefix="/outreach",
+    tags=["outreach"],
+    dependencies=[Depends(get_current_user)],
+)
+# Public router — the SES event webhook must stay reachable without a JWT.
+public_router = APIRouter(prefix="/outreach", tags=["outreach"])
 
 
 # --- Sequences ---
@@ -255,12 +263,17 @@ async def update_enrollment(
 
 # --- Events ---
 
-@router.post("/events", response_model=OutreachEventRead, status_code=201)
+@public_router.post("/events", response_model=OutreachEventRead, status_code=201)
 async def record_event(
     payload: OutreachEventCreate,
     db: AsyncSession = Depends(get_db),
 ):
-    """Record an outreach event (webhook from SES, manual tracking)."""
+    """Record an outreach event (webhook from SES, manual tracking).
+
+    Public by design: external ESP webhooks (SES bounce/complaint/open) post
+    here without a JWT. Guarded by the ``enrollment_id`` foreign key — an event
+    can only attach to an enrollment that already exists.
+    """
     result = await db.execute(
         select(OutreachEnrollment).where(OutreachEnrollment.id == payload.enrollment_id)
     )

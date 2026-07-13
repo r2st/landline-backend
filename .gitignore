@@ -10,6 +10,9 @@ build/
 
 # Virtual environments
 .env
+# Production secrets — NEVER commit. .env.example stays tracked (it doesn't match).
+.env.production
+.env.production.*
 .venv/
 .venv-test/
 .venv-test2/

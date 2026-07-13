@@ -89,13 +89,16 @@ async def get_current_user_optional(
 
     Use for endpoints that work for both authenticated users and API-key
     callers (backward compat).
+
+    Note the asymmetry: **no token** → ``None`` (legacy/API-key caller, unscoped
+    by ``get_scope``); a **present but invalid** token (bad signature, expired,
+    or belonging to a deleted/deactivated user) → 401. Swallowing the latter
+    would let a deactivated user's token silently fall back to the unscoped
+    "see everything" path, so it must fail closed.
     """
     if creds is None:
         return None
-    try:
-        return await get_current_user(creds, db)
-    except HTTPException:
-        return None
+    return await get_current_user(creds, db)
 
 
 def require_role(*roles: str):

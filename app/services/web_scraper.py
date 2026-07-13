@@ -1,14 +1,95 @@
 """Website scraper — extracts company info from their website."""
 
+import asyncio
+import ipaddress
 import logging
 import re
+import socket
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# Maximum redirects we follow manually (validating each hop) so a redirect to
+# an internal address can't bypass the SSRF check.
+_MAX_REDIRECTS = 5
+
+
+class UnsafeURLError(ValueError):
+    """Raised when a URL resolves to a private / disallowed address (SSRF guard)."""
+
+
+def _ip_is_disallowed(ip: ipaddress._BaseAddress) -> bool:
+    """Return True for any address an outbound scrape must never reach.
+
+    Covers loopback (127.0.0.0/8, ::1), private RFC1918 (10/8, 172.16/12,
+    192.168/16), link-local (169.254/16 — includes the 169.254.169.254 cloud
+    metadata endpoint — and fe80::/10), plus unspecified, multicast, and other
+    reserved ranges.
+    """
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _resolve_host_ips(host: str) -> list[ipaddress._BaseAddress]:
+    """Resolve *host* to the set of IPs it points at (literal or via DNS)."""
+    # A literal IP address — parse directly, no DNS.
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+    # A hostname — resolve every A/AAAA record; a host is only safe if *all*
+    # of its addresses are safe (defends against DNS rebinding to a public +
+    # private pair).
+    infos = socket.getaddrinfo(host, None)
+    ips: list[ipaddress._BaseAddress] = []
+    for family, _type, _proto, _canon, sockaddr in infos:
+        ips.append(ipaddress.ip_address(sockaddr[0]))
+    return ips
+
+
+def validate_public_url(url: str) -> str:
+    """Validate *url* is a fetchable public http(s) URL, or raise UnsafeURLError.
+
+    Rejects non-http(s) schemes, missing hosts, and any host that resolves to a
+    private, loopback, link-local, or otherwise reserved address (including the
+    169.254.169.254 cloud metadata IP).
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise UnsafeURLError(f"Unsupported URL scheme: {parts.scheme or '(none)'}")
+    host = parts.hostname
+    if not host:
+        raise UnsafeURLError("URL has no host")
+
+    try:
+        ips = _resolve_host_ips(host)
+    except (socket.gaierror, UnicodeError) as exc:
+        raise UnsafeURLError(f"Could not resolve host {host!r}: {exc}") from exc
+
+    if not ips:
+        raise UnsafeURLError(f"Host {host!r} did not resolve to any address")
+
+    for ip in ips:
+        if _ip_is_disallowed(ip):
+            raise UnsafeURLError(
+                f"Host {host!r} resolves to disallowed address {ip}"
+            )
+    return url
+
+
+async def _validate_public_url_async(url: str) -> str:
+    """Async wrapper — DNS resolution is blocking, so run it off the loop."""
+    return await asyncio.to_thread(validate_public_url, url)
 
 
 class WebScraper:
@@ -17,6 +98,19 @@ class WebScraper:
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (compatible; LandlineBot/1.0; +https://apprendtechnologies.com)",
     }
+
+    async def _safe_get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+        """GET *url*, validating the SSRF guard on the initial URL and every
+        redirect hop. Redirects are followed manually so an internal Location
+        can't slip past validation."""
+        for _ in range(_MAX_REDIRECTS + 1):
+            await _validate_public_url_async(url)
+            resp = await client.get(url, headers=self.HEADERS, follow_redirects=False)
+            if resp.is_redirect and "location" in resp.headers:
+                url = urljoin(url, resp.headers["location"])
+                continue
+            return resp
+        raise UnsafeURLError("Too many redirects")
 
     async def scrape_company(self, domain: str) -> dict:
         """Scrape a company website for useful information."""
@@ -37,9 +131,15 @@ class WebScraper:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            # follow_redirects is False on the client: _safe_get follows them
+            # manually so each hop is SSRF-validated.
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
                 # Scrape homepage
-                resp = await client.get(url, headers=self.HEADERS)
+                try:
+                    resp = await self._safe_get(client, url)
+                except UnsafeURLError as e:
+                    logger.warning("Blocked scrape of %s: %s", domain, e)
+                    return {"error": "URL rejected (private or disallowed host)", "domain": domain}
                 if resp.status_code != 200:
                     return {"error": f"HTTP {resp.status_code}", "domain": domain}
 
@@ -85,7 +185,7 @@ class WebScraper:
 
                 if about_links:
                     try:
-                        about_resp = await client.get(about_links[0], headers=self.HEADERS)
+                        about_resp = await self._safe_get(client, about_links[0])
                         if about_resp.status_code == 200:
                             about_soup = BeautifulSoup(about_resp.text, "html.parser")
                             # Get main content text
@@ -113,7 +213,7 @@ class WebScraper:
 
                 if contact_links:
                     try:
-                        contact_resp = await client.get(contact_links[0], headers=self.HEADERS)
+                        contact_resp = await self._safe_get(client, contact_links[0])
                         if contact_resp.status_code == 200:
                             result["pages_checked"].append(contact_links[0])
                             more_emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', contact_resp.text))
