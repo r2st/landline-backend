@@ -42,6 +42,7 @@ from app.models.call_recording import CallRecording
 from app.models.orchestration import OrchestrationPolicy
 from app.models.relationship import StakeholderMap, OrgRelationship
 from app.models.meeting import MeetingBrief
+from app.models.agent_daily_summary import AgentDailySummary
 
 __all__ = [
     "User",
@@ -100,4 +101,5 @@ __all__ = [
     "StakeholderMap",
     "OrgRelationship",
     "MeetingBrief",
+    "AgentDailySummary",
 ]

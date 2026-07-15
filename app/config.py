@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     # Scheduling link (Calendly or similar) — included in auto-replies when set
     scheduling_link: str = ""
 
+    # --- Daily autonomous-activity summary ---
+    # Timezone whose calendar day the daily summary covers (the beat runs at
+    # 6 PM in this zone). Also drives the day-boundary windowing.
+    daily_summary_timezone: str = "Asia/Kolkata"
+    # Rewrite the narrative into warmer prose via Claude (falls back to the
+    # deterministic rule-based text if the model is unavailable).
+    daily_summary_use_ai: bool = True
+    # Email the daily digest to notification_email when True.
+    daily_summary_email_enabled: bool = False
+
     # --- Phase 1 AI features ---
     # 1.2 AI-Optimized Sequence Engine: when enabled, the optimizer may adjust
     # timing, rewrite content, switch channel, or skip a step before each send.

@@ -7,14 +7,16 @@ Rows are windowed and aggregated in Python so naive (SQLite) and aware
 
 import logging
 from collections import Counter, defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
+from app.models.agent_daily_summary import AgentDailySummary
 from app.models.client_health import ClientHealthSnapshot
 from app.models.company import Company
 from app.models.deal import Deal
@@ -23,6 +25,7 @@ from app.models.interaction import Interaction
 from app.models.lead_score import LeadScore
 from app.models.prospecting import ProspectingRun
 from app.models.task import Task
+from app.services.daily_summary import generate_and_store_summary
 from app.services.scoring import grade_for_fit
 from app.schemas.company import VALID_STAGES
 from app.schemas.reports import (
@@ -573,3 +576,117 @@ async def lead_quality(
     disqualified counts, new-lead sources, average fit, and the latest
     autonomous-prospecting run summary."""
     return await build_lead_quality_report(db, days)
+
+
+# --------------------------------------------------------------------------- #
+# Daily autonomous-activity summary
+# --------------------------------------------------------------------------- #
+
+
+def _serialize_summary(row: AgentDailySummary) -> dict:
+    """Shape an AgentDailySummary row for the API."""
+    return {
+        "id": str(row.id),
+        "date": row.summary_date.isoformat(),
+        "narrative": row.narrative,
+        "emails_sent": row.emails_sent,
+        "leads_discovered": row.leads_discovered,
+        "replies_received": row.replies_received,
+        "bounces_received": row.bounces_received,
+        "follow_ups_created": row.follow_ups_created,
+        "calls_queued": row.calls_queued,
+        "metrics": row.metrics,
+        "created_at": _aware(row.created_at),
+        "updated_at": _aware(row.updated_at),
+    }
+
+
+async def _get_or_build_summary(
+    db: AsyncSession, target_date, *, generate_if_missing: bool
+) -> Optional[AgentDailySummary]:
+    """Fetch a stored summary for ``target_date``; optionally compute-and-store it
+    on the fly if it doesn't exist yet (never runs the AI pass on-demand)."""
+    row = (
+        await db.execute(
+            select(AgentDailySummary).where(AgentDailySummary.summary_date == target_date)
+        )
+    ).scalar_one_or_none()
+    if row is None and generate_if_missing:
+        row = await generate_and_store_summary(
+            db, target_date=target_date,
+            tz_name=get_settings().daily_summary_timezone, use_ai=False,
+        )
+        await db.commit()
+    return row
+
+
+@router.get("/daily-summary")
+async def daily_summary_latest(
+    days: int = Query(1, ge=1, le=90, description="How many recent days of history to include"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Latest daily activity summary plus a short history window.
+
+    Returns the most recent stored summary as ``latest`` and the last ``days``
+    summaries (newest-first) as ``history`` — enough to drive the trend charts.
+    If today's summary hasn't been generated yet, it is computed on the fly
+    (without the AI narrative pass) so the card is never empty.
+    """
+    tz_name = get_settings().daily_summary_timezone
+    try:
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:
+        today = datetime.now(timezone.utc).date()
+
+    # Ensure today's summary exists so the card always has fresh data.
+    await _get_or_build_summary(db, today, generate_if_missing=True)
+
+    rows = list(
+        (
+            await db.execute(
+                select(AgentDailySummary)
+                .order_by(AgentDailySummary.summary_date.desc())
+                .limit(days)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest = rows[0] if rows else None
+    return {
+        "latest": _serialize_summary(latest) if latest else None,
+        "history": [_serialize_summary(r) for r in rows],
+    }
+
+
+@router.get("/daily-summary/{summary_date}")
+async def daily_summary_by_date(
+    summary_date: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """The daily activity summary for a specific ``YYYY-MM-DD`` date.
+
+    Computes and stores it on the fly if missing (no AI pass). Returns 400 for a
+    malformed date and 404 only if the date is in the future (nothing to report).
+    """
+    try:
+        target = date.fromisoformat(summary_date)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid date; use YYYY-MM-DD")
+
+    tz_name = get_settings().daily_summary_timezone
+    try:
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:
+        today = datetime.now(timezone.utc).date()
+    if target > today:
+        raise HTTPException(status_code=404, detail="No summary for a future date")
+
+    row = await _get_or_build_summary(db, target, generate_if_missing=True)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No summary for that date")
+    return _serialize_summary(row)

@@ -183,6 +183,11 @@ celery_app.conf.update(
             "task": "app.tasks.orchestration.run_orchestrator",
             "schedule": 900.0,  # every 15 minutes
         },
+        # Daily autonomous-activity digest — 6 PM IST (12:30 UTC).
+        "generate-daily-summary": {
+            "task": "app.tasks.reporting.generate_daily_summary",
+            "schedule": crontab(hour=12, minute=30),
+        },
     },
 )
 
