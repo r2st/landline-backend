@@ -448,13 +448,23 @@ async def test_rotation_skips_sending_disabled_accounts():
     disabled_account.sending_enabled = False
     disabled_account.status = "connected"
 
-    # Mock the queries for sending-enabled accounts
+    # Mock the queries. Rotation issues: (1) gmail accounts, (2) smtp accounts,
+    # then a per-rotation sender-health lookup. Return an empty result for any
+    # further queries so the health/warm-up filter finds no rows and keeps the
+    # enabled account.
     gmail_result = MagicMock()
     gmail_result.scalars.return_value.all.return_value = [enabled_account]
     smtp_result = MagicMock()
     smtp_result.scalars.return_value.all.return_value = []
+    empty_result = MagicMock()
+    empty_result.scalars.return_value.all.return_value = []
 
-    mock_db.execute = AsyncMock(side_effect=[gmail_result, smtp_result])
+    results = iter([gmail_result, smtp_result])
+
+    async def _execute(*args, **kwargs):
+        return next(results, empty_result)
+
+    mock_db.execute = AsyncMock(side_effect=_execute)
 
     account = await get_next_rotation_account(mock_db)
     assert account.email == "sender@apprend.tech"

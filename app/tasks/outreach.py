@@ -61,6 +61,62 @@ async def _advance_step(db: AsyncSession, enrollment: OutreachEnrollment) -> Non
         enrollment.completed_at = now
 
 
+async def _prior_step_engagement(
+    db: AsyncSession, enrollment: OutreachEnrollment, prior_step_number: int
+) -> dict:
+    """Whether the enrollment's prior step was opened / the contact ever replied.
+
+    Reads ``OutreachEvent`` rows for this enrollment: an ``opened``/``clicked``
+    event on ``prior_step_number`` means the prior touch was opened; a
+    ``replied`` event on any step means they responded. Used to evaluate a
+    step's ``send_condition``.
+    """
+    rows = (
+        await db.execute(
+            select(OutreachEvent.event_type, OutreachEvent.step_number).where(
+                OutreachEvent.enrollment_id == enrollment.id
+            )
+        )
+    ).all()
+    opened = any(
+        et in ("opened", "clicked") and sn == prior_step_number for et, sn in rows
+    )
+    replied = any(et == "replied" for et, _ in rows)
+    return {"opened": opened, "replied": replied}
+
+
+async def evaluate_step_condition(
+    db: AsyncSession, enrollment: OutreachEnrollment, step: SequenceStep
+) -> tuple[bool, str]:
+    """Decide whether a step should send given its ``send_condition``.
+
+    * ``always`` (or unknown) → always send.
+    * ``if_not_opened`` → send only if the prior step was NOT opened.
+    * ``if_opened_no_reply`` → send only if the prior step WAS opened and the
+      contact has not replied.
+
+    The first step (no prior touch) has nothing to branch on: ``if_not_opened``
+    sends (nothing was opened yet); ``if_opened_no_reply`` does not (nothing was
+    opened yet). Returns ``(should_send, reason)``.
+    """
+    condition = getattr(step, "send_condition", "always") or "always"
+    if condition == "always":
+        return True, "always"
+
+    eng = await _prior_step_engagement(db, enrollment, step.step_number - 1)
+    if condition == "if_not_opened":
+        if eng["opened"]:
+            return False, "prior step was opened — skipping the not-opened branch"
+        return True, "prior step not opened"
+    if condition == "if_opened_no_reply":
+        if eng["replied"]:
+            return False, "contact already replied — skipping"
+        if not eng["opened"]:
+            return False, "prior step not opened — skipping the opened-no-reply branch"
+        return True, "prior step opened, no reply yet"
+    return True, "unknown condition — defaulting to send"
+
+
 @celery_app.task(name="app.tasks.outreach.send_sequence_step", bind=True, max_retries=3)
 def send_sequence_step(self, enrollment_id: str):
     """Send the current step of a sequence to the enrolled contact.
@@ -186,6 +242,50 @@ def send_sequence_step(self, enrollment_id: str):
                                     "reason": f"step not due until {due_at.isoformat()}",
                                     "step": enrollment.current_step,
                                 }
+
+                # --- Non-email channel step ---
+                # A "call"/"linkedin"/"video"/"direct_mail" step isn't an email:
+                # surface a human task on the right channel and advance the
+                # sequence rather than sending mail.
+                if step.channel and step.channel != "email":
+                    reminder = FollowUp(
+                        contact_id=contact.id,
+                        company_id=company.id,
+                        due_date=datetime.now(timezone.utc),
+                        reason=f"Sequence step {step.step_number}: reach out via {step.channel}"[:500],
+                        status="pending",
+                    )
+                    db.add(reminder)
+                    await _advance_step(db, enrollment)
+                    await db.commit()
+                    logger.info(
+                        "Non-email step %d (%s) for enrollment %s → follow-up task created",
+                        step.step_number, step.channel, enrollment_id,
+                    )
+                    return {
+                        "status": "channel_task_created",
+                        "channel": step.channel,
+                        "step": step.step_number,
+                    }
+
+                # --- Conditional branching ---
+                # Honour the step's send_condition against the prior step's
+                # engagement. When the condition isn't met, advance past the
+                # step without sending.
+                should_send, cond_reason = await evaluate_step_condition(db, enrollment, step)
+                if not should_send:
+                    await _advance_step(db, enrollment)
+                    await db.commit()
+                    logger.info(
+                        "Condition '%s' not met for enrollment %s step %d: %s",
+                        step.send_condition, enrollment_id, step.step_number, cond_reason,
+                    )
+                    return {
+                        "status": "skipped_by_condition",
+                        "condition": step.send_condition,
+                        "reason": cond_reason,
+                        "step": step.step_number,
+                    }
 
                 # Build template context (includes demo_link resolved by industry)
                 template_context = build_merge_context(contact, company)
@@ -396,14 +496,14 @@ def process_outreach_queue():
             )
             enrollments = list(result.scalars().all())
             dispatched = 0
+            skipped_window = 0
 
             # Anti-spam: don't send outside business hours / on weekends. Cold
-            # mail that lands at 3 AM reads as a bot and tanks reply rates.
+            # mail that lands at 3 AM reads as a bot and tanks reply rates. The
+            # window is evaluated per contact in THEIR timezone when known (see
+            # the per-enrollment check below), so a lead in Los Angeles isn't
+            # emailed at 5 AM their time even when the global window is open.
             limiter = get_send_limiter()
-            in_window, window_reason = limiter.within_send_window()
-            if not in_window:
-                logger.info("Skipping outreach queue: %s", window_reason)
-                return {"active_enrollments": len(enrollments), "dispatched": 0, "reason": window_reason}
 
             now = datetime.now(timezone.utc)
             for enrollment in enrollments:
@@ -463,11 +563,22 @@ def process_outreach_queue():
                     logger.warning("Daily send limit reached: %s — stopping queue processing", reason)
                     break
 
-                # Load contact to check per-contact limits
+                # Load contact to check per-contact limits + timezone window
                 contact_result = await db.execute(
                     select(Contact).where(Contact.id == enrollment.contact_id)
                 )
                 contact = contact_result.scalar_one_or_none()
+
+                # Timezone-aware send window: use the contact's own timezone when
+                # set, else the global default. Skip (don't drop) if it's outside
+                # their business-hours window right now.
+                tz = getattr(contact, "timezone", None) if contact else None
+                in_window, window_reason = limiter.within_send_window(tz)
+                if not in_window:
+                    skipped_window += 1
+                    logger.debug("Enrollment %s outside send window: %s", enrollment.id, window_reason)
+                    continue
+
                 if contact and contact.email:
                     can_send_contact, contact_reason = await limiter.can_send_to_contact(db, contact.email)
                     if not can_send_contact:
@@ -479,7 +590,11 @@ def process_outreach_queue():
                 dispatched += 1
 
             await db.commit()
-            return {"active_enrollments": len(enrollments), "dispatched": dispatched}
+            return {
+                "active_enrollments": len(enrollments),
+                "dispatched": dispatched,
+                "skipped_outside_window": skipped_window,
+            }
 
     try:
         return _run_async(_run())

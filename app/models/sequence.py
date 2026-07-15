@@ -82,6 +82,15 @@ class SequenceStep(Base):
     # Channel for this step — enables multi-channel cadence orchestration.
     # "email" (default), "call", "linkedin", "video", "direct_mail"
     channel: Mapped[str] = mapped_column(String(20), nullable=False, default="email")
+    # Conditional branching gate evaluated against the PRIOR step's engagement
+    # for the contact before this step sends:
+    #   "always"            — send unconditionally (default; unchanged behaviour)
+    #   "if_not_opened"     — only send if the prior step was not opened
+    #   "if_opened_no_reply"— only send if the prior step was opened but not replied
+    # When the condition isn't met the step is skipped (advanced past, no send).
+    send_condition: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="always", server_default="always"
+    )
 
     # Relationships
     sequence: Mapped["OutreachSequence"] = relationship("OutreachSequence", back_populates="steps")

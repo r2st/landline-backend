@@ -29,6 +29,25 @@ from app.models.lead_score import LeadScore
 
 logger = logging.getLogger(__name__)
 
+# Letter-grade bands for a 0-100 fit score. A/B are the leads worth working;
+# C is nurture; D/F are poor fits / disqualify candidates.
+_GRADE_BANDS: list[tuple[int, str]] = [(80, "A"), (65, "B"), (50, "C"), (35, "D")]
+
+
+def grade_for_fit(fit_score: Optional[int]) -> str:
+    """Map a 0-100 fit score to an A/B/C/D/F letter grade.
+
+    A ≥ 80, B ≥ 65, C ≥ 50, D ≥ 35, else F. ``None`` grades as ``F`` (unscored
+    leads are treated as the lowest tier until scored).
+    """
+    if fit_score is None:
+        return "F"
+    for threshold, letter in _GRADE_BANDS:
+        if fit_score >= threshold:
+            return letter
+    return "F"
+
+
 # Engagement bonus weights (points added on top of data-completeness). These
 # reward real buying signals — a reply is worth far more than an open.
 _ENGAGEMENT_WEIGHTS = {"replied": 12, "clicked": 7, "opened": 3}

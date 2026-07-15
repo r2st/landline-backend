@@ -47,6 +47,16 @@ class Contact(Base):
     card_image: Mapped[str | None] = mapped_column(Text, deferred=True)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
     unsubscribed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # IANA timezone name (e.g. "America/Los_Angeles"). When set, outreach to this
+    # contact only sends inside the business-hours window of THEIR timezone
+    # rather than the global default. NULL → use the global send window.
+    timezone: Mapped[str | None] = mapped_column(String(64))
+    # Bounce tracking for deliverability hygiene. A hard bounce (or
+    # ``soft_bounce_suppress_threshold`` soft bounces) sets ``unsubscribed`` so
+    # the dead address is never emailed again.
+    bounce_count: Mapped[int] = mapped_column("bounce_count", default=0, server_default="0")
+    last_bounce_type: Mapped[str | None] = mapped_column(String(10))  # 'hard' | 'soft'
+    last_bounced_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     source: Mapped[str | None] = mapped_column(String(50), index=True)
     # 'genuine' (real business lead) or 'test' (internal/test data), or NULL if
     # unclassified. Lets the UI and outreach keep test contacts out of the way.

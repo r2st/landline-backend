@@ -161,6 +161,40 @@ def generate_stale_lead_followups():
         return {"status": "error", "error": str(exc)}
 
 
+@celery_app.task(name="app.tasks.followups.generate_weekly_lead_quality_report")
+def generate_weekly_lead_quality_report():
+    """Beat task: compute and log the weekly lead-quality report.
+
+    Summarises the grade distribution, qualified vs disqualified counts, and new
+    leads by source so the team gets a standing read on lead quality without
+    opening the dashboard. Returns the report dict (also logged).
+    """
+    logger.info("Generating weekly lead-quality report")
+
+    async def _run():
+        from app.routers.reports import build_lead_quality_report
+
+        async with celery_session() as db:
+            report = await build_lead_quality_report(db, days=7)
+            grades = report.get("grade_distribution", {})
+            logger.info(
+                "Weekly lead quality — total=%s grades A/B/C/D/F=%s/%s/%s/%s/%s "
+                "qualified=%s disqualified=%s avg_fit=%s new(7d)=%s",
+                report.get("total_companies"),
+                grades.get("A"), grades.get("B"), grades.get("C"),
+                grades.get("D"), grades.get("F"),
+                report.get("qualified_leads"), report.get("disqualified_leads"),
+                report.get("average_fit_score"), report.get("new_leads_in_window"),
+            )
+            return report
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("generate_weekly_lead_quality_report failed: %s", str(exc))
+        return {"status": "error", "error": str(exc)}
+
+
 @celery_app.task(name="app.tasks.followups.rescore_active_leads")
 def rescore_active_leads():
     """Beat task: re-run rule-based scoring for active-pipeline companies."""

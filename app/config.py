@@ -149,6 +149,22 @@ class Settings(BaseSettings):
     rag_top_k: int = 5                             # retrieved chunks per query
     rag_min_similarity: float = 0.05               # drop weak matches below this cosine sim
 
+    # --- Autonomous lead-gen enhancements ---
+    # Per-account warm-up: a newly connected mailbox ramps its own daily cap
+    # based on how long ago it was connected, independent of the global warm-up
+    # date. Applied by send_limiter.account_capacity() alongside the reputation
+    # throttle. Disable to fall back to the reputation-only cap.
+    account_warmup_enabled: bool = True
+    account_warmup_daily_limit_week1: int = 10   # days 0-6 since connected_at
+    account_warmup_daily_limit_week2: int = 25   # days 7-13
+    account_warmup_daily_limit_week3: int = 40   # days 14-20 (then uncapped by warm-up)
+    # Bounce handling: after this many soft bounces a contact is suppressed
+    # (treated like a hard bounce). A single hard bounce suppresses immediately.
+    soft_bounce_suppress_threshold: int = 3
+    # DKIM has no directory record; we probe these common selectors at
+    # <selector>._domainkey.<domain> when no explicit selector is supplied.
+    dkim_default_selectors: List[str] = ["google", "default", "selector1", "selector2", "k1"]
+
     # 3.5 Voice Intelligence.
     voice_intelligence_enabled: bool = True
     # OpenAI key for Whisper transcription (optional — a transcript can also be

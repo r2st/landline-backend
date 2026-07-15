@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -55,35 +56,49 @@ class SendLimiter:
 
         return True, "OK"
 
-    def within_send_window(self) -> tuple[bool, str]:
+    def within_send_window(self, tz_name: Optional[str] = None) -> tuple[bool, str]:
         """Whether the current time is inside the configured send window.
 
         Cold email that arrives at 3 AM (or Sunday) reads as a bot and depresses
-        reply rates. We restrict sends to business hours on weekdays in the
-        configured timezone. Returns (allowed, reason).
+        reply rates. We restrict sends to business hours on weekdays. When
+        ``tz_name`` is given (a contact's own IANA timezone) the window is
+        evaluated in THAT timezone so a lead in Los Angeles isn't emailed at
+        5 AM their time; otherwise the global default timezone is used. An
+        unknown/invalid tz falls back to the global default. Returns
+        (allowed, reason).
         """
         if not self.settings.send_window_enabled:
             return True, "send window disabled"
 
-        try:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo(self.settings.send_window_timezone)
-        except Exception:
-            # Unknown tz name → fail open rather than block all sending.
-            return True, "send window tz unavailable"
+        from zoneinfo import ZoneInfo
+
+        tz = None
+        used_tz_name = tz_name or self.settings.send_window_timezone
+        if tz_name:
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = None  # bad contact tz → fall back to global default below
+        if tz is None:
+            used_tz_name = self.settings.send_window_timezone
+            try:
+                tz = ZoneInfo(self.settings.send_window_timezone)
+            except Exception:
+                # Unknown tz name → fail open rather than block all sending.
+                return True, "send window tz unavailable"
 
         now_local = datetime.now(tz)
         if self.settings.send_window_weekdays_only and now_local.weekday() >= 5:
-            return False, f"outside send window (weekend, {now_local:%a %H:%M} {self.settings.send_window_timezone})"
+            return False, f"outside send window (weekend, {now_local:%a %H:%M} {used_tz_name})"
 
         start = self.settings.send_window_start_hour
         end = self.settings.send_window_end_hour
         if not (start <= now_local.hour < end):
             return False, (
                 f"outside send window ({now_local:%H:%M} not in "
-                f"{start:02d}:00–{end:02d}:00 {self.settings.send_window_timezone})"
+                f"{start:02d}:00–{end:02d}:00 {used_tz_name})"
             )
-        return True, f"within send window ({now_local:%a %H:%M})"
+        return True, f"within send window ({now_local:%a %H:%M} {used_tz_name})"
 
     async def can_send_today(self, db: AsyncSession) -> tuple[bool, str]:
         """Check if we have hit the daily sending limit."""
@@ -161,12 +176,44 @@ class SendLimiter:
             "min_days_between_followups": self.settings.min_days_between_followups,
         }
 
-    async def account_capacity(self, db: AsyncSession, account) -> dict:
-        """Deliverability-aware daily capacity for a single sending account (feature 3.3).
+    def account_warmup_limit(self, account) -> int | None:
+        """Per-account warm-up cap based on how long ago the account connected.
 
-        The static daily cap is scaled by the account's ``throttle_factor`` from
-        its ``SenderHealth`` row (1.0 when unknown), so a struggling account is
-        allowed fewer sends and volume shifts to healthier accounts.
+        A freshly connected mailbox ramps its own volume (week1 → week2 → week3
+        → uncapped) independent of the global ``warmup_start_date``, so adding a
+        new sender never dumps full volume from a cold IP/mailbox. Returns
+        ``None`` when per-account warm-up is disabled or the account is old
+        enough to be fully warmed.
+        """
+        s = self.settings
+        if not s.account_warmup_enabled:
+            return None
+        connected = getattr(account, "connected_at", None)
+        try:
+            if connected is None:
+                return None
+            if connected.tzinfo is None:
+                connected = connected.replace(tzinfo=timezone.utc)
+            days = (datetime.now(timezone.utc) - connected).days
+        except (TypeError, AttributeError):
+            # Non-datetime (e.g. a bare mock) → no warm-up cap.
+            return None
+        if days < 7:
+            return s.account_warmup_daily_limit_week1
+        if days < 14:
+            return s.account_warmup_daily_limit_week2
+        if days < 21:
+            return s.account_warmup_daily_limit_week3
+        return None  # fully warmed
+
+    async def account_capacity(self, db: AsyncSession, account) -> dict:
+        """Deliverability-aware daily capacity for a single sending account.
+
+        The static daily cap is (a) scaled by the account's ``throttle_factor``
+        from its ``SenderHealth`` row (feature 3.3; 1.0 when unknown) and (b)
+        capped by a per-account **warm-up** ramp keyed off ``connected_at``. The
+        effective limit is the lower of the two, so a struggling *or* brand-new
+        account sends less and volume shifts to healthy, warmed accounts.
         """
         from app.models.sender_health import SenderHealth
 
@@ -182,6 +229,11 @@ class SendLimiter:
         throttle = row.throttle_factor if row is not None else 1.0
         base = self.settings.max_emails_per_day
         effective = max(1, round(base * throttle))
+
+        warmup_limit = self.account_warmup_limit(account)
+        if warmup_limit is not None:
+            effective = min(effective, warmup_limit)
+
         used = account.daily_send_count or 0
         remaining = max(0, effective - used)
         return {
@@ -189,6 +241,7 @@ class SendLimiter:
             "reputation_score": row.reputation_score if row is not None else None,
             "health_status": row.status if row is not None else "unknown",
             "base_daily_limit": base,
+            "warmup_daily_limit": warmup_limit,
             "effective_daily_limit": effective,
             "used_today": used,
             "remaining_today": remaining,

@@ -76,6 +76,11 @@ celery_app.conf.update(
             "task": "app.tasks.followups.rescore_active_leads",
             "schedule": 43200.0,  # twice a day
         },
+        # Weekly lead-quality report (grade distribution, qualified vs disqualified).
+        "weekly-lead-quality-report": {
+            "task": "app.tasks.followups.generate_weekly_lead_quality_report",
+            "schedule": crontab(hour=6, minute=15, day_of_week=1),  # Mondays 6:15 AM UTC
+        },
         "sync-email-replies": {
             "task": "app.tasks.outreach.sync_email_replies",
             "schedule": 300.0,  # every 5 minutes

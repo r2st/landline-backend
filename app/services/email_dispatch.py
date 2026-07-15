@@ -224,14 +224,17 @@ async def get_sending_accounts(db: AsyncSession) -> list:
 
 
 async def _filter_by_sender_health(db: AsyncSession, accounts: list) -> list:
-    """Drop accounts that deliverability health says should not send right now.
+    """Drop accounts that shouldn't send right now: deliverability health + warm-up.
 
-    Feature 3.3: excludes accounts whose reputation is ``critical`` and accounts
-    that have already hit their (health-throttled) daily cap. When no SenderHealth
-    rows exist (e.g. before the first assessment, or in tests), nothing is
-    filtered and rotation behaves exactly as before.
+    Excludes accounts whose reputation is ``critical`` and accounts that have
+    already hit their **effective** daily cap — the lower of the reputation-
+    throttled cap (feature 3.3) and the per-account **warm-up** ramp (based on
+    ``connected_at`` age). A brand-new mailbox is therefore held to its warm-up
+    volume even before any SenderHealth assessment exists. Fail-open: accounts
+    with non-numeric send counts (mocks) or no data are never excluded.
     """
     from app.models.sender_health import SenderHealth  # local import avoids a cycle
+    from app.services.send_limiter import get_send_limiter
 
     if not accounts:
         return accounts
@@ -240,21 +243,25 @@ async def _filter_by_sender_health(db: AsyncSession, accounts: list) -> list:
         await db.execute(select(SenderHealth).where(SenderHealth.account_id.in_(ids)))
     ).scalars().all()
     health = {(r.account_type, r.account_id): r for r in rows}
-    if not health:
-        return accounts
 
     base_limit = get_settings().max_emails_per_day
+    limiter = get_send_limiter()
     keep = []
     for a in accounts:
         h = health.get((_transport_for(a), a.id))
-        if h is None:
-            keep.append(a)
+        if h is not None and h.status == "critical":
             continue
-        if h.status == "critical":
-            continue
-        effective = max(1, round(base_limit * h.throttle_factor))
-        if (a.daily_send_count or 0) >= effective:
-            continue
+        throttle = h.throttle_factor if h is not None else 1.0
+        effective = max(1, round(base_limit * throttle))
+        warmup = limiter.account_warmup_limit(a)
+        if warmup is not None:
+            effective = min(effective, warmup)
+        try:
+            if int(a.daily_send_count or 0) >= effective:
+                continue
+        except (TypeError, ValueError):
+            # Non-numeric send count (e.g. a bare mock) → don't exclude.
+            pass
         keep.append(a)
     return keep
 

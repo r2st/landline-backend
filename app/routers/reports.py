@@ -20,7 +20,10 @@ from app.models.company import Company
 from app.models.deal import Deal
 from app.models.email_template import EmailSend
 from app.models.interaction import Interaction
+from app.models.lead_score import LeadScore
+from app.models.prospecting import ProspectingRun
 from app.models.task import Task
+from app.services.scoring import grade_for_fit
 from app.schemas.company import VALID_STAGES
 from app.schemas.reports import (
     ActivitySummaryReport,
@@ -482,3 +485,91 @@ async def pipeline_analytics(
         "loss_rate": loss_rate,
         "total_pipeline_value": total_pipeline_value,
     }
+
+
+async def build_lead_quality_report(db: AsyncSession, days: int = 30) -> dict:
+    """Assemble the lead-quality report used by the endpoint and weekly task.
+
+    Grades every company by its latest fit score (A/B/C/D/F), counts qualified
+    vs disqualified leads, breaks new leads down by acquisition source over the
+    window, and attaches the most recent autonomous-prospecting run summary.
+    """
+    days = max(1, min(days, 365))
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=days)
+
+    # Latest fit score per company (highest scored_at wins).
+    scores = list((await db.execute(select(LeadScore))).scalars().all())
+    latest_by_company: dict = {}
+    for s in scores:
+        cur = latest_by_company.get(s.company_id)
+        if cur is None or _aware(s.scored_at) > _aware(cur.scored_at):
+            latest_by_company[s.company_id] = s
+
+    grade_counts: Counter = Counter()
+    fit_values: list[int] = []
+    for s in latest_by_company.values():
+        grade_counts[grade_for_fit(s.fit_score)] += 1
+        fit_values.append(s.fit_score)
+
+    companies = list((await db.execute(select(Company))).scalars().all())
+    # Unscored companies grade as F (not yet qualified).
+    unscored = sum(1 for c in companies if c.id not in latest_by_company)
+    grade_counts["F"] += unscored
+
+    stage_counts: Counter = Counter(c.stage for c in companies)
+    pipeline_counts: Counter = Counter(c.pipeline_stage for c in companies)
+
+    new_by_source: Counter = Counter()
+    new_leads = 0
+    for c in companies:
+        if _in_window(c.created_at, window_start, now):
+            new_leads += 1
+            new_by_source[c.source or "unknown"] += 1
+
+    total_graded = sum(grade_counts.values())
+    qualified = grade_counts["A"] + grade_counts["B"]
+    disqualified = stage_counts.get("disqualified", 0)
+
+    last_run = (
+        await db.execute(
+            select(ProspectingRun).order_by(ProspectingRun.started_at.desc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    prospecting = None
+    if last_run is not None:
+        prospecting = {
+            "status": last_run.status,
+            "started_at": last_run.started_at.isoformat() if last_run.started_at else None,
+            "companies_found": last_run.companies_found,
+            "companies_qualified": last_run.companies_qualified,
+            "companies_enrolled": last_run.companies_enrolled,
+            "companies_review_queue": last_run.companies_review_queue,
+        }
+
+    return {
+        "window_days": days,
+        "generated_at": now.isoformat(),
+        "total_companies": len(companies),
+        "grade_distribution": {g: grade_counts.get(g, 0) for g in ("A", "B", "C", "D", "F")},
+        "qualified_leads": qualified,
+        "qualified_rate": round(qualified / total_graded * 100, 1) if total_graded else 0.0,
+        "disqualified_leads": disqualified,
+        "average_fit_score": round(sum(fit_values) / len(fit_values), 1) if fit_values else 0.0,
+        "new_leads_in_window": new_leads,
+        "new_leads_by_source": dict(new_by_source),
+        "stage_distribution": dict(stage_counts),
+        "pipeline_distribution": dict(pipeline_counts),
+        "last_prospecting_run": prospecting,
+    }
+
+
+@router.get("/lead-quality")
+async def lead_quality(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lead-quality report: A/B/C/D/F grade distribution, qualified vs
+    disqualified counts, new-lead sources, average fit, and the latest
+    autonomous-prospecting run summary."""
+    return await build_lead_quality_report(db, days)

@@ -4,11 +4,12 @@ Exposes per-account sender health, an on-demand reassessment trigger, and a
 pre-send content spam-risk scanner.
 """
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.sender_health import SenderHealth
 from app.services.deliverability_optimizer import get_deliverability_optimizer
+from app.services import domain_auth
+from app.services.bounce_handler import record_bounce
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/deliverability", tags=["deliverability"])
@@ -80,3 +83,45 @@ async def scan_content(payload: ContentScanRequest):
     return await get_deliverability_optimizer().scan_content(
         payload.subject, payload.body, has_unsubscribe=payload.has_unsubscribe, use_ai=payload.use_ai
     )
+
+
+@router.get("/domain-auth")
+async def domain_auth_check(domain: str, dkim_selector: Optional[str] = None):
+    """Check a sending domain's SPF, DKIM and DMARC DNS records.
+
+    Pass a bare domain (or an email address). ``dkim_selector`` overrides the
+    default selector probe list. Runs the (blocking) DNS lookups off the event
+    loop; degrades to status "unknown" rather than erroring when DNS is
+    unavailable.
+    """
+    if not (domain or "").strip():
+        raise HTTPException(status_code=400, detail="domain is required")
+    selectors = [dkim_selector] if dkim_selector else None
+    return await asyncio.to_thread(domain_auth.check_domain_auth, domain, selectors)
+
+
+class BounceReport(BaseModel):
+    email: str
+    status_code: Optional[str] = None
+    diagnostic: str = ""
+    kind: Optional[str] = None  # force 'hard'|'soft'; else classified
+
+
+@router.post("/bounce")
+async def report_bounce(payload: BounceReport, db: AsyncSession = Depends(get_db)):
+    """Record a bounce (webhook or manual) and suppress the address if warranted.
+
+    Hard bounces suppress the contact immediately; soft bounces are tracked and
+    suppress after the configured threshold.
+    """
+    if not (payload.email or "").strip():
+        raise HTTPException(status_code=400, detail="email is required")
+    result = await record_bounce(
+        db,
+        payload.email,
+        status_code=payload.status_code,
+        diagnostic=payload.diagnostic,
+        kind=payload.kind,
+    )
+    await db.commit()
+    return result
