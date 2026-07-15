@@ -112,7 +112,7 @@ class SendLimiter:
         )
         today_count = result.scalar() or 0
 
-        daily_limit = self._get_daily_limit()
+        daily_limit = await self._get_daily_limit_db(db)
 
         if today_count >= daily_limit:
             warmup_note = " Warmup mode active." if self.settings.warmup_enabled else ""
@@ -120,26 +120,37 @@ class SendLimiter:
 
         return True, f"OK ({today_count}/{daily_limit} sent today)"
 
-    def _get_daily_limit(self) -> int:
-        """Get current daily limit, accounting for warmup period."""
-        if not self.settings.warmup_enabled or not self.settings.warmup_start_date:
+    def _daily_limit_for_start(self, start_date: Optional[str]) -> int:
+        """Daily limit for a given warm-up start date (ISO string or None)."""
+        if not self.settings.warmup_enabled or not start_date:
             return self.settings.max_emails_per_day
-
         try:
-            start = datetime.fromisoformat(self.settings.warmup_start_date).replace(tzinfo=timezone.utc)
+            start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
             days_active = (datetime.now(timezone.utc) - start).days
-
             if days_active < 7:
                 return self.settings.warmup_daily_limit_week1
             elif days_active < 14:
                 return self.settings.warmup_daily_limit_week2
             elif days_active < 21:
                 return self.settings.warmup_daily_limit_week3
-            else:
-                # Warmup complete
-                return self.settings.max_emails_per_day
+            return self.settings.max_emails_per_day
         except (ValueError, TypeError):
             return self.settings.max_emails_per_day
+
+    def _get_daily_limit(self) -> int:
+        """Config-only daily limit (no DB). Used where no session is available."""
+        return self._daily_limit_for_start(self.settings.warmup_start_date)
+
+    async def _get_daily_limit_db(self, db: AsyncSession) -> int:
+        """Daily limit using the persisted (system_settings) warm-up start date.
+
+        Prefers the warm-up start stamped on first send / reset from the UI over
+        the static config value, so a stale env date can't keep the ramp pinned.
+        """
+        from app.services import system_settings
+
+        start_date = await system_settings.get_warmup_start_date(db)
+        return self._daily_limit_for_start(start_date)
 
     async def get_send_stats(self, db: AsyncSession) -> dict:
         """Get current sending statistics for display."""
@@ -163,15 +174,18 @@ class SendLimiter:
         )
         monthly_count = result.scalar() or 0
 
-        daily_limit = self._get_daily_limit()
+        from app.services import system_settings
+
+        warmup_start = await system_settings.get_warmup_start_date(db)
+        daily_limit = self._daily_limit_for_start(warmup_start)
 
         return {
             "today_sent": today_count,
             "daily_limit": daily_limit,
             "daily_remaining": max(0, daily_limit - today_count),
             "monthly_sent": monthly_count,
-            "warmup_active": self.settings.warmup_enabled and bool(self.settings.warmup_start_date),
-            "warmup_week": self._get_warmup_week(),
+            "warmup_active": self.settings.warmup_enabled and bool(warmup_start),
+            "warmup_week": self._get_warmup_week(warmup_start),
             "max_per_contact_monthly": self.settings.max_emails_per_contact_per_month,
             "min_days_between_followups": self.settings.min_days_between_followups,
         }
@@ -248,11 +262,12 @@ class SendLimiter:
             "can_send": remaining > 0 and (row is None or row.status != "critical"),
         }
 
-    def _get_warmup_week(self) -> int | None:
-        if not self.settings.warmup_enabled or not self.settings.warmup_start_date:
+    def _get_warmup_week(self, start_date: Optional[str] = None) -> int | None:
+        start_date = start_date if start_date is not None else self.settings.warmup_start_date
+        if not self.settings.warmup_enabled or not start_date:
             return None
         try:
-            start = datetime.fromisoformat(self.settings.warmup_start_date).replace(tzinfo=timezone.utc)
+            start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
             days = (datetime.now(timezone.utc) - start).days
             return min(days // 7 + 1, 4)  # Cap at week 4 (warmup complete)
         except (ValueError, TypeError):

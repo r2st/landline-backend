@@ -363,6 +363,17 @@ async def process_sequence_queue(
     ``process_outreach_queue`` Celery beat task.
     """
     from app.tasks.outreach import send_sequence_step
+    from app.services import system_settings
+
+    # Global kill switch — dispatch nothing while sending is halted.
+    if not await system_settings.is_sending_enabled(db):
+        return {
+            "status": "halted",
+            "reason": "Global sending kill switch is engaged.",
+            "active_enrollments": 0,
+            "dispatched": 0,
+            "skipped": 0,
+        }
 
     result = await db.execute(
         select(OutreachEnrollment).where(OutreachEnrollment.status == "active")
@@ -440,6 +451,10 @@ async def process_sequence_queue(
             select(Contact).where(Contact.id == enrollment.contact_id)
         )
         contact = contact_result.scalar_one_or_none()
+        # Skip enrollments whose recipient domain is known-undeliverable.
+        if contact and contact.email_status == "invalid":
+            skipped += 1
+            continue
         if contact and contact.email:
             can_send_contact, _ = await limiter.can_send_to_contact(db, contact.email)
             if not can_send_contact:

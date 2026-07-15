@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test
 
 settings = get_settings()
 
@@ -146,6 +146,10 @@ app.include_router(deliverability.router, prefix=settings.api_prefix, dependenci
 app.include_router(orchestration.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(relationships.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(meetings.router, prefix=settings.api_prefix, dependencies=_auth)
+# System control — global sending kill switch + warm-up reset.
+app.include_router(system.router, prefix=settings.api_prefix, dependencies=_auth)
+# Test-send + deliverability verification.
+app.include_router(email_test.router, prefix=settings.api_prefix, dependencies=_auth)
 
 
 @app.get("/health")

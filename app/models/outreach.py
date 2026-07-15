@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,6 +42,14 @@ class OutreachEnrollment(Base):
         UUID(as_uuid=True), ForeignKey("gmail_accounts.id", ondelete="SET NULL")
     )
     next_send_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    # Set True when the global sending kill switch paused this enrollment (it was
+    # ``active`` when sending was halted). Lets a subsequent re-enable resume
+    # *only* the enrollments the kill switch paused, leaving ones paused for
+    # other reasons (no email, consent, bounce) untouched.
+    kill_switch_paused: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     # AI-Optimized Sequence Engine (feature 1.2): per-enrollment record of the
     # optimizer's decisions and reasoning. Each entry is one decision dict

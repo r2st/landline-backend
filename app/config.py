@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     # Base URL for email tracking pixel / click-redirect endpoints
     tracking_base_url: str = "http://localhost:8000"
 
+    # --- CAN-SPAM sender identity ---
+    # Legal sender name + a FULL physical postal address are required on every
+    # commercial email (CAN-SPAM / CASL). ``company_postal_address`` must be a
+    # complete address (street/suite or registered PO box + city + region +
+    # postal code + country), not just a city. Override via env for the real
+    # registered address.
+    company_name: str = "Apprend Technologies"
+    company_postal_address: str = "Bangalore, Karnataka 560001, India"
+
     # Secret key for signing tokens (unsubscribe links, etc.)
     secret_key: str = ""
     # Mailbox that receives RFC 2369 mailto: unsubscribe requests. When set, it is

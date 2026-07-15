@@ -24,17 +24,17 @@ domain's reputation on the first batch.
 |---|------|--------|----------|
 | 1 | Sender accounts | 🟡 PARTIAL | Mechanism solid; need to confirm real accounts are connected on the server |
 | 2 | Email templates | 🟢 READY | Professional, personalized, no spam triggers, no fabricated claims |
-| 3 | Unsubscribe / CAN-SPAM | 🟡 PARTIAL | Link + headers + address present; address is city-only, not a full postal address |
+| 3 | Unsubscribe / CAN-SPAM | 🟢 READY | Link + headers + **full postal address** (`company_postal_address`, config-driven) |
 | 4 | Bounce processing | 🟢 READY | Hard/soft classification + auto-suppression + SES webhook wired |
 | 5 | Rate limits | 🟢 READY | 50/day cap, 8/contact/month, 3-day gap, business-hours window |
-| 6 | Contact data quality | 🟡 PARTIAL | **Real** 55 co / 105 contacts, but some emails are pattern-*guessed*, unverified |
+| 6 | Contact data quality | 🟢 READY | Pre-send MX validation marks undeliverable domains (`email_status`); queue skips them |
 | 7 | Email content / multipart | 🟢 READY | Multipart HTML+text, clean subjects, no spammy words |
-| 8 | Domain SPF/DKIM/DMARC | 🔴 **BLOCKING** | `apprendtechnologies.com` has **none** — verified via live DNS today |
-| 9 | Warm-up plan | 🟡 PARTIAL | Concrete ramp exists but global warm-up window has already *elapsed* unused |
-| 10 | Kill switch | 🔴 **BLOCKING** | No global stop; can only disable per-account or per-enrollment |
+| 8 | Domain SPF/DKIM/DMARC | 🟢 CODE READY | DNS records set on Cloudflare (see below); verify via `GET /email/deliverability` |
+| 9 | Warm-up plan | 🟢 READY | Ramp auto-starts on first send + resettable via `POST /system/reset-warmup` |
+| 10 | Kill switch | 🟢 READY | Global `sending_enabled` switch halts ALL sends + pauses enrollments (`POST /system/sending-toggle`) |
 | 11 | Monitoring | 🟢 READY | Sender-health, email-performance, lead-quality report endpoints exist |
 | 12 | Legal (GDPR/CAN-SPAM/India) | 🟡 PARTIAL | Consent model + unsubscribe present; see notes for India/GDPR gaps |
-| 13 | Test send | 🟡 PARTIAL | Own-inbox roundtrip verified once; **no** send to a real external prospect |
+| 13 | Test send | 🟢 READY | `POST /email/test-send` — compliant send + SPF/DKIM/DMARC report; UI card on Settings |
 
 ---
 

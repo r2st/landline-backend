@@ -128,6 +128,17 @@ def send_sequence_step(self, enrollment_id: str):
     async def _run():
         async with celery_session() as db:
             try:
+                # Global kill switch — never send while sending is halted. Checked
+                # first so a paused system does no work and takes no side effects.
+                from app.services import system_settings
+
+                if not await system_settings.is_sending_enabled(db):
+                    logger.warning(
+                        "send_sequence_step halted for %s: kill switch engaged", enrollment_id
+                    )
+                    return {"status": "halted", "reason": "sending kill switch engaged",
+                            "enrollment_id": enrollment_id}
+
                 # Load enrollment with related data
                 result = await db.execute(
                     select(OutreachEnrollment)
@@ -149,6 +160,23 @@ def send_sequence_step(self, enrollment_id: str):
                     enrollment.status = "paused"
                     await db.commit()
                     return {"status": "paused", "reason": "no_contact_email"}
+
+                # Recipient validation — a domain with no MX can't receive mail,
+                # so sending guarantees a hard bounce. Validate once (lazily) and
+                # pause the enrollment on a definitively invalid domain.
+                from app.services.email_validation import validate_contact
+
+                if contact.email_status is None:
+                    await validate_contact(db, contact)
+                if contact.email_status == "invalid":
+                    enrollment.status = "paused"
+                    await db.commit()
+                    logger.warning(
+                        "Enrollment %s paused: %s has an undeliverable domain",
+                        enrollment_id, contact.email,
+                    )
+                    return {"status": "skipped", "reason": "invalid_recipient_domain",
+                            "contact_email": contact.email}
 
                 # Load company for consent check
                 result = await db.execute(
@@ -490,6 +518,13 @@ def process_outreach_queue():
 
     async def _run():
         async with celery_session() as db:
+            # Global kill switch pre-check — when engaged, dispatch nothing.
+            from app.services import system_settings
+
+            if not await system_settings.is_sending_enabled(db):
+                logger.warning("process_outreach_queue halted: sending kill switch engaged")
+                return {"status": "halted", "reason": "sending kill switch engaged", "dispatched": 0}
+
             result = await db.execute(
                 select(OutreachEnrollment)
                 .where(OutreachEnrollment.status == "active")
@@ -577,6 +612,11 @@ def process_outreach_queue():
                 if not in_window:
                     skipped_window += 1
                     logger.debug("Enrollment %s outside send window: %s", enrollment.id, window_reason)
+                    continue
+
+                # Skip enrollments whose recipient domain is already known-bad.
+                if contact and contact.email_status == "invalid":
+                    logger.info("Skipping enrollment %s: invalid recipient domain", enrollment.id)
                     continue
 
                 if contact and contact.email:

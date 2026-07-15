@@ -501,8 +501,14 @@ class SmartReplyService:
         # Auto-send response if conditions are met
         auto_sent = False
         settings = get_settings()
+        # Respect the global sending kill switch — an auto-reply is still an
+        # outbound send, so a paused system must not fire it.
+        from app.services import system_settings
+
+        sending_on = await system_settings.is_sending_enabled(db)
         if (
-            analysis.get("should_auto_send")
+            sending_on
+            and analysis.get("should_auto_send")
             and analysis.get("draft_reply")
             and getattr(settings, "auto_reply_enabled", False)
         ):

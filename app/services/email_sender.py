@@ -49,10 +49,10 @@ class EmailSender:
         unsubscribe_url = f"https://landline.apprendtechnologies.com/unsubscribe?token={token}"
         return (
             "\n\n—\n"
-            "Apprend Technologies\n"
+            f"{settings.company_name}\n"
             f"Don't want these emails? Reply UNSUBSCRIBE or click: "
             f"{unsubscribe_url}\n"
-            "Toronto, ON, Canada"
+            f"{settings.company_postal_address}"
         )
 
     def send_email(

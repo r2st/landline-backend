@@ -324,22 +324,26 @@ def _make_unsubscribe_url(contact_email: str) -> str:
 def _unsubscribe_footer_text(contact_email: str) -> str:
     """Plain-text unsubscribe footer for the text/plain part."""
     unsubscribe_url = _make_unsubscribe_url(contact_email)
+    settings = get_settings()
     return (
         "\n\n—\n"
-        "Apprend Technologies\n"
+        f"{settings.company_name}\n"
         f"Don't want these emails? Reply UNSUBSCRIBE or click: "
         f"{unsubscribe_url}\n"
-        "Toronto, ON, Canada"
+        f"{settings.company_postal_address}"
     )
 
 
 def _unsubscribe_footer_html(contact_email: str) -> str:
     """HTML unsubscribe footer with proper inline styles."""
     unsubscribe_url = _make_unsubscribe_url(contact_email)
+    settings = get_settings()
+    address = html_mod.escape(settings.company_postal_address)
+    name = html_mod.escape(settings.company_name)
     return (
         '<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0 12px 0">'
         '<p style="margin:0 0 4px 0;font-size:11px;color:#9ca3af">'
-        'Apprend Technologies &middot; Toronto, ON, Canada</p>'
+        f'{name} &middot; {address}</p>'
         '<p style="margin:0;font-size:11px;color:#9ca3af">'
         'Don\'t want these emails? Reply UNSUBSCRIBE or '
         f'<a href="{unsubscribe_url}" style="color:#9ca3af">unsubscribe here</a></p>'
@@ -359,12 +363,34 @@ async def send_outreach_email(
     thread_id: Optional[str] = None,
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
+    bypass_kill_switch: bool = False,
 ) -> dict:
     """Send one outreach email via the resolved sender.
 
-    Returns a dict with at least ``status`` ("sent" | "skipped" | "error") plus
-    ``transport`` and ``sender`` so callers can record how it went.
+    Returns a dict with at least ``status`` ("sent" | "skipped" | "halted" |
+    "error") plus ``transport`` and ``sender`` so callers can record how it went.
+
+    The **global sending kill switch** is checked first: when engaged, nothing is
+    put on the wire and ``{"status": "halted", ...}`` is returned. This is the
+    single choke point every outreach path funnels through, so the switch covers
+    sequence steps, the outreach queue, and manual sends alike. ``bypass_kill_switch``
+    exists only for internal callers that must still work while paused (none in
+    normal operation).
     """
+    if not bypass_kill_switch:
+        from app.services import system_settings
+
+        if not await system_settings.is_sending_enabled(db):
+            logger.warning(
+                "Send to %s blocked: global sending kill switch is engaged", to_email
+            )
+            return {
+                "status": "halted",
+                "reason": "Global sending kill switch is engaged — all outbound email is paused.",
+                "transport": "none",
+                "sender": None,
+            }
+
     account = None
     if sender_account_id is not None:
         account = await get_account(db, sender_account_id)
@@ -441,6 +467,10 @@ async def send_outreach_email(
         # the daily total.
         if result.get("status") == "sent":
             account.daily_send_count = (account.daily_send_count or 0) + 1
+            # Auto-start the warm-up ramp on the first real send so the daily
+            # cap ratchets up from the true first-send date (not a stale config).
+            from app.services import system_settings
+            await system_settings.ensure_warmup_started(db)
         if result.get("status") == "error":
             account.status = "error"
         return result
@@ -458,4 +488,7 @@ async def send_outreach_email(
     )
     result.setdefault("transport", "ses")
     result.setdefault("sender", ses.sender)
+    if result.get("status") == "sent":
+        from app.services import system_settings
+        await system_settings.ensure_warmup_started(db)
     return result

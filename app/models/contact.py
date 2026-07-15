@@ -57,6 +57,11 @@ class Contact(Base):
     bounce_count: Mapped[int] = mapped_column("bounce_count", default=0, server_default="0")
     last_bounce_type: Mapped[str | None] = mapped_column(String(10))  # 'hard' | 'soft'
     last_bounced_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    # Email deliverability pre-check (MX record validation). NULL = never checked.
+    # 'valid' — domain has MX records; 'invalid' — no MX / bad syntax (never email);
+    # 'unknown' — lookup could not complete (DNS down / dep missing), don't block.
+    email_status: Mapped[str | None] = mapped_column(String(10))
+    email_checked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     source: Mapped[str | None] = mapped_column(String(50), index=True)
     # 'genuine' (real business lead) or 'test' (internal/test data), or NULL if
     # unclassified. Lets the UI and outreach keep test contacts out of the way.
