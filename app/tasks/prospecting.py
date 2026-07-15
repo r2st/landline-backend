@@ -22,7 +22,7 @@ def _run_async(coro):
 @celery_app.task(name="app.tasks.prospecting.run_prospecting_agent")
 def run_prospecting_agent(target_volume: int | None = None):
     """Run one autonomous prospecting session (scheduled daily)."""
-    logger.info("Starting autonomous prospecting run")
+    logger.info("Dialtone: starting autonomous prospecting run")
 
     async def _run():
         prospector = get_prospector()

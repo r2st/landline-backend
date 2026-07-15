@@ -103,6 +103,19 @@ async def test_compute_metrics_empty_day(db_session: AsyncSession):
     assert metrics["deliverability"]["bounce_rate_today"] == 0.0
     narrative = build_narrative(metrics)
     assert "Quiet day" in narrative
+    # Even on a quiet day the agent is named "Dialtone", not "the agent".
+    assert "Dialtone" in narrative
+
+
+@pytest.mark.asyncio
+async def test_narrative_brands_agent_as_dialtone(db_session: AsyncSession):
+    """The active-day narrative refers to the autonomous agent as "Dialtone"."""
+    await _seed_day_activity(db_session)
+    metrics = await compute_daily_metrics(db_session, TODAY, tz_name="UTC")
+    narrative = build_narrative(metrics)
+    assert "Dialtone was active" in narrative
+    # The old generic phrasing should be gone.
+    assert "the autonomous agent" not in narrative
 
 
 @pytest.mark.asyncio

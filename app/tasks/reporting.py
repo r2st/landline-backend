@@ -1,6 +1,6 @@
-"""Celery task: generate the daily autonomous-activity summary.
+"""Celery task: generate Dialtone's daily autonomous-activity summary.
 
-Runs once a day (6 PM IST via Celery Beat), aggregates everything the agent did
+Runs once a day (6 PM IST via Celery Beat), aggregates everything Dialtone did
 that day into ``agent_daily_summaries``, and optionally emails the digest to the
 configured admin address.
 """
@@ -30,8 +30,8 @@ def _run_async(coro):
 
 @celery_app.task(name="app.tasks.reporting.generate_daily_summary")
 def generate_daily_summary():
-    """Build and persist today's agent activity summary, then optionally email it."""
-    logger.info("Generating daily agent activity summary")
+    """Build and persist today's Dialtone activity summary, then optionally email it."""
+    logger.info("Generating Dialtone daily activity summary")
     settings = get_settings()
 
     async def _run():
@@ -57,7 +57,7 @@ def generate_daily_summary():
                     from app.services.notifications import get_notification_service
 
                     notifier = get_notification_service()
-                    subject = f"Landline daily activity — {summary.summary_date}"
+                    subject = f"Dialtone daily activity — {summary.summary_date}"
                     body = (
                         f"{summary.narrative}\n\n"
                         f"Emails sent: {summary.emails_sent}\n"

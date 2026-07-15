@@ -1,6 +1,7 @@
 """Daily autonomous-activity summary.
 
-Aggregates everything the agent did on a given calendar day — leads discovered
+Aggregates everything Dialtone — Landline's autonomous cold-email agent — did on
+a given calendar day: leads discovered
 and enriched, emails sent (broken out by sequence and by step/stage), bounces,
 replies, follow-ups triggered, lead qualification and grade distribution, cold
 calls queued, and overall deliverability — into a single metrics blob plus a
@@ -278,7 +279,7 @@ async def compute_daily_metrics(
 
 
 def build_narrative(metrics: dict) -> str:
-    """Deterministic, human-readable "what the agent did today" summary."""
+    """Deterministic, human-readable "what Dialtone did today" summary."""
     d = metrics.get("date", "")
     leads = metrics.get("leads", {})
     emails = metrics.get("emails", {})
@@ -294,7 +295,7 @@ def build_narrative(metrics: dict) -> str:
 
     if sent == 0 and leads.get("discovered", 0) == 0 and calls.get("queued", 0) == 0:
         return (
-            f"Quiet day on {d}: the agent took no outbound actions — no emails "
+            f"Quiet day on {d}: Dialtone took no outbound actions — no emails "
             f"sent, no new leads discovered, and no calls queued."
         )
 
@@ -345,7 +346,7 @@ def build_narrative(metrics: dict) -> str:
             health += f"; avg sender reputation {rep}/100"
         parts.append(health + ".")
 
-    return f"On {d}, the autonomous agent was active. " + " ".join(parts)
+    return f"On {d}, Dialtone was active. " + " ".join(parts)
 
 
 async def enhance_narrative_with_ai(metrics: dict, base_narrative: str) -> str:
@@ -359,9 +360,10 @@ async def enhance_narrative_with_ai(metrics: dict, base_narrative: str) -> str:
 
         prompt = (
             "You are writing a concise daily activity briefing for a sales team "
-            "using an autonomous outreach agent. Rewrite the following factual "
-            "summary as a warm, professional 2–4 sentence briefing. Do not invent "
-            "numbers — only use the facts given. Keep it tight.\n\n"
+            "whose autonomous cold-email agent is named Dialtone. Rewrite the "
+            "following factual summary as a warm, professional 2–4 sentence "
+            "briefing, referring to the agent by name as \"Dialtone\". Do not "
+            "invent numbers — only use the facts given. Keep it tight.\n\n"
             f"Facts: {base_narrative}\n\n"
             f"Key metrics JSON: {metrics}"
         )

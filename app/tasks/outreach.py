@@ -522,7 +522,7 @@ def process_outreach_queue():
             from app.services import system_settings
 
             if not await system_settings.is_sending_enabled(db):
-                logger.warning("process_outreach_queue halted: sending kill switch engaged")
+                logger.warning("Dialtone paused: outreach queue halted — sending kill switch engaged")
                 return {"status": "halted", "reason": "sending kill switch engaged", "dispatched": 0}
 
             result = await db.execute(

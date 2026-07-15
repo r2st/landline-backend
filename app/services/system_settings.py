@@ -143,7 +143,7 @@ async def set_sending_enabled(
         )
         affected = result.rowcount or 0
         logger.warning(
-            "KILL SWITCH ENGAGED by %s (%s) — sending halted, %d enrollments paused",
+            "Dialtone PAUSED (kill switch engaged) by %s (%s) — sending halted, %d enrollments paused",
             updated_by or "system", reason or "no reason given", affected,
         )
         await _notify_admin_killswitch(engaged=True, actor=updated_by, reason=reason, count=affected)
@@ -155,7 +155,7 @@ async def set_sending_enabled(
         )
         affected = result.rowcount or 0
         logger.warning(
-            "Kill switch released by %s — sending resumed, %d enrollments reactivated",
+            "Dialtone RESUMED (kill switch released) by %s — sending resumed, %d enrollments reactivated",
             updated_by or "system", affected,
         )
         await _notify_admin_killswitch(engaged=False, actor=updated_by, reason=reason, count=affected)
@@ -177,10 +177,10 @@ async def _notify_admin_killswitch(
     try:
         from app.services.email_sender import EmailSender
 
-        action = "ENGAGED — all sending halted" if engaged else "released — sending resumed"
-        subject = f"[Landline] Sending kill switch {action}"
+        action = "PAUSED — all sending halted" if engaged else "RESUMED — sending back on"
+        subject = f"[Dialtone] {action}"
         body = (
-            f"The global sending kill switch was {'engaged' if engaged else 'released'}.\n\n"
+            f"Dialtone was {'paused (kill switch engaged)' if engaged else 'resumed (kill switch released)'}.\n\n"
             f"By: {actor or 'system'}\n"
             f"Reason: {reason or 'n/a'}\n"
             f"Enrollments affected: {count}\n"
