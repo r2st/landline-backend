@@ -74,12 +74,25 @@ async def set_value(
 # --- Global sending kill switch -------------------------------------------------
 
 
+def _default_sending_enabled() -> bool:
+    """Fallback kill-switch state when it has never been explicitly configured.
+
+    Controlled by ``sending_enabled_default`` — production sets it False so a
+    fresh install stays paused until an operator turns sending on.
+    """
+    return bool(get_settings().sending_enabled_default)
+
+
 async def is_sending_enabled(db: AsyncSession) -> bool:
-    """Whether autonomous email sending is currently allowed (defaults True)."""
+    """Whether autonomous email sending is currently allowed.
+
+    Defaults to ``sending_enabled_default`` (True in dev, False in production)
+    when the switch has never been explicitly set.
+    """
     value = await get_value(db, SENDING_ENABLED_KEY, default=None)
     if not value:
-        return True  # never configured → sending on by default
-    return bool(value.get("enabled", True))
+        return _default_sending_enabled()  # never configured → config default
+    return bool(value.get("enabled", _default_sending_enabled()))
 
 
 async def get_sending_status(db: AsyncSession) -> dict:
@@ -87,14 +100,14 @@ async def get_sending_status(db: AsyncSession) -> dict:
     row = await _get_row(db, SENDING_ENABLED_KEY)
     if row is None:
         return {
-            "enabled": True,
+            "enabled": _default_sending_enabled(),
             "reason": None,
             "updated_by": None,
             "updated_at": None,
         }
     value = row.value or {}
     return {
-        "enabled": bool(value.get("enabled", True)),
+        "enabled": bool(value.get("enabled", _default_sending_enabled())),
         "reason": value.get("reason"),
         "updated_by": row.updated_by,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,

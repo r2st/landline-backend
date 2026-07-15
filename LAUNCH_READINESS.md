@@ -1,5 +1,52 @@
 # Landline Autonomous Email — Launch Readiness Audit
 
+> ## 📌 2026-07-15 update — switched primary sender to `suman.das@apprend.tech`
+>
+> Outreach now sends via the **apprend.tech Google Workspace** mailbox over Gmail
+> OAuth (not SES, not apprendtechnologies.com). This resolves most of blocker B1:
+> Google Workspace signs SPF/DKIM for `apprend.tech` automatically.
+>
+> **Live DNS check for `apprend.tech` (via `app/services/domain_auth.py`):**
+>
+> | Record | Status | Detail |
+> |--------|--------|--------|
+> | SPF   | ✅ pass | `v=spf1 include:_spf.google.com ~all` |
+> | DKIM  | ✅ pass | `google` selector, valid RSA key (Workspace) |
+> | DMARC | ❌ fail | no `_dmarc.apprend.tech` record |
+>
+> DMARC can't be added — **no DNS access for apprend.tech**. With SPF+DKIM
+> passing and mail sent through Google, Gmail/Outlook deliverability is decent;
+> the residual gap is no DMARC policy/reporting. Verify anytime with
+> `GET /api/v1/email/deliverability`.
+>
+> **Config/code changes shipped this pass:**
+> - `primary_sender_email = suman.das@apprend.tech` (`app/config.py`); the
+>   deliverability/test-send endpoints report the apprend.tech domain even before
+>   OAuth is connected.
+> - Warm-up ramp made explicit & conservative: **20 → 50 → 100 / day** over
+>   weeks 1–3, steady at 100 (`warmup_*` + `account_warmup_*`); `WARMUP_START_DATE`
+>   reset to `2026-07-15`.
+> - Kill switch now **defaults OFF in production** (`SENDING_ENABLED_DEFAULT=false`
+>   + migration `059` seeds `sending_enabled={enabled:false}`): sending stays
+>   PAUSED until an operator turns it on.
+> - `scripts/configure_sender.py` — sets the apprend.tech account as primary,
+>   resets warm-up, and flips the kill switch (run after connecting the mailbox).
+>
+> **Still required before the first real send (operator, not code):**
+> 1. Connect `suman.das@apprend.tech` via OAuth (Settings → Connect Gmail). The
+>    Google OAuth app is in **Testing** mode → add the address as a test user in
+>    the `metal-cascade-500017-k3` project's consent screen first, or it can't
+>    connect (see `project_landline-gmail-oauth-debug`).
+> 2. Run `scripts/configure_sender.py --reset-warmup` to make it primary.
+> 3. Send a real test via `POST /api/v1/email/test-send` to an external inbox and
+>    confirm it lands (not spam) + headers show SPF=pass, DKIM=pass.
+> 4. Only then `scripts/configure_sender.py --enable-sending` (or the UI toggle).
+>
+> The audit below predates this change and still describes the
+> apprendtechnologies.com/SES posture — kept for history.
+
+---
+
 **Date:** 2026-07-15
 **Auditor:** Claude (code + live-DNS audit)
 **Verdict:** 🔴 **NOT ready to send to real prospects yet.** The *software* is in

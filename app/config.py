@@ -22,11 +22,21 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
 
-    # AWS SES (fallback email transport when no Gmail account is connected)
+    # AWS SES (fallback email transport when no Gmail account is connected).
+    # SES sends from its own DNS-verified domain, so this stays on the
+    # SES-verified apprendtechnologies.com identity even though the *primary*
+    # sender is the connected apprend.tech Gmail account (see primary_sender_email).
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
     ses_sender_email: str = "landline@apprendtechnologies.com"
+
+    # The canonical primary sender for outreach. Real sending goes through the
+    # connected Gmail OAuth account whose address matches this (Google Workspace
+    # signs DKIM for the domain automatically), so this is both the operator's
+    # intended default sender and the domain reported by the deliverability /
+    # test-send endpoints before any Gmail account is connected.
+    primary_sender_email: str = "suman.das@apprend.tech"
 
     # Google / Gmail OAuth (per-user email sending)
     # Create these in Google Cloud Console — see deploy/GOOGLE-OAUTH-SETUP.md
@@ -58,6 +68,13 @@ class Settings(BaseSettings):
 
     # API key authentication (empty = disabled for backward compat)
     api_key: str = ""
+
+    # Global sending kill switch — default state when the switch has never been
+    # explicitly set in system_settings. Ships True (sending allowed) so existing
+    # deployments and tests are unaffected; set SENDING_ENABLED_DEFAULT=false in
+    # production so a fresh install stays PAUSED until an operator turns sending on
+    # (belt-and-suspenders with the seeded "off" system_settings row, migration 059).
+    sending_enabled_default: bool = True
 
     # JWT auth
     jwt_secret_key: str = ""  # Falls back to secret_key or token_encryption_key
@@ -99,14 +116,19 @@ class Settings(BaseSettings):
 
     # Anti-spam / sending limits
     max_emails_per_contact_per_sequence: int = 5       # Max steps in any sequence
-    max_emails_per_day: int = 50                        # Max emails per day across all sequences
+    max_emails_per_day: int = 100                       # Steady-state daily cap (== fully-warmed week-3 volume)
     min_days_between_followups: int = 3                 # Minimum gap between follow-ups to same contact
     max_emails_per_contact_per_month: int = 8           # Hard cap per contact per 30 days
     warmup_enabled: bool = True                         # Gradual ramp-up
-    warmup_daily_limit_week1: int = 10                  # Week 1 daily limit
-    warmup_daily_limit_week2: int = 25                  # Week 2 daily limit
-    warmup_daily_limit_week3: int = 40                  # Week 3+ daily limit
-    warmup_start_date: str = ""                         # ISO date when warmup started
+    # Conservative warm-up ramp for a brand-new sending domain/mailbox:
+    # 20/day week 1 → 50/day week 2 → 100/day week 3+ (then steady at max_emails_per_day).
+    warmup_daily_limit_week1: int = 20                  # Week 1 daily limit
+    warmup_daily_limit_week2: int = 50                  # Week 2 daily limit
+    warmup_daily_limit_week3: int = 100                 # Week 3+ daily limit
+    # ISO date the warm-up ramp starts from. Defaults to the launch date; the
+    # persisted system_settings value (auto-stamped on first send, or reset from
+    # the UI) takes precedence over this static default.
+    warmup_start_date: str = "2026-07-15"
 
     # Smart auto-reply
     auto_reply_enabled: bool = True                        # Auto-send AI-drafted replies for clear positive intents
@@ -174,9 +196,9 @@ class Settings(BaseSettings):
     # date. Applied by send_limiter.account_capacity() alongside the reputation
     # throttle. Disable to fall back to the reputation-only cap.
     account_warmup_enabled: bool = True
-    account_warmup_daily_limit_week1: int = 10   # days 0-6 since connected_at
-    account_warmup_daily_limit_week2: int = 25   # days 7-13
-    account_warmup_daily_limit_week3: int = 40   # days 14-20 (then uncapped by warm-up)
+    account_warmup_daily_limit_week1: int = 20   # days 0-6 since connected_at
+    account_warmup_daily_limit_week2: int = 50   # days 7-13
+    account_warmup_daily_limit_week3: int = 100  # days 14-20 (then uncapped by warm-up)
     # Bounce handling: after this many soft bounces a contact is suppressed
     # (treated like a hard bounce). A single hard bounce suppresses immediately.
     soft_bounce_suppress_threshold: int = 3

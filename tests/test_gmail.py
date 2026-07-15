@@ -149,10 +149,11 @@ async def test_compose_falls_back_to_ses_when_no_gmail(client, sample_contact):
     )
     assert resp.status_code == 200
     data = resp.json()
-    # No SES creds configured in tests, so the send is "skipped", but the
-    # transport is SES and the From is the shared fallback sender.
+    # No Gmail account connected, so the send is "skipped" (no SES creds in
+    # tests). The transport is the SES fallback, but the From reported is the
+    # intended primary sender (apprend.tech) so the UI shows the real sender.
     assert data["transport"] == "ses"
-    assert data["sender"] == get_settings().ses_sender_email
+    assert data["sender"] == get_settings().primary_sender_email
 
 
 async def test_compose_uses_gmail_when_connected(client, db_session, sample_contact, monkeypatch):

@@ -40,8 +40,8 @@ async def test_capacity_takes_lower_of_throttle_and_warmup(db_session):
     # New account (week 1 → cap 10), no health row → throttle 1.0.
     acct = await _persist(db_session, _account(days_old=2, daily_sent=0))
     cap = await limiter.account_capacity(db_session, acct)
-    assert cap["warmup_daily_limit"] == 10
-    assert cap["effective_daily_limit"] == 10  # min(50*1.0, 10)
+    assert cap["warmup_daily_limit"] == 20
+    assert cap["effective_daily_limit"] == 20  # min(100*1.0, 20)
     assert cap["can_send"] is True
 
 
@@ -56,20 +56,20 @@ async def test_capacity_throttle_beats_warmup_when_lower(db_session):
     await db_session.flush()
     cap = await limiter.account_capacity(db_session, acct)
     assert cap["warmup_daily_limit"] is None
-    assert cap["effective_daily_limit"] == 20  # 50 * 0.4
+    assert cap["effective_daily_limit"] == 40  # 100 * 0.4
     assert cap["throttle_factor"] == 0.4
 
 
 async def test_capacity_exhausted_when_warmup_hit(db_session):
     limiter = get_send_limiter()
-    acct = await _persist(db_session, _account(days_old=2, daily_sent=10))  # hit week-1 cap
+    acct = await _persist(db_session, _account(days_old=2, daily_sent=20))  # hit week-1 cap
     cap = await limiter.account_capacity(db_session, acct)
     assert cap["remaining_today"] == 0
     assert cap["can_send"] is False
 
 
 async def test_filter_excludes_warmup_capped_and_critical(db_session):
-    fresh_capped = await _persist(db_session, _account(email="new@a.co", days_old=1, daily_sent=10))
+    fresh_capped = await _persist(db_session, _account(email="new@a.co", days_old=1, daily_sent=20))
     healthy = await _persist(db_session, _account(email="ok@a.co", days_old=200, daily_sent=0))
     crit = await _persist(db_session, _account(email="bad@a.co", days_old=200, daily_sent=0))
     db_session.add(SenderHealth(
@@ -88,7 +88,7 @@ async def test_filter_excludes_warmup_capped_and_critical(db_session):
 
 async def test_rotation_prefers_account_with_capacity(db_session):
     # capped fresh account vs a warmed healthy one → rotation must pick the healthy one.
-    await _persist(db_session, _account(email="capped@a.co", days_old=1, daily_sent=10))
+    await _persist(db_session, _account(email="capped@a.co", days_old=1, daily_sent=20))
     healthy = await _persist(db_session, _account(email="healthy@a.co", days_old=200, daily_sent=0))
     chosen = await get_next_rotation_account(db_session)
     assert chosen is not None
@@ -98,8 +98,8 @@ async def test_rotation_prefers_account_with_capacity(db_session):
 async def test_rotation_falls_back_when_all_capped(db_session):
     # Every account is over its warm-up cap → rotation still returns one (never
     # halts sending entirely; the queue's global gate handles a full stop).
-    a = await _persist(db_session, _account(email="a@a.co", days_old=1, daily_sent=10))
-    b = await _persist(db_session, _account(email="b@a.co", days_old=1, daily_sent=10))
+    a = await _persist(db_session, _account(email="a@a.co", days_old=1, daily_sent=20))
+    b = await _persist(db_session, _account(email="b@a.co", days_old=1, daily_sent=20))
     chosen = await get_next_rotation_account(db_session)
     assert chosen is not None
     assert chosen.id in {a.id, b.id}
@@ -109,9 +109,9 @@ async def test_rotation_falls_back_when_all_capped(db_session):
 
 def test_account_warmup_limit_ramps_by_age():
     limiter = get_send_limiter()
-    assert limiter.account_warmup_limit(_account(days_old=1)) == 10   # week 1
-    assert limiter.account_warmup_limit(_account(days_old=9)) == 25   # week 2
-    assert limiter.account_warmup_limit(_account(days_old=16)) == 40  # week 3
+    assert limiter.account_warmup_limit(_account(days_old=1)) == 20    # week 1
+    assert limiter.account_warmup_limit(_account(days_old=9)) == 50    # week 2
+    assert limiter.account_warmup_limit(_account(days_old=16)) == 100  # week 3
     assert limiter.account_warmup_limit(_account(days_old=30)) is None  # warmed
 
 

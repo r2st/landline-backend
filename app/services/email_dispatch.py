@@ -306,9 +306,14 @@ async def resolve_sender_info(
             account_id=account.id,
             connected=True,
         )
+    # No Gmail/SMTP account connected yet. Report the intended primary sender
+    # (apprend.tech) so the deliverability + test-send endpoints check the domain
+    # outreach will actually send from once OAuth is connected. Fall back to the
+    # SES identity only if no primary sender is configured.
+    settings = get_settings()
     return SenderInfo(
         transport="ses",
-        from_email=get_settings().ses_sender_email,
+        from_email=settings.primary_sender_email or settings.ses_sender_email,
         connected=False,
     )
 
