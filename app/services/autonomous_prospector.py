@@ -56,6 +56,16 @@ logger = logging.getLogger(__name__)
 # and asserted against the real one in tests.
 PLACES_SOURCE = "google_places"
 
+# Places rows this source may still pick up. A row leaves this set once it has
+# been dispositioned: 'imported' became a company, and 'skipped' was judged not
+# worth importing. Both were decided by an earlier run, and re-sourcing either
+# re-spends enrichment credit to reach the same verdict — which is what pinned
+# every run to the same first 25 rejects and starved the ones behind them.
+# 'enriched' stays in: that is a row the nightly sweep found an email for and
+# nobody has ruled on yet, which makes it the best candidate on the table, not a
+# spent one. Mirrors the sweep's own filter in tasks/places_discovery.py.
+SOURCEABLE_PLACES_STATUSES = frozenset({"new", "enriched"})
+
 
 class AutonomousProspector:
     def __init__(self) -> None:
@@ -407,12 +417,20 @@ class AutonomousProspector:
         if outcome.error:
             notes["places_error"] = outcome.error
 
-        # Businesses a previous run already imported are done — ingestion would
-        # dedup them back onto their company, but they'd crowd out unseen ones
-        # under the run's target and re-report as "found" every week. Bound to
-        # `limit` here, before the expensive part: enriching a business this run
-        # won't use is pure spend.
-        fresh = [b for b in outcome.businesses if b.company_id is None][:limit]
+        # Businesses an earlier run already dispositioned are done — ingestion
+        # would dedup an imported one back onto its company, but they'd crowd out
+        # unseen ones under the run's target and re-report as "found" every week.
+        # `company_id is None` alone doesn't express that: a rejected row keeps a
+        # NULL company_id and only carries its verdict in `status`, so filtering
+        # on the FK re-picked the same rejects forever. Bound to `limit` here,
+        # before the expensive part: enriching a business this run won't use is
+        # pure spend.
+        fresh = [
+            b
+            for b in outcome.businesses
+            if b.company_id is None
+            and (b.status is None or b.status in SOURCEABLE_PLACES_STATUSES)
+        ][:limit]
         await self._enrich_places_emails(db, svc, fresh, notes)
 
         records: list[CandidateRecord] = []

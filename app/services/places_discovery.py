@@ -711,14 +711,27 @@ class PlacesDiscoveryService:
             city=business.city,
             state=business.state,
             phone=business.phone,
-            industry=business.category,
+            # The search query, not the Places category, is the industry signal.
+            # Places speaks its own taxonomy ('manufacturer', 'hardware_store')
+            # and none of those strings match an ICP segment like 'CNC
+            # Machining', so scoring off `category` scores every business 0/40
+            # for industry and caps it at 38 — under the review line, which is
+            # why nothing Places found ever got looked at. The query is what
+            # surfaced this business, and it is an ICP term by construction, so
+            # it is both the truer signal and the better `industry_segment`.
+            industry=business.search_query or business.category,
             # Places has no employee count or revenue — the two things the ICP
             # scores hardest on. Left None so `qualify()` treats size as
             # unknown rather than as zero.
             employee_count=None,
             contacts=contacts,
             source=PROVIDER,
-            raw={"place_id": business.place_id, **(business.raw or {})},
+            raw={
+                "place_id": business.place_id,
+                # Kept because `industry` no longer carries it.
+                "places_category": business.category,
+                **(business.raw or {}),
+            },
         )
 
     async def import_business(

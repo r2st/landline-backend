@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.models.discovered_business import DiscoveredBusiness
+from app.models.prospecting import IcpProfile
 from app.services import places_discovery
 from app.services.enrichment import ApolloSearchResult
 from app.services.ingestion import CandidateRecord
@@ -572,3 +573,243 @@ class _StubRun:
     """``_source_candidates`` only ever reads ``run.id`` (for Apollo's ledger)."""
 
     id = None
+
+
+# ── Places taxonomy vs ICP taxonomy ─────────────────────────────────────────
+#
+# Places labels a machine shop 'manufacturer'; the ICP scores segments like
+# 'CNC Machining'. Nothing matches across that gap, so industry scored 0/40 and
+# capped every Places business at 38 — under the 50 review line, which is why a
+# source that was finding businesses was never landing any. The query that found
+# the business is an ICP term by construction, and is the signal used instead.
+
+
+def _learned_icp(**kw) -> IcpProfile:
+    """An ICP learned from won deals concentrated on one vertical.
+
+    ``learn_icp`` normalizes the winning segment to weight 1.0; the seeded
+    defaults it blends in only reach 0.8. Built explicitly so the scores below
+    are the real production arithmetic and not an artifact of the seed.
+    """
+    return IcpProfile(
+        name="test-icp",
+        is_active=True,
+        industry_weights=kw.get("industry_weights", {"CNC Machining": 1.0, "Plastics": 0.7}),
+        size_range={"min": 50, "max": 500, "ideal": 150},
+        location_preferences={"countries": ["US"], "states": []},
+        exclusion_criteria={
+            "industries": [], "countries": [], "max_employees": 2000, "min_employees": 5,
+        },
+    )
+
+
+def _places_candidate(industry: str) -> dict:
+    """What a Places business looks like to `qualify`: no employee count, ever."""
+    return {
+        "name": "Acme Precision",
+        "domain": "acme-precision.example.com",
+        "country": "US",
+        "industry": industry,
+    }
+
+
+async def test_places_category_alone_scores_below_the_review_line():
+    # The bug, pinned to its arithmetic: 0 industry + 10 unknown-size + 20
+    # location + 8 completeness = 38. The 40 industry points are unreachable, so
+    # no Places business could clear 50 no matter how good a fit it was.
+    q = get_prospector().qualify(_places_candidate("manufacturer"), _learned_icp())
+
+    assert q["components"]["industry"] == 0.0
+    assert q["fit_score"] == 38
+    assert q["fit_score"] < 50
+
+
+async def test_search_query_as_industry_clears_the_auto_enroll_line():
+    # Same business, same missing employee count — only the industry signal
+    # changes, and it is worth the full 40: 40 + 10 + 20 + 8 = 78, past 75.
+    q = get_prospector().qualify(_places_candidate("CNC Machining"), _learned_icp())
+
+    assert q["components"]["industry"] == 40.0
+    assert q["fit_score"] == 78
+    assert q["fit_score"] >= 75
+
+
+async def test_to_candidate_prefers_the_search_query_over_the_places_category():
+    business = DiscoveredBusiness(
+        place_id="tc-1",
+        business_name="Acme Precision",
+        domain="acme-precision.example.com",
+        country="US",
+        category="manufacturer",
+        search_query="CNC Machining",
+        raw={},
+    )
+
+    record = places_discovery.get_places_service().to_candidate(business)
+
+    assert record.industry == "CNC Machining"
+    # The Places label is still worth keeping — it just isn't the ICP signal.
+    assert record.raw["places_category"] == "manufacturer"
+
+
+async def test_to_candidate_falls_back_to_the_category_without_a_query():
+    # Rows staged before the query was carried, and any future source that has a
+    # category but no query, must still get their best available signal.
+    business = DiscoveredBusiness(
+        place_id="tc-2",
+        business_name="Nashik Toolworks",
+        domain="nashik.example.com",
+        category="Injection Molding",
+        search_query=None,
+        raw={},
+    )
+
+    record = places_discovery.get_places_service().to_candidate(business)
+
+    assert record.industry == "Injection Molding"
+
+
+async def test_sourced_records_carry_the_icp_query_as_their_industry(
+    db_session, places_on, no_enrichment, monkeypatch
+):
+    # End to end through the real discover/_stage/to_candidate chain: what Places
+    # calls the business is irrelevant, what the ICP asked for is what scores.
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    _fake_places_search(
+        monkeypatch,
+        PlacesSearchResult(results=[_place("icp-q", "Acme Precision", category="manufacturer")]),
+    )
+
+    records, notes = await prospector._source_from_places(db_session, icp, 10)
+
+    assert [r.industry for r in records] == [prospector._top_industry(icp)]
+    assert records[0].industry != "manufacturer"
+    assert notes["places_query"] == prospector._top_industry(icp)
+
+
+# ── dispositioned rows must not come back ───────────────────────────────────
+#
+# A rejected row keeps company_id NULL and records its verdict only in `status`,
+# so the old `company_id is None` filter re-picked the same 25 rejects every run
+# and never reached the businesses behind them.
+
+
+def _staged(place_id: str, name: str, **kw) -> DiscoveredBusiness:
+    return DiscoveredBusiness(
+        place_id=place_id,
+        business_name=name,
+        domain=kw.get("domain", f"{place_id}.example.com"),
+        country=kw.get("country", "US"),
+        category="manufacturer",
+        search_query="CNC Machining",
+        discovered_via=PROVIDER,
+        status=kw.get("status", "new"),
+        status_reason=kw.get("status_reason"),
+        email=kw.get("email"),
+        raw={},
+    )
+
+
+async def test_skipped_business_is_not_resourced(
+    db_session, places_on, no_enrichment, monkeypatch
+):
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    db_session.add(
+        _staged(
+            "reject-1",
+            "Already Judged Ltd",
+            status="skipped",
+            status_reason="not imported (route=discard)",
+        )
+    )
+    await db_session.flush()
+    # Same stable query, so Places hands back the same business it did last run.
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("reject-1", "Already Judged Ltd")])
+    )
+
+    records, notes = await prospector._source_from_places(db_session, icp, 10)
+
+    assert records == []
+    assert notes["places_duplicates"] == 1
+    assert notes["places_candidates"] == 0
+
+
+async def test_enriched_business_is_still_sourced(
+    db_session, places_on, no_enrichment, monkeypatch
+):
+    # The nightly sweep parks rows at 'enriched' once it recovers an email and
+    # nobody has ruled on them yet. Those are the *best* rows on the table — the
+    # only Places businesses with someone to email — so excluding everything but
+    # 'new' would quietly starve the prospector of exactly them.
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    db_session.add(
+        _staged(
+            "sweep-1",
+            "Sweep Enriched Ltd",
+            status="enriched",
+            email="ops@sweep-1.example.com",
+        )
+    )
+    await db_session.flush()
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("sweep-1", "Sweep Enriched Ltd")])
+    )
+
+    records, notes = await prospector._source_from_places(db_session, icp, 10)
+
+    assert [r.name for r in records] == ["Sweep Enriched Ltd"]
+    assert notes["places_candidates"] == 1
+
+
+async def test_run_reaches_the_businesses_behind_a_wall_of_rejects(
+    db_session, places_on, no_enrichment, monkeypatch
+):
+    # The symptom that started this: rejects filled the whole per-run budget, so
+    # the unseen businesses behind them were never reached. With them excluded, a
+    # 2-wide run spends its budget on the two nobody has looked at.
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    for i in range(3):
+        db_session.add(_staged(f"wall-{i}", f"Rejected {i}", status="skipped"))
+    await db_session.flush()
+    _fake_places_search(
+        monkeypatch,
+        PlacesSearchResult(
+            results=[_place(f"wall-{i}", f"Rejected {i}") for i in range(3)]
+            + [_place("fresh-a", "Unseen A"), _place("fresh-b", "Unseen B")]
+        ),
+    )
+
+    records, notes = await prospector._source_from_places(db_session, icp, 2)
+
+    assert [r.name for r in records] == ["Unseen A", "Unseen B"]
+    assert notes["places_candidates"] == 2
+
+
+async def test_second_run_does_not_resource_a_business_it_rejected(
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
+):
+    # The two-run version, through the real writeback: whatever verdict run one
+    # reaches, run two must not pay to reach it again.
+    prospector = get_prospector()
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("verdict-1", "Judged Once Ltd")])
+    )
+
+    await prospector.run(db_session, target_volume=5, trigger="test")
+    business = (
+        await db_session.execute(
+            select(DiscoveredBusiness).where(DiscoveredBusiness.place_id == "verdict-1")
+        )
+    ).scalar_one()
+    assert business.status in ("imported", "skipped")
+
+    second = await prospector.run(db_session, target_volume=5, trigger="test")
+
+    assert second.results["places_duplicates"] == 1
+    assert second.results["places_candidates"] == 0
