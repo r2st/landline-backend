@@ -332,11 +332,33 @@ def send_sequence_step(self, enrollment_id: str):
                 template_context["company_domain"] = company.domain or ""
                 template_context["company_industry"] = company.industry_segment or ""
 
+                # --- Calendar Booking Injection (Feature 4) ---
+                # Resolve {{booking_link}} to the sender's booking URL only when
+                # the interest gate is met (or the step opts out of the gate via
+                # ``always_inject``). Otherwise it renders empty and its
+                # scaffolding line is stripped, so we never send a dangling
+                # "Grab a time here:" with no link.
+                from app.services.booking import (
+                    apply_booking_placeholder,
+                    resolve_booking_url,
+                    should_inject_booking_link,
+                )
+
+                always_inject = bool(getattr(step, "always_inject", False))
+                booking_url = ""
+                if always_inject or await should_inject_booking_link(contact, enrollment, db):
+                    booking_url = await resolve_booking_url(db, enrollment.sender_account_id)
+                template_context["booking_link"] = booking_url
+
                 # Send email via the active connected Gmail account (falls back
                 # to SES when no account is connected). Templates are rendered
                 # here; the dispatcher appends the CAN-SPAM footer.
-                subject = render(step.subject_template, template_context)
-                body = render(step.body_template, template_context)
+                subject = render(
+                    apply_booking_placeholder(step.subject_template, booking_url), template_context
+                )
+                body = render(
+                    apply_booking_placeholder(step.body_template, booking_url), template_context
+                )
 
                 # --- AI-Optimized Sequence Engine (feature 1.2) ---
                 # Ask the optimizer what to do with this step before sending. It

@@ -51,6 +51,17 @@ class GmailAccount(Base):
     daily_send_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     daily_count_reset_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
+    # --- Calendar Booking Injection (Feature 4) ---
+    # The rep's scheduling link, injected into follow-ups once a prospect shows
+    # interest. ``booking_provider`` is a display-only label; ``booking_auto_inject``
+    # governs whether AI follow-ups auto-weave the link (the interest gate still
+    # applies). Validated (https + known-scheduler host) on save.
+    booking_url: Mapped[str | None] = mapped_column(String(500))
+    booking_provider: Mapped[str | None] = mapped_column(String(40))
+    booking_auto_inject: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
     connected_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

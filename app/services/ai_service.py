@@ -554,11 +554,26 @@ Return ONLY valid JSON:
         step_number: int,
         contact_name: str,
         days_since_last: int,
+        booking_url: str = "",
     ) -> dict:
-        """Generate an intelligent follow-up email that does not feel spammy."""
+        """Generate an intelligent follow-up email that does not feel spammy.
+
+        ``booking_url`` (Feature 4) is passed in *already interest-gated* by the
+        caller — when set, the model is instructed to weave the link in once,
+        conversationally, never as a hard CTA. A post-render check collapses the
+        body to a single link if the model ignores the "once" instruction.
+        """
         try:
             is_final = step_number >= 3
             final_note = "This is the final follow-up. Make it a graceful breakup email — keep it classy, leave the door open." if is_final else ""
+
+            booking_note = ""
+            if booking_url:
+                booking_note = (
+                    f'8. They\'ve shown interest — include this booking link EXACTLY ONCE, conversationally '
+                    f'(e.g. "happy to grab 15 min — here\'s my calendar: {booking_url}"). '
+                    f'Never as a hard CTA block, never more than once: {booking_url}'
+                )
 
             prompt = f"""Write follow-up #{step_number} for a cold email I sent {days_since_last} days ago.
 
@@ -575,12 +590,20 @@ RULES:
 5. After #3: Set should_stop_sequence to true
 6. NEVER say: "just checking in", "circling back", "following up on my previous email", "touching base", "wanted to circle back"
 7. Sound like you dashed this off in 30 seconds, because you did
+{booking_note}
 {final_note}
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "is_final": {str(is_final).lower()}, "should_stop_sequence": {str(is_final).lower()}}}"""
 
             response_text = await self._chat(prompt, max_tokens=512)
-            return self._parse_json_response(response_text)
+            result = self._parse_json_response(response_text)
+
+            # Post-render safety: never let more than one booking link through.
+            if booking_url and isinstance(result, dict) and result.get("body"):
+                from app.services.booking import collapse_booking_links
+
+                result["body"] = collapse_booking_links(result["body"], booking_url)
+            return result
         except Exception as e:
             logger.error("AI follow-up generation failed: %s", str(e))
             return {"error": str(e)}

@@ -154,8 +154,34 @@ class Settings(BaseSettings):
     auto_followup_batch_limit: int = 50                    # Max reminders created per beat run
     rescore_batch_limit: int = 50                          # Max companies re-scored per beat run
 
-    # Scheduling link (Calendly or similar) — included in auto-replies when set
+    # Scheduling link (Calendly or similar) — included in auto-replies when set.
+    # Also the global fallback for the per-sender {{booking_link}} (Feature 4):
+    # sender booking_url → scheduling_link → empty.
     scheduling_link: str = ""
+
+    # --- Calendar Booking Injection (Feature 4) ---
+    # Allowlist of scheduler hosts a booking URL may point at. A saved booking_url
+    # must be https and its host must equal (or be a subdomain of) one of these —
+    # defense against injecting an arbitrary link into outbound mail.
+    booking_scheduler_hosts: List[str] = [
+        "calendly.com",
+        "cal.com",
+        "acuityscheduling.com",
+        "savvycal.com",
+        "hubspot.com",          # meetings.hubspot.com
+        "chilipiper.com",
+        "youcanbook.me",
+        "oncehub.com",          # ...scheduleonce
+        "tidycal.com",
+        "zcal.co",
+        "koalendar.com",
+        "outlook.office365.com", # Microsoft Bookings
+        "calendar.google.com",   # Google appointment schedules
+        "calendar.app.google",
+    ]
+    # Soft interest signal: how many opens of a contact's mail gate booking-link
+    # injection (a repeated open reads as warming interest).
+    booking_min_opens: int = 2
 
     # --- Daily autonomous-activity summary ---
     # Timezone whose calendar day the daily summary covers (the beat runs at

@@ -37,6 +37,7 @@ from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate
 from app.models.sender_health import SenderHealth
 from app.models.smtp_account import SmtpAccount
+from app.schemas.booking import BookingConfig, BookingConfigUpdate
 from app.schemas.dialtone import (
     DIALTONE_EVENT_TYPES,
     DialtoneActivityFeed,
@@ -48,6 +49,7 @@ from app.schemas.dialtone import (
     DialtoneWarmup,
 )
 from app.services import system_settings
+from app.services.booking import validate_booking_url
 from app.services.send_limiter import get_send_limiter
 
 logger = logging.getLogger(__name__)
@@ -581,3 +583,90 @@ async def get_dialtone_console(db: AsyncSession = Depends(get_db)):
         today=today_counts,
         senders=senders,
     )
+
+
+# ─── Per-sender Calendar Booking config (Feature 4) ──────────────────────────
+
+
+async def _load_sender(db: AsyncSession, account_id: str):
+    """Load a sending identity (Gmail first, then SMTP) by id.
+
+    Returns ``(account, transport)`` or ``(None, None)`` when the id doesn't
+    parse or no account matches.
+    """
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except (ValueError, TypeError):
+        return None, None
+
+    account = (
+        await db.execute(select(GmailAccount).where(GmailAccount.id == acct_uuid))
+    ).scalar_one_or_none()
+    if account is not None:
+        return account, "gmail"
+
+    account = (
+        await db.execute(select(SmtpAccount).where(SmtpAccount.id == acct_uuid))
+    ).scalar_one_or_none()
+    if account is not None:
+        return account, "smtp"
+
+    return None, None
+
+
+def _booking_config(account, transport: str) -> BookingConfig:
+    return BookingConfig(
+        account_id=str(account.id),
+        account_type=transport,
+        email=getattr(account, "email", None),
+        booking_url=getattr(account, "booking_url", None),
+        booking_provider=getattr(account, "booking_provider", None),
+        booking_auto_inject=bool(getattr(account, "booking_auto_inject", True)),
+    )
+
+
+@router.get("/senders/{account_id}/booking", response_model=BookingConfig)
+async def get_sender_booking(account_id: str, db: AsyncSession = Depends(get_db)):
+    """Read a sender's calendar-booking configuration."""
+    account, transport = await _load_sender(db, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Sender account not found")
+    return _booking_config(account, transport)
+
+
+@router.put("/senders/{account_id}/booking", response_model=BookingConfig)
+async def set_sender_booking(
+    account_id: str,
+    payload: BookingConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a sender's ``booking_url`` / ``booking_provider`` / ``booking_auto_inject``.
+
+    The booking URL is validated (https + known-scheduler-host allowlist) before
+    it is persisted — a rejected URL returns 400 and nothing is written. Passing
+    an empty string clears the configured URL.
+    """
+    account, transport = await _load_sender(db, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Sender account not found")
+
+    fields = payload.model_dump(exclude_unset=True)
+
+    if "booking_url" in fields:
+        url = fields["booking_url"]
+        ok, error = validate_booking_url(url)
+        if not ok:
+            raise HTTPException(status_code=400, detail=error)
+        # Normalize an empty/blank URL to NULL (cleared).
+        account.booking_url = url.strip() if url and url.strip() else None
+
+    if "booking_provider" in fields:
+        provider = fields["booking_provider"]
+        account.booking_provider = provider.strip() if provider and provider.strip() else None
+
+    if "booking_auto_inject" in fields and fields["booking_auto_inject"] is not None:
+        account.booking_auto_inject = bool(fields["booking_auto_inject"])
+
+    await db.commit()
+    await db.refresh(account)
+    return _booking_config(account, transport)
