@@ -504,6 +504,79 @@ class HunterVerificationService:
             )
         return email
 
+    async def domain_search(
+        self,
+        db: AsyncSession,
+        domain: str,
+        *,
+        budget: Optional[_Budget] = None,
+    ) -> dict:
+        """Find addresses for a domain via Hunter's ``/domain-search``.
+
+        The bridge P4 needs: Google Places gives a business a website and no
+        email, and ``find_email`` can't help because Places gives us no *names*
+        either. Domain-search is the one Hunter endpoint that goes from a bare
+        domain to addresses.
+
+        Returns ``{"email", "score", "emails", "status"}`` — ``email`` is the
+        best candidate or None. Never raises; a failure returns
+        ``email: None`` so the caller falls back to scraping.
+
+        **Personal beats generic regardless of confidence.** Hunter scores a
+        catch-all ``info@`` at 90+ and a real ``priya.sharma@`` at 70, but the
+        generic one lands in a shared inbox nobody answers — and it's precisely
+        the kind of address that accept_all domains bounce later. Sorting on
+        confidence alone would pick the wrong one almost every time.
+        """
+        domain = (domain or "").strip().lower()
+        if not self.api_key:
+            return {"status": "skipped", "reason": "no_api_key", "email": None, "emails": []}
+        if not domain:
+            return {"status": "skipped", "reason": "no_domain", "email": None, "emails": []}
+
+        if budget is None:
+            budget = await self.make_budget(db)
+        if not budget.take():
+            logger.warning("Hunter budget exhausted — skipping domain-search for %s", domain)
+            return {"status": "skipped", "reason": "budget_exhausted", "email": None, "emails": []}
+
+        payload, error = await self._get("/domain-search", {"domain": domain, "limit": 10})
+        if error is not None or not payload:
+            return {"status": "error", "reason": error, "email": None, "emails": []}
+
+        entries = ((payload.get("data") or {}).get("emails")) or []
+        emails = [
+            {
+                "email": (e.get("value") or "").strip().lower(),
+                "type": e.get("type"),
+                "score": e.get("confidence"),
+                "first_name": e.get("first_name"),
+                "last_name": e.get("last_name"),
+                "position": e.get("position"),
+            }
+            for e in entries
+            if (e.get("value") or "").strip()
+        ]
+        if not emails:
+            return {"status": "not_found", "email": None, "emails": []}
+
+        ranked = sorted(
+            emails,
+            key=lambda e: (e.get("type") == "personal", e.get("score") or 0),
+            reverse=True,
+        )
+        best = ranked[0]
+        logger.info(
+            "Hunter domain-search found %d address(es) for %s; best %s (%s, confidence %s)",
+            len(emails), domain, best["email"], best.get("type"), best.get("score"),
+        )
+        return {
+            "status": "ok",
+            "email": best["email"],
+            "score": best.get("score"),
+            "emails": ranked,
+        }
+
     # ── routing helper ──────────────────────────────────────────────────────
 
     def is_auto_enroll_eligible(self, contact: Contact) -> bool:

@@ -52,6 +52,7 @@ celery_app.conf.update(
         "app.tasks.ab_testing.*": {"queue": "enrichment"},
         "app.tasks.send_timing.*": {"queue": "enrichment"},
         "app.tasks.verification.*": {"queue": "enrichment"},
+        "app.tasks.places_discovery.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -245,6 +246,22 @@ celery_app.conf.update(
             "task": "app.tasks.verification.reverify_stale_contacts",
             "schedule": crontab(hour=2, minute=0, day_of_week=0),
         },
+        # P4: re-run saved Google Places searches. Weekly rather than daily on
+        # purpose — local business data changes slowly, so a daily cadence pays
+        # seven times over for nearly the same results. 4 AM Monday UTC, clear
+        # of the Sunday-night verification sweep.
+        "run-places-discoveries": {
+            "task": "app.tasks.places_discovery.run_scheduled_discoveries",
+            "schedule": crontab(hour=4, minute=0, day_of_week=1),
+        },
+        # P4: recover emails for discovered businesses that have a website but
+        # no address (Hunter domain-search, then the free scraper). Daily and
+        # separate from discovery: this is the hop where the funnel narrows, and
+        # it shouldn't be gated on a Places search succeeding. 5 AM UTC.
+        "enrich-discovered-emails": {
+            "task": "app.tasks.places_discovery.enrich_discovered_emails",
+            "schedule": crontab(hour=5, minute=0),
+        },
     },
 )
 
@@ -278,3 +295,4 @@ import app.tasks.replies  # noqa: F401
 import app.tasks.ab_testing  # noqa: F401
 import app.tasks.send_timing  # noqa: F401
 import app.tasks.verification  # noqa: F401
+import app.tasks.places_discovery  # noqa: F401

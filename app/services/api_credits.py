@@ -82,8 +82,15 @@ def _budgets_for(provider: str) -> tuple[int, int]:
     s = get_settings()
     if provider == "apollo":
         return s.apollo_daily_credit_budget, s.apollo_monthly_credit_budget
+    if provider == "google_places":
+        return s.google_places_daily_budget, s.google_places_monthly_budget
     # Providers without configured budgets are unlimited until they get one.
     # Better to under-guard a provider than to silently block a live path.
+    #
+    # Hunter is deliberately absent: it gates on its own ledger-derived daily
+    # allowance (``HunterVerificationService.make_budget``) so a batch can
+    # reserve credits across concurrent calls. Adding it here would double-gate
+    # it against the same ledger rows.
     return 0, 0
 
 

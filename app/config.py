@@ -107,6 +107,29 @@ class Settings(BaseSettings):
     hunter_max_batch: int = 100
     hunter_concurrency: int = 5
 
+    # --- Google Places SMB discovery (P4) ---
+    # Places API (New) — the legacy Places API is deprecated for new projects.
+    # Apollo's coverage of small international manufacturers is thin; Places has
+    # near-exhaustive local-business coverage. What it does *not* have is emails
+    # or named people, so a Places result is a lead on a prospect, not a
+    # prospect — see app/services/places_discovery.py. Empty key = capability
+    # disabled; searches return 'skipped' and never raise.
+    google_places_api_key: str = ""
+    google_places_base_url: str = "https://places.googleapis.com/v1"
+    # Guardrail on Places calls per UTC day. Broad coverage needs many narrow
+    # queries (a grid over geography x category) and each page is billed, so
+    # this is the one that stops a scheduled search from quietly compounding.
+    # 0 = unlimited.
+    google_places_daily_budget: int = 100
+    google_places_monthly_budget: int = 2000
+    # Client-side token bucket, so we back off before Google has to 429 us.
+    google_places_max_requests_per_minute: int = 60
+    # Places caps a text search at 20 results/page and 60 results total (3
+    # pages). Encoded here so the pagination loop and its test agree on the
+    # ceiling rather than both hardcoding it.
+    google_places_page_size: int = 20
+    google_places_max_results: int = 60
+
     # Census Bureau
     census_api_key: str = ""
 

@@ -161,6 +161,9 @@ app.include_router(ab_tests.router, prefix=settings.api_prefix, dependencies=_au
 app.include_router(send_timing.router, prefix=settings.api_prefix, dependencies=_auth)
 # P3 — Hunter.io email verification (on-demand verify, bulk verify, stats).
 app.include_router(verification.router, prefix=settings.api_prefix, dependencies=_auth)
+# P4 — Google Places SMB discovery. A second router out of routers/discovery.py,
+# on the /dialtone/discovery prefix; the /discovery one above is Apollo's.
+app.include_router(discovery.places_router, prefix=settings.api_prefix, dependencies=_auth)
 
 
 @app.get("/health")
