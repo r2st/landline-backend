@@ -493,10 +493,18 @@ class AutonomousProspector:
             await db.flush()
         except Exception as e:
             logger.exception("Prospecting run failed")
-            run.status = "failed"
-            run.error = str(e)
-            run.completed_at = datetime.now(timezone.utc)
-            await db.flush()
+            try:
+                # The failure may have poisoned the transaction, which would make
+                # any write here fail too. Roll back first so the audit row lands
+                # on a clean transaction.
+                await db.rollback()
+                run.status = "failed"
+                run.error = str(e)[:500]
+                run.completed_at = datetime.now(timezone.utc)
+                db.add(run)
+                await db.commit()
+            except Exception as inner:
+                logger.error(f"Could not record prospecting failure: {inner}")
         return run
 
 
