@@ -40,6 +40,7 @@ from app.models.prospecting import (
     ProspectingRun,
 )
 from app.models.sequence import OutreachSequence
+from app.services.industry_verticals import resolve_vertical
 from app.services.ingestion import (
     ROUTE_AUTO_ENROLL,
     ROUTE_DISCARD,
@@ -495,6 +496,56 @@ class AutonomousProspector:
                 self.settings.prospecting_places_enrich_max,
             )
 
+    async def _pick_sequence(
+        self, db: AsyncSession, company: Company
+    ) -> Optional[OutreachSequence]:
+        """The active sequence whose vertical matches this company's industry.
+
+        Routing goes through ``resolve_vertical``, the same keyword matcher the
+        rest of the stack uses, so a company's free-text ``industry_segment``
+        ("CNC Machining") lands on the vertical key stored in
+        ``OutreachSequence.industry`` ("cnc_machining").
+
+        Deliberately *not* ``resolve_vertical_or_default``: that defaults to
+        injection molding, which is how a CNC lead would get pitched someone
+        else's vertical. An unrecognised industry falls through to the generic
+        fallback below instead of borrowing a wrong vertical's copy.
+
+        The fallback (any active sequence) is ordered by ``created_at`` only to
+        make it deterministic — an unordered ``.first()`` is what let this pick
+        an arbitrary sequence per call.
+        """
+        base = (
+            OutreachSequence.is_active == True,  # noqa: E712
+            OutreachSequence.status == "active",
+        )
+        vertical = resolve_vertical(
+            industry=company.industry_segment or "", company_name=company.name or ""
+        )
+        if vertical is not None:
+            matched = (
+                await db.execute(
+                    select(OutreachSequence)
+                    .where(*base, OutreachSequence.industry == vertical.key)
+                    .order_by(OutreachSequence.created_at)
+                )
+            ).scalars().first()
+            if matched is not None:
+                return matched
+            # The vertical is known but nobody seeded (or activated) its
+            # sequence: better a generic touch than none, but say so — this is
+            # a seeding gap, not a routing decision.
+            logger.warning(
+                "No active sequence tagged '%s' for %s; falling back to a "
+                "generic sequence",
+                vertical.key, company.name,
+            )
+        return (
+            await db.execute(
+                select(OutreachSequence).where(*base).order_by(OutreachSequence.created_at)
+            )
+        ).scalars().first()
+
     async def _auto_enroll(self, db: AsyncSession, company: Company) -> bool:
         """Advance a company to outreach and best-effort enroll a primary contact.
 
@@ -502,20 +553,20 @@ class AutonomousProspector:
         pipeline stage always happens for a high-confidence match.
         """
         company.pipeline_stage = "outreach"
+        # An enrollment for a contact with no email address is a row that can
+        # never send: the step would come due forever and the lead would look
+        # worked without a single touch. Prefer the primary among the rest.
         contact = (
             await db.execute(
-                select(Contact).where(Contact.company_id == company.id)
+                select(Contact).where(
+                    Contact.company_id == company.id,
+                    Contact.email.isnot(None),
+                    func.trim(Contact.email) != "",
+                )
                 .order_by(Contact.is_primary.desc())
             )
         ).scalars().first()
-        sequence = (
-            await db.execute(
-                select(OutreachSequence).where(
-                    OutreachSequence.is_active == True,  # noqa: E712
-                    OutreachSequence.status == "active",
-                )
-            )
-        ).scalars().first()
+        sequence = await self._pick_sequence(db, company)
         if contact is None or sequence is None:
             return False
         existing = (
