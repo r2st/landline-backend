@@ -29,6 +29,7 @@ Two rules this module holds to:
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -38,6 +39,7 @@ from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.prospecting import IcpProfile
+from app.services.email_pattern_generator import get_pattern_generator
 from app.services.normalize import normalize_domain, normalize_name_key, normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -416,6 +418,93 @@ class IngestionService:
         if created_any:
             await db.flush()
         return outcomes
+
+    async def discover_contact_emails(
+        self,
+        db: AsyncSession,
+        company: Company,
+        contacts: list[Contact],
+    ) -> int:
+        """Best-effort: derive addresses for named contacts that arrived without one.
+
+        Apollo hands back people with ``email: null`` constantly and Places gives
+        us businesses with no people at all, so ``ingest_contacts`` regularly
+        persists a row that names a decision-maker we have no way to reach.
+        This converts some of those dead rows into contactable ones by guessing
+        the address from the name + the company's domain — see
+        ``email_pattern_generator``. Returns the number of contacts filled in.
+
+        **Called explicitly, not folded into ``ingest_contacts``.** Discovery does
+        DNS and (optionally) SMTP I/O per person, and ``ingest_contacts`` runs
+        inside the caller's open transaction — putting network probes in that
+        loop would hold a transaction open across a stranger's mail server, and
+        make a 500-row CSV import take minutes. Callers opt in once the cheap
+        work is committed.
+
+        Keeps this module's rules: owns no transaction (flushes, never commits),
+        and never invents deliverability — an unproven guess lands with
+        ``email_status='unknown'``, which the send paths treat as sendable-by-a-
+        human but never auto-enrollable.
+        """
+        settings = get_settings()
+        if not settings.pattern_discovery_enabled:
+            return 0
+        domain = getattr(company, "domain", None)
+        if not domain:
+            # No domain, nothing to build a local part onto. Places-sourced
+            # companies often land here — that's P4's scrape/domain-search job.
+            return 0
+
+        generator = get_pattern_generator()
+        filled = 0
+        for contact in contacts:
+            if contact.email:
+                continue
+            if not (contact.first_name and contact.last_name):
+                # A lone first name generates 'first@' for every junior at the
+                # company — collides across people and isn't worth a probe.
+                continue
+
+            verdict = await generator.discover(
+                contact.first_name, contact.last_name, domain
+            )
+            email = verdict.get("email")
+            if verdict.get("status") != "ok" or not email:
+                continue
+
+            # A dead domain says nothing about the person — leave the row alone
+            # rather than stamping a contact 'invalid' over an address we made up.
+            if verdict.get("result") == "undeliverable":
+                continue
+
+            # The global email dedup rule applies to discovered addresses too.
+            # Guessing an address that already belongs to someone would hand two
+            # contacts one mailbox and mail them both — and worse, could
+            # resurrect a suppressed person under a new row.
+            existing = await self._find_contact_by_email(db, email.strip().lower())
+            if existing is not None:
+                logger.info(
+                    "Pattern discovery guessed %s for contact %s, but it already "
+                    "belongs to contact %s — leaving unset",
+                    email, contact.id, existing.id,
+                )
+                continue
+
+            contact.email = email
+            contact.email_status = verdict.get("email_status")
+            contact.email_checked_at = datetime.now(timezone.utc)
+            contact.email_verification_result = verdict.get("result")
+            contact.email_verification_source = verdict.get("source")
+            contact.email_verification_meta = verdict.get("meta") or {}
+            # `email_verified_at` stays NULL unless a probe actually confirmed the
+            # mailbox, so the Hunter sweep still picks a guess up and re-checks it.
+            if verdict.get("email_status") == "valid":
+                contact.email_verified_at = datetime.now(timezone.utc)
+            filled += 1
+
+        if filled:
+            await db.flush()
+        return filled
 
     def _apply_fields(self, company: Company, record: CandidateRecord) -> None:
         """Fill blanks on an existing company. Never overwrites real data."""

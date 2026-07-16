@@ -107,6 +107,35 @@ class Settings(BaseSettings):
     hunter_max_batch: int = 100
     hunter_concurrency: int = 5
 
+    # --- DIY email pattern discovery ---
+    # The free fallback under Hunter's email-finder: derive likely addresses from
+    # a name + the employer's domain (see app/services/email_pattern_generator.py).
+    # Generation is always free and offline; what needs configuring is how — or
+    # whether — a guess gets *proven*, because an unproven guess is never
+    # promoted past email_status='unknown'.
+    pattern_discovery_enabled: bool = True
+    # A Reacher instance (https://reacher.email) — self-hostable, so unlike
+    # Hunter it costs no per-address credit. Empty = no probe layer, which
+    # degrades to generate-only: candidates are surfaced for a human, never
+    # auto-marked valid.
+    reacher_url: str = ""
+    reacher_api_key: str = ""
+    # Raw SMTP RCPT-TO probing as a last resort. **Off by default, deliberately.**
+    # Two reasons, both load-bearing: (1) AWS blocks outbound port 25 from EC2
+    # unless you file a request, so on this deployment it would simply time out
+    # into 'unknown'; (2) probing from a sending IP is the behaviour DNSBLs
+    # classify as address harvesting — the exact reputation damage
+    # blacklist_check and domain_health exist to catch. Enable only from an IP
+    # you do not send from.
+    pattern_smtp_fallback_enabled: bool = False
+    # MAIL FROM for the probe. A real, monitored address on a domain you own:
+    # a bogus sender is itself a spam signal to the receiving MTA.
+    pattern_smtp_from_address: str = ""
+    # Probes per person. Seven patterns exist, but each probe is an SMTP
+    # conversation with a stranger's mail server; stopping early keeps a bulk
+    # import from looking like a dictionary attack.
+    pattern_max_probes: int = 4
+
     # --- Google Places SMB discovery (P4) ---
     # Places API (New) — the legacy Places API is deprecated for new projects.
     # Apollo's coverage of small international manufacturers is thin; Places has
