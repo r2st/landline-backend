@@ -51,6 +51,7 @@ celery_app.conf.update(
         "app.tasks.replies.*": {"queue": "enrichment"},
         "app.tasks.ab_testing.*": {"queue": "enrichment"},
         "app.tasks.send_timing.*": {"queue": "enrichment"},
+        "app.tasks.verification.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -228,6 +229,22 @@ celery_app.conf.update(
             "task": "app.tasks.send_timing.refresh_engagement_profiles",
             "schedule": crontab(hour=3, minute=0),
         },
+        # P3: verify never-verified contacts (Hunter, behind the free syntax+MX
+        # pre-filter). Every 15 min so an imported/prospected contact is verified
+        # well before its sequence's first send, without making import block on a
+        # paid API call. Idempotent via contacts.email_verified_at.
+        "verify-pending-contacts": {
+            "task": "app.tasks.verification.verify_pending_contacts",
+            "schedule": 900.0,  # every 15 minutes
+        },
+        # P3: re-verify addresses that have gone stale (default >90 days) —
+        # people leave and mailboxes are retired. Weekly, oldest-first, and
+        # limited to contacts we could still email, so it can't burn credits on
+        # a list we'd never send to. 2 AM Sunday UTC.
+        "reverify-stale-contacts": {
+            "task": "app.tasks.verification.reverify_stale_contacts",
+            "schedule": crontab(hour=2, minute=0, day_of_week=0),
+        },
     },
 )
 
@@ -260,3 +277,4 @@ import app.tasks.voice  # noqa: F401
 import app.tasks.replies  # noqa: F401
 import app.tasks.ab_testing  # noqa: F401
 import app.tasks.send_timing  # noqa: F401
+import app.tasks.verification  # noqa: F401

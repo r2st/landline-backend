@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, String, Text, func, inspect as sa_inspect
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, func, inspect as sa_inspect
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -72,6 +72,24 @@ class Contact(Base):
     # 'unknown' — lookup could not complete (DNS down / dep missing), don't block.
     email_status: Mapped[str | None] = mapped_column(String(10))
     email_checked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    # --- Verification detail (P3). ``email_status`` above stays the only gate a
+    # send path reads; everything here explains how it got that value. ---
+    # Which layer produced the verdict: 'mx' (free syntax/DNS pre-check) or
+    # 'hunter' (paid per-mailbox SMTP check). 'manual' when an operator overrides.
+    email_verification_source: Mapped[str | None] = mapped_column(String(10))
+    # Hunter's verdict: 'deliverable' | 'undeliverable' | 'risky' | 'unknown'.
+    # 'risky' is sendable but never auto-enrollable — see hunter_verification.
+    email_verification_result: Mapped[str | None] = mapped_column(String(15))
+    email_verification_score: Mapped[int | None] = mapped_column(Integer)  # 0-100
+    # {disposable, webmail, gibberish, accept_all, smtp_check, mx_records, raw}
+    email_verification_meta: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default="{}"
+    )
+    # NULL = never verified. Set only once a layer reached a *verdict*, so a
+    # Hunter outage leaves it NULL and the contact is retried, not written off.
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), index=True
+    )
     source: Mapped[str | None] = mapped_column(String(50), index=True)
     # 'genuine' (real business lead) or 'test' (internal/test data), or NULL if
     # unclassified. Lets the UI and outreach keep test contacts out of the way.

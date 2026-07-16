@@ -72,6 +72,33 @@ class Settings(BaseSettings):
     apollo_api_key: str = ""
     apollo_base_url: str = "https://api.apollo.io/v1"
 
+    # --- Hunter.io email verification (P3) ---
+    # Per-mailbox SMTP verification, layered behind the free syntax + MX check.
+    # MX proves a *domain* accepts mail; Hunter proves the *mailbox* exists —
+    # which is what keeps a bad Apollo batch from tripping the Feature 2 bounce
+    # auto-pause. Empty key = capability disabled; the pipeline degrades to
+    # today's MX-only behaviour and never blocks.
+    hunter_api_key: str = ""
+    hunter_base_url: str = "https://api.hunter.io/v2"
+    # A 'deliverable' below this confidence still sends, but is flagged
+    # low-confidence and is excluded from the auto-enroll high-confidence band.
+    hunter_min_score: int = 80
+    # Re-verify a contact whose verification is older than this. People leave;
+    # addresses rot. Only applied to contacts we could actually still email.
+    hunter_reverify_days: int = 90
+    # Guardrail (not billing truth) on Hunter calls per UTC day. 0 = unlimited.
+    hunter_daily_credit_budget: int = 100
+    # Verify newly-imported contacts before they can enter a sequence.
+    hunter_verify_on_import: bool = True
+    # Last-resort gate: verify at send time if a contact somehow reached a send
+    # unverified. Set False if verification latency ever becomes a bottleneck —
+    # the async task still covers the normal path.
+    hunter_verify_before_send: bool = True
+    # Max contacts accepted by one bulk-verify request, and how many Hunter calls
+    # run concurrently within a batch (Hunter rate-limits per-second).
+    hunter_max_batch: int = 100
+    hunter_concurrency: int = 5
+
     # Census Bureau
     census_api_key: str = ""
 

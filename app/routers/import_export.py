@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
@@ -32,6 +33,27 @@ def _csv_safe(value) -> str:
     if text and text[0] in _CSV_FORMULA_PREFIXES:
         return "'" + text
     return text
+
+
+def _trigger_verification():
+    """Kick the Hunter verification sweep for freshly imported contacts (P3).
+
+    Import deliberately does NOT block on a paid per-address API call — a 10 MB
+    CSV would hold the request worker open for the whole batch. The sweep runs
+    every 15 minutes regardless and is idempotent + budget-gated; firing it here
+    just means an imported contact is verified *before* its sequence's first send
+    instead of up to 15 minutes later.
+
+    The sweep is oldest-first, so a large unverified backlog (or an exhausted
+    daily budget) can still defer this import's contacts to a later run — the
+    pre-send gate in ``app.tasks.outreach`` is the backstop for that case.
+    """
+    try:
+        from app.tasks.verification import verify_pending_contacts
+        verify_pending_contacts.delay()
+        logger.info("Dispatched email verification sweep for imported contacts")
+    except Exception as e:
+        logger.error("Failed to dispatch verification after import: %s", str(e))
 
 
 def _trigger_scoring_for_companies(company_ids: list[str]):
@@ -185,6 +207,10 @@ async def import_csv(
     # Auto-enrich and auto-score newly imported companies
     if new_company_ids:
         background_tasks.add_task(_trigger_scoring_for_companies, new_company_ids)
+
+    # Verify imported addresses before they can enter a sequence (P3).
+    if imported_contacts and get_settings().hunter_verify_on_import:
+        background_tasks.add_task(_trigger_verification)
 
     logger.info(
         "CSV import: %d companies, %d contacts, %d skipped, %d errors",

@@ -180,6 +180,25 @@ def send_sequence_step(self, enrollment_id: str):
 
                 if contact.email_status is None:
                     await validate_contact(db, contact)
+
+                # Mailbox verification (P3) — the MX check above only proves the
+                # *domain* accepts mail; it can't tell a real mailbox from one
+                # that hard-bounces. Normally app.tasks.verification has already
+                # verified this contact within 15 min of import, so this is the
+                # backstop for a contact that raced the sweep to its first send.
+                # Fail-open by construction: a Hunter outage / missing key writes
+                # nothing, so email_status keeps its MX verdict and the send goes
+                # ahead — only a definitive 'undeliverable' stops it below.
+                from app.config import get_settings
+                from app.services.hunter_verification import get_hunter_service
+
+                if (
+                    get_settings().hunter_verify_before_send
+                    and contact.email_status != "invalid"
+                    and contact.email_verified_at is None
+                ):
+                    await get_hunter_service().verify_contact(db, contact)
+
                 if contact.email_status == "invalid":
                     enrollment.status = "paused"
                     await db.commit()
