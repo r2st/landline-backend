@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.models.contact import Contact
+from app.models.danger_signal import DangerSignalEvent
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
@@ -315,6 +316,54 @@ async def _collect_events(
                     "status": cand.status,
                 },
             ))
+
+    # --- Auto-pause danger-signal trips (Feature 2) --------------------------
+    if contact_id is None:  # danger trips are system-wide, not contact-scoped
+        trip_query = (
+            select(DangerSignalEvent)
+            .order_by(DangerSignalEvent.triggered_at.desc())
+            .limit(cap)
+        )
+        for trip in (await db.execute(trip_query)).scalars().all():
+            reason = (trip.details or {}).get("reason") or (
+                f"{trip.metric} breached on {trip.scope}"
+            )
+            if q_lower and q_lower not in reason.lower() and q_lower not in (trip.account_email or "").lower():
+                continue
+            trip_meta = {
+                "danger_signal_event_id": str(trip.id),
+                "metric": trip.metric,
+                "scope": trip.scope,
+                "account_email": trip.account_email,
+                "observed_value": trip.observed_value,
+                "threshold": trip.threshold,
+                "sample_size": trip.sample_size,
+                "window": trip.window,
+                "resolved": trip.resolved_at is not None,
+            }
+            # The auto-pause itself (error severity — drives the console banner).
+            items.append(DialtoneEvent(
+                id=f"auto_paused:{trip.id}",
+                type="auto_paused",
+                timestamp=_aware(trip.triggered_at),
+                title="Dialtone auto-paused — deliverability danger signal",
+                description=reason,
+                source="danger_monitor",
+                severity="error",
+                metadata=trip_meta,
+            ))
+            # The operator's acknowledged resume that cleared it, if any.
+            if trip.resolved_at is not None:
+                items.append(DialtoneEvent(
+                    id=f"resumed:{trip.id}",
+                    type="resumed",
+                    timestamp=_aware(trip.resolved_at),
+                    title="Sending resumed after auto-pause",
+                    description=trip.resolve_note,
+                    source="danger_monitor",
+                    severity="ok",
+                    metadata={**trip_meta, "resolved_by": trip.resolved_by},
+                ))
 
     # Apply the date window per-event (events carry their own timestamps).
     if start is not None or end is not None:

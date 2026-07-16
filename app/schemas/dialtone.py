@@ -28,6 +28,10 @@ DIALTONE_EVENT_TYPES = (
     "unsubscribed",
     "error",
     "lead_discovered",
+    # Feature 2: the danger monitor auto-paused all sending (severity error), and
+    # the operator's acknowledged resume that cleared it.
+    "auto_paused",
+    "resumed",
 )
 
 

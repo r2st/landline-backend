@@ -44,6 +44,7 @@ celery_app.conf.update(
         "app.tasks.prospecting.*": {"queue": "enrichment"},
         "app.tasks.client_health.*": {"queue": "enrichment"},
         "app.tasks.deliverability.*": {"queue": "enrichment"},
+        "app.tasks.danger_signals.*": {"queue": "enrichment"},
         "app.tasks.rag.*": {"queue": "enrichment"},
         "app.tasks.voice.*": {"queue": "enrichment"},
     },
@@ -172,6 +173,13 @@ celery_app.conf.update(
             "task": "app.tasks.deliverability.assess_sender_health",
             "schedule": 3600.0,  # hourly
         },
+        # Feature 2: auto-pause on danger signals — 24h bounce/complaint monitor.
+        # Every 5 minutes so an acute spike (bad list, burning domain) is stopped
+        # fast and cheaply.
+        "monitor-danger-signals": {
+            "task": "app.tasks.danger_signals.monitor_danger_signals",
+            "schedule": 300.0,  # every 5 minutes
+        },
         # 3.4: index new content into the RAG knowledge base.
         "index-new-content": {
             "task": "app.tasks.rag.index_new_content",
@@ -213,5 +221,6 @@ import app.tasks.smart_suggestions_task  # noqa: F401
 import app.tasks.prospecting  # noqa: F401
 import app.tasks.client_health  # noqa: F401
 import app.tasks.deliverability  # noqa: F401
+import app.tasks.danger_signals  # noqa: F401
 import app.tasks.rag  # noqa: F401
 import app.tasks.voice  # noqa: F401

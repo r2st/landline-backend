@@ -198,6 +198,26 @@ class Settings(BaseSettings):
     sender_complaint_rate_throttle: float = 0.003  # 7d complaint rate above this → throttle
     sender_min_reputation: int = 40                # below this the account is 'critical'
 
+    # Feature 2 — Auto-Pause on Danger Signals (deliverability safety rail).
+    # A 5-minute monitor task computes 24h rolling bounce/complaint metrics per
+    # sending account and globally, and auto-engages the kill switch on breach.
+    danger_signals_enabled: bool = True
+    # 24h bounce rate: >5% auto-pauses, >3% warns (needs the min sample below).
+    danger_bounce_rate_threshold: float = 0.05
+    danger_bounce_rate_warn: float = 0.03
+    # 24h spam-complaint rate: >0.1% auto-pauses, >0.05% warns (min sample too).
+    danger_complaint_rate_threshold: float = 0.001
+    danger_complaint_rate_warn: float = 0.0005
+    # Absolute hard-bounce floor in 24h — trips regardless of sample size, so a
+    # bad list burns the domain even during low-volume warm-up (rates lie at
+    # small N). >=5 auto-pauses, >=3 warns.
+    danger_hard_bounce_count_threshold: int = 5
+    danger_hard_bounce_count_warn: int = 3
+    # Minimum sends in the window before a *rate* trip is trusted (rates are
+    # meaningless at low volume — 1 bounce of 20 is 5%). The hard-bounce floor is
+    # the low-volume backstop and is NOT gated by this.
+    danger_min_sample_size: int = 20
+
     # 3.4 RAG Knowledge System.
     rag_enabled: bool = True
     rag_top_k: int = 5                             # retrieved chunks per query
