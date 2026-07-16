@@ -78,7 +78,7 @@ class ReplyTracker:
             token_uri=_TOKEN_URI,
             client_id=settings.google_client_id,
             client_secret=settings.google_client_secret,
-            scopes=google_oauth.SCOPES,
+            scopes=google_oauth.credential_scopes_for(account.scopes),
         )
 
     async def _check_account_replies(

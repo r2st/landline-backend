@@ -39,6 +39,37 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
+# Minimal Gmail scopes every connected account is guaranteed to hold. Used as a
+# fallback when an account row predates scope recording. Intentionally excludes
+# calendar.events — see credential_scopes_for below.
+_GMAIL_FALLBACK_SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
+
+
+def credential_scopes_for(stored_scopes: Optional[str]) -> list[str]:
+    """Scopes to request when refreshing a connected account's access token.
+
+    google-auth sends these as the ``scope`` parameter on token refresh, and
+    Google rejects the refresh with ``invalid_scope`` if *any* requested scope
+    was not part of the original grant. Older accounts were connected before
+    ``calendar.events`` (and even ``gmail.readonly``) were added to
+    :data:`SCOPES`, so refreshing with the full ``SCOPES`` superset fails.
+
+    Requesting exactly what the account was granted at connect time (recorded in
+    ``gmail_accounts.scopes``) keeps refresh working and self-heals the moment a
+    user re-consents to broader scopes. Falls back to the guaranteed Gmail
+    subset for legacy rows with no recorded scopes.
+    """
+    if stored_scopes and stored_scopes.strip():
+        return stored_scopes.split()
+    return list(_GMAIL_FALLBACK_SCOPES)
+
+
 _AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 _USERINFO_URI = "https://openidconnect.googleapis.com/v1/userinfo"

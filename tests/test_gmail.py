@@ -47,6 +47,36 @@ def test_state_roundtrip_and_rejects_garbage():
     assert google_oauth.verify_state("") is False
 
 
+def test_credential_scopes_use_the_accounts_actual_grant():
+    """Refresh must request only what the account was granted.
+
+    An account connected before calendar.events was added to SCOPES holds a
+    narrower grant; requesting the full SCOPES superset on refresh makes Google
+    reject it with invalid_scope. The helper must echo back the stored grant so
+    the refresh stays within it.
+    """
+    legacy_grant = (
+        "openid https://www.googleapis.com/auth/userinfo.email "
+        "https://www.googleapis.com/auth/userinfo.profile "
+        "https://www.googleapis.com/auth/gmail.send "
+        "https://www.googleapis.com/auth/gmail.readonly"
+    )
+    scopes = google_oauth.credential_scopes_for(legacy_grant)
+    assert scopes == legacy_grant.split()
+    # The scope that was never granted must not be requested on refresh.
+    assert "https://www.googleapis.com/auth/calendar.events" not in scopes
+
+
+def test_credential_scopes_fall_back_to_gmail_subset_when_unrecorded():
+    """Legacy rows with no recorded scopes fall back to a guaranteed subset."""
+    for empty in (None, "", "   "):
+        scopes = google_oauth.credential_scopes_for(empty)
+        assert "https://www.googleapis.com/auth/gmail.send" in scopes
+        assert "https://www.googleapis.com/auth/gmail.readonly" in scopes
+        # Never over-request the sensitive scope on a fallback refresh.
+        assert "https://www.googleapis.com/auth/calendar.events" not in scopes
+
+
 # --- endpoints ---
 
 async def test_status_not_connected_reports_fallback(client):
