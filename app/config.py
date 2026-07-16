@@ -275,6 +275,13 @@ class Settings(BaseSettings):
     # Auto-pause the agent if the rolling enroll→engaged conversion drops below
     # this fraction (guardrail against enrolling junk). 0 disables the check.
     prospecting_min_conversion_rate: float = 0.0
+    # Places businesses arrive with no email, so the prospector enriches them
+    # inline (Hunter, then a scrape) to have anyone to enrol. Both hops are slow
+    # and `POST /prospecting/run` awaits the run, so this caps how many a single
+    # run will pay for. The nightly sweep in tasks/places_discovery.py picks up
+    # whatever is left over, unbounded by the request clock. 0 disables inline
+    # enrichment and defers entirely to that sweep.
+    prospecting_places_enrich_max: int = 10
 
     # --- Market policy ---
     # Countries we actually import and prospect into. Narrower than the schema

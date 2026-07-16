@@ -10,6 +10,7 @@ run for real, so a change to the Places → CandidateRecord mapping fails here.
 """
 
 import pytest
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.models.discovered_business import DiscoveredBusiness
@@ -50,6 +51,33 @@ def places_on(monkeypatch):
     monkeypatch.setattr(settings, "google_places_max_requests_per_minute", 0)
     monkeypatch.setattr(settings, "supported_countries", ["US", "CA", "IN"])
     return settings
+
+
+@pytest.fixture
+def no_enrichment(monkeypatch):
+    """Most tests here are about sourcing, not email recovery. Off by default so
+    they can't reach Hunter or the scraper."""
+    monkeypatch.setattr(get_settings(), "prospecting_places_enrich_max", 0)
+
+
+def _fake_extract_email(monkeypatch, by_domain: dict):
+    """Stub extract_email; ``by_domain`` maps domain -> email (or None to miss)."""
+    calls = []
+
+    async def _extract(self, db, business):
+        calls.append(business.domain)
+        email = by_domain.get(business.domain)
+        if email is None:
+            return {"status": "not_found", "reason": "no_emails"}
+        business.email = email
+        business.email_source = "scrape"
+        business.status = "enriched"
+        return {"status": "enriched", "source": "scrape", "email": email}
+
+    monkeypatch.setattr(
+        places_discovery.PlacesDiscoveryService, "extract_email", _extract
+    )
+    return calls
 
 
 @pytest.fixture
@@ -117,7 +145,7 @@ async def test_apollo_results_short_circuit_places(db_session, apollo_on, places
 # ── the 403 that started this ───────────────────────────────────────────────
 
 
-async def test_apollo_403_falls_back_to_places(db_session, apollo_on, places_on, monkeypatch):
+async def test_apollo_403_falls_back_to_places(db_session, apollo_on, places_on, no_enrichment, monkeypatch):
     prospector = get_prospector()
     icp = await prospector.ensure_icp(db_session)
     _fake_apollo(
@@ -145,7 +173,7 @@ async def test_apollo_403_falls_back_to_places(db_session, apollo_on, places_on,
 
 
 async def test_apollo_empty_ok_result_falls_back_to_places(
-    db_session, apollo_on, places_on, monkeypatch
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
 ):
     prospector = get_prospector()
     icp = await prospector.ensure_icp(db_session)
@@ -163,7 +191,7 @@ async def test_apollo_empty_ok_result_falls_back_to_places(
     assert sources == ["apollo", PROVIDER]
 
 
-async def test_no_apollo_key_still_reaches_places(db_session, places_on, monkeypatch):
+async def test_no_apollo_key_still_reaches_places(db_session, places_on, no_enrichment, monkeypatch):
     monkeypatch.setattr(get_settings(), "apollo_api_key", "")
     prospector = get_prospector()
     icp = await prospector.ensure_icp(db_session)
@@ -250,7 +278,7 @@ async def test_places_without_a_key_is_skipped_not_queried(
 
 
 async def test_already_imported_businesses_are_not_resourced(
-    db_session, apollo_on, places_on, monkeypatch
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
 ):
     """A business a previous run imported must not crowd out unseen ones."""
     prospector = get_prospector()
@@ -315,7 +343,7 @@ async def test_places_query_falls_back_to_country_without_states(db_session, pla
 
 
 async def test_places_candidate_carries_no_invented_firmographics(
-    db_session, apollo_on, places_on, monkeypatch
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
 ):
     """Places has no employee count. qualify() must see unknown, not zero."""
     prospector = get_prospector()
@@ -340,7 +368,7 @@ async def test_places_candidate_carries_no_invented_firmographics(
 
 
 async def test_run_completes_via_places_when_apollo_is_dead(
-    db_session, apollo_on, places_on, monkeypatch
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
 ):
     prospector = get_prospector()
     _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="error", error="HTTP 403"))
@@ -356,6 +384,188 @@ async def test_run_completes_via_places_when_apollo_is_dead(
     assert run.companies_found == 1
     assert run.results["places_status"] == "ok"
     assert run.results["apollo_error"] == "HTTP 403"
+
+
+# ── email enrichment: Places gives businesses, not people ───────────────────
+
+
+async def test_places_businesses_are_enriched_into_contacts(
+    db_session, apollo_on, places_on, monkeypatch
+):
+    """Without this, every Places candidate reaches ingestion with no contact
+    and _auto_enroll has nobody to enrol however well the company fits."""
+    monkeypatch.setattr(get_settings(), "prospecting_places_enrich_max", 10)
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("e1", "Emailable Molders")])
+    )
+    calls = _fake_extract_email(monkeypatch, {"e1.example.com": "owner@e1.example.com"})
+
+    records, _, notes = await prospector._source_candidates(
+        db_session, icp, 10, _StubRun()
+    )
+
+    assert calls == ["e1.example.com"]
+    assert [c.email for c in records[0].contacts] == ["owner@e1.example.com"]
+    assert notes["places_enrich_attempted"] == 1
+    assert notes["places_enriched"] == 1
+    assert notes["places_with_email"] == 1
+
+
+async def test_enrichment_miss_still_yields_a_candidate(
+    db_session, apollo_on, places_on, monkeypatch
+):
+    """No email found is not a failure — the phone still feeds the call queue."""
+    monkeypatch.setattr(get_settings(), "prospecting_places_enrich_max", 10)
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("m1", "No Email Ltd")])
+    )
+    _fake_extract_email(monkeypatch, {"m1.example.com": None})
+
+    records, _, notes = await prospector._source_candidates(
+        db_session, icp, 10, _StubRun()
+    )
+
+    assert [r.name for r in records] == ["No Email Ltd"]
+    assert records[0].contacts == []
+    assert records[0].phone == "+91 20 1234 5678"
+    assert notes["places_enriched"] == 0
+    assert notes["places_with_email"] == 0
+
+
+async def test_enrichment_is_capped_per_run(
+    db_session, apollo_on, places_on, monkeypatch
+):
+    """POST /prospecting/run awaits the run, so enrichment can't be unbounded."""
+    monkeypatch.setattr(get_settings(), "prospecting_places_enrich_max", 2)
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch,
+        PlacesSearchResult(results=[_place(f"c{i}", f"Co {i}") for i in range(5)]),
+    )
+    calls = _fake_extract_email(monkeypatch, {})
+
+    records, _, notes = await prospector._source_candidates(
+        db_session, icp, 10, _StubRun()
+    )
+
+    assert len(calls) == 2
+    assert notes["places_enrich_attempted"] == 2
+    assert notes["places_enrich_capped"] is True
+    # Capped enrichment must not drop candidates — they just have no email yet.
+    assert len(records) == 5
+
+
+async def test_enrichment_failure_does_not_fail_the_run(
+    db_session, apollo_on, places_on, monkeypatch
+):
+    monkeypatch.setattr(get_settings(), "prospecting_places_enrich_max", 10)
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch,
+        PlacesSearchResult(results=[_place("boom", "Exploding Co"), _place("ok", "Fine Co")]),
+    )
+
+    async def _explode(self, db, business):
+        if business.domain == "boom.example.com":
+            raise RuntimeError("site unreachable")
+        business.email = "hi@ok.example.com"
+        return {"status": "enriched", "source": "scrape", "email": business.email}
+
+    monkeypatch.setattr(
+        places_discovery.PlacesDiscoveryService, "extract_email", _explode
+    )
+
+    records, _, notes = await prospector._source_candidates(
+        db_session, icp, 10, _StubRun()
+    )
+
+    # One unreachable site must not cost us the other business.
+    assert len(records) == 2
+    assert notes["places_enriched"] == 1
+
+
+async def test_business_without_a_domain_is_not_enrichment_budget(
+    db_session, apollo_on, places_on, monkeypatch
+):
+    monkeypatch.setattr(get_settings(), "prospecting_places_enrich_max", 1)
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch,
+        PlacesSearchResult(results=[
+            _place("nosite", "Phone Only Co", website=None, domain=None),
+            _place("hassite", "Web Co"),
+        ]),
+    )
+    calls = _fake_extract_email(monkeypatch, {"hassite.example.com": "a@hassite.example.com"})
+
+    _, _, notes = await prospector._source_candidates(db_session, icp, 10, _StubRun())
+
+    # The domain-less business costs no call, so the budget reaches the real one.
+    assert calls == ["hassite.example.com"]
+    assert notes["places_enrich_attempted"] == 1
+
+
+# ── the writeback that makes the dedup filter real ──────────────────────────
+
+
+async def test_imported_places_business_is_written_back(
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
+):
+    """Nothing else on this path sets company_id, so without the writeback the
+    next run re-sources and re-enriches the same business forever."""
+    prospector = get_prospector()
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("wb", "Writeback Molding")])
+    )
+
+    run = await prospector.run(db_session, target_volume=5, trigger="test")
+    assert run.status == "completed"
+
+    business = (
+        await db_session.execute(
+            select(DiscoveredBusiness).where(DiscoveredBusiness.place_id == "wb")
+        )
+    ).scalar_one()
+    assert business.status in ("imported", "skipped")
+    if business.status == "imported":
+        assert business.company_id is not None
+        assert business.imported_at is not None
+    else:
+        # Routed to discard — recorded so it isn't re-sourced next run.
+        assert business.status_reason
+
+
+async def test_second_run_does_not_resource_an_imported_business(
+    db_session, apollo_on, places_on, no_enrichment, monkeypatch
+):
+    prospector = get_prospector()
+    _fake_apollo(monkeypatch, ApolloSearchResult(records=[], status="ok"))
+    _fake_places_search(
+        monkeypatch, PlacesSearchResult(results=[_place("once", "Only Once Ltd")])
+    )
+
+    first = await prospector.run(db_session, target_volume=5, trigger="test")
+    assert first.companies_found == 1
+
+    second = await prospector.run(db_session, target_volume=5, trigger="test")
+
+    # Same query, same business — but it has already been dispositioned.
+    assert second.companies_found == 0
+    assert second.results["places_duplicates"] == 1
+    assert second.results["places_candidates"] == 0
 
 
 class _StubRun:

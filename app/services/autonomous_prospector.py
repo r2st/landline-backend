@@ -31,6 +31,7 @@ from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.deal import Deal
+from app.models.discovered_business import DiscoveredBusiness
 from app.models.discovery_search import DiscoverySearch
 from app.models.outreach import OutreachEnrollment
 from app.models.prospecting import (
@@ -387,7 +388,13 @@ class AutonomousProspector:
             return [], {"places_status": "skipped", "places_error": "no_api_key"}
 
         search = self._places_search_from_icp(icp)
-        outcome = await svc.discover(db, search, limit=limit)
+        # Page to the API's own per-query ceiling rather than to ``limit``. The
+        # ICP-derived query is stable, so a limit-sized fetch returns the *same*
+        # first N businesses every run; once those are imported the source would
+        # go quiet with the rest of the ceiling never looked at. Fetching the
+        # ceiling and filtering costs a page or two more per run and lets
+        # successive runs walk the whole result set.
+        outcome = await svc.discover(db, search)
         notes = {
             "places_status": outcome.status,
             "places_query": search.query,
@@ -400,14 +407,16 @@ class AutonomousProspector:
         if outcome.error:
             notes["places_error"] = outcome.error
 
+        # Businesses a previous run already imported are done — ingestion would
+        # dedup them back onto their company, but they'd crowd out unseen ones
+        # under the run's target and re-report as "found" every week. Bound to
+        # `limit` here, before the expensive part: enriching a business this run
+        # won't use is pure spend.
+        fresh = [b for b in outcome.businesses if b.company_id is None][:limit]
+        await self._enrich_places_emails(db, svc, fresh, notes)
+
         records: list[CandidateRecord] = []
-        for business in outcome.businesses:
-            # Re-running a search re-surfaces businesses a previous run already
-            # imported. Ingestion would dedup them back onto their company, but
-            # they'd crowd out unseen businesses under the run's target and
-            # report as "found" every week.
-            if business.company_id is not None:
-                continue
+        for business in fresh:
             record = svc.to_candidate(business)
             record.icp_profile_id = icp.id
             records.append(record)
@@ -419,6 +428,54 @@ class AutonomousProspector:
                 search.query, outcome.status, outcome.error,
             )
         return records, notes
+
+    async def _enrich_places_emails(
+        self, db: AsyncSession, svc, businesses: list, notes: dict
+    ) -> None:
+        """Recover an email per business, in place, so there is someone to enrol.
+
+        Places returns businesses, never people: without this every Places
+        candidate reaches ingestion with no contact, and ``_auto_enroll`` has
+        nobody to enrol no matter how well the company fits. ``extract_email``
+        tries Hunter then a free scrape, and writes the winner onto the row.
+
+        Sequential on purpose — these share one ``AsyncSession``, which is not
+        safe to drive concurrently, so gathering them would corrupt the run's
+        transaction rather than speed it up.
+
+        Best-effort throughout: this buys contacts, and a business we can't find
+        an email for still has a phone number for the call queue.
+        """
+        budget = self.settings.prospecting_places_enrich_max
+        attempted = enriched = 0
+        for business in businesses:
+            if budget <= 0:
+                break
+            # Neither costs a call, so neither should cost budget.
+            if business.email or not business.domain:
+                continue
+            budget -= 1
+            attempted += 1
+            try:
+                result = await svc.extract_email(db, business)
+            except Exception:
+                # One unreachable site must not fail the run.
+                logger.exception("Places email extraction failed for %s", business.domain)
+                continue
+            if result.get("status") == "enriched":
+                enriched += 1
+
+        notes["places_enrich_attempted"] = attempted
+        notes["places_enriched"] = enriched
+        # The honest headline: how many of this run's businesses anyone can email.
+        notes["places_with_email"] = sum(1 for b in businesses if b.email)
+        if attempted and budget <= 0:
+            notes["places_enrich_capped"] = True
+            logger.info(
+                "Places inline enrichment hit its per-run cap (%d); the nightly "
+                "sweep will pick up the rest",
+                self.settings.prospecting_places_enrich_max,
+            )
 
     async def _auto_enroll(self, db: AsyncSession, company: Company) -> bool:
         """Advance a company to outreach and best-effort enroll a primary contact.
@@ -486,6 +543,49 @@ class AutonomousProspector:
             raw=candidate.get("raw") or {},
         )
 
+    async def _record_places_imports(self, db: AsyncSession, outcomes: list) -> None:
+        """Point each staged Places row at what its candidate became.
+
+        Without this the ``company_id is None`` filter in ``_source_from_places``
+        never fires: nothing else on this path writes back, so every run would
+        re-source, re-enrich and re-ingest the same businesses forever and never
+        reach the ones behind them.
+
+        Mirrors the operator import endpoint's writeback (routers/discovery.py)
+        so a business imported by the agent and one imported by hand end up in
+        the same state. ``contact_id`` is left alone — that link is the router's
+        and is not needed to keep this filter honest.
+        """
+        by_place: dict[str, object] = {}
+        for outcome in outcomes:
+            place_id = (getattr(outcome.record, "raw", None) or {}).get("place_id")
+            if place_id:
+                by_place[place_id] = outcome
+        if not by_place:
+            return
+
+        rows = (
+            await db.execute(
+                select(DiscoveredBusiness).where(
+                    DiscoveredBusiness.place_id.in_(list(by_place))
+                )
+            )
+        ).scalars().all()
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            outcome = by_place[row.place_id]
+            if outcome.company_id is None:
+                # Routed to discard. Recording *why* stops the next run from
+                # re-sourcing and re-enriching a business already judged once.
+                row.status = "skipped"
+                row.status_reason = (
+                    outcome.error or f"not imported (route={outcome.route})"
+                )[:500]
+                continue
+            row.company_id = outcome.company_id
+            row.status = "imported"
+            row.imported_at = now
+
     # Ingestion routes -> the disposition recorded on ProspectCandidate.
     _ROUTE_TO_STATUS = {
         ROUTE_AUTO_ENROLL: "enrolled",
@@ -539,6 +639,7 @@ class AutonomousProspector:
                 enroll_budget=enroll_budget,
                 score=True,
             )
+            await self._record_places_imports(db, result.outcomes)
 
             summaries = []
             found = qualified = enrolled = review = 0
