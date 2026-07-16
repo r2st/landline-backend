@@ -224,3 +224,36 @@ async def test_anthropic_backend_chat(monkeypatch):
 
     text = await svc._chat("hello")
     assert text == "anthropic reply"
+
+
+@pytest.mark.asyncio
+async def test_score_lead_degrades_on_anthropic_credit_exhaustion(monkeypatch):
+    """The real production outage: Anthropic backend, NO OpenRouter key, and
+    ``messages.create`` raising "credit balance is too low". ``score_lead`` must
+    swallow it and return the neutral mid-range score so the Dialtone
+    auto-scoring batch keeps recording leads instead of scoring 0/N.
+    """
+    settings = Settings(ai_provider="anthropic", anthropic_api_key="sk-ant", openrouter_api_key="")
+    monkeypatch.setattr(ai_module, "get_settings", lambda: settings)
+    svc = AIService()
+    assert svc.provider == "anthropic"  # no OpenRouter fallback available
+
+    async def fake_create(**kwargs):
+        # Mirror the Anthropic SDK error seen in production logs.
+        raise RuntimeError("Your credit balance is too low to access the Anthropic API")
+
+    monkeypatch.setattr(svc.client.messages, "create", fake_create)
+
+    result = await svc.score_lead(
+        company_name="Acme Plastics",
+        industry="plastics",
+        employee_count=120,
+        location="Ohio, US",
+    )
+
+    # No "error" key -> the enrichment task persists it and increments `scored`.
+    assert "error" not in result
+    assert result["score"] == 50
+    assert result["grade"] == "C"
+    assert result["priority"] == "medium"
+    assert result["degraded"] is True
