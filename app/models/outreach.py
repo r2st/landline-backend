@@ -70,6 +70,16 @@ class OutreachEnrollment(Base):
     )
     orchestration_log: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
 
+    # Smart Send-Time Optimization (Feature 6). ``scheduled_send_at`` is the
+    # smart-timing target for the CURRENTLY-due step: the send queue computes the
+    # recipient's next optimal (local) window when a step comes due and holds the
+    # send until then, capped by ``max_smart_delay`` so optimization never stalls
+    # a sequence. ``timing_arm`` splits enrollments into an ``optimized`` arm
+    # (per-recipient timing) and a ``control`` arm (naive next-window timing) so
+    # the lift can be measured — assigned once, then stable.
+    scheduled_send_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    timing_arm: Mapped[str | None] = mapped_column(String(20))  # 'optimized' | 'control'
+
     # Relationships
     contact: Mapped["Contact"] = relationship("Contact", back_populates="enrollments")
     sequence: Mapped["OutreachSequence"] = relationship("OutreachSequence", back_populates="enrollments")

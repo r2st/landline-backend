@@ -21,6 +21,7 @@ from app.services.email_dispatch import send_outreach_email
 from app.services.sequence_optimizer import get_sequence_optimizer, record_decision
 from app.tasks.celery_app import celery_app
 from app.services.send_limiter import get_send_limiter
+from app.services.send_time_optimizer import get_send_time_optimizer
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +591,7 @@ def process_outreach_queue():
             enrollments = list(result.scalars().all())
             dispatched = 0
             skipped_window = 0
+            scheduled_smart = 0
 
             # Anti-spam: don't send outside business hours / on weekends. Cold
             # mail that lands at 3 AM reads as a bot and tanks reply rates. The
@@ -607,6 +609,7 @@ def process_outreach_queue():
                         next_at = next_at.replace(tzinfo=timezone.utc)
                     if now < next_at:
                         continue  # Not yet due
+                    due_at = next_at
                 else:
                     # Legacy path: check delay from last event
                     last_event_result = await db.execute(
@@ -648,6 +651,7 @@ def process_outreach_queue():
                         due_date = enrollment.enrolled_at + timedelta(days=step.delay_days)
                         if now < due_date:
                             continue
+                    due_at = due_date
 
                 # --- Anti-spam checks ---
                 # Check daily limit — if hit, stop processing entirely
@@ -689,6 +693,24 @@ def process_outreach_queue():
                         logger.info("Skipping enrollment %s: %s", enrollment.id, contact_reason)
                         continue
 
+                # --- Smart Send-Time Optimization (Feature 6) ---
+                # The step is due and we're inside the (broad) business-hours
+                # window. Ask the optimizer whether to HOLD it for the recipient's
+                # personal best moment instead of firing now. It assigns the A/B
+                # arm (optimized vs control) once, resolves/caches the contact's
+                # timezone, and stamps ``scheduled_send_at``; the delay is capped
+                # (max_smart_delay) so it can never stall a sequence, and the
+                # warm-up/danger-pause guards above always take precedence.
+                if contact is not None:
+                    optimizer = get_send_time_optimizer()
+                    if await optimizer.should_defer(db, enrollment, contact, now, due_at):
+                        scheduled_smart += 1
+                        logger.debug(
+                            "Enrollment %s held for optimal window (scheduled %s)",
+                            enrollment.id, enrollment.scheduled_send_at,
+                        )
+                        continue
+
                 # Dispatch the send
                 send_sequence_step.delay(str(enrollment.id))
                 dispatched += 1
@@ -698,6 +720,7 @@ def process_outreach_queue():
                 "active_enrollments": len(enrollments),
                 "dispatched": dispatched,
                 "skipped_outside_window": skipped_window,
+                "held_for_optimal_window": scheduled_smart,
             }
 
     try:

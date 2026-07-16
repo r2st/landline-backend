@@ -50,6 +50,7 @@ celery_app.conf.update(
         "app.tasks.voice.*": {"queue": "enrichment"},
         "app.tasks.replies.*": {"queue": "enrichment"},
         "app.tasks.ab_testing.*": {"queue": "enrichment"},
+        "app.tasks.send_timing.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -219,6 +220,14 @@ celery_app.conf.update(
             "task": "app.tasks.ab_testing.evaluate_ab_tests",
             "schedule": crontab(hour=4, minute=30),
         },
+        # Feature 6: nightly recompute of per-contact engagement profiles (local
+        # (dow, hour) buckets, best day/hour) + timezone backfill, feeding the
+        # per-recipient send-time scheduling done inside process_outreach_queue.
+        # 3 AM UTC — quiet hours, and ahead of the morning sending window.
+        "refresh-engagement-profiles": {
+            "task": "app.tasks.send_timing.refresh_engagement_profiles",
+            "schedule": crontab(hour=3, minute=0),
+        },
     },
 )
 
@@ -250,3 +259,4 @@ import app.tasks.rag  # noqa: F401
 import app.tasks.voice  # noqa: F401
 import app.tasks.replies  # noqa: F401
 import app.tasks.ab_testing  # noqa: F401
+import app.tasks.send_timing  # noqa: F401

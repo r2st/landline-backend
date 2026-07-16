@@ -285,6 +285,29 @@ class Settings(BaseSettings):
     # On-demand recheck cooldown (seconds) to be polite to the DNSBL zones.
     domain_health_recheck_cooldown_seconds: int = 60
 
+    # --- Feature 6: Smart Send-Time Optimization ---
+    # Master switch. When off, the send queue keeps today's naive next-window
+    # timing for every enrollment (no scheduling layer, no A/B split).
+    smart_send_timing_enabled: bool = True
+    # A contact needs at least this many prior opens before its PERSONAL pattern
+    # is trusted; below it we blend to the cohort/best-practice default. Cold
+    # lists have 0-2 opens, so the default is load-bearing.
+    smart_timing_min_opens: int = 3
+    # Hard ceiling on how far past a step's due time smart timing may defer it, so
+    # optimization can never stall a sequence. Warm-up caps + danger-pause always
+    # take precedence over this.
+    max_smart_delay_hours: int = 48
+    # Best-practice default window (recipient-local) when personal data is thin:
+    # Tue-Thu, 9-11 AM. Days are 0=Sunday..6=Saturday (matches send_timing).
+    smart_timing_default_dows: List[int] = [2, 3, 4]   # Tue, Wed, Thu
+    smart_timing_default_hour_start: int = 9            # inclusive
+    smart_timing_default_hour_end: int = 11            # exclusive
+    # Width (hours) of the window built around a recipient's personal best hour.
+    smart_timing_personal_window_hours: int = 2
+    # Fraction of newly-scheduled enrollments assigned to the 'optimized' arm; the
+    # rest are 'control' (naive timing) so the lift can be measured. 0.5 = even.
+    smart_timing_optimized_fraction: float = 0.5
+
     # 3.5 Voice Intelligence.
     voice_intelligence_enabled: bool = True
     # OpenAI key for Whisper transcription (optional — a transcript can also be
