@@ -34,6 +34,16 @@ EXCLUDED = {
     "country": "US",
     "source": "seed",
 }
+# Also review-bound, but scores below BORDERLINE: 600 employees sits outside the
+# default ICP's 50-500 band, so it loses size points BORDERLINE keeps. Two review
+# rows with *distinct* fit scores is what makes the sort assertions meaningful.
+BORDERLINE_LOWER = {
+    "name": "Woodcraft Fixtures",
+    "industry": "Woodworking",
+    "employee_count": 600,
+    "country": "US",
+    "source": "seed",
+}
 
 
 async def test_learn_icp_defaults(db_session):
@@ -141,6 +151,92 @@ async def test_prospecting_api_flow(client):
     assert r.status_code == 200
     assert r.json()["status"] == "enrolled"
     assert r.json()["reviewed_by"] == "jane"
+
+
+async def test_review_queue_exposes_sourced_context(client):
+    """The queue carries what a reviewer needs to actually decide.
+
+    Name + score alone can't be judged: `raw_data` is the sourced record (for a
+    Places candidate, `industry` is the search query that surfaced it), and
+    `has_email` says whether there's anyone to enrol.
+    """
+    r = await client.post("/api/v1/prospecting/run", json={"seed_candidates": [BORDERLINE]})
+    assert r.status_code == 200, r.text
+
+    r = await client.get("/api/v1/prospecting/review-queue")
+    assert r.status_code == 200, r.text
+    queue = r.json()
+    assert len(queue) == 1
+    cand = queue[0]
+    assert cand["raw_data"]["industry"] == "Woodworking"
+    assert cand["raw_data"]["country"] == "US"
+    assert cand["raw_data"]["employee_count"] == 150
+    # Seeded with no contact → nobody to email yet.
+    assert cand["has_email"] is False
+
+    r = await client.post("/api/v1/contacts/", json={
+        "company_id": cand["company_id"],
+        "first_name": "Dale",
+        "last_name": "Reed",
+        "email": "dale@woodcraft.example",
+    })
+    assert r.status_code == 201, r.text
+
+    r = await client.get("/api/v1/prospecting/review-queue")
+    assert r.json()[0]["has_email"] is True
+
+
+async def test_review_queue_filters_by_status(client):
+    """One run produces all three dispositions; each is reachable by status."""
+    r = await client.post(
+        "/api/v1/prospecting/run", json={"seed_candidates": [STRONG, BORDERLINE, EXCLUDED]}
+    )
+    assert r.status_code == 200, r.text
+
+    # Default stays the pending queue — the borderline one.
+    r = await client.get("/api/v1/prospecting/review-queue")
+    assert [c["company_name"] for c in r.json()] == ["Woodcraft Interiors"]
+
+    # Approved candidates land in 'enrolled', not 'approved'.
+    r = await client.get("/api/v1/prospecting/review-queue", params={"status": "enrolled"})
+    assert r.status_code == 200, r.text
+    assert [c["company_name"] for c in r.json()] == ["Precision Stamping Corp"]
+
+    r = await client.get("/api/v1/prospecting/review-queue", params={"status": "rejected"})
+    assert r.status_code == 200, r.text
+    assert [c["company_name"] for c in r.json()] == ["MegaCorp Global"]
+
+    r = await client.get("/api/v1/prospecting/review-queue", params={"status": "bogus"})
+    assert r.status_code == 422
+
+
+async def test_review_queue_sorting(client):
+    r = await client.post(
+        "/api/v1/prospecting/run", json={"seed_candidates": [BORDERLINE, BORDERLINE_LOWER]}
+    )
+    assert r.status_code == 200, r.text
+
+    r = await client.get("/api/v1/prospecting/review-queue")
+    assert r.status_code == 200, r.text
+    desc_scores = [c["fit_score"] for c in r.json()]
+    assert len(desc_scores) == 2
+    assert desc_scores == sorted(desc_scores, reverse=True)
+
+    r = await client.get("/api/v1/prospecting/review-queue", params={"order": "asc"})
+    assert [c["fit_score"] for c in r.json()] == sorted(desc_scores)
+
+    # Date sort is a different ranking key, not a different result set.
+    r = await client.get(
+        "/api/v1/prospecting/review-queue", params={"sort": "created_at", "order": "desc"}
+    )
+    assert r.status_code == 200, r.text
+    assert sorted(c["company_name"] for c in r.json()) == [
+        "Woodcraft Fixtures",
+        "Woodcraft Interiors",
+    ]
+
+    r = await client.get("/api/v1/prospecting/review-queue", params={"sort": "bogus"})
+    assert r.status_code == 422
 
 
 async def test_icp_api(client):

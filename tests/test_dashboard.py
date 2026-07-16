@@ -64,6 +64,66 @@ async def test_top_leads_after_scoring(client):
 
 
 @pytest.mark.asyncio
+async def test_top_leads_uses_icp_fit_for_prospected_companies(client):
+    """An autonomously-sourced company ranks on its ICP fit, not on nothing.
+
+    These never get a `lead_scores` row, so ranking on the rule-based score
+    alone reported them as score=null and sorted them last — the newly-found
+    leads were the ones the widget couldn't show.
+    """
+    resp = await client.post("/api/v1/prospecting/run", json={
+        "seed_candidates": [{
+            "name": "Precision Stamping Corp",
+            "domain": "precisionstamp.com",
+            "industry": "Metal Stamping",
+            "employee_count": 150,
+            "country": "US",
+            "source": "seed",
+        }],
+    })
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get("/api/v1/dashboard/top-leads")
+    assert resp.status_code == 200, resp.text
+    match = [l for l in resp.json() if l["name"] == "Precision Stamping Corp"]
+    assert len(match) == 1
+    assert match[0]["score_type"] == "icp"
+    assert match[0]["score"] is not None and match[0]["score"] > 0
+
+
+@pytest.mark.asyncio
+async def test_top_leads_ranks_icp_and_rule_scored_together(client):
+    """Both scorers feed one ranking, and each lead says which produced it."""
+    await _make_company(client, name="Hand Scored Co")
+    resp = await client.post("/api/v1/leads/score", json={
+        "company_id": (await client.get("/api/v1/companies/")).json()["items"][0]["id"],
+    })
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.post("/api/v1/prospecting/run", json={
+        "seed_candidates": [{
+            "name": "Precision Stamping Corp",
+            "domain": "precisionstamp.com",
+            "industry": "Metal Stamping",
+            "employee_count": 150,
+            "country": "US",
+            "source": "seed",
+        }],
+    })
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get("/api/v1/dashboard/top-leads", params={"limit": 50})
+    assert resp.status_code == 200, resp.text
+    leads = resp.json()
+    by_name = {l["name"]: l for l in leads}
+    assert by_name["Precision Stamping Corp"]["score_type"] == "icp"
+    assert by_name["Hand Scored Co"]["score_type"] == "rule_based"
+    # Ranked on the effective score regardless of which scorer produced it.
+    scores = [l["score"] for l in leads if l["score"] is not None]
+    assert scores == sorted(scores, reverse=True)
+
+
+@pytest.mark.asyncio
 async def test_industry_breakdown_endpoint(client):
     await _make_company(client, name="A Co", industry="Injection Molding")
     await _make_company(client, name="B Co", industry="Injection Molding")

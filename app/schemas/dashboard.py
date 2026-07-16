@@ -76,6 +76,10 @@ class TopLead(BaseModel):
     stage: str
     score: Optional[int] = None
     industry: Optional[str] = None
+    # Which scorer produced `score`: "icp" (fit against the learned ICP, from
+    # the prospecting run that surfaced the company) or "rule_based". Callers
+    # shouldn't have to guess whether a 68 and an 85 are the same measurement.
+    score_type: Optional[str] = None
 
 
 class EmailTrendPoint(BaseModel):

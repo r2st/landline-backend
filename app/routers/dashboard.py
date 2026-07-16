@@ -13,6 +13,7 @@ from app.models.contact import Contact
 from app.models.deal import Deal
 from app.models.lead_score import LeadScore
 from app.models.outreach import OutreachEvent
+from app.models.prospecting import ProspectCandidate
 from app.models.task import Task
 from app.models.email_template import EmailSend
 from app.schemas.dashboard import (
@@ -320,7 +321,15 @@ async def get_top_leads(
     limit: int = Query(5, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the highest-scoring companies (by latest rule-based fit score)."""
+    """The highest-scoring companies, by ICP fit where we have one.
+
+    Ranked on the ICP fit score from the prospecting run that surfaced the
+    company, falling back to the rule-based score. Rule-based alone hid every
+    autonomously-sourced lead: Places/Apollo candidates are scored against the
+    learned ICP and never get a `lead_scores` row, so they ranked NULL and
+    `nullslast` parked them behind every hand-scored company — the leads the
+    prospector just found were the ones you couldn't see.
+    """
     latest_score = (
         select(
             LeadScore.company_id,
@@ -330,14 +339,27 @@ async def get_top_leads(
         .group_by(LeadScore.company_id)
         .subquery()
     )
+    # The newest candidate row per company: a company re-surfaced by a later run
+    # is re-scored against the ICP as it stands now, and that verdict supersedes.
+    latest_candidate = (
+        select(
+            ProspectCandidate.company_id,
+            func.max(ProspectCandidate.created_at).label("max_created_at"),
+        )
+        .where(ProspectCandidate.company_id.isnot(None))
+        .group_by(ProspectCandidate.company_id)
+        .subquery()
+    )
 
+    effective_score = func.coalesce(ProspectCandidate.fit_score, LeadScore.fit_score)
     query = (
         select(
             Company.id,
             Company.name,
             Company.stage,
             Company.industry_segment,
-            LeadScore.fit_score,
+            LeadScore.fit_score.label("rule_score"),
+            ProspectCandidate.fit_score.label("icp_score"),
         )
         .outerjoin(latest_score, Company.id == latest_score.c.company_id)
         .outerjoin(
@@ -348,7 +370,15 @@ async def get_top_leads(
                 LeadScore.score_type == "rule_based",
             ),
         )
-        .order_by(LeadScore.fit_score.desc().nullslast())
+        .outerjoin(latest_candidate, Company.id == latest_candidate.c.company_id)
+        .outerjoin(
+            ProspectCandidate,
+            and_(
+                ProspectCandidate.company_id == Company.id,
+                ProspectCandidate.created_at == latest_candidate.c.max_created_at,
+            ),
+        )
+        .order_by(effective_score.desc().nullslast())
         .limit(limit)
     )
     result = await db.execute(query)
@@ -357,8 +387,13 @@ async def get_top_leads(
             id=r.id,
             name=r.name,
             stage=r.stage,
-            score=r.fit_score,
+            score=r.icp_score if r.icp_score is not None else r.rule_score,
             industry=r.industry_segment,
+            score_type=(
+                "icp"
+                if r.icp_score is not None
+                else ("rule_based" if r.rule_score is not None else None)
+            ),
         )
         for r in result.all()
     ]

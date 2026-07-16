@@ -16,7 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.company import Company
-from app.models.prospecting import IcpProfile, ProspectCandidate, ProspectingRun
+from app.models.contact import Contact
+from app.models.prospecting import (
+    CANDIDATE_STATUSES,
+    IcpProfile,
+    ProspectCandidate,
+    ProspectingRun,
+)
 from app.services import api_credits
 from app.services.autonomous_prospector import get_prospector
 
@@ -77,9 +83,55 @@ class CandidateRead(BaseModel):
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     created_at: datetime
+    # The normalized source record behind this candidate: industry (for Places,
+    # the search query that surfaced it), city/state/country, employee_count.
+    # A reviewer can't judge a company from a name and a number alone.
+    raw_data: dict = {}
+    # Whether the candidate's company has anyone to email. Derived rather than
+    # stored: `raw_data` carries no email (Places attaches it to the contact,
+    # not the company dict), and this answers the question a reviewer is really
+    # asking — is there someone to enrol?
+    has_email: bool = False
 
     class Config:
         from_attributes = True
+
+
+async def _emailable_company_ids(
+    db: AsyncSession, candidates: list[ProspectCandidate]
+) -> set[uuid.UUID]:
+    """Which of these candidates' companies have at least one emailable contact.
+
+    One grouped lookup for the whole page rather than a query per row.
+    """
+    ids = {c.company_id for c in candidates if c.company_id is not None}
+    if not ids:
+        return set()
+    rows = (
+        await db.execute(
+            select(Contact.company_id)
+            .where(
+                Contact.company_id.in_(ids),
+                Contact.email.isnot(None),
+                Contact.email != "",
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    return set(rows)
+
+
+async def _to_reads(
+    db: AsyncSession, candidates: list[ProspectCandidate]
+) -> list[CandidateRead]:
+    """Serialize candidates with `has_email` resolved for the whole batch."""
+    emailable = await _emailable_company_ids(db, candidates)
+    return [
+        CandidateRead.model_validate(c).model_copy(
+            update={"has_email": c.company_id in emailable}
+        )
+        for c in candidates
+    ]
 
 
 class MergeCandidateRequest(BaseModel):
@@ -150,24 +202,42 @@ async def run_candidates(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
             .order_by(desc(ProspectCandidate.fit_score))
         )
     ).scalars().all()
-    return list(rows)
+    return await _to_reads(db, list(rows))
 
 
 @router.get("/review-queue", response_model=list[CandidateRead])
 async def review_queue(
     limit: int = Query(100, ge=1, le=500),
+    status: str = Query(
+        "review",
+        description="Candidate disposition to list. 'review' (the default) is "
+        "the pending queue; 'enrolled' is what a reviewer approved.",
+    ),
+    sort: str = Query("fit_score", pattern="^(fit_score|created_at)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Borderline candidates awaiting a human decision, best fit first."""
+    """Candidates by disposition — by default the ones awaiting a decision.
+
+    Sorting is applied here rather than in the client because `limit` truncates:
+    sorting a fit-score-ordered page by date client-side would only ever reorder
+    the top `limit` by fit, which is not the newest `limit`.
+    """
+    if status not in CANDIDATE_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {', '.join(CANDIDATE_STATUSES)}",
+        )
+    column = ProspectCandidate.fit_score if sort == "fit_score" else ProspectCandidate.created_at
     rows = (
         await db.execute(
             select(ProspectCandidate)
-            .where(ProspectCandidate.status == "review")
-            .order_by(desc(ProspectCandidate.fit_score))
+            .where(ProspectCandidate.status == status)
+            .order_by(desc(column) if order == "desc" else column)
             .limit(limit)
         )
     ).scalars().all()
-    return list(rows)
+    return await _to_reads(db, list(rows))
 
 
 @router.post("/candidates/{candidate_id}/approve", response_model=CandidateRead)
@@ -193,7 +263,7 @@ async def approve_candidate(
     cand.reviewed_by = reviewer
     cand.reviewed_at = datetime.now(timezone.utc)
     await db.flush()
-    return cand
+    return (await _to_reads(db, [cand]))[0]
 
 
 @router.post("/candidates/{candidate_id}/reject", response_model=CandidateRead)
@@ -211,7 +281,7 @@ async def reject_candidate(
     cand.reviewed_by = reviewer
     cand.reviewed_at = datetime.now(timezone.utc)
     await db.flush()
-    return cand
+    return (await _to_reads(db, [cand]))[0]
 
 
 @router.get("/candidates/duplicates", response_model=list[CandidateRead])
@@ -236,7 +306,7 @@ async def duplicate_candidates(
             .limit(limit)
         )
     ).scalars().all()
-    return list(rows)
+    return await _to_reads(db, list(rows))
 
 
 @router.post("/candidates/{candidate_id}/merge", response_model=CandidateRead)
@@ -268,7 +338,7 @@ async def merge_candidate(
     cand.reviewed_by = reviewer
     cand.reviewed_at = datetime.now(timezone.utc)
     await db.flush()
-    return cand
+    return (await _to_reads(db, [cand]))[0]
 
 
 @router.get("/credits")
