@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from sqlalchemy import func, or_, select, union_all
@@ -208,6 +209,10 @@ class EmailHistoryService:
 
             await db.commit()
 
+        except RefreshError:
+            # Revoked/invalid refresh token (invalid_grant). Don't swallow it —
+            # let sync_all_accounts self-heal by deactivating the account.
+            raise
         except Exception as e:
             logger.error("Gmail sync error for %s: %s", account.email, str(e))
             errors += 1
@@ -228,16 +233,38 @@ class EmailHistoryService:
         total_synced = 0
         total_errors = 0
 
+        deactivated = 0
+
         for account in accounts:
             try:
                 r = await self.sync_replies_for_account(db, account)
                 total_synced += r["synced"]
                 total_errors += r["errors"]
+            except RefreshError as e:
+                # Self-heal: the OAuth refresh token has been revoked
+                # (invalid_grant), so this account can never sync again until
+                # it is re-connected. Flip its status to "revoked" so the
+                # connected-account filter above stops polling it — this ends
+                # the recurring error-log noise every 5 minutes. Warn (not
+                # error): this is an expected, handled condition. Then keep
+                # syncing the remaining accounts.
+                account.status = "revoked"
+                await db.commit()
+                deactivated += 1
+                logger.warning(
+                    "Gmail account %s auto-deactivated (status=revoked): "
+                    "OAuth token revoked / invalid_grant (%s)",
+                    account.email, str(e),
+                )
             except Exception as e:
                 logger.error("Failed to sync replies for %s: %s", account.email, str(e))
                 total_errors += 1
 
-        return {"synced": total_synced, "errors": total_errors}
+        return {
+            "synced": total_synced,
+            "errors": total_errors,
+            "deactivated": deactivated,
+        }
 
     # ------------------------------------------------------------------
     # Body extraction from Gmail API payload

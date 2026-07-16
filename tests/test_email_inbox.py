@@ -720,3 +720,115 @@ class TestPagination:
 
         page3 = await service.get_inbox(db_session, page=3, per_page=2)
         assert len(page3["threads"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Reply-sync self-healing on revoked OAuth tokens
+# ---------------------------------------------------------------------------
+
+class _FakeGmailExecute:
+    """Terminal ``.execute()`` node of the fake Gmail fluent chain."""
+
+    def __init__(self, result=None, raise_exc=None):
+        self._result = result
+        self._raise = raise_exc
+
+    def execute(self):
+        if self._raise is not None:
+            raise self._raise
+        return self._result
+
+
+class _FakeGmailMessages:
+    def __init__(self, list_exc=None):
+        self._list_exc = list_exc
+
+    def list(self, **kwargs):
+        # The token refresh is triggered on the first real API call.
+        return _FakeGmailExecute(result={"messages": []}, raise_exc=self._list_exc)
+
+
+class _FakeGmailUsers:
+    def __init__(self, list_exc=None):
+        self._messages = _FakeGmailMessages(list_exc=list_exc)
+
+    def messages(self):
+        return self._messages
+
+
+class _FakeGmailService:
+    """Minimal stand-in for the googleapiclient Gmail resource."""
+
+    def __init__(self, list_exc=None):
+        self._users = _FakeGmailUsers(list_exc=list_exc)
+
+    def users(self):
+        return self._users
+
+
+class TestReplySyncSelfHealing:
+    """sync_all_accounts must self-heal when an account's OAuth token is revoked."""
+
+    async def test_revoked_token_deactivates_account_and_continues(
+        self, db_session, monkeypatch
+    ):
+        """A RefreshError (invalid_grant) flips the account to 'revoked',
+        logs a warning, and does not stop the other accounts from syncing."""
+        from google.auth.exceptions import RefreshError
+
+        revoked = await _make_gmail_account(db_session, "suman.onenet@gmail.com")
+        healthy = await _make_gmail_account(db_session, "good@company.com")
+        await db_session.commit()
+
+        def _fake_build_service(self, account):
+            if account.email == "suman.onenet@gmail.com":
+                return _FakeGmailService(
+                    list_exc=RefreshError("invalid_grant: Token has been expired or revoked.")
+                )
+            return _FakeGmailService()
+
+        monkeypatch.setattr(
+            EmailHistoryService, "_build_gmail_service", _fake_build_service
+        )
+
+        service = EmailHistoryService()
+        result = await service.sync_all_accounts(db_session)
+
+        # The revoked account was auto-deactivated; the batch did not crash.
+        assert result["deactivated"] == 1
+
+        await db_session.refresh(revoked)
+        await db_session.refresh(healthy)
+        assert revoked.status == "revoked"
+        # The healthy account is untouched and still connected.
+        assert healthy.status == "connected"
+
+    async def test_revoked_account_dropped_from_next_poll(
+        self, db_session, monkeypatch
+    ):
+        """Once flipped to 'revoked', the account no longer matches the
+        connected-only query, so it stops being polled entirely."""
+        from google.auth.exceptions import RefreshError
+
+        await _make_gmail_account(db_session, "suman.onenet@gmail.com")
+        await db_session.commit()
+
+        polled: list[str] = []
+
+        def _fake_build_service(self, account):
+            polled.append(account.email)
+            return _FakeGmailService(
+                list_exc=RefreshError("invalid_grant: Token has been expired or revoked.")
+            )
+
+        monkeypatch.setattr(
+            EmailHistoryService, "_build_gmail_service", _fake_build_service
+        )
+
+        service = EmailHistoryService()
+        # First run trips the RefreshError and deactivates the account.
+        await service.sync_all_accounts(db_session)
+        # Second run: the account is 'revoked', so it must not be polled again.
+        await service.sync_all_accounts(db_session)
+
+        assert polled == ["suman.onenet@gmail.com"]
