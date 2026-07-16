@@ -6,13 +6,19 @@ deliverability, so the Domain Health Dashboard (Feature 5) checks the relevant
 zones daily.
 
 **How a DNSBL query works:** you look up an ``A`` record for a synthesized name
-and interpret the *presence* of an answer as "listed":
+and decode the address it answers with:
 
 * **IP-based** zones (``zen.spamhaus.org``, …): reverse the IP octets and prefix
-  the zone — ``4.3.2.1.zen.spamhaus.org``. An ``A`` answer (typically
-  ``127.0.0.x``) means *listed*; ``NXDOMAIN`` means *not listed*.
+  the zone — ``4.3.2.1.zen.spamhaus.org``. A ``127.0.0.x`` answer means *listed*;
+  ``NXDOMAIN`` means *not listed*.
 * **Domain-based** zones (``dbl.spamhaus.org``): prefix the domain itself —
-  ``apprend.tech.dbl.spamhaus.org``. Same answer semantics.
+  ``apprend.tech.dbl.spamhaus.org``. A ``127.0.1.x`` answer means *listed*.
+
+**Not every answer is a listing.** Spamhaus answers in ``127.255.255.0/24`` to
+report a problem with the *query* — most importantly ``127.255.255.254``, "you
+asked via a public/open resolver, so I won't serve you data". Those are decoded
+by ``is_dnsbl_error_code`` and reported as ``unknown``; treating them as
+listings false-flags every domain checked (it did — see git history).
 
 **Fail-open, exactly like ``domain_auth._txt_records``:** a missing
 ``dnspython``, a timeout, or any resolver error yields ``status="unknown"`` for
@@ -39,6 +45,29 @@ logger = logging.getLogger(__name__)
 
 # Kept short so a slow/absent DNS server can't hang the daily task.
 _DNS_TIMEOUT = 5.0
+
+# DNSBL answers that encode a *query error* rather than a listing. Spamhaus (and
+# zones following its conventions) answer in 127.255.255.0/24 when it will not
+# serve the query at all:
+#
+#   127.255.255.252  typo'd DNSBL name
+#   127.255.255.254  query arrived via a public/open resolver — refused, no data
+#   127.255.255.255  excessive queries — refused
+#
+# plus the DBL-specific 127.0.1.255 ("IP queries prohibited" — DBL is domain-only).
+# These mean *we learned nothing*, so they map to ``unknown``, never ``listed``.
+#
+# NB: 127.0.0.10 and 127.0.0.11 are **real PBL listings** (ISP-maintained and
+# Spamhaus-maintained), not error codes — deliberately not listed here. Genuine
+# listings live in 127.0.0.x (ZEN: SBL/CSS/XBL/DROP/PBL) and 127.0.1.x (DBL).
+_DNSBL_ERROR_PREFIX = "127.255.255."
+_DNSBL_ERROR_CODES = frozenset({"127.0.1.255"})
+
+
+def is_dnsbl_error_code(answer: str) -> bool:
+    """True when an ``A`` answer is a DNSBL error code rather than a listing."""
+    a = (answer or "").strip()
+    return a.startswith(_DNSBL_ERROR_PREFIX) or a in _DNSBL_ERROR_CODES
 
 
 def _a_records(name: str) -> tuple[list[str], Optional[str]]:
@@ -105,13 +134,20 @@ def _query_zone(query_name: str, zone: str) -> dict:
 
     Returns ``{listed, status, answers, issue}`` where ``status`` is
     ``ok`` (resolved, not listed), ``listed`` (resolved, listed), or ``unknown``
-    (lookup failed).
+    (lookup failed, or the zone refused to answer — see ``is_dnsbl_error_code``).
     """
     answers, err = _a_records(f"{query_name}.{zone}")
     if err:
         return {"listed": False, "status": "unknown", "answers": [], "issue": err}
+    listings = [a for a in answers if not is_dnsbl_error_code(a)]
+    if listings:
+        return {"listed": True, "status": "listed", "answers": listings, "issue": None}
     if answers:
-        return {"listed": True, "status": "listed", "answers": answers, "issue": None}
+        # Every answer was an error code: the zone declined to tell us anything,
+        # which is *not* evidence of being clean — stay unknown so the component
+        # drops out of the score denominator instead of scoring a false 0.
+        return {"listed": False, "status": "unknown", "answers": answers,
+                "issue": f"dnsbl_error:{answers[0]}"}
     return {"listed": False, "status": "ok", "answers": [], "issue": None}
 
 

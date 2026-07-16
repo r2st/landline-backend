@@ -230,6 +230,134 @@ def test_check_blacklists_all_unknown(monkeypatch):
     assert r["status"] == "unknown"
 
 
+# ─── DNSBL error codes vs real listings ──────────────────────────────────────
+# Spamhaus answers in 127.255.255.0/24 to refuse a query (e.g. .254 = "you asked
+# via a public resolver"). Reading those as listings flagged every domain as
+# blacklisted and cost 30 points of health score.
+
+def test_error_code_is_not_a_listing(monkeypatch):
+    """127.255.255.254 (public-resolver refusal) must not read as listed."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "acme.com.dbl.spamhaus.org": (["127.255.255.254"], None),
+    }))
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org")
+    assert r["listed"] is False
+    assert r["status"] == "unknown"  # refused ≠ clean; must not score as either
+    assert r["issue"] == "dnsbl_error:127.255.255.254"
+
+
+@pytest.mark.parametrize("code", [
+    "127.255.255.252",  # typo'd DNSBL name
+    "127.255.255.254",  # query via public/open resolver
+    "127.255.255.255",  # excessive queries
+    "127.0.1.255",      # DBL: IP queries prohibited
+])
+def test_all_error_codes_are_not_listings(monkeypatch, code):
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "acme.com.dbl.spamhaus.org": ([code], None),
+    }))
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org")
+    assert r["listed"] is False and r["status"] == "unknown"
+
+
+@pytest.mark.parametrize("code,what", [
+    ("127.0.0.2", "SBL"),
+    ("127.0.0.3", "CSS"),
+    ("127.0.0.4", "XBL/CBL"),
+    ("127.0.0.9", "DROP"),
+    ("127.0.0.10", "PBL ISP-maintained"),      # a real listing, NOT an error code
+    ("127.0.0.11", "PBL Spamhaus-maintained"),
+])
+def test_real_listing_codes_still_count(monkeypatch, code, what):
+    """Genuine 127.0.0.x listings must survive the error-code filter."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "4.3.2.1.zen.spamhaus.org": ([code], None),
+    }))
+    r = blacklist_check.check_ip_blacklist("1.2.3.4", "zen.spamhaus.org")
+    assert r["listed"] is True, f"{code} ({what}) must still read as listed"
+    assert r["status"] == "listed"
+
+
+def test_real_dbl_listing_still_counts(monkeypatch):
+    """127.0.1.2 (DBL spam domain) is a listing — adjacent to error 127.0.1.255."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "acme.com.dbl.spamhaus.org": (["127.0.1.2"], None),
+    }))
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org")
+    assert r["listed"] is True and r["status"] == "listed"
+
+
+def test_real_listing_wins_over_mixed_error_code(monkeypatch):
+    """A real listing alongside an error code is still a listing."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "acme.com.dbl.spamhaus.org": (["127.255.255.254", "127.0.1.2"], None),
+    }))
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org")
+    assert r["listed"] is True
+    assert r["answers"] == ["127.0.1.2"]  # the error code is dropped
+
+
+def test_error_code_does_not_flag_domain_as_blacklisted(monkeypatch):
+    """End-to-end: the exact prod failure — refusal on the only meaningful zone."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "apprend.tech.dbl.spamhaus.org": (["127.255.255.254"], None),
+    }))
+    r = blacklist_check.check_blacklists(
+        "apprend.tech", domain_zones=["dbl.spamhaus.org"], ip_zones=[],
+    )
+    assert r["listed_meaningful"] == []
+    assert r["any_listed_meaningful"] is False
+    assert r["status"] == "unknown"
+
+
+def test_error_code_does_not_cost_blacklist_points(monkeypatch):
+    """A refused zone drops out of the denominator rather than scoring 0/30."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "apprend.tech.dbl.spamhaus.org": (["127.255.255.254"], None),
+    }))
+    bl = blacklist_check.check_blacklists(
+        "apprend.tech", domain_zones=["dbl.spamhaus.org"], ip_zones=[],
+    )
+    c = get_domain_health_checker()
+    r = c.compute_score(_spf(), _dkim(), _dmarc(), bl)
+    # Pre-fix this scored 68/at_risk (blacklists forced to 0/30). Now blacklists
+    # are excluded as unverifiable and the verified components carry the score.
+    assert r["coverage"]["components"]["blacklists"]["verified"] is False
+    assert r["coverage"]["denominator"] == 65  # 20+20+25, blacklists(30) excluded
+    assert r["health_score"] == 100
+    assert r["band"] == "healthy"
+
+
+def test_clean_domain_gets_full_blacklist_points(monkeypatch):
+    """A genuine NXDOMAIN (nothing listed) still earns the full 30 points."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({}))  # NXDOMAIN
+    bl = blacklist_check.check_blacklists(
+        "clean.com", domain_zones=["dbl.spamhaus.org"], ip_zones=[],
+    )
+    assert bl["status"] == "ok"
+    c = get_domain_health_checker()
+    r = c.compute_score(_spf(), _dkim(), _dmarc(), bl)
+    assert r["coverage"]["components"]["blacklists"]["verified"] is True
+    assert r["coverage"]["components"]["blacklists"]["fraction"] == 1.0
+    assert r["coverage"]["denominator"] == 95  # blacklists counted in full
+    assert r["health_score"] == 100 and r["band"] == "healthy"
+
+
+def test_real_listing_still_costs_points(monkeypatch):
+    """The filter must not defang a genuine listing: still 0/30 and at_risk."""
+    monkeypatch.setattr(blacklist_check, "_a_records", _fake_a({
+        "bad.com.dbl.spamhaus.org": (["127.0.1.2"], None),  # real DBL spam listing
+    }))
+    bl = blacklist_check.check_blacklists(
+        "bad.com", domain_zones=["dbl.spamhaus.org"], ip_zones=[],
+    )
+    assert bl["listed_meaningful"] == ["dbl.spamhaus.org"]
+    c = get_domain_health_checker()
+    r = c.compute_score(_spf(), _dkim(), _dmarc(), bl)
+    assert r["coverage"]["components"]["blacklists"]["fraction"] == 0.0
+    assert r["health_score"] == 68 and r["band"] == "at_risk"
+
+
 # ─── change-only alerting ────────────────────────────────────────────────────
 
 class _FakeNotifier:
