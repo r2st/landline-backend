@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # Claude API
     anthropic_api_key: str = ""
 
+    # --- AI provider selection ---
+    # Which LLM backend AIService uses. "auto" (default) picks OpenRouter when an
+    # OPENROUTER_API_KEY is set, else Anthropic — so setting the key is enough to
+    # fail over when Anthropic credits are depleted. Force a backend with
+    # AI_PROVIDER=anthropic or AI_PROVIDER=openrouter.
+    ai_provider: str = "auto"
+    # OpenRouter (OpenAI-compatible) — a drop-in fallback that can serve free-tier
+    # models. Base URL is the OpenAI-compatible endpoint; the default model is a
+    # free-tier model so scoring keeps working at zero cost.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
+
     # Apollo.io
     apollo_api_key: str = ""
     apollo_base_url: str = "https://api.apollo.io/v1"

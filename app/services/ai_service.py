@@ -1,27 +1,143 @@
-"""AI service using Anthropic Claude for intelligent email and lead decisions."""
+"""AI service for intelligent email and lead decisions.
+
+Supports two backends behind one interface:
+
+* **anthropic** — Claude via the Anthropic Messages API (the historical default).
+* **openrouter** — any model served through OpenRouter's OpenAI-compatible
+  ``/chat/completions`` endpoint, including free-tier models. Used as a drop-in
+  when the Anthropic account runs out of credits.
+
+The backend is chosen in :meth:`__init__` from settings (see
+``ai_provider`` / ``openrouter_api_key`` in :mod:`app.config`). All the public
+methods build the same prompts regardless of backend and route the actual call
+through :meth:`_chat` / :meth:`_chat_completion`, which normalise the request
+and response shapes so the rest of the code never sees the difference.
+"""
 
 import logging
 import json
 from typing import Optional
 
 import anthropic
+import httpx
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class AIService:
-    """Uses Claude to make intelligent decisions about outreach and leads.
+    """Makes intelligent decisions about outreach and leads via an LLM backend.
 
-    Uses AsyncAnthropic so that calls do not block the FastAPI event loop.
-    Celery tasks call these via _run_async() wrappers which create a new
-    event loop, so the await is resolved there too.
+    Anthropic calls use AsyncAnthropic; OpenRouter calls use httpx directly
+    against the OpenAI-compatible endpoint. Both are async so they do not block
+    the FastAPI event loop. Celery tasks call these via _run_async() wrappers
+    which create a new event loop, so the await is resolved there too.
     """
 
     def __init__(self):
         settings = get_settings()
-        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self.model = "claude-sonnet-4-6"
+
+        # Resolve the backend. "auto" prefers OpenRouter when a key is present
+        # (e.g. Anthropic credits depleted) and otherwise stays on Anthropic.
+        provider = (getattr(settings, "ai_provider", "auto") or "auto").lower()
+        if provider == "auto":
+            provider = "openrouter" if settings.openrouter_api_key else "anthropic"
+        self.provider = provider
+
+        if self.provider == "openrouter":
+            self._openrouter_key = settings.openrouter_api_key
+            self._openrouter_base = settings.openrouter_base_url.rstrip("/")
+            self.model = settings.openrouter_model
+            # AsyncAnthropic is still constructed lazily-free (no network) so any
+            # stray direct references don't explode; it is simply never called.
+            self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key or "unused")
+            logger.info("AIService using OpenRouter backend, model=%s", self.model)
+        else:
+            self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            self.model = "claude-sonnet-4-6"
+            logger.info("AIService using Anthropic backend, model=%s", self.model)
+
+    # ------------------------------------------------------------------
+    # Backend transport
+    # ------------------------------------------------------------------
+    async def _chat_completion(
+        self,
+        messages: list,
+        max_tokens: int = 1024,
+        temperature: float | None = None,
+    ) -> str:
+        """Send chat ``messages`` to the active backend and return the reply text.
+
+        ``messages`` use the Anthropic/OpenAI-common shape
+        ``[{"role": "user", "content": <str | list-of-blocks>}]``. For the
+        OpenRouter backend, Anthropic-style image blocks are translated to the
+        OpenAI ``image_url`` form. Raises on transport/HTTP errors so callers
+        keep their existing try/except degradation.
+        """
+        if self.provider == "openrouter":
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "messages": [self._to_openai_message(m) for m in messages],
+            }
+            if temperature is not None:
+                payload["temperature"] = temperature
+            headers = {
+                "Authorization": f"Bearer {self._openrouter_key}",
+                "Content-Type": "application/json",
+                # Optional attribution headers OpenRouter recommends.
+                "HTTP-Referer": "https://apprend.tech",
+                "X-Title": "Landline",
+            }
+            async with httpx.AsyncClient(timeout=60.0) as http:
+                resp = await http.post(
+                    f"{self._openrouter_base}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            return data["choices"][0]["message"]["content"] or ""
+
+        # Anthropic backend.
+        kwargs = {"model": self.model, "max_tokens": max_tokens, "messages": messages}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        message = await self.client.messages.create(**kwargs)
+        return message.content[0].text
+
+    @staticmethod
+    def _to_openai_message(message: dict) -> dict:
+        """Translate one Anthropic-shaped message to OpenAI chat format.
+
+        Plain string content passes through unchanged. A list of content blocks
+        (used by the vision card-scanner) has its ``image``/``text`` blocks
+        rewritten to the OpenAI ``image_url``/``text`` block form.
+        """
+        content = message.get("content")
+        if not isinstance(content, list):
+            return {"role": message.get("role", "user"), "content": content}
+
+        blocks = []
+        for block in content:
+            btype = block.get("type")
+            if btype == "text":
+                blocks.append({"type": "text", "text": block.get("text", "")})
+            elif btype == "image":
+                source = block.get("source", {})
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{data}"},
+                })
+        return {"role": message.get("role", "user"), "content": blocks}
+
+    async def _chat(self, prompt: str, max_tokens: int = 1024, temperature: float | None = None) -> str:
+        """Convenience wrapper: send a single user-text prompt, return reply text."""
+        return await self._chat_completion(
+            [{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature
+        )
 
     def _parse_json_response(self, response_text: str) -> dict:
         """Parse JSON from Claude response, handling markdown code blocks and
@@ -61,12 +177,7 @@ class AIService:
         """
         response_text = ""
         try:
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            response_text = message.content[0].text
+            response_text = await self._chat(prompt, max_tokens=max_tokens)
             return self._parse_json_response(response_text)
         except json.JSONDecodeError as e:
             logger.error("Failed to parse AI JSON response: %s", str(e))
@@ -83,12 +194,7 @@ class AIService:
         on failure so callers can degrade gracefully.
         """
         try:
-            kwargs = {"model": self.model, "max_tokens": max_tokens,
-                      "messages": [{"role": "user", "content": prompt}]}
-            if temperature is not None:
-                kwargs["temperature"] = temperature
-            message = await self.client.messages.create(**kwargs)
-            return message.content[0].text
+            return await self._chat(prompt, max_tokens=max_tokens, temperature=temperature)
         except Exception as e:
             logger.error("AI text completion failed: %s", str(e))
             return ""
@@ -111,6 +217,7 @@ class AIService:
         which the model may draw on. It is advisory context, appended after the
         per-lead ``additional_context``.
         """
+        response_text = ""
         try:
             ctx_line = ""
             if additional_context:
@@ -150,13 +257,7 @@ Body: Hey {contact_name.split()[0] if contact_name else 'there'}, saw that {comp
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "follow_up_suggestion": "..."}}"""
 
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
+            response_text = await self._chat(prompt, max_tokens=1024)
             result = self._parse_json_response(response_text)
             return {
                 "subject": result.get("subject", ""),
@@ -196,13 +297,7 @@ What to do:
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "changes_made": "..."}}"""
 
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
+            response_text = await self._chat(prompt, max_tokens=1024)
             return self._parse_json_response(response_text)
         except Exception as e:
             logger.error("AI email improvement failed: %s", str(e))
@@ -248,17 +343,37 @@ Scoring criteria:
 
 Return ONLY valid JSON: {{"score": 75, "grade": "A/B/C/D/F", "reasoning": "...", "recommended_action": "...", "priority": "high/medium/low"}}"""
 
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
-            return self._parse_json_response(response_text)
+            response_text = await self._chat(prompt, max_tokens=512)
+            result = self._parse_json_response(response_text)
+            # A parse failure or an error dict means we couldn't get a usable
+            # score — degrade gracefully rather than block the batch.
+            if not isinstance(result, dict) or "score" not in result:
+                return self._default_lead_score("AI returned no usable score")
+            return result
         except Exception as e:
-            logger.error("AI lead scoring failed: %s", str(e))
-            return {"error": str(e)}
+            # Graceful degradation: if the AI backend is unavailable (e.g. the
+            # provider is out of credits or rate-limited), assign a neutral
+            # mid-range score so the lead is still recorded and reviewable,
+            # instead of failing the whole auto-scoring batch.
+            logger.error("AI lead scoring failed, using default mid-range score: %s", str(e))
+            return self._default_lead_score(str(e))
+
+    @staticmethod
+    def _default_lead_score(reason: str) -> dict:
+        """Neutral fallback score used when AI scoring is unavailable.
+
+        Returns a valid score dict (no ``error`` key) so downstream persistence
+        treats it as a real, if provisional, score. ``degraded`` flags that a
+        human should re-score once AI is back.
+        """
+        return {
+            "score": 50,
+            "grade": "C",
+            "reasoning": f"AI scoring unavailable ({reason}); assigned a default mid-range score pending review.",
+            "recommended_action": "Re-score once AI scoring is restored, or review manually.",
+            "priority": "medium",
+            "degraded": True,
+        }
 
     async def analyze_company(self, company_data: dict) -> dict:
         """Analyze a company and suggest outreach strategy."""
@@ -288,13 +403,7 @@ Return ONLY valid JSON:
   "red_flags": ["..."]
 }}"""
 
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
+            response_text = await self._chat(prompt, max_tokens=1024)
             return self._parse_json_response(response_text)
         except Exception as e:
             logger.error("AI company analysis failed: %s", str(e))
@@ -332,13 +441,7 @@ RULES:
 
 Return ONLY valid JSON: {{"subject": "...", "body": "...", "is_final": {str(is_final).lower()}, "should_stop_sequence": {str(is_final).lower()}}}"""
 
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
+            response_text = await self._chat(prompt, max_tokens=512)
             return self._parse_json_response(response_text)
         except Exception as e:
             logger.error("AI follow-up generation failed: %s", str(e))
@@ -405,13 +508,7 @@ Return ONLY valid JSON:
 Auto-send: true ONLY for "interested" and "question". false for everything else. NEVER for "auto_reply".
 """
 
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
+            response_text = await self._chat(prompt, max_tokens=1024)
             return self._parse_json_response(response_text)
         except Exception as e:
             logger.error("AI reply analysis failed: %s", str(e))
@@ -585,11 +682,7 @@ Provide 5-8 steps."""
         on failure so the request handler can surface it cleanly.
         """
         try:
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=1536,
-                temperature=0,  # deterministic transcription, not creative writing
-                messages=[{
+            messages = [{
                     "role": "user",
                     "content": [
                         {
@@ -660,10 +753,10 @@ Confidence rules:
   factoring in image clarity, glare, blur and how much you had to guess.""",
                         },
                     ],
-                }],
-            )
+                }]
 
-            result = self._parse_json_response(message.content[0].text)
+            response_text = await self._chat_completion(messages, max_tokens=1536, temperature=0)
+            result = self._parse_json_response(response_text)
             if not isinstance(result, dict):
                 return {"error": "Failed to parse extracted data"}
             return result
