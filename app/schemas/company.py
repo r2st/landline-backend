@@ -144,6 +144,35 @@ class PipelineSummary(BaseModel):
     total: int
 
 
+class CompanyContact(BaseModel):
+    """A company's contact as shown alongside the company itself.
+
+    Deliberately narrower than ``ContactRead``: this is the "who do we reach and
+    how" summary a company list or detail header needs, not the full contact
+    record (no card image, no postal address).
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    # "First Last", or None when enrichment found an address but no name.
+    # Deliberately not the Contact.full_name property, which reports "Unknown"
+    # for a nameless contact — a literal "Unknown" rendered beside a real email
+    # reads as a data error. Null lets the UI fall back to the address.
+    full_name: Optional[str] = None
+    title: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    mobile: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    is_primary: bool = False
+    # True when this contact can never be emailed again (opt-out/suppression),
+    # so the UI can show the address without implying it is reachable.
+    unsubscribed: bool = False
+    suppressed: bool = False
+
+
 class CompanyRead(CompanyBase):
     model_config = ConfigDict(from_attributes=True)
 
@@ -157,6 +186,19 @@ class CompanyRead(CompanyBase):
     # Derived, attached by the router (not stored on the model itself).
     fit_score: Optional[int] = None
     contact_count: Optional[int] = None
+    # The contact this company is represented by in a list — resolved by
+    # app.services.company_contacts, not simply the ``is_primary`` row.
+    primary_contact: Optional[CompanyContact] = None
+
+
+class CompanyDetailRead(CompanyRead):
+    """Single-company view — adds the full contact roster, best-first.
+
+    Kept off ``CompanyRead`` so a 200-row list response can't drag every
+    company's whole roster with it (and so the field name can't collide with
+    the eagerly-loaded ``Company.contacts`` relationship during validation).
+    """
+    contacts: list[CompanyContact] = Field(default_factory=list)
 
 
 class CompanyListResponse(BaseModel):

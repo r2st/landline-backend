@@ -19,7 +19,9 @@ from app.schemas.company import (
     BulkOpResult,
     BulkTagRequest,
     BulkUpdateStageRequest,
+    CompanyContact,
     CompanyCreate,
+    CompanyDetailRead,
     CompanyListResponse,
     CompanyMergeRequest,
     CompanyMergeResponse,
@@ -27,15 +29,31 @@ from app.schemas.company import (
     CompanyStageUpdate,
     CompanyUpdate,
 )
+from app.services.company_contacts import (
+    display_name,
+    pick_primary,
+    rank_contacts,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/companies", tags=["companies"])
 
 
+def _to_company_contact(contact: Contact) -> CompanyContact:
+    """Contact row → the summary shape a company response carries."""
+    return CompanyContact.model_validate(contact).model_copy(
+        update={"full_name": display_name(contact)}
+    )
+
+
 async def _attach_extras(db: AsyncSession, companies: list[Company]) -> None:
-    """Attach derived ``fit_score`` (latest rule-based) and ``contact_count``
+    """Attach derived ``fit_score``, ``contact_count`` and ``primary_contact``
     onto company instances so they serialize into CompanyRead. Bulk-queried to
-    avoid N+1."""
+    avoid N+1.
+
+    Contacts themselves need no query here: ``Company.contacts`` is a
+    ``lazy="selectin"`` relationship, so they are already loaded.
+    """
     if not companies:
         return
     ids = [c.id for c in companies]
@@ -63,17 +81,14 @@ async def _attach_extras(db: AsyncSession, companies: list[Company]) -> None:
     )
     score_by_company = {row[0]: row[1] for row in score_rows.all()}
 
-    # Contact counts per company.
-    count_rows = await db.execute(
-        select(Contact.company_id, func.count(Contact.id))
-        .where(Contact.company_id.in_(ids))
-        .group_by(Contact.company_id)
-    )
-    count_by_company = {row[0]: row[1] for row in count_rows.all()}
-
     for c in companies:
         c.fit_score = score_by_company.get(c.id)
-        c.contact_count = count_by_company.get(c.id, 0)
+        # The count and the fronted contact come from the same rows, so the
+        # number and the name can never disagree.
+        ordered = rank_contacts(c.contacts)
+        c.contact_count = len(ordered)
+        primary = pick_primary(ordered)
+        c.primary_contact = _to_company_contact(primary) if primary else None
 
 
 @router.post("/", response_model=CompanyRead, status_code=201)
@@ -462,18 +477,25 @@ async def bulk_export(
     }
 
 
-@router.get("/{company_id}", response_model=CompanyRead)
+@router.get("/{company_id}", response_model=CompanyDetailRead)
 async def get_company(
     company_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single company by ID."""
+    """Get a single company by ID, with every contact attached."""
     result = await db.execute(select(Company).where(Company.id == company_id))
     company = result.scalar_one_or_none()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     await _attach_extras(db, [company])
-    return company
+    # Built explicitly rather than by attribute injection: ``contacts`` is a
+    # mapped relationship, so assigning schema objects onto it would corrupt
+    # the ORM instance.
+    return CompanyDetailRead.model_validate(company).model_copy(
+        update={
+            "contacts": [_to_company_contact(ct) for ct in rank_contacts(company.contacts)]
+        }
+    )
 
 
 @router.patch("/{company_id}", response_model=CompanyRead)

@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.company import Company
-from app.models.contact import Contact
 from app.models.prospecting import (
     CANDIDATE_STATUSES,
     IcpProfile,
@@ -25,6 +24,7 @@ from app.models.prospecting import (
 )
 from app.services import api_credits
 from app.services.autonomous_prospector import get_prospector
+from app.services.company_contacts import display_name, resolve_primary_contacts
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/prospecting", tags=["prospecting"])
@@ -92,46 +92,42 @@ class CandidateRead(BaseModel):
     # not the company dict), and this answers the question a reviewer is really
     # asking — is there someone to enrol?
     has_email: bool = False
+    # The address itself, plus who it belongs to. "Yes" alone tells a reviewer
+    # an email exists but not whether it's worth enrolling — a generic
+    # info@ inbox and a named owner are very different decisions.
+    contact_email: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    contact_phone: Optional[str] = None
 
     class Config:
         from_attributes = True
 
 
-async def _emailable_company_ids(
-    db: AsyncSession, candidates: list[ProspectCandidate]
-) -> set[uuid.UUID]:
-    """Which of these candidates' companies have at least one emailable contact.
-
-    One grouped lookup for the whole page rather than a query per row.
-    """
-    ids = {c.company_id for c in candidates if c.company_id is not None}
-    if not ids:
-        return set()
-    rows = (
-        await db.execute(
-            select(Contact.company_id)
-            .where(
-                Contact.company_id.in_(ids),
-                Contact.email.isnot(None),
-                Contact.email != "",
-            )
-            .distinct()
-        )
-    ).scalars().all()
-    return set(rows)
-
-
 async def _to_reads(
     db: AsyncSession, candidates: list[ProspectCandidate]
 ) -> list[CandidateRead]:
-    """Serialize candidates with `has_email` resolved for the whole batch."""
-    emailable = await _emailable_company_ids(db, candidates)
-    return [
-        CandidateRead.model_validate(c).model_copy(
-            update={"has_email": c.company_id in emailable}
+    """Serialize candidates with their contact resolved for the whole batch."""
+    primaries = await resolve_primary_contacts(
+        db, [c.company_id for c in candidates if c.company_id is not None]
+    )
+    reads = []
+    for c in candidates:
+        contact = primaries.get(c.company_id) if c.company_id else None
+        reads.append(
+            CandidateRead.model_validate(c).model_copy(
+                update={
+                    "has_email": bool(contact and contact.email),
+                    "contact_email": contact.email if contact else None,
+                    "contact_name": display_name(contact) if contact else None,
+                    "contact_title": contact.title if contact else None,
+                    "contact_phone": (
+                        (contact.phone or contact.mobile) if contact else None
+                    ),
+                }
+            )
         )
-        for c in candidates
-    ]
+    return reads
 
 
 class MergeCandidateRequest(BaseModel):

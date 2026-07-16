@@ -51,6 +51,7 @@ from app.schemas.dialtone import (
 )
 from app.services import system_settings
 from app.services.booking import validate_booking_url
+from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
 
 logger = logging.getLogger(__name__)
@@ -337,15 +338,26 @@ async def _collect_events(
             .order_by(ProspectCandidate.created_at.desc())
             .limit(cap)
         )
-        for cand in (await db.execute(cand_query)).scalars().all():
-            if q_lower and q_lower not in (cand.company_name or "").lower():
-                continue
+        candidates = [
+            cand
+            for cand in (await db.execute(cand_query)).scalars().all()
+            if not q_lower or q_lower in (cand.company_name or "").lower()
+        ]
+        # "Lead discovered" without the address is only half the event — the
+        # console's whole point is seeing what the autonomous side found.
+        lead_contacts = await resolve_primary_contacts(
+            db, [c.company_id for c in candidates if c.company_id is not None]
+        )
+        for cand in candidates:
+            contact = lead_contacts.get(cand.company_id) if cand.company_id else None
+            contact_email = contact.email if contact else None
+            description = f"Fit {cand.fit_score}/100 · {cand.status}"
             items.append(DialtoneEvent(
                 id=f"lead_discovered:{cand.id}",
                 type="lead_discovered",
                 timestamp=_aware(cand.created_at),
                 title=f"Lead discovered: {cand.company_name}",
-                description=f"Fit {cand.fit_score}/100 · {cand.status}",
+                description=description,
                 source="prospecting",
                 severity="ok",
                 metadata={
@@ -356,6 +368,11 @@ async def _collect_events(
                     "source": cand.source,
                     "fit_score": cand.fit_score,
                     "status": cand.status,
+                    "contact_email": contact_email,
+                    "contact_name": display_name(contact) if contact else None,
+                    "contact_phone": (
+                        (contact.phone or contact.mobile) if contact else None
+                    ),
                 },
             ))
 
