@@ -37,6 +37,14 @@ from app.models.prospecting import (
     ProspectingRun,
 )
 from app.models.sequence import OutreachSequence
+from app.services.ingestion import (
+    ROUTE_AUTO_ENROLL,
+    ROUTE_DISCARD,
+    ROUTE_IMPORT,
+    ROUTE_REVIEW,
+    CandidateRecord,
+    get_ingestion_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -265,85 +273,47 @@ class AutonomousProspector:
     # Sourcing
     # ------------------------------------------------------------------
     async def _source_candidates(
-        self, db: AsyncSession, icp: IcpProfile, limit: int
-    ) -> tuple[list[dict], list[str]]:
-        """Return (candidate dicts, sources queried) from Apollo when configured."""
+        self, db: AsyncSession, icp: IcpProfile, limit: int, run: ProspectingRun
+    ) -> tuple[list[CandidateRecord], list[str], dict]:
+        """Return (records, sources queried, sourcing notes) from Apollo.
+
+        Apollo no longer imports anything here — it returns records and the
+        ingestion service persists them. ``notes`` carries why sourcing stopped,
+        so a rate-limited run can't masquerade as a run that found nothing.
+        """
         sources: list[str] = []
-        candidates: list[dict] = []
+        notes: dict = {}
         if not self.settings.apollo_api_key:
-            return candidates, sources
-        try:
-            from app.services.enrichment import get_enrichment_service
+            return [], sources, notes
 
-            svc = get_enrichment_service()
-            top_industry = None
-            if icp.industry_weights:
-                top_industry = max(icp.industry_weights, key=icp.industry_weights.get)
-            sr = icp.size_range or {}
-            imported = await svc.search_companies(
-                db,
-                industry=top_industry or "manufacturing",
-                min_employees=sr.get("min"),
-                max_employees=sr.get("max"),
-                per_page=min(limit, 25),
-            )
-            sources.append("apollo")
-            for row in imported or []:
-                candidates.append({
-                    "name": row.get("name"),
-                    "domain": row.get("domain"),
-                    "industry": row.get("industry_segment") or row.get("industry"),
-                    "employee_count": row.get("employee_count"),
-                    "country": row.get("country"),
-                    "city": row.get("city"),
-                    "state": row.get("state_province"),
-                    "source": "apollo",
-                    "company_id": row.get("id"),
-                    "raw": row,
-                })
-        except Exception as e:  # pragma: no cover - network path
-            logger.warning("Apollo sourcing failed: %s", e)
-        return candidates, sources
+        from app.services.enrichment import get_enrichment_service
 
-    async def _find_or_create_company(self, db: AsyncSession, candidate: dict) -> Company:
-        """Resolve an existing Company (by id/domain/name) or create a new lead."""
-        cid = candidate.get("company_id")
-        if cid:
-            existing = (
-                await db.execute(select(Company).where(Company.id == cid))
-            ).scalar_one_or_none()
-            if existing:
-                return existing
-        domain = candidate.get("domain")
-        if domain:
-            existing = (
-                await db.execute(select(Company).where(Company.domain == domain))
-            ).scalar_one_or_none()
-            if existing:
-                return existing
-        name = candidate.get("name") or "Unknown Company"
-        existing = (
-            await db.execute(
-                select(Company).where(func.lower(Company.name) == name.lower())
-            )
-        ).scalar_one_or_none()
-        if existing:
-            return existing
-        company = Company(
-            name=name,
-            domain=domain or None,
-            industry_segment=candidate.get("industry"),
-            employee_count=candidate.get("employee_count"),
-            country=(candidate.get("country") or "US")[:2].upper() or "US",
-            city=candidate.get("city"),
-            state_province=candidate.get("state"),
-            source="autonomous_prospector",
-            stage="new",
-            pipeline_stage="new_lead",
+        svc = get_enrichment_service()
+        top_industry = None
+        if icp.industry_weights:
+            top_industry = max(icp.industry_weights, key=icp.industry_weights.get)
+        sr = icp.size_range or {}
+        search = await svc.search_companies(
+            db,
+            industry=top_industry or "manufacturing",
+            min_employees=sr.get("min"),
+            max_employees=sr.get("max"),
+            target_volume=limit,
+            run_id=run.id,
+            icp_profile_id=icp.id,
         )
-        db.add(company)
-        await db.flush()
-        return company
+        sources.append("apollo")
+        notes = {
+            "apollo_status": search.status,
+            "apollo_pages": search.pages_fetched,
+            "apollo_credits_spent": search.credits_spent,
+            "apollo_truncated": search.truncated,
+        }
+        if search.error:
+            notes["apollo_error"] = search.error
+        for record in search.records:
+            record.icp_profile_id = icp.id
+        return search.records, sources, notes
 
     async def _auto_enroll(self, db: AsyncSession, company: Company) -> bool:
         """Advance a company to outreach and best-effort enroll a primary contact.
@@ -389,6 +359,36 @@ class AutonomousProspector:
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
+    @staticmethod
+    def _record_from_dict(candidate: dict) -> CandidateRecord:
+        """Adapt a legacy candidate dict to the shared record shape.
+
+        The API's manual trigger and the test suite both pass dicts, so this
+        stays the seam rather than pushing the change out to every caller.
+        """
+        return CandidateRecord(
+            name=candidate.get("name") or "Unknown Company",
+            domain=candidate.get("domain"),
+            industry=candidate.get("industry"),
+            employee_count=candidate.get("employee_count"),
+            country=candidate.get("country"),
+            city=candidate.get("city"),
+            state=candidate.get("state"),
+            phone=candidate.get("phone"),
+            website=candidate.get("website"),
+            source=candidate.get("source") or "unknown",
+            company_id=candidate.get("company_id"),
+            raw=candidate.get("raw") or {},
+        )
+
+    # Ingestion routes -> the disposition recorded on ProspectCandidate.
+    _ROUTE_TO_STATUS = {
+        ROUTE_AUTO_ENROLL: "enrolled",
+        ROUTE_REVIEW: "review",
+        ROUTE_DISCARD: "rejected",
+        ROUTE_IMPORT: "qualified",
+    }
+
     async def run(
         self,
         db: AsyncSession,
@@ -413,65 +413,68 @@ class AutonomousProspector:
             icp = await self.ensure_icp(db)
             run.icp_profile_id = icp.id
 
-            candidates = list(seed_candidates or [])
-            if not candidates:
-                sourced, sources = await self._source_candidates(db, icp, target)
-                candidates = sourced
-                run.sources_queried = sources or ["seed"]
-            else:
+            notes: dict = {}
+            if seed_candidates:
+                records = [self._record_from_dict(c) for c in seed_candidates]
                 run.sources_queried = ["seed"]
+            else:
+                records, sources, notes = await self._source_candidates(db, icp, target, run)
+                run.sources_queried = sources or ["seed"]
 
             # Daily guardrail: how many more we may enroll today.
             enroll_budget = max(0, s.prospecting_daily_max - await self._enrolled_today(db))
 
+            # One dedup rule, one enrichment step, one scorer, one router — for
+            # every source. ``score=True`` seeds the real lead score per company;
+            # a run's ~25 candidates is well within budget for an inline pass.
+            result = await get_ingestion_service().ingest(
+                db,
+                records[:target],
+                icp=icp,
+                enroll_budget=enroll_budget,
+                score=True,
+            )
+
             summaries = []
             found = qualified = enrolled = review = 0
-            for cand in candidates[:target]:
+            for outcome in result.outcomes:
                 found += 1
-                q = self.qualify(cand, icp)
-                fit = q["fit_score"]
-                disposition = "rejected"
-                company_id = None
+                disposition = self._ROUTE_TO_STATUS.get(outcome.route, "rejected")
                 enrolled_seq = False
 
-                if q["excluded"]:
-                    disposition = "rejected"
-                elif fit >= s.prospecting_auto_enroll_threshold and enroll_budget > 0:
-                    company = await self._find_or_create_company(db, cand)
-                    company.pipeline_stage = "researching"
-                    enrolled_seq = await self._auto_enroll(db, company)
-                    company_id = company.id
-                    disposition = "enrolled"
-                    enroll_budget -= 1
+                if outcome.route == ROUTE_AUTO_ENROLL and outcome.company is not None:
+                    enrolled_seq = await self._auto_enroll(db, outcome.company)
+                    enroll_budget = max(0, enroll_budget - 1)
                     enrolled += 1
                     qualified += 1
-                elif fit >= s.prospecting_review_threshold:
-                    company = await self._find_or_create_company(db, cand)
-                    company_id = company.id
-                    disposition = "review"
+                elif outcome.route == ROUTE_REVIEW:
                     review += 1
                     qualified += 1
-                else:
-                    disposition = "rejected"
 
-                cand_row = ProspectCandidate(
+                q = outcome.qualification or {}
+                db.add(ProspectCandidate(
                     run_id=run.id,
-                    company_id=company_id,
-                    company_name=cand.get("name") or "Unknown Company",
-                    domain=cand.get("domain"),
-                    source=cand.get("source") or "unknown",
-                    raw_data={k: v for k, v in cand.items() if k != "raw"},
-                    fit_score=fit,
+                    company_id=outcome.company_id,
+                    company_name=outcome.record.name,
+                    domain=outcome.record.domain,
+                    source=outcome.record.source or "unknown",
+                    raw_data=outcome.record.as_candidate_dict(),
+                    fit_score=outcome.fit_score,
                     qualification=q,
-                    reasoning=q.get("reason") or f"fit {fit}/100 via ICP components {q.get('components')}",
+                    dedup_confidence=outcome.dedup.confidence,
+                    reasoning=(
+                        outcome.error
+                        or q.get("reason")
+                        or f"fit {outcome.fit_score}/100 via ICP components {q.get('components')}"
+                    ),
                     status=disposition,
-                )
-                db.add(cand_row)
+                ))
                 summaries.append({
-                    "company": cand.get("name"),
-                    "fit_score": fit,
+                    "company": outcome.record.name,
+                    "fit_score": outcome.fit_score,
                     "disposition": disposition,
                     "enrolled_sequence": enrolled_seq,
+                    "dedup_confidence": outcome.dedup.confidence,
                 })
 
             run.companies_found = found
@@ -482,6 +485,8 @@ class AutonomousProspector:
                 "candidates": summaries,
                 "enroll_budget_remaining": enroll_budget,
                 "icp_profile": icp.name,
+                "ingestion_errors": result.errors,
+                **notes,
             }
             run.status = "completed"
             run.completed_at = datetime.now(timezone.utc)

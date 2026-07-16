@@ -43,6 +43,11 @@ async def test_enrichment_find_contacts_dedups(db_session, sample_company, sampl
 
     async def fake_post(*args, **kwargs):
         class R:
+            # A real httpx.Response always carries these; the client now reads
+            # status_code to decide whether to back off on a 429/5xx.
+            status_code = 200
+            headers: dict = {}
+
             def raise_for_status(self): ...
             def json(self):
                 return {"people": [

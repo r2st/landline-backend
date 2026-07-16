@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models.company import Company
 from app.models.prospecting import IcpProfile, ProspectCandidate, ProspectingRun
+from app.services import api_credits
 from app.services.autonomous_prospector import get_prospector
 
 logger = logging.getLogger(__name__)
@@ -71,12 +72,20 @@ class CandidateRead(BaseModel):
     qualification: dict
     reasoning: Optional[str] = None
     status: str
+    dedup_confidence: Optional[str] = None
+    merged_into_company_id: Optional[uuid.UUID] = None
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class MergeCandidateRequest(BaseModel):
+    """Confirm that a medium-confidence match really is the same company."""
+
+    target_company_id: uuid.UUID
 
 
 class IcpRead(BaseModel):
@@ -203,6 +212,74 @@ async def reject_candidate(
     cand.reviewed_at = datetime.now(timezone.utc)
     await db.flush()
     return cand
+
+
+@router.get("/candidates/duplicates", response_model=list[CandidateRead])
+async def duplicate_candidates(
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Name-only dedup matches awaiting a human merge decision.
+
+    These are candidates the pipeline refused to auto-merge: a shared company
+    name with nothing to corroborate it. "Precision Manufacturing" in Ohio and
+    in Pune land here rather than being silently folded into one row.
+    """
+    rows = (
+        await db.execute(
+            select(ProspectCandidate)
+            .where(
+                ProspectCandidate.dedup_confidence == "medium",
+                ProspectCandidate.merged_into_company_id.is_(None),
+            )
+            .order_by(desc(ProspectCandidate.created_at))
+            .limit(limit)
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+@router.post("/candidates/{candidate_id}/merge", response_model=CandidateRead)
+async def merge_candidate(
+    candidate_id: uuid.UUID,
+    payload: MergeCandidateRequest,
+    reviewer: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Confirm a merge the pipeline declined to make on its own."""
+    cand = (
+        await db.execute(
+            select(ProspectCandidate).where(ProspectCandidate.id == candidate_id)
+        )
+    ).scalar_one_or_none()
+    if cand is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    target = (
+        await db.execute(
+            select(Company).where(Company.id == payload.target_company_id)
+        )
+    ).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Target company not found")
+
+    cand.merged_into_company_id = target.id
+    cand.dedup_confidence = "certain"  # a human confirmed identity
+    cand.reviewed_by = reviewer
+    cand.reviewed_at = datetime.now(timezone.utc)
+    await db.flush()
+    return cand
+
+
+@router.get("/credits")
+async def credit_usage(db: AsyncSession = Depends(get_db)):
+    """Apollo spend for today and this month against budget.
+
+    The daily enrollment cap bounds *enrollments*, not *API calls* — this is the
+    meter for what the loop actually spends.
+    """
+    status = await api_credits.get_budget_status(db, "apollo", cost=0)
+    return status.as_dict()
 
 
 @router.get("/icp", response_model=Optional[IcpRead])

@@ -133,6 +133,16 @@ class ProspectCandidate(Base):
     qualification: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="qualified", index=True)
+    # How confident the unified ingestion dedup was when it matched (or didn't
+    # match) this candidate to an existing company: 'certain' | 'high' |
+    # 'medium' | 'none'. Anything below 'certain' vetoes auto-enroll — merging
+    # two real prospects is worse than a trip through the review queue.
+    dedup_confidence: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Set when a human confirms a medium-confidence match, recording which
+    # company this candidate was folded into.
+    merged_into_company_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id", ondelete="SET NULL"), nullable=True
+    )
     reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

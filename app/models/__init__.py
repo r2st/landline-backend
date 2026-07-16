@@ -37,6 +37,7 @@ from app.models.tenant import Tenant, TenantUsage
 from app.models.integration import Integration, WebhookSubscription, WebhookEvent
 from app.models.workflow import Workflow, WorkflowRun
 from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
+from app.models.api_credit import ApiCreditLedger
 from app.models.sender_health import SenderHealth
 from app.models.danger_signal import DangerSignalEvent
 from app.models.domain_health import DomainHealth
@@ -101,6 +102,7 @@ __all__ = [
     "IcpProfile",
     "ProspectingRun",
     "ProspectCandidate",
+    "ApiCreditLedger",
     "SenderHealth",
     "DangerSignalEvent",
     "DomainHealth",

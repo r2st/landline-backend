@@ -16,7 +16,12 @@ from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
 from app.schemas.dashboard import CSVImportResult
-from app.services.normalize import normalize_domain
+from app.services.ingestion import (
+    CandidateRecord,
+    ContactRecord,
+    IngestionError,
+    get_ingestion_service,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/import-export", tags=["import/export"])
@@ -97,6 +102,7 @@ async def import_csv(
 
     reader = csv.DictReader(io.StringIO(text))
 
+    ingestion = get_ingestion_service()
     imported_companies = 0
     imported_contacts = 0
     skipped = 0
@@ -113,89 +119,66 @@ async def import_csv(
                 skipped += 1
                 continue
 
-            # Check for existing company by domain first, then name
-            domain = normalize_domain(row.get("domain"))
-            existing = None
+            # Parse employee count
+            emp_str = row.get("employee_count", "").strip()
+            employee_count = None
+            if emp_str:
+                try:
+                    employee_count = int(emp_str.replace(",", ""))
+                except ValueError:
+                    pass
 
-            if domain:
-                result = await db.execute(
-                    select(Company).where(Company.domain == domain).limit(1)
-                )
-                existing = result.scalar_one_or_none()
-
-            if not existing:
-                result = await db.execute(
-                    select(Company).where(Company.name == company_name).limit(1)
-                )
-                existing = result.scalar_one_or_none()
-
-            if existing:
-                company = existing
-                skipped += 1
-            else:
-                # Parse employee count
-                emp_str = row.get("employee_count", "").strip()
-                employee_count = None
-                if emp_str:
-                    try:
-                        employee_count = int(emp_str.replace(",", ""))
-                    except ValueError:
-                        pass
-
-                country = row.get("country", "US").strip().upper()
-                if country not in ("US", "CA"):
-                    country = "US"
-
-                company = Company(
-                    name=company_name,
-                    domain=domain,
-                    city=row.get("city", "").strip() or None,
-                    state_province=row.get("state", "").strip() or None,
-                    country=country,
-                    employee_count=employee_count,
-                    source=source,
-                )
-                db.add(company)
-                await db.flush()
-                imported_companies += 1
-                new_company_ids.append(str(company.id))
-
-            # Handle contact if present
             contact_name = row.get("contact_name", "").strip()
             contact_email = row.get("contact_email", "").strip()
             contact_title = row.get("contact_title", "").strip()
-
+            contacts = []
             if contact_name or contact_email:
-                # Parse contact name
-                first_name = None
-                last_name = None
+                first_name = last_name = None
                 if contact_name:
                     parts = contact_name.split(None, 1)
                     first_name = parts[0] if parts else None
                     last_name = parts[1] if len(parts) > 1 else None
-
-                # Check for duplicate contact by email
-                if contact_email:
-                    result = await db.execute(
-                        select(Contact).where(
-                            Contact.company_id == company.id,
-                            Contact.email == contact_email,
-                        ).limit(1)
-                    )
-                    if result.scalar_one_or_none():
-                        continue  # Skip duplicate contact
-
-                contact = Contact(
-                    company_id=company.id,
+                contacts.append(ContactRecord(
                     first_name=first_name,
                     last_name=last_name,
                     email=contact_email or None,
                     title=contact_title or None,
                     source=source,
-                )
-                db.add(contact)
-                imported_contacts += 1
+                ))
 
+            record = CandidateRecord(
+                name=company_name,
+                domain=row.get("domain") or None,
+                city=row.get("city", "").strip() or None,
+                state=row.get("state", "").strip() or None,
+                # Passed through verbatim. An unsupported country now raises an
+                # IngestionError and fails this row, instead of being quietly
+                # relabelled "US" — which turned every non-NA list into
+                # plausible-looking corrupt data.
+                country=row.get("country", "").strip() or None,
+                employee_count=employee_count,
+                contacts=contacts,
+                source=source,
+            )
+
+            # One shared dedup rule. The old path matched company names
+            # **case-sensitively** here and case-insensitively everywhere else,
+            # so a CSV happily created the "Acme Corp" that the prospector would
+            # have matched to the existing "ACME CORP".
+            outcome = await ingestion.ingest_one(db, record)
+            if outcome.created:
+                imported_companies += 1
+                if outcome.company_id:
+                    new_company_ids.append(str(outcome.company_id))
+            else:
+                skipped += 1
+            imported_contacts += outcome.contacts_created
+
+        except IngestionError as e:
+            errors.append(f"Row {row_num}: {e}")
+            if len(errors) > 100:
+                errors.append("... (truncated, too many errors)")
+                break
         except Exception as e:
             errors.append(f"Row {row_num}: {str(e)}")
             if len(errors) > 100:
@@ -204,7 +187,9 @@ async def import_csv(
 
     await db.flush()
 
-    # Auto-enrich and auto-score newly imported companies
+    # Auto-enrich and auto-score newly imported companies. Kept as a Celery
+    # dispatch rather than the pipeline's inline scorer: a large list would pay
+    # for thousands of synchronous scoring passes inside the request.
     if new_company_ids:
         background_tasks.add_task(_trigger_scoring_for_companies, new_company_ids)
 

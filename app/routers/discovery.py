@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.database import get_db
 from app.models.company import Company
 from app.services.enrichment import get_enrichment_service
+from app.services.ingestion import get_ingestion_service
 
 router = APIRouter(prefix="/discovery", tags=["discovery"])
 
@@ -36,9 +37,14 @@ async def search_companies(
     payload: CompanySearchRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Search Apollo for companies matching criteria and import them."""
+    """Search Apollo for companies matching criteria and import them.
+
+    Two steps now, deliberately: Apollo returns records, the ingestion service
+    persists them under the one shared dedup rule. ``get_db`` owns the commit —
+    the service used to commit mid-request on its own.
+    """
     service = get_enrichment_service()
-    results = await service.search_companies(
+    search = await service.search_companies(
         db,
         industry=payload.industry,
         location=payload.location,
@@ -46,14 +52,36 @@ async def search_companies(
         min_employees=payload.min_employees,
         max_employees=payload.max_employees,
         per_page=payload.per_page,
+        target_volume=payload.per_page,
     )
-    imported_count = sum(1 for r in results if r["status"] == "imported")
-    existing_count = sum(1 for r in results if r["status"] == "exists")
+    result = await get_ingestion_service().ingest(db, search.records)
+
+    companies = []
+    for outcome in result.outcomes:
+        companies.append({
+            "name": outcome.record.name,
+            "domain": outcome.record.domain,
+            "status": "imported" if outcome.created else (
+                "error" if outcome.error else "exists"
+            ),
+            "id": str(outcome.company_id) if outcome.company_id else None,
+            "industry": outcome.record.industry,
+            "employee_count": outcome.record.employee_count,
+            "city": outcome.record.city,
+            "state": outcome.record.state,
+            "dedup_confidence": outcome.dedup.confidence,
+            "error": outcome.error,
+        })
     return {
-        "total": len(results),
-        "imported": imported_count,
-        "already_existed": existing_count,
-        "companies": results,
+        "total": len(companies),
+        "imported": result.companies_created,
+        "already_existed": result.companies_matched,
+        # 'ok' | 'rate_limited' | 'budget_exhausted' | 'error' | 'skipped' —
+        # a rate-limited search must not read as "found nothing".
+        "search_status": search.status,
+        "credits_spent": search.credits_spent,
+        "errors": result.errors,
+        "companies": companies,
     }
 
 

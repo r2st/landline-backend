@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     # Apollo.io
     apollo_api_key: str = ""
     apollo_base_url: str = "https://api.apollo.io/v1"
+    # Client-side token bucket, so we back off before Apollo has to 429 us.
+    apollo_max_requests_per_minute: int = 50
+    # Credit guardrails. The gate is checked *before* each call, so an
+    # exhausted budget costs nothing. 0 = unlimited (escape hatch).
+    apollo_daily_credit_budget: int = 200
+    apollo_monthly_credit_budget: int = 5000
+    # Notify once when spend crosses this fraction of a budget.
+    prospecting_credit_alert_threshold: float = 0.8
 
     # --- Hunter.io email verification (P3) ---
     # Per-mailbox SMTP verification, layered behind the free syntax + MX check.
@@ -244,6 +252,14 @@ class Settings(BaseSettings):
     # Auto-pause the agent if the rolling enroll→engaged conversion drops below
     # this fraction (guardrail against enrolling junk). 0 disables the check.
     prospecting_min_conversion_rate: float = 0.0
+
+    # --- Market policy ---
+    # Countries we actually import and prospect into. Narrower than the schema
+    # allowlist (``app.constants.ALLOWED_COUNTRIES``) and tunable without a
+    # migration. A record whose country is outside this list is **rejected**,
+    # never relabelled — a mislabelled company is worse than a rejected one.
+    # Must stay a subset of ALLOWED_COUNTRIES or inserts fail the CHECK.
+    supported_countries: list[str] = ["US", "CA", "IN"]
 
     # 3.3 Deliverability Optimizer.
     deliverability_optimizer_enabled: bool = True

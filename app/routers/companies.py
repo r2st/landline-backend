@@ -9,6 +9,7 @@ from sqlalchemy import func, select, or_, and_, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.constants import COUNTRY_QUERY_PATTERN
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
@@ -169,7 +170,7 @@ async def generate_company_research(
 @router.get("/", response_model=CompanyListResponse)
 async def list_companies(
     q: Optional[str] = Query(None, description="Search name, domain, or industry"),
-    country: Optional[str] = Query(None, pattern="^(US|CA)$"),
+    country: Optional[str] = Query(None, pattern=COUNTRY_QUERY_PATTERN),
     stage: Optional[str] = Query(None),
     pipeline_stage: Optional[str] = Query(None, description="Kanban pipeline stage"),
     naics_code: Optional[str] = Query(None),

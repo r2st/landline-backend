@@ -6,6 +6,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.constants import ALLOWED_COUNTRIES, COUNTRY_QUERY_PATTERN
 from app.services.normalize import normalize_domain
 
 VALID_STAGES = (
@@ -17,7 +18,11 @@ VALID_PIPELINE_STAGES = (
     "new_lead", "researching", "outreach", "engaged",
     "negotiating", "client", "churned",
 )
-VALID_COUNTRIES = ("US", "CA")
+# The schema-level allowlist, shared with the companies.country CHECK
+# constraint so the API and the database can never disagree about what is
+# insertable.
+VALID_COUNTRIES = ALLOWED_COUNTRIES
+_COUNTRY_PATTERN = COUNTRY_QUERY_PATTERN
 
 
 class CompanyBase(BaseModel):
@@ -25,7 +30,7 @@ class CompanyBase(BaseModel):
     domain: Optional[str] = Field(None, max_length=255)
     city: Optional[str] = Field(None, max_length=100)
     state_province: Optional[str] = Field(None, max_length=100)
-    country: str = Field("US", pattern="^(US|CA)$")
+    country: str = Field("US", pattern=_COUNTRY_PATTERN)
     employee_count: Optional[int] = Field(None, ge=0)
     naics_code: Optional[str] = Field(None, max_length=10)
     naics_description: Optional[str] = Field(None, max_length=255)
@@ -52,7 +57,7 @@ class CompanyUpdate(BaseModel):
     domain: Optional[str] = Field(None, max_length=255)
     city: Optional[str] = Field(None, max_length=100)
     state_province: Optional[str] = Field(None, max_length=100)
-    country: Optional[str] = Field(None, pattern="^(US|CA)$")
+    country: Optional[str] = Field(None, pattern=_COUNTRY_PATTERN)
     employee_count: Optional[int] = Field(None, ge=0)
     naics_code: Optional[str] = Field(None, max_length=10)
     naics_description: Optional[str] = Field(None, max_length=255)

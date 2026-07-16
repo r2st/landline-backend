@@ -23,6 +23,7 @@ from typing import Optional
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
@@ -237,12 +238,26 @@ def _size_score(employee_count: Optional[int]) -> tuple[int, str]:
 
 
 def _location_score(country: str) -> tuple[int, str]:
-    """Score based on country. US = 20, CA = 15."""
-    if country == "US":
+    """Score based on country. Max 20.
+
+    US and CA keep their historical weights as the primary/secondary markets.
+    Every *other supported* market scores 12 rather than 0: scoring a country we
+    deliberately prospect as "outside target markets" would structurally
+    disqualify every lead the expansion was meant to find — the scorer would
+    zero exactly the companies it is supposed to rank.
+
+    A country outside ``settings.supported_countries`` still scores 0; that one
+    really is off-market.
+    """
+    code = (country or "").upper()
+    if code == "US":
         return 20, "United States — primary market"
-    if country == "CA":
+    if code == "CA":
         return 15, "Canada — secondary market (CASL applies)"
-    return 0, f"Country {country} outside target markets"
+    supported = [c.upper() for c in get_settings().supported_countries]
+    if code in supported:
+        return 12, f"{code} — supported market"
+    return 0, f"Country {code} outside target markets"
 
 
 def _completeness_score(

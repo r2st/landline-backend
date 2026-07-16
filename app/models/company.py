@@ -7,13 +7,19 @@ from sqlalchemy import CheckConstraint, Integer, String, Text, ARRAY, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.constants import ALLOWED_COUNTRIES_SQL
 from app.database import Base
 
 
 class Company(Base):
     __tablename__ = "companies"
     __table_args__ = (
-        CheckConstraint("country IN ('US', 'CA')", name="ck_companies_country"),
+        # An allowlist rather than no validation: garbage like 'XX' still fails
+        # loudly, but non-NA markets are insertable. Widening it means a
+        # migration — see app/constants.py.
+        CheckConstraint(
+            f"country IN ({ALLOWED_COUNTRIES_SQL})", name="ck_companies_country"
+        ),
         CheckConstraint(
             "stage IN ('new','researched','scored','contacted','engaged','qualified','opportunity','customer','disqualified')",
             name="ck_companies_stage",
@@ -28,6 +34,10 @@ class Company(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Canonical, lossy match key derived from ``name`` — see
+    # normalize.normalize_name_key. Matching only, never display. Deliberately
+    # not unique: the same key across two countries is two real companies.
+    name_key: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     domain: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     city: Mapped[str | None] = mapped_column(String(100))
     state_province: Mapped[str | None] = mapped_column(String(100))

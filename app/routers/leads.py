@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.constants import COUNTRY_QUERY_PATTERN
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
@@ -85,7 +86,7 @@ async def score_companies_batch(
 async def get_pipeline(
     stage: Optional[str] = Query(None),
     min_score: Optional[int] = Query(None, ge=0, le=100),
-    country: Optional[str] = Query(None, pattern="^(US|CA)$"),
+    country: Optional[str] = Query(None, pattern=COUNTRY_QUERY_PATTERN),
     sort_by: Optional[str] = Query("fit_score", description="fit_score, name, stage"),
     sort_dir: Optional[str] = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
