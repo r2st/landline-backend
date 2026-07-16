@@ -161,6 +161,17 @@ def send_sequence_step(self, enrollment_id: str):
                     await db.commit()
                     return {"status": "paused", "reason": "no_contact_email"}
 
+                # Hard suppression (Feature 1): never send to a suppressed contact.
+                if getattr(contact, "suppressed", False):
+                    enrollment.status = "unsubscribed"
+                    enrollment.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+                    logger.info(
+                        "Enrollment %s stopped: contact %s is suppressed",
+                        enrollment_id, contact.email,
+                    )
+                    return {"status": "skipped", "reason": "contact_suppressed"}
+
                 # Recipient validation — a domain with no MX can't receive mail,
                 # so sending guarantees a hard bounce. Validate once (lazily) and
                 # pause the enrollment on a definitively invalid domain.
@@ -603,6 +614,12 @@ def process_outreach_queue():
                     select(Contact).where(Contact.id == enrollment.contact_id)
                 )
                 contact = contact_result.scalar_one_or_none()
+
+                # Hard suppression (Feature 1): a contact suppressed via an
+                # unsubscribe reply is never emailed again. Skip before any send.
+                if contact and getattr(contact, "suppressed", False):
+                    logger.info("Skipping enrollment %s: contact suppressed", enrollment.id)
+                    continue
 
                 # Timezone-aware send window: use the contact's own timezone when
                 # set, else the global default. Skip (don't drop) if it's outside

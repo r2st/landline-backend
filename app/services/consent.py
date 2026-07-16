@@ -49,6 +49,17 @@ async def check_consent(
     """
     country = company.country
 
+    # Hard suppression (single source of truth). A contact suppressed via an
+    # unsubscribe reply (Feature 1) is never emailed again, regardless of regime.
+    # Checked before everything else so it can never be bypassed.
+    if getattr(contact, "suppressed", False):
+        return ConsentCheckResult(
+            can_email=False,
+            reason="Contact is suppressed (unsubscribe/compliance) — never email",
+            regime="CAN-SPAM" if country == "US" else "CASL" if country == "CA" else "unknown",
+            consent_type="none",
+        )
+
     # Global check: if contact has explicitly unsubscribed via link, block all sends
     if getattr(contact, "unsubscribed", False):
         return ConsentCheckResult(

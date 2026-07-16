@@ -47,6 +47,16 @@ class Contact(Base):
     card_image: Mapped[str | None] = mapped_column(Text, deferred=True)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
     unsubscribed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Hard compliance-suppression flag (single source of truth). Set when a reply
+    # is classified as an explicit unsubscribe/opt-out; a suppressed contact is
+    # filtered out of EVERY send path and is never emailed again. Distinct from
+    # ``unsubscribed`` (link-based opt-out) so the two signals stay auditable.
+    suppressed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", index=True
+    )
+    # General lifecycle marker. Feature 1 sets it to 'wrong_person' when a reply
+    # says we've reached the wrong contact, so the list-cleanup view can find them.
+    status: Mapped[str | None] = mapped_column(String(20))
     # IANA timezone name (e.g. "America/Los_Angeles"). When set, outreach to this
     # contact only sends inside the business-hours window of THEIR timezone
     # rather than the global default. NULL → use the global send window.

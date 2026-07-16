@@ -30,6 +30,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
+from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
@@ -285,6 +286,44 @@ async def _collect_events(
                 "step_number": event.step_number,
                 "event_type": event.event_type,
                 "error": meta.get("error"),
+            },
+        ))
+
+    # --- Reply classification (Feature 1) ------------------------------------
+    # Surface every auto-classified reply so the feed reflects the routing
+    # outcome (hot lead flagged, unsubscribe suppressed, OOO re-queued, …).
+    reply_query = (
+        select(EmailReply, Contact)
+        .outerjoin(Contact, EmailReply.contact_id == Contact.id)
+        .where(EmailReply.reply_classification.isnot(None))
+        .order_by(EmailReply.classified_at.desc())
+        .limit(cap)
+    )
+    if contact_id is not None:
+        reply_query = reply_query.where(EmailReply.contact_id == contact_id)
+    for reply, contact in (await db.execute(reply_query)).all():
+        who = contact.full_name if contact is not None else (reply.from_email or "a contact")
+        if q_lower and q_lower not in (reply.from_email or "").lower() and q_lower not in who.lower():
+            continue
+        category = reply.reply_classification
+        items.append(DialtoneEvent(
+            id=f"reply_classified:{reply.id}",
+            type="reply_classified",
+            timestamp=_aware(reply.classified_at or reply.received_at),
+            title=f"Reply from {who} classified: {category}",
+            description=(reply.classification_meta or {}).get("reason") or reply.subject,
+            source="reply",
+            severity="warn" if category in ("unsubscribe", "unknown") else "ok",
+            metadata={
+                "reply_id": str(reply.id),
+                "contact_id": str(reply.contact_id) if reply.contact_id else None,
+                "contact_name": who,
+                "from_email": reply.from_email,
+                "subject": reply.subject,
+                "classification": category,
+                "confidence": reply.classification_confidence,
+                "priority_flag": bool(reply.priority_flag),
+                "handled_action": reply.handled_action,
             },
         ))
 

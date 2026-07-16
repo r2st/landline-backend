@@ -3,8 +3,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
+from sqlalchemy import Boolean, Float, ForeignKey, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -50,6 +50,25 @@ class EmailReply(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
+
+    # --- Reply Classification (Feature 1) ---
+    # The persisted routing category: one of the 5 top-level categories or
+    # 'unknown' (low-confidence / error). NULL means the reply has not been
+    # processed by the classifier yet — that is the idempotency guard the
+    # ``classify_new_replies`` task selects on.
+    reply_classification: Mapped[str | None] = mapped_column(String(20), index=True)
+    classification_confidence: Mapped[float | None] = mapped_column(Float)
+    # Hot-lead routing marker — surfaces the reply in the priority inbox.
+    priority_flag: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", index=True
+    )
+    classified_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    # Extras from classification: return_date, referral {name,email}, keyword-hit,
+    # model, source ('keyword'|'ai'|'fallback'|'operator'), manual overrides.
+    classification_meta: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    # Which auto-action the task took:
+    # 'requeued' | 'unsubscribed' | 'sequence_removed' | 'flagged_cleanup' | 'none'.
+    handled_action: Mapped[str | None] = mapped_column(String(40))
 
     # Relationships
     email_send: Mapped["EmailSend | None"] = relationship("EmailSend")

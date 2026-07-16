@@ -16,6 +16,8 @@ and response shapes so the rest of the code never sees the difference.
 
 import logging
 import json
+import re
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import anthropic
@@ -23,6 +25,142 @@ import httpx
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# The five routing categories (+ the internal 'unknown' fallback) used by
+# ``classify_reply``. Kept as a module constant so the task and tests share it.
+REPLY_CATEGORIES = (
+    "interested",
+    "not_interested",
+    "out_of_office",
+    "wrong_person",
+    "unsubscribe",
+    "unknown",
+)
+
+# --- Cheap keyword pre-filter (no LLM) -----------------------------------------
+# High-precision phrases only. These are the compliance-critical / autoresponder
+# signals we must never miss on an AI outage, so the patterns are deliberately
+# narrow (explicit opt-out language, unambiguous OOO markers) to keep false
+# positives near zero. Anything not matched here falls through to the LLM.
+
+# Explicit, legally-meaningful opt-out language. Matching any of these ALWAYS
+# wins — unsubscribe is never gated by AI confidence.
+_UNSUBSCRIBE_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bunsubscribe\b",
+        r"\bopt[\s-]?out\b",
+        r"\bopt (?:me|us) out\b",
+        r"\bremove me\b",
+        r"\btake me off\b",
+        r"\bremove (?:me )?from (?:your )?(?:the )?(?:mailing |email |distribution )?list\b",
+        r"\bstop (?:emailing|contacting|messaging) me\b",
+        r"\bdo not (?:email|contact) me\b",
+        r"\bdon'?t (?:email|contact) me\b",
+    )
+]
+
+# Automated out-of-office / vacation autoresponder markers.
+_OOO_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bout of (?:the )?office\b",
+        r"\bon vacation\b",
+        r"\bon (?:annual |parental |medical |sick )?leave\b",
+        r"\bon holiday\b",
+        r"\bauto[\s-]?reply\b",
+        r"\bautomatic reply\b",
+        r"\bautoresponder\b",
+        r"\baway from (?:my|the) (?:desk|office)\b",
+        r"\bcurrently (?:away|travelling|traveling|unavailable)\b",
+        r"\bi am away\b",
+        r"\breturning to the office\b",
+    )
+]
+
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def keyword_prefilter(subject: Optional[str], body_text: Optional[str]) -> Optional[str]:
+    """Return a high-precision category from keywords alone, or ``None``.
+
+    Runs before any LLM call. Returns ``"unsubscribe"`` for explicit opt-out
+    language (which always wins), ``"out_of_office"`` for autoresponder markers,
+    or ``None`` when nothing matched (the caller then asks the LLM). Unsubscribe
+    is checked first so an OOO message that also says "unsubscribe" is treated as
+    the compliance-critical opt-out.
+    """
+    text = f"{subject or ''}\n{body_text or ''}"
+    if any(p.search(text) for p in _UNSUBSCRIBE_PATTERNS):
+        return "unsubscribe"
+    if any(p.search(text) for p in _OOO_PATTERNS):
+        return "out_of_office"
+    return None
+
+
+def extract_return_date(text: Optional[str], *, today: Optional[date] = None) -> Optional[str]:
+    """Best-effort parse of an OOO return date → ISO ``YYYY-MM-DD`` or ``None``.
+
+    Handles the common autoresponder shapes ("back on August 3", "returning
+    2026-08-15", "until 08/20") without a heavyweight date dependency. Ambiguous
+    or missing dates return ``None`` so the caller can apply the safe +7-day
+    default. ``today`` is injectable for deterministic tests.
+    """
+    if not text:
+        return None
+    today = today or datetime.now(timezone.utc).date()
+
+    # ISO: 2026-08-15
+    m = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", text)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mo, d).isoformat()
+        except ValueError:
+            return None
+
+    # Month name: "August 3", "Aug 3rd", "3 August"
+    month_alt = "|".join(_MONTHS.keys())
+    m = re.search(rf"\b({month_alt})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", text, re.IGNORECASE)
+    if not m:
+        m2 = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_alt})\b", text, re.IGNORECASE)
+        if m2:
+            day_num, mon = int(m2.group(1)), _MONTHS[m2.group(2).lower()]
+            return _resolve_forward(today, mon, day_num)
+    else:
+        mon, day_num = _MONTHS[m.group(1).lower()], int(m.group(2))
+        return _resolve_forward(today, mon, day_num)
+
+    # Numeric MM/DD or MM/DD/YYYY
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", text)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        if m.group(3):
+            y = int(m.group(3))
+            y = y + 2000 if y < 100 else y
+            try:
+                return date(y, mo, d).isoformat()
+            except ValueError:
+                return None
+        return _resolve_forward(today, mo, d)
+    return None
+
+
+def _resolve_forward(today: date, month: int, day: int) -> Optional[str]:
+    """Resolve a month/day (no year) to the next such date on/after ``today``."""
+    for year in (today.year, today.year + 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return None
+        if candidate >= today:
+            return candidate.isoformat()
+    return None
 
 
 class AIService:
@@ -513,6 +651,159 @@ Auto-send: true ONLY for "interested" and "question". false for everything else.
         except Exception as e:
             logger.error("AI reply analysis failed: %s", str(e))
             return {"error": str(e), "should_send": False, "should_auto_send": False}
+
+    async def classify_reply(
+        self,
+        subject: Optional[str],
+        body_text: Optional[str],
+        original_subject: str = "",
+        contact_name: str = "",
+        company_name: str = "",
+    ) -> dict:
+        """Classify an incoming reply into one routing category. Never raises.
+
+        A dedicated, cheap *routing* pass (distinct from the richer, drafting-
+        oriented :meth:`analyze_reply`). It runs a high-precision keyword
+        pre-filter first — compliance-critical opt-outs and OOO autoresponders
+        never depend on the LLM — and only falls through to ``complete_json`` for
+        ambiguous replies. On an AI outage the keyword result stands, else the
+        reply is ``unknown`` (manual review). Output shape::
+
+            {
+              "category": "interested|not_interested|out_of_office|"
+                          "wrong_person|unsubscribe|unknown",
+              "confidence": 0.0-1.0,
+              "reason": "one-line justification",
+              "return_date": "YYYY-MM-DD" | None,   # OOO only
+              "referral": {"name": None, "email": None},  # wrong_person only
+              "unsubscribe_explicit": bool,
+              "source": "keyword|ai|fallback",
+              "model": "<model or None>",
+            }
+        """
+        combined = f"{subject or ''}\n{body_text or ''}"
+
+        # 1. Keyword pre-filter — high precision, no LLM, guarantees the
+        #    compliance-critical categories survive an AI outage.
+        kw = keyword_prefilter(subject, body_text)
+        if kw == "unsubscribe":
+            return {
+                "category": "unsubscribe",
+                "confidence": 1.0,
+                "reason": "Explicit opt-out language detected (keyword match).",
+                "return_date": None,
+                "referral": {"name": None, "email": None},
+                "unsubscribe_explicit": True,
+                "source": "keyword",
+                "model": None,
+            }
+        if kw == "out_of_office":
+            return {
+                "category": "out_of_office",
+                "confidence": 0.9,
+                "reason": "Out-of-office / autoresponder markers detected (keyword match).",
+                "return_date": extract_return_date(combined),
+                "referral": {"name": None, "email": None},
+                "unsubscribe_explicit": False,
+                "source": "keyword",
+                "model": None,
+            }
+
+        # 2. Ambiguous → ask the LLM. temperature=0 for stability.
+        prompt = f"""Classify this reply to a cold sales email into EXACTLY ONE routing category.
+Your job is to CLASSIFY ONLY — do NOT draft a reply.
+
+CATEGORIES:
+- interested: positive intent — wants to talk, learn more, asks a qualifying question, or requests a call/demo.
+- not_interested: a clear rejection ("no thanks", "not a fit", "we're all set"). NO legal opt-out language.
+- out_of_office: an automated out-of-office / vacation autoresponder (even if the body sounds positive).
+- wrong_person: the recipient is not the right contact ("I don't handle this", "try our CTO", "no longer with the company").
+- unsubscribe: an explicit opt-out request ("unsubscribe", "remove me", "take me off your list").
+- unknown: genuinely unclear.
+
+TIE-BREAKERS (apply in order):
+1. Explicit opt-out / unsubscribe language ALWAYS wins over not_interested.
+2. An autoresponder is ALWAYS out_of_office even if the wording sounds interested.
+3. If it points you to a different person/role, it is wrong_person (capture the referral).
+
+THE REPLY:
+Subject: {subject or ''}
+Body: {(body_text or '')[:1200]}
+
+CONTEXT (our original outreach):
+Original subject: {original_subject}
+Who they are: {contact_name or 'unknown'} at {company_name or 'unknown'}
+
+Return ONLY valid JSON:
+{{
+  "category": "interested|not_interested|out_of_office|wrong_person|unsubscribe|unknown",
+  "confidence": 0.0,
+  "reason": "one-line justification",
+  "return_date": null,
+  "referral": {{"name": null, "email": null}},
+  "unsubscribe_explicit": false
+}}
+- confidence is your 0..1 certainty in the category.
+- return_date: ISO date (YYYY-MM-DD) ONLY for out_of_office when a return date is stated, else null.
+- referral: name/email ONLY for wrong_person when they point elsewhere, else nulls.
+- unsubscribe_explicit: true ONLY for legally-explicit opt-out language."""
+
+        result = await self.complete_json(prompt, max_tokens=400)
+        return self._normalize_classification(result)
+
+    def _normalize_classification(self, result: dict) -> dict:
+        """Validate/coerce a raw LLM classification into the canonical shape.
+
+        A parse error, missing category, or out-of-vocabulary category degrades
+        to ``unknown`` (confidence 0) so a bad AI response is surfaced for manual
+        review rather than mis-routing a reply.
+        """
+        if not isinstance(result, dict) or result.get("error") or "category" not in result:
+            return {
+                "category": "unknown",
+                "confidence": 0.0,
+                "reason": "Classifier unavailable or returned no category; needs manual review.",
+                "return_date": None,
+                "referral": {"name": None, "email": None},
+                "unsubscribe_explicit": False,
+                "source": "fallback",
+                "model": None,
+            }
+
+        category = str(result.get("category", "unknown")).strip().lower()
+        if category not in REPLY_CATEGORIES:
+            category = "unknown"
+
+        try:
+            confidence = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        referral = result.get("referral") or {}
+        if not isinstance(referral, dict):
+            referral = {}
+
+        return_date = result.get("return_date")
+        if category != "out_of_office":
+            return_date = None
+
+        unsub_explicit = bool(result.get("unsubscribe_explicit", False))
+        # A model that labels something unsubscribe must have seen explicit
+        # opt-out language; keep the flag consistent for the compliance path.
+        if category == "unsubscribe":
+            unsub_explicit = True
+
+        return {
+            "category": category,
+            "confidence": confidence,
+            "reason": str(result.get("reason", ""))[:500],
+            "return_date": return_date if isinstance(return_date, str) else None,
+            "referral": {"name": referral.get("name"), "email": referral.get("email")},
+            "unsubscribe_explicit": unsub_explicit,
+            "source": "ai",
+            "model": self.model,
+        }
 
     # ------------------------------------------------------------------
     # Sales tactics / playbook generators

@@ -69,6 +69,7 @@ async def generate_stale_lead_followups_for_session(db) -> dict:
         .where(
             Contact.email.isnot(None),
             Contact.unsubscribed.is_(False),
+            Contact.suppressed.is_(False),
             Company.stage.in_(stages),
         )
     )

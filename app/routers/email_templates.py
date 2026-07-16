@@ -365,17 +365,19 @@ async def compose_and_send(
             ))
             continue
 
-        # Never email a contact who has unsubscribed (CAN-SPAM / CASL).
-        if contact.unsubscribed:
+        # Never email a contact who has unsubscribed or been suppressed
+        # (CAN-SPAM / CASL; suppression is the Feature-1 hard opt-out flag).
+        if contact.unsubscribed or getattr(contact, "suppressed", False):
             skipped += 1
+            reason = "suppressed" if getattr(contact, "suppressed", False) else "unsubscribed"
             results.append(EmailComposeResult(
                 contact_id=contact_id, to_email=contact.email,
-                status="skipped", detail="unsubscribed",
+                status="skipped", detail=reason,
             ))
             db.add(EmailSend(
                 template_id=template.id, contact_id=contact.id,
                 to_email=contact.email, subject=template.subject,
-                status="skipped", error="unsubscribed",
+                status="skipped", error=reason,
             ))
             continue
 

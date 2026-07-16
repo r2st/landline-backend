@@ -48,6 +48,7 @@ celery_app.conf.update(
         "app.tasks.domain_health.*": {"queue": "enrichment"},
         "app.tasks.rag.*": {"queue": "enrichment"},
         "app.tasks.voice.*": {"queue": "enrichment"},
+        "app.tasks.replies.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -197,6 +198,12 @@ celery_app.conf.update(
             "task": "app.tasks.reporting.generate_daily_summary",
             "schedule": crontab(hour=12, minute=30),
         },
+        # Feature 1: classify newly-arrived replies and route them (hot leads →
+        # priority inbox, unsubscribes → suppression, OOO → re-queue).
+        "classify-new-replies": {
+            "task": "app.tasks.replies.classify_new_replies",
+            "schedule": 300.0,  # every 5 minutes
+        },
         # Feature 5: daily SPF/DKIM/DMARC + DNSBL sweep per sending domain,
         # scored, persisted, and alerted on change. Daily is plenty (DNS moves
         # slowly) and polite to the DNSBL zones. 5 AM UTC.
@@ -233,3 +240,4 @@ import app.tasks.danger_signals  # noqa: F401
 import app.tasks.domain_health  # noqa: F401
 import app.tasks.rag  # noqa: F401
 import app.tasks.voice  # noqa: F401
+import app.tasks.replies  # noqa: F401

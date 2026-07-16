@@ -35,6 +35,8 @@ DIALTONE_EVENT_TYPES = (
     # Feature 5: a sending domain's health changed (score/band transition or a
     # new blacklist listing).
     "domain_health_changed",
+    # Feature 1: an incoming reply was auto-classified + routed.
+    "reply_classified",
 )
 
 

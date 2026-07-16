@@ -152,6 +152,9 @@ async def _enroll_into_sequence(
         if contact.unsubscribed:
             skipped.append(EnrollSkip(contact_id=cid, reason="Contact has unsubscribed"))
             continue
+        if getattr(contact, "suppressed", False):
+            skipped.append(EnrollSkip(contact_id=cid, reason="Contact is suppressed"))
+            continue
         if cid in already:
             skipped.append(EnrollSkip(contact_id=cid, reason="Already enrolled in this sequence"))
             continue
