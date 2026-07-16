@@ -8,9 +8,14 @@ bounces in 24h: one bad Apollo batch can pause the whole system. Verification is
 upstream insurance for that safety rail.
 
 **Layered cheapest-first.** Syntax (free, local) → MX (free, cached per domain)
-→ Hunter (paid, per address). Hunter is only called for addresses the free
-layers couldn't already condemn, so a syntactically broken address never costs a
-credit.
+→ SMTP probe (free, per address — see ``smtp_probe``) → Hunter (paid, per
+address). Hunter is only called for addresses the free layers couldn't settle,
+so a syntactically broken address never costs a credit, and neither does one a
+mail server will plainly answer for.
+
+The SMTP probe is **off by default** and answers ``unknown`` when it can't reach
+port 25, which is the state on a stock AWS/Hetzner host. That is deliberate:
+every free layer degrades to "ask Hunter", never to "condemn".
 
 **Fail-open is non-negotiable.** A missing key, a timeout, a 429 that outlives
 its retries, or any other error leaves the contact *exactly as it was* —
@@ -37,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.contact import Contact
+from app.services import smtp_probe
 from app.services.email_validation import check_mx, domain_of, is_valid_syntax
 
 logger = logging.getLogger(__name__)
@@ -313,10 +319,46 @@ class HunterVerificationService:
             )
         return None
 
+    async def _smtp_probe(self, address: str) -> Optional[dict]:
+        """The free per-mailbox layer. Returns a verdict to short-circuit on, or
+        None when the address survives to the paid layer.
+
+        Only a *decisive* probe short-circuits. ``unknown`` — which is what a
+        blocked port 25, a timeout, a greylisting 4xx, or a reputation-flavoured
+        rejection all produce — falls through to Hunter, so the probe can only
+        ever save credits, never cost coverage. Disabled (the default) is just
+        another ``unknown``.
+        """
+        probe = await asyncio.to_thread(smtp_probe.probe_email, address)
+        result = probe["result"]
+        if result == smtp_probe.UNKNOWN:
+            return None
+
+        if result == smtp_probe.DELIVERABLE:
+            email_status = "valid"
+        elif result == smtp_probe.UNDELIVERABLE:
+            email_status = "invalid"
+        else:
+            # Catch-all → risky → sendable but uncertain, same as Hunter's
+            # accept_all. Hunter would only tell us the same thing, so spending a
+            # credit to re-learn it is waste.
+            email_status = "unknown"
+
+        return _verdict(
+            "ok",
+            result=result,
+            source="smtp",
+            email_status=email_status,
+            meta=probe["meta"],
+        )
+
     async def verify_email(
         self, email: Optional[str], *, budget: Optional[_Budget] = None
     ) -> dict:
-        """Verify one address: syntax → MX → Hunter.
+        """Verify one address: syntax → MX → SMTP probe → Hunter.
+
+        Cheapest-first: each layer only sees what the ones before it couldn't
+        settle, so Hunter is paid only for genuinely ambiguous addresses.
 
         ``budget`` gates the paid layer and is checked **before** the HTTP call.
         Pass None for no gate (callers with a ``db`` should use ``make_budget``).
@@ -327,6 +369,10 @@ class HunterVerificationService:
         precheck = await self._precheck(address)
         if precheck is not None:
             return precheck
+
+        probed = await self._smtp_probe(address)
+        if probed is not None:
+            return probed
 
         if not self.api_key:
             # Not an error — the capability is off. Fall back to MX-only.

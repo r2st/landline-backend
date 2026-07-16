@@ -107,6 +107,25 @@ class Settings(BaseSettings):
     hunter_max_batch: int = 100
     hunter_concurrency: int = 5
 
+    # --- SMTP probe (P3a) — the free per-mailbox layer before Hunter ---
+    # Asks a domain's MX host whether a mailbox exists, so Hunter is only paid
+    # for addresses the probe can't resolve. Requires outbound port 25, which
+    # AWS and Hetzner both block to public IPs by default (lifted on request) —
+    # hence off by default: enabled without port 25 egress it just adds a
+    # connect timeout per contact and changes no verdict. See
+    # app/services/smtp_probe.py.
+    smtp_probe_enabled: bool = False
+    # MAIL FROM for the probe. Must be a real address on a domain we control
+    # (ideally with SPF) — servers reject probes from a bogus sender, and that
+    # rejection is indistinguishable from a mailbox verdict. No default: an
+    # unset value disables the probe rather than guessing wrong.
+    smtp_probe_from: str = ""
+    # EHLO name. Defaults to smtp_probe_from's domain; set explicitly when the
+    # host's PTR record differs.
+    smtp_probe_helo: str = ""
+    smtp_probe_port: int = 25
+    smtp_probe_timeout: float = 10.0
+
     # --- Google Places SMB discovery (P4) ---
     # Places API (New) — the legacy Places API is deprecated for new projects.
     # Apollo's coverage of small international manufacturers is thin; Places has
