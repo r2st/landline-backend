@@ -29,6 +29,7 @@ from app.services.ingestion import (
     DEDUP_MEDIUM,
     DEDUP_NONE,
     ROUTE_AUTO_ENROLL,
+    ROUTE_DISCARD,
     ROUTE_REVIEW,
     CandidateRecord,
     ContactRecord,
@@ -847,6 +848,44 @@ async def test_dedup_medium_vetoes_auto_enroll(db_session):
     strong = {"fit_score": 95, "excluded": False}
     assert svc.route(strong, _match(DEDUP_CERTAIN), enroll_budget=5) == ROUTE_AUTO_ENROLL
     assert svc.route(strong, _match(DEDUP_MEDIUM), enroll_budget=5) == ROUTE_REVIEW
+
+
+async def test_auto_enroll_threshold_is_65(db_session):
+    """The Places-era threshold: a 70-fit SMB is enrollable, not just reviewable.
+
+    Places candidates cluster in the 60s-70s, so 75 parked all of them in the
+    review queue. Pinned because the exact number is a business decision, not
+    an implementation detail — moving it should be a deliberate edit here.
+    """
+    svc = IngestionService()
+    assert svc.settings.prospecting_auto_enroll_threshold == 65
+    at_70 = {"fit_score": 70, "excluded": False}
+    assert svc.route(at_70, _match(DEDUP_CERTAIN), enroll_budget=5) == ROUTE_AUTO_ENROLL
+
+
+async def test_route_bands_at_threshold_boundaries(db_session):
+    """Walk the exact edges of discard → review → auto-enroll."""
+    svc = IngestionService()
+
+    def route_at(fit: int) -> str:
+        return svc.route({"fit_score": fit, "excluded": False},
+                         _match(DEDUP_CERTAIN), enroll_budget=5)
+
+    assert route_at(49) == ROUTE_DISCARD      # below review floor
+    assert route_at(50) == ROUTE_REVIEW       # review floor is inclusive
+    assert route_at(64) == ROUTE_REVIEW       # last point below auto-enroll
+    assert route_at(65) == ROUTE_AUTO_ENROLL  # auto-enroll floor is inclusive
+
+
+async def test_zero_enroll_budget_downgrades_auto_enroll_to_review(db_session):
+    """The dry-run guarantee: budget 0 means nothing can enrol, however good.
+
+    PROSPECTING_DAILY_MAX=0 is the safety recipe used to rehearse live runs, so
+    the downgrade has to hold even for a candidate way over the threshold.
+    """
+    svc = IngestionService()
+    strong = {"fit_score": 95, "excluded": False}
+    assert svc.route(strong, _match(DEDUP_CERTAIN), enroll_budget=0) == ROUTE_REVIEW
 
 
 async def test_dry_run_persists_nothing(db_session):

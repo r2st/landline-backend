@@ -299,7 +299,7 @@ class Settings(BaseSettings):
     prospecting_enabled: bool = True
     prospecting_target_volume: int = 25            # candidates evaluated per run
     prospecting_daily_max: int = 25                # hard cap on companies enrolled per day
-    prospecting_auto_enroll_threshold: int = 75    # fit >= → auto-enroll into outreach
+    prospecting_auto_enroll_threshold: int = 65    # fit >= → auto-enroll into outreach
     prospecting_review_threshold: int = 50         # fit >= → human review queue
     # Auto-pause the agent if the rolling enroll→engaged conversion drops below
     # this fraction (guardrail against enrolling junk). 0 disables the check.
