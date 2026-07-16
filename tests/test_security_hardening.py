@@ -198,6 +198,29 @@ async def test_login_is_rate_limited(unauth_client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_successful_login_under_active_limiter(unauth_client: AsyncClient, admin_user):
+    """Correct credentials return 200 while the limiter is live.
+
+    The rest of the H4 coverage only ever sends *wrong* credentials, which raise
+    before slowapi post-processes the return value — so the success path went
+    unexercised with the limiter on, and shipped a 500 that only ever hit users
+    who typed the right password.
+    """
+    limiter.reset()
+    limiter.enabled = True
+    try:
+        resp = await unauth_client.post(
+            "/api/v1/auth/login",
+            json={"email": "admin@landline.app", "password": "adminpass123"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert "access_token" in resp.json()
+    finally:
+        limiter.enabled = False
+        limiter.reset()
+
+
+@pytest.mark.asyncio
 async def test_ai_endpoint_is_rate_limited(client: AsyncClient, monkeypatch):
     """AI endpoints are rate limited. The AI service is stubbed so no external
     call is made; we only care that the limiter trips."""
@@ -213,13 +236,17 @@ async def test_ai_endpoint_is_rate_limited(client: AsyncClient, monkeypatch):
     limiter.reset()
     limiter.enabled = True
     try:
-        last = None
+        statuses = []
         for _ in range(limit + 1):
-            last = await client.post(
+            r = await client.post(
                 "/api/v1/ai/improve-email",
                 json={"subject": "hi", "body": "there", "instruction": "shorten"},
             )
-        assert last.status_code == 429
+            statuses.append(r.status_code)
+        # The calls before the limit trips must genuinely succeed; asserting only
+        # on the final 429 would let a broken success path pass unnoticed.
+        assert statuses[:limit] == [200] * limit, statuses
+        assert statuses[-1] == 429
     finally:
         limiter.enabled = False
         limiter.reset()
