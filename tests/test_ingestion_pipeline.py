@@ -11,6 +11,7 @@ Covers the seven fixes this change set lands:
 7. API credit tracking + backoff               (test_budget_gate_*, test_rate_limited_*)
 """
 
+import json as json_lib
 import uuid
 
 import pytest
@@ -359,24 +360,19 @@ def test_location_score_is_nonzero_for_supported_international():
 # ---------------------------------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, payload=None, status_code=200, headers=None):
+    def __init__(self, payload=None, status_code=200, headers=None, text=None):
         self._payload = payload or {}
         self.status_code = status_code
         self.headers = headers or {}
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            import httpx
-
-            raise httpx.HTTPStatusError(
-                f"HTTP {self.status_code}", request=None, response=None
-            )
+        # A real httpx.Response always carries .text, and the client reads it to
+        # record *why* a call failed. Defaults to the JSON body, like the real one.
+        self.text = text if text is not None else json_lib.dumps(self._payload)
 
     def json(self):
         return self._payload
 
 
-def _install_fake_apollo(monkeypatch, responses, captured=None):
+def _install_fake_apollo(monkeypatch, responses, captured=None, headers_out=None):
     """Point httpx.AsyncClient at a scripted list of responses."""
     import httpx
 
@@ -389,6 +385,8 @@ def _install_fake_apollo(monkeypatch, responses, captured=None):
         async def post(self, url, headers=None, json=None):
             if captured is not None:
                 captured.append(json)
+            if headers_out is not None:
+                headers_out.append(headers or {})
             return seq.pop(0) if len(seq) > 1 else seq[0]
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
@@ -462,6 +460,105 @@ async def test_industry_filter_is_absent_not_empty(db_session, monkeypatch):
     )
     # The industry still reaches Apollo, honestly, as a keyword tag.
     assert body["q_organization_keyword_tags"] == ["Metal Stamping"]
+
+
+async def test_api_key_travels_in_header_never_in_body(db_session, monkeypatch):
+    """The bug: the key was POSTed in the JSON body, so Apollo answered every
+    org search with 422 INVALID_API_KEY_LOCATION — "API key must be passed in
+    the X-Api-Key header for security reasons".
+    """
+    from app.services.enrichment import ApolloEnrichmentService
+
+    svc = ApolloEnrichmentService()
+    svc.api_key = "secret-key"
+    captured, headers = [], []
+    _install_fake_apollo(
+        monkeypatch, [_FakeResponse({"organizations": []})], captured, headers
+    )
+
+    await svc.search_companies(db_session, industry="CNC Machining", per_page=5)
+
+    assert headers[0].get("X-Api-Key") == "secret-key", "Apollo 422s without this header"
+    assert "api_key" not in captured[0], (
+        "the key in the request body is exactly what Apollo rejects"
+    )
+
+
+async def test_search_payload_is_shaped_the_way_apollo_expects(db_session, monkeypatch):
+    """The whole org-search body, pinned. This is the heuristic-v1 ICP: an
+    industry, 50-500 employees, US.
+    """
+    from app.services.enrichment import ApolloEnrichmentService
+
+    svc = ApolloEnrichmentService()
+    svc.api_key = "fake"
+    captured = []
+    _install_fake_apollo(monkeypatch, [_FakeResponse({"organizations": []})], captured)
+
+    await svc.search_companies(
+        db_session,
+        industry="Injection Molding",
+        location="United States",
+        min_employees=50,
+        max_employees=500,
+        per_page=5,
+    )
+
+    assert captured[0] == {
+        "page": 1,
+        "per_page": 5,
+        "q_organization_keyword_tags": ["Injection Molding"],
+        "organization_locations": ["United States"],
+        "organization_num_employees_ranges": ["50,500"],
+    }
+
+
+async def test_apollo_error_body_reaches_the_ledger(db_session, monkeypatch):
+    """The 422 was diagnosed as a payload bug for want of one line of evidence:
+    the client recorded "HTTP 422" and dropped the body, where Apollo had
+    already explained itself.
+    """
+    from app.services.enrichment import ApolloEnrichmentService
+
+    svc = ApolloEnrichmentService()
+    svc.api_key = "fake"
+    monkeypatch.setattr(svc.settings, "apollo_daily_credit_budget", 100)
+    body = (
+        '{"error":"API key must be passed in the X-Api-Key header for security '
+        'reasons.","error_code":"INVALID_API_KEY_LOCATION"}'
+    )
+    _install_fake_apollo(monkeypatch, [_FakeResponse({}, status_code=422, text=body)])
+
+    result = await svc.search_companies(db_session, industry="x", per_page=5)
+
+    assert result.status == "error"
+    assert "422" in result.error
+    assert "INVALID_API_KEY_LOCATION" in result.error, (
+        "Apollo said why; the client must not throw it away"
+    )
+    rows = (await db_session.execute(select(ApiCreditLedger))).scalars().all()
+    assert "INVALID_API_KEY_LOCATION" in rows[0].details["error"]
+
+
+async def test_permanent_4xx_is_not_retried(db_session, monkeypatch):
+    """A 403 (endpoint not on this Apollo plan) is a verdict, not weather.
+    Retrying it three times just spends three credits to be told the same thing.
+    """
+    from app.services.enrichment import ApolloEnrichmentService
+
+    svc = ApolloEnrichmentService()
+    svc.api_key = "fake"
+    monkeypatch.setattr(svc.settings, "apollo_daily_credit_budget", 100)
+    body = '{"error":"not accessible with this api_key on a free plan.","error_code":"API_INACCESSIBLE"}'
+    _install_fake_apollo(monkeypatch, [_FakeResponse({}, status_code=403, text=body)])
+
+    result = await svc.search_companies(db_session, industry="x", per_page=5)
+
+    assert result.status == "error"
+    assert "free plan" in result.error, "the operator needs the reason, not just a number"
+    rows = (await db_session.execute(select(ApiCreditLedger))).scalars().all()
+    assert rows[0].details["attempts"] == 1, "a plan limit was retried like a blip"
+    assert rows[0].credits == 1
 
 
 async def test_apollo_country_is_passed_through_verbatim(db_session, monkeypatch):

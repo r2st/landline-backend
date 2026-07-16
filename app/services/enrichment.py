@@ -9,8 +9,13 @@ three; its internal ``db.commit()`` committed the caller's half-built
 error.
 
 Every outbound call goes through :meth:`ApolloEnrichmentService._apollo_request`,
-which checks the credit budget *before* spending, rate-limits, backs off on 429,
-and records the attempt in the ledger whatever the outcome.
+which authenticates with the ``X-Api-Key`` header, checks the credit budget
+*before* spending, rate-limits, backs off on 429, and records the attempt in the
+ledger whatever the outcome.
+
+Apollo requires the key in that header and rejects it in the request body with
+HTTP 422 ``INVALID_API_KEY_LOCATION`` — which is what every org search returned
+until 2026-07-16.
 """
 
 import asyncio
@@ -44,6 +49,9 @@ APOLLO_MAX_PER_PAGE = 25
 APOLLO_MAX_ATTEMPTS = 3
 # Base for exponential backoff, seconds. Scaled by 2**attempt plus jitter.
 APOLLO_BACKOFF_BASE = 0.5
+# How much of an error body to keep. Apollo's are one sentence; the cap is for
+# the day it returns an HTML error page.
+APOLLO_ERROR_BODY_LIMIT = 300
 
 # Fallback title lists for contact discovery. Hardcoded to Apprend's
 # manufacturing motion — moving these onto the ICP (`icp.job_titles`) is P1's
@@ -138,10 +146,37 @@ class ApolloEnrichmentService:
         self.settings = get_settings()
         self.api_key = self.settings.apollo_api_key
         self.base_url = self.settings.apollo_base_url
+        # The key is *not* baked in here: callers (and tests) reassign
+        # ``self.api_key`` after construction, and a header snapshotted in
+        # __init__ would silently keep authenticating as the old key.
         self.headers = {
             "Content-Type": "application/json",
             "Cache-Control": "no-cache",
         }
+
+    def _auth_headers(self) -> dict:
+        """Request headers including Apollo's key header.
+
+        Apollo rejects the key in the request body with HTTP 422
+        ``INVALID_API_KEY_LOCATION``; it must travel in ``X-Api-Key``.
+        """
+        return {**self.headers, "X-Api-Key": self.api_key}
+
+    @staticmethod
+    def _error_detail(response: httpx.Response) -> str:
+        """The status line plus Apollo's own explanation of it.
+
+        Apollo says precisely what it dislikes in the response body — "API key
+        must be passed in the X-Api-Key header", "not accessible with this
+        api_key on a free plan". Recording a bare "HTTP 422" threw that away and
+        sent us hunting a payload bug that never existed.
+        """
+        body = " ".join((response.text or "").split())
+        if len(body) > APOLLO_ERROR_BODY_LIMIT:
+            body = body[:APOLLO_ERROR_BODY_LIMIT] + "…"
+        if not body:
+            return f"HTTP {response.status_code}"
+        return f"HTTP {response.status_code}: {body}"
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> Optional[float]:
@@ -200,11 +235,11 @@ class ApolloEnrichmentService:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.post(
                         f"{self.base_url}{path}",
-                        headers=self.headers,
-                        json={"api_key": self.api_key, **params},
+                        headers=self._auth_headers(),
+                        json=params,
                     )
                 if response.status_code == 429 or response.status_code >= 500:
-                    last_error = f"HTTP {response.status_code}"
+                    last_error = self._error_detail(response)
                     status = "rate_limited" if response.status_code == 429 else "error"
                     if attempt == APOLLO_MAX_ATTEMPTS:
                         break
@@ -216,13 +251,15 @@ class ApolloEnrichmentService:
                         delay *= 1 + random.random()
                     await _sleep(delay)
                     continue
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    # Any other 4xx is a verdict on the request, not weather:
+                    # a rejected key or an unaffordable endpoint answers the same
+                    # way three times, so retrying only spends credits.
+                    last_error = self._error_detail(response)
+                    status = "error"
+                    break
                 data = response.json()
                 status = "ok"
-                break
-            except httpx.HTTPStatusError as e:
-                last_error = str(e)
-                status = "error"
                 break
             except Exception as e:
                 last_error = str(e)
