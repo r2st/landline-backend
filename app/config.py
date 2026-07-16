@@ -239,6 +239,26 @@ class Settings(BaseSettings):
     # <selector>._domainkey.<domain> when no explicit selector is supplied.
     dkim_default_selectors: List[str] = ["google", "default", "selector1", "selector2", "k1"]
 
+    # --- Feature 5: Domain Health Dashboard ---
+    # DNSBL zones queried per sending domain/IP by the daily domain-health check.
+    # IP-based zones (reversed-IP.<zone> A-record lookup). For Gmail domains the
+    # sending IP is Google's shared pool, so these are informational only.
+    dnsbl_zones: List[str] = ["zen.spamhaus.org", "b.barracudacentral.org", "bl.spamcop.net"]
+    # Domain-based zones (<domain>.<zone>) — the meaningful signal for shared-pool
+    # senders; these DO count toward the health score.
+    dnsbl_domain_zones: List[str] = ["dbl.spamhaus.org"]
+    # Composite health-score weights (unknown/unverifiable components are dropped
+    # from the denominator so the score reflects only what we could verify).
+    domain_health_weight_spf: int = 20
+    domain_health_weight_dkim: int = 20
+    domain_health_weight_dmarc: int = 25
+    domain_health_weight_blacklists: int = 30
+    # Band boundaries: >= healthy_min → healthy; >= watch_min → watch; else at_risk.
+    domain_health_band_healthy_min: int = 90
+    domain_health_band_watch_min: int = 70
+    # On-demand recheck cooldown (seconds) to be polite to the DNSBL zones.
+    domain_health_recheck_cooldown_seconds: int = 60
+
     # 3.5 Voice Intelligence.
     voice_intelligence_enabled: bool = True
     # OpenAI key for Whisper transcription (optional — a transcript can also be

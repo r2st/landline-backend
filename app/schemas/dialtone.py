@@ -32,6 +32,9 @@ DIALTONE_EVENT_TYPES = (
     # the operator's acknowledged resume that cleared it.
     "auto_paused",
     "resumed",
+    # Feature 5: a sending domain's health changed (score/band transition or a
+    # new blacklist listing).
+    "domain_health_changed",
 )
 
 

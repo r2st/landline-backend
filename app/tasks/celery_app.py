@@ -45,6 +45,7 @@ celery_app.conf.update(
         "app.tasks.client_health.*": {"queue": "enrichment"},
         "app.tasks.deliverability.*": {"queue": "enrichment"},
         "app.tasks.danger_signals.*": {"queue": "enrichment"},
+        "app.tasks.domain_health.*": {"queue": "enrichment"},
         "app.tasks.rag.*": {"queue": "enrichment"},
         "app.tasks.voice.*": {"queue": "enrichment"},
     },
@@ -196,6 +197,13 @@ celery_app.conf.update(
             "task": "app.tasks.reporting.generate_daily_summary",
             "schedule": crontab(hour=12, minute=30),
         },
+        # Feature 5: daily SPF/DKIM/DMARC + DNSBL sweep per sending domain,
+        # scored, persisted, and alerted on change. Daily is plenty (DNS moves
+        # slowly) and polite to the DNSBL zones. 5 AM UTC.
+        "check-domain-health": {
+            "task": "app.tasks.domain_health.check_domain_health",
+            "schedule": crontab(hour=5, minute=30),
+        },
     },
 )
 
@@ -222,5 +230,6 @@ import app.tasks.prospecting  # noqa: F401
 import app.tasks.client_health  # noqa: F401
 import app.tasks.deliverability  # noqa: F401
 import app.tasks.danger_signals  # noqa: F401
+import app.tasks.domain_health  # noqa: F401
 import app.tasks.rag  # noqa: F401
 import app.tasks.voice  # noqa: F401

@@ -46,6 +46,24 @@ That's a strong signal. Good time to follow up while they're actively looking. C
 """
         await self._send_notification(subject, body)
 
+    async def notify_domain_health_change(
+        self, domain: str, summary: str, details: str = ""
+    ):
+        """Notify when a sending domain's health changes (Feature 5).
+
+        Fired only on a *transition* (score/band change or a new blacklist
+        listing), never on an unchanged daily run — the caller guards this.
+        """
+        subject = f"⚠️ Domain health: {domain} — {summary}"
+        body = (
+            f"Dialtone detected a change in the health of sending domain {domain}:\n\n"
+            f"{summary}\n"
+        )
+        if details:
+            body += f"\n{details}\n"
+        body += "\nOpen the Domain Health dashboard in Landline for the full breakdown and DNS fixes.\n"
+        await self._send_notification(subject, body)
+
     async def _send_notification(self, subject: str, body: str):
         """Send notification email to the configured recipient."""
         notify_email = self.settings.notification_email

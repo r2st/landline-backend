@@ -38,6 +38,7 @@ from app.models.workflow import Workflow, WorkflowRun
 from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
 from app.models.sender_health import SenderHealth
 from app.models.danger_signal import DangerSignalEvent
+from app.models.domain_health import DomainHealth
 from app.models.content_embedding import ContentEmbedding
 from app.models.call_recording import CallRecording
 from app.models.orchestration import OrchestrationPolicy
@@ -99,6 +100,7 @@ __all__ = [
     "ProspectCandidate",
     "SenderHealth",
     "DangerSignalEvent",
+    "DomainHealth",
     "ContentEmbedding",
     "CallRecording",
     "OrchestrationPolicy",
