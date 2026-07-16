@@ -3,7 +3,7 @@
 Chains the existing sales stack into a hands-off pipeline:
 
     learn ICP (from won deals)
-        → source candidate companies (Apollo, or supplied seeds)
+        → source candidate companies (Apollo, then Places, or supplied seeds)
         → qualify each against the ICP (fit score 0-100)
         → for high-confidence matches: persist + advance to outreach + (best-effort) enroll
         → for borderline matches: persist as a new lead in the human review queue
@@ -15,7 +15,8 @@ agent can do autonomously.
 
 The core is deterministic and network-free: ``run`` accepts a list of candidate
 dicts (used by the API's manual trigger and by tests). When no seeds are given
-and Apollo is configured, it sources candidates from Apollo automatically.
+it sources automatically: Apollo first, then Google Places when Apollo yields
+nothing (see ``_source_candidates``).
 """
 
 import logging
@@ -30,6 +31,7 @@ from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.deal import Deal
+from app.models.discovery_search import DiscoverySearch
 from app.models.outreach import OutreachEnrollment
 from app.models.prospecting import (
     IcpProfile,
@@ -47,6 +49,11 @@ from app.services.ingestion import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Matches ``places_discovery.PROVIDER``. Imported lazily at call sites (the
+# service pulls in httpx and the ingestion graph), so the string is pinned here
+# and asserted against the real one in tests.
+PLACES_SOURCE = "google_places"
 
 
 class AutonomousProspector:
@@ -272,37 +279,63 @@ class AutonomousProspector:
     # ------------------------------------------------------------------
     # Sourcing
     # ------------------------------------------------------------------
+    def _top_industry(self, icp: IcpProfile) -> str:
+        if icp.industry_weights:
+            return max(icp.industry_weights, key=icp.industry_weights.get)
+        return "manufacturing"
+
     async def _source_candidates(
         self, db: AsyncSession, icp: IcpProfile, limit: int, run: ProspectingRun
     ) -> tuple[list[CandidateRecord], list[str], dict]:
-        """Return (records, sources queried, sourcing notes) from Apollo.
+        """Return (records, sources queried, sourcing notes) from Apollo, then Places.
 
-        Apollo no longer imports anything here — it returns records and the
+        Neither source imports anything here — they return records and the
         ingestion service persists them. ``notes`` carries why sourcing stopped,
         so a rate-limited run can't masquerade as a run that found nothing.
+
+        Places runs only when Apollo yields no records. That covers the free
+        plan's 403 on both search endpoints, a missing key, an exhausted budget
+        and a genuinely empty result — the distinction doesn't change what to do
+        next, and ``notes`` keeps it legible after the fact. Places is second and
+        not parallel because it is the weaker source: it carries no employee
+        count or revenue (the two things ``qualify`` weighs hardest) and no
+        people, so a Places run costs more per emailable contact than Apollo.
         """
         sources: list[str] = []
         notes: dict = {}
+
+        records, apollo_notes = await self._source_from_apollo(db, icp, limit, run)
+        notes.update(apollo_notes)
+        if apollo_notes.get("apollo_status") != "skipped":
+            sources.append("apollo")
+        if records:
+            return records, sources, notes
+
+        places_records, places_notes = await self._source_from_places(db, icp, limit)
+        notes.update(places_notes)
+        if places_notes.get("places_status") != "skipped":
+            sources.append(PLACES_SOURCE)
+        return places_records, sources, notes
+
+    async def _source_from_apollo(
+        self, db: AsyncSession, icp: IcpProfile, limit: int, run: ProspectingRun
+    ) -> tuple[list[CandidateRecord], dict]:
         if not self.settings.apollo_api_key:
-            return [], sources, notes
+            return [], {"apollo_status": "skipped", "apollo_error": "no_api_key"}
 
         from app.services.enrichment import get_enrichment_service
 
         svc = get_enrichment_service()
-        top_industry = None
-        if icp.industry_weights:
-            top_industry = max(icp.industry_weights, key=icp.industry_weights.get)
         sr = icp.size_range or {}
         search = await svc.search_companies(
             db,
-            industry=top_industry or "manufacturing",
+            industry=self._top_industry(icp),
             min_employees=sr.get("min"),
             max_employees=sr.get("max"),
             target_volume=limit,
             run_id=run.id,
             icp_profile_id=icp.id,
         )
-        sources.append("apollo")
         notes = {
             "apollo_status": search.status,
             "apollo_pages": search.pages_fetched,
@@ -313,7 +346,79 @@ class AutonomousProspector:
             notes["apollo_error"] = search.error
         for record in search.records:
             record.icp_profile_id = icp.id
-        return search.records, sources, notes
+        return search.records, notes
+
+    def _places_search_from_icp(self, icp: IcpProfile) -> DiscoverySearch:
+        """An unsaved ``DiscoverySearch`` describing what the ICP wants from Places.
+
+        Transient on purpose. ``DiscoverySearch`` rows are the operator's saved,
+        scheduled queries; this one is derived fresh from the ICP each run and
+        persisting it would put a row nobody curated into that list. ``_stage``
+        keeps the audit trail anyway — it copies ``query`` onto every staged
+        business and leaves the nullable ``search_id`` NULL, which reads
+        correctly as "not from a saved search".
+        """
+        prefs = icp.location_preferences or {}
+        countries = [c for c in (prefs.get("countries") or []) if c]
+        states = [s for s in (prefs.get("states") or []) if s]
+        country = countries[0].strip().upper()[:2] if countries else None
+        return DiscoverySearch(
+            name="autonomous-prospector",
+            query=self._top_industry(icp),
+            # Places resolves a place name better than we can, and it costs no
+            # extra call. Prefer the ICP's strongest state, else the country.
+            location_text=states[0] if states else country,
+            country=country,
+        )
+
+    async def _source_from_places(
+        self, db: AsyncSession, icp: IcpProfile, limit: int
+    ) -> tuple[list[CandidateRecord], dict]:
+        """Discover SMBs via Places and hand back records, never raising.
+
+        ``discover`` stages to ``discovered_businesses`` (deduped on
+        ``place_id``) and reports its own failures as a status rather than an
+        exception, so a Places outage degrades this run instead of failing it.
+        """
+        from app.services.places_discovery import get_places_service
+
+        svc = get_places_service()
+        if not svc.enabled:
+            return [], {"places_status": "skipped", "places_error": "no_api_key"}
+
+        search = self._places_search_from_icp(icp)
+        outcome = await svc.discover(db, search, limit=limit)
+        notes = {
+            "places_status": outcome.status,
+            "places_query": search.query,
+            "places_location": search.location_text,
+            "places_staged": outcome.created,
+            "places_duplicates": outcome.duplicates,
+            "places_credits_spent": outcome.credits_spent,
+            "places_truncated": outcome.truncated,
+        }
+        if outcome.error:
+            notes["places_error"] = outcome.error
+
+        records: list[CandidateRecord] = []
+        for business in outcome.businesses:
+            # Re-running a search re-surfaces businesses a previous run already
+            # imported. Ingestion would dedup them back onto their company, but
+            # they'd crowd out unseen businesses under the run's target and
+            # report as "found" every week.
+            if business.company_id is not None:
+                continue
+            record = svc.to_candidate(business)
+            record.icp_profile_id = icp.id
+            records.append(record)
+
+        notes["places_candidates"] = len(records)
+        if outcome.status != "ok":
+            logger.warning(
+                "Places sourcing for '%s' ended %s: %s",
+                search.query, outcome.status, outcome.error,
+            )
+        return records, notes
 
     async def _auto_enroll(self, db: AsyncSession, company: Company) -> bool:
         """Advance a company to outreach and best-effort enroll a primary contact.
