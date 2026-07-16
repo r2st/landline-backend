@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
+from app.models.ab_test import AbTest, AbTestVariant
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
 from app.models.email_reply import EmailReply
@@ -405,6 +406,43 @@ async def _collect_events(
                     severity="ok",
                     metadata={**trip_meta, "resolved_by": trip.resolved_by},
                 ))
+
+    # --- A/B test conclusions (Feature 3) ------------------------------------
+    # Surface each declared winner so the feed reflects that a test converged and
+    # the step's copy was promoted.
+    if contact_id is None:  # tests are step-scoped, not contact-scoped
+        concluded_query = (
+            select(AbTest)
+            .where(AbTest.status == "completed", AbTest.winner_variant_id.isnot(None))
+            .order_by(AbTest.declared_at.desc())
+            .limit(cap)
+        )
+        for test in (await db.execute(concluded_query)).scalars().all():
+            winner = (
+                await db.execute(
+                    select(AbTestVariant).where(AbTestVariant.id == test.winner_variant_id)
+                )
+            ).scalar_one_or_none()
+            label = winner.label if winner is not None else "?"
+            if q_lower and q_lower not in f"variant {label}".lower():
+                continue
+            items.append(DialtoneEvent(
+                id=f"ab_test_concluded:{test.id}",
+                type="ab_test_concluded",
+                timestamp=_aware(test.declared_at),
+                title=f"A/B test concluded — variant {label} won",
+                description=f"{test.metric} rate winner promoted to the step template",
+                source="ab_testing",
+                severity="ok",
+                metadata={
+                    "ab_test_id": str(test.id),
+                    "sequence_step_id": str(test.sequence_step_id),
+                    "winner_variant_id": str(test.winner_variant_id),
+                    "winner_label": label,
+                    "metric": test.metric,
+                    "strategy": test.strategy,
+                },
+            ))
 
     # Apply the date window per-event (events carry their own timestamps).
     if start is not None or end is not None:

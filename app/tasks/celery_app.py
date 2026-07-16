@@ -49,6 +49,7 @@ celery_app.conf.update(
         "app.tasks.rag.*": {"queue": "enrichment"},
         "app.tasks.voice.*": {"queue": "enrichment"},
         "app.tasks.replies.*": {"queue": "enrichment"},
+        "app.tasks.ab_testing.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -211,6 +212,13 @@ celery_app.conf.update(
             "task": "app.tasks.domain_health.check_domain_health",
             "schedule": crontab(hour=5, minute=30),
         },
+        # Feature 3: auto-evaluate running A/B tests and declare/promote winners
+        # once they reach significance (or the hard cap). Daily is plenty — copy
+        # tests accrue sample slowly. 4:30 AM UTC.
+        "evaluate-ab-tests": {
+            "task": "app.tasks.ab_testing.evaluate_ab_tests",
+            "schedule": crontab(hour=4, minute=30),
+        },
     },
 )
 
@@ -241,3 +249,4 @@ import app.tasks.domain_health  # noqa: F401
 import app.tasks.rag  # noqa: F401
 import app.tasks.voice  # noqa: F401
 import app.tasks.replies  # noqa: F401
+import app.tasks.ab_testing  # noqa: F401

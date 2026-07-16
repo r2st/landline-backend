@@ -39,6 +39,7 @@ from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
 from app.models.sender_health import SenderHealth
 from app.models.danger_signal import DangerSignalEvent
 from app.models.domain_health import DomainHealth
+from app.models.ab_test import AbTest, AbTestVariant, AbTestAssignment
 from app.models.content_embedding import ContentEmbedding
 from app.models.call_recording import CallRecording
 from app.models.orchestration import OrchestrationPolicy
@@ -101,6 +102,9 @@ __all__ = [
     "SenderHealth",
     "DangerSignalEvent",
     "DomainHealth",
+    "AbTest",
+    "AbTestVariant",
+    "AbTestAssignment",
     "ContentEmbedding",
     "CallRecording",
     "OrchestrationPolicy",

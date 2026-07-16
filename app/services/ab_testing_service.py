@@ -318,6 +318,75 @@ Return ONLY valid JSON: {{"variants": ["...", "...", "..."]}}"""
     return _fallback_subject_variants(base_subject, count)
 
 
+def _fallback_body_variants(base_body: str, count: int) -> list[str]:
+    """Deterministic body variants when AI generation is unavailable.
+
+    Returns the original body first so the control is always present; the caller
+    can accept/edit the alternatives. Never raises, always returns ≥1 option.
+    """
+    base = (base_body or "").strip()
+    out = [base] if base else []
+    if not out:
+        out = ["Quick note — thought this might be relevant to your team."]
+    return out[: max(1, count)]
+
+
+async def generate_body_variants(
+    base_body: str,
+    *,
+    industry: Optional[str] = None,
+    subject: str = "",
+    count: int = 3,
+    ai=None,
+) -> list[str]:
+    """Generate ``count`` (2-3) email-body variants for a sequence step.
+
+    Thin parallel to :func:`generate_subject_variants` for A/B-testing bodies.
+    Uses Claude to write short, distinct cold-email bodies in the Apprend voice;
+    never raises — falls back to :func:`_fallback_body_variants` on any failure.
+    """
+    count = max(2, min(3, count))
+    try:
+        if ai is None:
+            from app.services.ai_service import get_ai_service
+
+            ai = get_ai_service()
+
+        industry_line = f"Industry: {industry}\n" if industry else ""
+        subject_line = f"Subject line: {subject}\n" if subject else ""
+        prompt = f"""You run A/B tests on cold-email bodies for Apprend Technologies
+(manufacturing software). Write {count} DISTINCT short email-body variants to
+test for this sequence step.
+
+{industry_line}{subject_line}Current body: {base_body or '(none yet)'}
+
+Rules:
+- Short (2-4 sentences), conversational, like a human wrote it — not marketing copy.
+- Each variant should take a genuinely different angle (pain point, specific
+  result, curiosity, social proof) so the test is informative.
+- No spam-trigger words, no exclamation marks, no ALL CAPS. Keep any template
+  variables (e.g. {{{{first_name}}}}) intact if present in the current body.
+
+Return ONLY valid JSON: {{"variants": ["...", "...", "..."]}}"""
+
+        result = await ai._complete_json(prompt, max_tokens=800)
+        variants = result.get("variants") if isinstance(result, dict) else None
+        if isinstance(variants, list):
+            cleaned = [str(v).strip() for v in variants if str(v).strip()]
+            seen: set[str] = set()
+            out: list[str] = []
+            for v in cleaned:
+                if v.lower() not in seen:
+                    seen.add(v.lower())
+                    out.append(v)
+            if len(out) >= 2:
+                return out[:count]
+    except Exception as e:  # noqa: BLE001 — never fail the caller
+        logger.warning("AI body-variant generation failed: %s", e)
+
+    return _fallback_body_variants(base_body, count)
+
+
 # ---------------------------------------------------------------------------
 # Automation: multi-armed bandit traffic allocation (UCB1)
 # ---------------------------------------------------------------------------

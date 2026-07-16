@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, domain_health, danger_signals
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, domain_health, danger_signals, ab_tests
 
 settings = get_settings()
 
@@ -155,6 +155,8 @@ app.include_router(danger_signals.router, prefix=settings.api_prefix, dependenci
 app.include_router(replies.router, prefix=settings.api_prefix, dependencies=_auth)
 # Feature 5 — Domain Health Dashboard (SPF/DKIM/DMARC + DNSBL, scored & persisted).
 app.include_router(domain_health.router, prefix=settings.api_prefix, dependencies=_auth)
+# Feature 3 — A/B Testing (variant persistence, assignment, results dashboard).
+app.include_router(ab_tests.router, prefix=settings.api_prefix, dependencies=_auth)
 
 
 @app.get("/health")

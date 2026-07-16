@@ -37,6 +37,8 @@ DIALTONE_EVENT_TYPES = (
     "domain_health_changed",
     # Feature 1: an incoming reply was auto-classified + routed.
     "reply_classified",
+    # Feature 3: an A/B test concluded (a winner was declared and promoted).
+    "ab_test_concluded",
 )
 
 

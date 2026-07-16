@@ -350,14 +350,30 @@ def send_sequence_step(self, enrollment_id: str):
                     booking_url = await resolve_booking_url(db, enrollment.sender_account_id)
                 template_context["booking_link"] = booking_url
 
+                # --- A/B testing (Feature 3) ---
+                # Resolve which copy variant to send BEFORE rendering. For a step
+                # with an active A/B test (≥2 active variants) this assigns a
+                # variant and persists the assignment before the send (crash
+                # safety); for every other step it returns the step's own
+                # template, i.e. the exact current behaviour (backwards compat).
+                from app.services.ab_test_resolver import (
+                    backfill_assignment_send,
+                    resolve_variant,
+                )
+
+                resolution = await resolve_variant(db, enrollment, step)
+
                 # Send email via the active connected Gmail account (falls back
-                # to SES when no account is connected). Templates are rendered
-                # here; the dispatcher appends the CAN-SPAM footer.
+                # to SES when no account is connected). Render the chosen variant
+                # copy, with the booking placeholder applied to it; the dispatcher
+                # appends the CAN-SPAM footer.
                 subject = render(
-                    apply_booking_placeholder(step.subject_template, booking_url), template_context
+                    apply_booking_placeholder(resolution.subject_template, booking_url),
+                    template_context,
                 )
                 body = render(
-                    apply_booking_placeholder(step.body_template, booking_url), template_context
+                    apply_booking_placeholder(resolution.body_template, booking_url),
+                    template_context,
                 )
 
                 # --- AI-Optimized Sequence Engine (feature 1.2) ---
@@ -483,6 +499,15 @@ def send_sequence_step(self, enrollment_id: str):
                 db.add(event)
 
                 if event_type == "sent":
+                    # A/B backfill: link the assignment to its send. The sequence
+                    # path records no EmailSend row, so this is a no-op here
+                    # (send_result carries none) and per-variant metrics attribute
+                    # through the assignment's enrollment + step number instead.
+                    if resolution.assignment_id is not None:
+                        await backfill_assignment_send(
+                            db, resolution.assignment_id, send_result.get("email_send_id")
+                        )
+
                     # Store threading info for subsequent steps
                     if send_result.get("gmail_thread_id"):
                         enrollment.gmail_thread_id = send_result["gmail_thread_id"]
