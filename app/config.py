@@ -273,6 +273,17 @@ class Settings(BaseSettings):
     # Domain-based zones (<domain>.<zone>) — the meaningful signal for shared-pool
     # senders; these DO count toward the health score.
     dnsbl_domain_zones: List[str] = ["dbl.spamhaus.org"]
+    # Spamhaus Data Query Service key (26 chars). Optional. Spamhaus refuses
+    # public-mirror queries that arrive via an open/public resolver — which is
+    # exactly what our EC2 box uses — answering 127.255.255.254 ("no data for
+    # you"), so every spamhaus.org zone currently reports `unknown`. A DQS key
+    # authenticates the query and makes the answer real. When set, the
+    # spamhaus.org zones above are transparently queried as
+    # <key>.<zone>.dq.spamhaus.net (see blacklist_check.dqs_zone); non-Spamhaus
+    # zones (Barracuda, SpamCop) are unaffected. Note the free DQS tier is
+    # non-commercial-only, so a commercial deployment wants the trial or a paid
+    # subscription — see .env.example. Treat the key as a credential.
+    spamhaus_dqs_key: str = ""
     # Composite health-score weights (unknown/unverifiable components are dropped
     # from the denominator so the score reflects only what we could verify).
     domain_health_weight_spf: int = 20

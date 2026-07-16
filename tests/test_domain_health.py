@@ -543,3 +543,200 @@ async def test_collect_domains_dedups(db_session: AsyncSession):
 
     domains = await get_domain_health_checker().collect_domains(db_session)
     assert domains == ["apprend.tech"]  # deduped
+
+
+# ─── Spamhaus DQS (authenticated queries) ────────────────────────────────────
+# The public mirrors refuse us (127.255.255.254 — we resolve via a public
+# resolver), so a DQS key is the only way the blacklist component ever becomes
+# real. These lock the wire format: the key is a DNS label between the query and
+# the zone, and it must never escape into what we report or persist.
+
+_KEY = "abcdefghijklmnopqrstuvwxyz"  # 26 chars, like a real DQS key
+
+
+def _capture_a(answers_for: dict | None = None):
+    """An _a_records stand-in that records every name looked up.
+
+    Returns ``(lookup, names)``; ``names`` fills in as queries are made.
+    """
+    names: list[str] = []
+    table = answers_for or {}
+
+    def _lookup(name: str):
+        names.append(name)
+        return table.get(name, ([], None))
+
+    return _lookup, names
+
+
+def _settings_with_key(key: str, **over):
+    """Stand in for get_settings() — blacklist_check reads the key from it."""
+    from types import SimpleNamespace
+    return lambda: SimpleNamespace(
+        spamhaus_dqs_key=key,
+        dnsbl_zones=over.get("dnsbl_zones", ["zen.spamhaus.org"]),
+        dnsbl_domain_zones=over.get("dnsbl_domain_zones", ["dbl.spamhaus.org"]),
+    )
+
+
+# -- zone rewriting ----------------------------------------------------------
+
+@pytest.mark.parametrize("zone,expected", [
+    ("zen.spamhaus.org", f"{_KEY}.zen.dq.spamhaus.net"),
+    ("dbl.spamhaus.org", f"{_KEY}.dbl.dq.spamhaus.net"),
+    ("sbl.spamhaus.org", f"{_KEY}.sbl.dq.spamhaus.net"),
+    ("pbl.spamhaus.org", f"{_KEY}.pbl.dq.spamhaus.net"),
+    ("zrd.spamhaus.org", f"{_KEY}.zrd.dq.spamhaus.net"),
+])
+def test_dqs_zone_rewrites_spamhaus_zones(zone, expected):
+    assert blacklist_check.dqs_zone(zone, _KEY) == expected
+
+
+@pytest.mark.parametrize("zone", [
+    "b.barracudacentral.org",   # not Spamhaus — no DQS equivalent
+    "bl.spamcop.net",
+])
+def test_dqs_zone_leaves_non_spamhaus_zones_alone(zone):
+    """A DQS key authenticates Spamhaus only; other zones must be untouched."""
+    assert blacklist_check.dqs_zone(zone, _KEY) == zone
+
+
+@pytest.mark.parametrize("key", ["", None, "   "])
+def test_dqs_zone_without_key_is_identity(key):
+    assert blacklist_check.dqs_zone("dbl.spamhaus.org", key) == "dbl.spamhaus.org"
+
+
+def test_dqs_zone_does_not_double_wrap_an_already_dqs_zone():
+    z = f"{_KEY}.dbl.dq.spamhaus.net"
+    assert blacklist_check.dqs_zone(z, _KEY) == z
+
+
+# -- query format ------------------------------------------------------------
+
+def test_domain_query_uses_dqs_format_when_key_set(monkeypatch):
+    """<domain>.<key>.dbl.dq.spamhaus.net — the documented DQS domain form."""
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org", dqs_key=_KEY)
+    assert names == [f"acme.com.{_KEY}.dbl.dq.spamhaus.net"]
+
+
+def test_ip_query_uses_dqs_format_when_key_set(monkeypatch):
+    """<reversed-ip>.<key>.zen.dq.spamhaus.net — the documented DQS IP form."""
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    blacklist_check.check_ip_blacklist("1.2.3.4", "zen.spamhaus.org", dqs_key=_KEY)
+    assert names == [f"4.3.2.1.{_KEY}.zen.dq.spamhaus.net"]
+
+
+def test_domain_query_uses_legacy_format_without_key(monkeypatch):
+    """No key → unchanged public-mirror behaviour."""
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org", dqs_key="")
+    assert names == ["acme.com.dbl.spamhaus.org"]
+
+
+def test_ip_query_uses_legacy_format_without_key(monkeypatch):
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    blacklist_check.check_ip_blacklist("1.2.3.4", "zen.spamhaus.org", dqs_key="")
+    assert names == ["4.3.2.1.zen.spamhaus.org"]
+
+
+def test_key_read_from_settings_when_not_passed(monkeypatch):
+    """The daily task calls check_blacklists(domain) with no key — settings supply it."""
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    monkeypatch.setattr(blacklist_check, "get_settings", _settings_with_key(_KEY))
+    blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org")
+    assert names == [f"acme.com.{_KEY}.dbl.dq.spamhaus.net"]
+
+
+def test_unset_key_in_settings_falls_back_to_public(monkeypatch):
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    monkeypatch.setattr(blacklist_check, "get_settings", _settings_with_key(""))
+    blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org")
+    assert names == ["acme.com.dbl.spamhaus.org"]
+
+
+def test_check_blacklists_mixes_dqs_and_plain_zones(monkeypatch):
+    """Spamhaus zones get the key; Barracuda/SpamCop in the same run do not."""
+    lookup, names = _capture_a()
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    monkeypatch.setattr(blacklist_check, "get_settings", _settings_with_key(
+        _KEY, dnsbl_zones=["zen.spamhaus.org", "b.barracudacentral.org"]))
+    blacklist_check.check_blacklists("acme.com", ips=["1.2.3.4"])
+    assert f"acme.com.{_KEY}.dbl.dq.spamhaus.net" in names
+    assert f"4.3.2.1.{_KEY}.zen.dq.spamhaus.net" in names
+    assert "4.3.2.1.b.barracudacentral.org" in names  # untouched by the key
+
+
+# -- response parsing (same codes as public, minus the refusals) --------------
+
+@pytest.mark.parametrize("code,what", [
+    ("127.0.0.2", "SBL"),
+    ("127.0.0.4", "XBL/CBL"),
+    ("127.0.0.10", "PBL ISP-maintained"),
+    ("127.0.0.11", "PBL Spamhaus-maintained"),
+])
+def test_dqs_ip_listing_parsed_like_public(monkeypatch, code, what):
+    lookup, _ = _capture_a({f"2.0.0.127.{_KEY}.zen.dq.spamhaus.net": ([code], None)})
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    # 127.0.0.2 is Spamhaus's documented DQS test point (listed in all IP zones).
+    r = blacklist_check.check_ip_blacklist("127.0.0.2", "zen.spamhaus.org", dqs_key=_KEY)
+    assert r["listed"] is True, f"{code} ({what}) must read as listed under DQS"
+    assert r["status"] == "listed" and r["dqs"] is True
+
+
+def test_dqs_domain_listing_parsed_like_public(monkeypatch):
+    lookup, _ = _capture_a({f"acme.com.{_KEY}.dbl.dq.spamhaus.net": (["127.0.1.2"], None)})
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org", dqs_key=_KEY)
+    assert r["listed"] is True and r["status"] == "listed"
+
+
+def test_dqs_not_listed(monkeypatch):
+    """NXDOMAIN under DQS is a real 'clean' verdict — the whole point of the key."""
+    lookup, _ = _capture_a()  # everything NXDOMAINs
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org", dqs_key=_KEY)
+    assert r["listed"] is False
+    assert r["status"] == "ok"  # not "unknown" — DQS answered, and said clean
+    assert r["dqs"] is True
+
+
+@pytest.mark.parametrize("code", [
+    "127.255.255.252",  # typo'd zone name
+    "127.255.255.254",  # unauthenticated/public resolver — a bad key looks like this
+    "127.255.255.255",  # excessive queries / over quota
+])
+def test_dqs_error_codes_still_map_to_unknown(monkeypatch, code):
+    """A wrong or expired key must degrade to unknown, never to clean or listed."""
+    lookup, _ = _capture_a({f"acme.com.{_KEY}.dbl.dq.spamhaus.net": ([code], None)})
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    r = blacklist_check.check_domain_blacklist("acme.com", "dbl.spamhaus.org", dqs_key=_KEY)
+    assert r["listed"] is False
+    assert r["status"] == "unknown"
+    assert r["issue"] == f"dnsbl_error:{code}"
+    assert r["dqs"] is True  # tells us the key was in play, so suspect the key
+
+
+# -- the key is a credential -------------------------------------------------
+
+def test_reported_zone_stays_public_and_key_never_leaks(monkeypatch):
+    """We persist this dict; it must not carry the key, and zone keys must be stable.
+
+    Change-alerting diffs against the persisted zone names, so enabling DQS must
+    not look like every zone was swapped for a new one.
+    """
+    lookup, _ = _capture_a({f"acme.com.{_KEY}.dbl.dq.spamhaus.net": (["127.0.1.2"], None)})
+    monkeypatch.setattr(blacklist_check, "_a_records", lookup)
+    monkeypatch.setattr(blacklist_check, "get_settings", _settings_with_key(_KEY))
+    out = blacklist_check.check_blacklists("acme.com", ips=["1.2.3.4"])
+
+    assert "dbl.spamhaus.org" in out["zones"]           # public name, not the DQS one
+    assert out["listed_meaningful"] == ["dbl.spamhaus.org"]
+    assert out["dqs"] is True
+    assert _KEY not in repr(out), "DQS key leaked into the persisted blacklist blob"
