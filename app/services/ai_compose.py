@@ -128,6 +128,31 @@ async def _latest_draft(db: AsyncSession, enrollment_id, step_number: int) -> Op
     ).scalars().first()
 
 
+async def _sequence_tone(db: AsyncSession, sequence_id) -> Optional[str]:
+    """The voice this sequence writes in, or None to let the generator decide.
+
+    Read as a scalar rather than off ``step.sequence``/``enrollment.sequence``:
+    neither relationship is eager-loaded, so touching them here would emit a
+    lazy load in async context and raise MissingGreenlet — turning a cosmetic
+    field into a dropped first touch.
+
+    Fails soft for the same reason everything in this module does. Tone shapes
+    copy; it does not decide whether copy is safe to send, so a lookup failure
+    means "write in the house voice", not "don't write".
+    """
+    try:
+        from app.models.sequence import OutreachSequence
+
+        return (
+            await db.execute(
+                select(OutreachSequence.tone).where(OutreachSequence.id == sequence_id)
+            )
+        ).scalar_one_or_none()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Tone lookup failed for sequence %s: %s", sequence_id, exc)
+        return None
+
+
 async def _scan_is_safe(db: AsyncSession, subject: str, body: str) -> bool:
     """Whether generated copy passes the spam-content scan. Fails open."""
     try:
@@ -219,11 +244,14 @@ async def compose_step(
         "employee_count": company.employee_count,
     }
 
+    tone = await _sequence_tone(db, enrollment.sequence_id)
+
     try:
         from app.services.ai_email_generator import generate_email
 
         generated = await generate_email(
             lead_data, template_type="first_touch", research_context=research_context,
+            tone=tone,
         )
     except Exception as exc:
         logger.warning("AI composition failed for %s: %s", company.name, exc)

@@ -49,6 +49,7 @@ async def create_sequence(
     sequence = OutreachSequence(
         name=payload.name,
         description=payload.description,
+        tone=payload.tone,
     )
     db.add(sequence)
     await db.flush()

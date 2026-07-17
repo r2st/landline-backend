@@ -6,6 +6,13 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.sequence import DEFAULT_SEQUENCE_TONE, SEQUENCE_TONES
+
+# Literal-ish validation without importing Literal for every tuple: the model
+# module owns the vocabulary, the schema reuses it, so they can't drift.
+_TONE_PATTERN = f"^({'|'.join(SEQUENCE_TONES)})$"
+_TONE_DESC = f"Voice the AI copywriter writes this sequence in. One of: {', '.join(SEQUENCE_TONES)}."
+
 
 # --- Sequence Steps ---
 
@@ -31,6 +38,7 @@ class SequenceStepRead(BaseModel):
 class SequenceCreate(BaseModel):
     name: str = Field(..., max_length=255)
     description: Optional[str] = None
+    tone: str = Field(DEFAULT_SEQUENCE_TONE, pattern=_TONE_PATTERN, description=_TONE_DESC)
     steps: list[SequenceStepCreate] = Field(default_factory=list)
 
 
@@ -38,6 +46,10 @@ class SequenceUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
     is_active: Optional[bool] = None
+    # Optional-with-no-default so ``exclude_unset`` can tell "set it to friendly"
+    # apart from "don't touch the tone" — the update endpoint patches only the
+    # fields the caller actually sent.
+    tone: Optional[str] = Field(None, pattern=_TONE_PATTERN, description=_TONE_DESC)
 
 
 class SequenceRead(BaseModel):
@@ -47,6 +59,7 @@ class SequenceRead(BaseModel):
     name: str
     description: Optional[str] = None
     is_active: bool
+    tone: str = DEFAULT_SEQUENCE_TONE
     created_at: datetime
     steps: list[SequenceStepRead] = []
 
@@ -60,6 +73,7 @@ class SequenceWithCounts(BaseModel):
     industry: Optional[str] = None
     is_active: bool
     status: str = "active"
+    tone: str = DEFAULT_SEQUENCE_TONE
     created_at: datetime
     step_count: int
     enrollment_count: int

@@ -23,6 +23,24 @@ STEP_CHANNELS = ("email", "call", "linkedin", "video", "direct_mail")
 # Cadence patterns from Combo Prospecting (Tony Hughes)
 CADENCE_PATTERNS = ("single_channel", "triple", "quad", "quint")
 
+# Voice the AI copywriter writes this sequence in. A quality lever, not a
+# routing one: nothing branches on tone, it only shapes the prompt, so an
+# unknown value degrades to the default rather than breaking a send.
+#
+# Per-sequence because tone is a property of the audience, not the sender —
+# a plant manager drowning in scrap reads "empathetic" as understanding and
+# "urgent" as noise, while an ops VP evaluating vendors reads the reverse.
+# Sequences are already seeded per industry vertical, so this is the seam
+# where that judgement belongs.
+#
+# The prompt guidance for each of these lives in
+# ``app.services.ai_email_generator.TONE_GUIDANCE``; the two vocabularies are
+# pinned to each other by a test. This tuple is the storage contract.
+SEQUENCE_TONES = ("friendly", "professional", "urgent", "empathetic", "conversational")
+# Conversational is the house voice the system prompt already describes, so
+# defaulting here changes nothing about how existing sequences read.
+DEFAULT_SEQUENCE_TONE = "conversational"
+
 
 class OutreachSequence(Base):
     __tablename__ = "outreach_sequences"
@@ -30,6 +48,10 @@ class OutreachSequence(Base):
         CheckConstraint(
             "status IN ('active','paused','completed')",
             name="ck_sequence_status",
+        ),
+        CheckConstraint(
+            "tone IN ('friendly','professional','urgent','empathetic','conversational')",
+            name="ck_sequence_tone",
         ),
     )
 
@@ -46,6 +68,13 @@ class OutreachSequence(Base):
     # Multi-channel cadence pattern (from Combo Prospecting by Tony Hughes).
     # "triple" = Call + VM + Email; "quad" = + LinkedIn; "quint" = + social DM.
     cadence_pattern: Mapped[str | None] = mapped_column(String(20), default="single_channel")
+    # Voice the AI copywriter writes this sequence in — see SEQUENCE_TONES.
+    # NOT NULL with a server default: the generator reads this on every compose,
+    # and a NULL would mean "no voice", which isn't a state that means anything.
+    tone: Mapped[str] = mapped_column(
+        String(20), nullable=False,
+        default=DEFAULT_SEQUENCE_TONE, server_default=DEFAULT_SEQUENCE_TONE,
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

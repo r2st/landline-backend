@@ -27,8 +27,8 @@ AI_REPLY = {
 }
 
 
-async def _setup(db, company, contact, step_number=1):
-    seq = OutreachSequence(id=uuid.uuid4(), name="Seq")
+async def _setup(db, company, contact, step_number=1, tone=None):
+    seq = OutreachSequence(id=uuid.uuid4(), name="Seq", **({"tone": tone} if tone else {}))
     db.add(seq)
     await db.flush()
     step = SequenceStep(
@@ -55,12 +55,28 @@ def ai_on(monkeypatch):
 
 
 def _patch_generator(monkeypatch, response):
+    """Stub the copywriter and record what it was called with.
+
+    The signature must track ``generate_email``'s for real: compose_step wraps the
+    call in ``except Exception -> static``, so a stub that rejects a newly-added
+    kwarg doesn't fail loudly — it silently turns every AI assertion in this file
+    into a static fallback that still "passes" the fail-safe tests. Returns the
+    call-capture dict so tests can assert on what was passed.
+    """
+    calls: dict = {}
+
     async def fake_generate(lead_data, template_type="first_touch", custom_instructions=None,
-                           research_context=""):
+                            research_context="", tone=None):
+        calls.update(
+            lead_data=lead_data, template_type=template_type,
+            custom_instructions=custom_instructions, research_context=research_context,
+            tone=tone,
+        )
         return response
 
     import app.services.ai_email_generator as gen
     monkeypatch.setattr(gen, "generate_email", fake_generate)
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +191,46 @@ async def test_later_steps_are_left_to_the_optimizer(
     assert result.action == "send"
     assert result.subject == STATIC_SUBJECT
     assert "first touch" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Tone reaches the copywriter
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_sequence_tone_is_passed_to_the_generator(
+    db_session, sample_company, sample_contact, ai_on, monkeypatch
+):
+    """The whole point of the column: the sequence's voice reaches the prompt."""
+    calls = _patch_generator(monkeypatch, AI_REPLY)
+    _, step, enr = await _setup(db_session, sample_company, sample_contact, tone="empathetic")
+
+    await compose_step(
+        db_session, enr, sample_contact, sample_company, step, STATIC_SUBJECT, STATIC_BODY
+    )
+    assert calls["tone"] == "empathetic"
+
+
+@pytest.mark.asyncio
+async def test_default_sequence_tone_is_conversational(
+    db_session, sample_company, sample_contact, ai_on, monkeypatch
+):
+    """A sequence created without an opinion gets the house voice, not None."""
+    calls = _patch_generator(monkeypatch, AI_REPLY)
+    _, step, enr = await _setup(db_session, sample_company, sample_contact)
+
+    await compose_step(
+        db_session, enr, sample_contact, sample_company, step, STATIC_SUBJECT, STATIC_BODY
+    )
+    assert calls["tone"] == "conversational"
+
+
+@pytest.mark.asyncio
+async def test_tone_of_a_missing_sequence_is_none(db_session):
+    """No row, no opinion — and no exception."""
+    from app.services.ai_compose import _sequence_tone
+
+    assert await _sequence_tone(db_session, uuid.uuid4()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +422,23 @@ async def test_approved_draft_sends_the_approved_copy(
     assert result.action == "send"
     assert result.subject == AI_REPLY["subject"]
     assert result.ai_generated is True
+
+
+# ---------------------------------------------------------------------------
+# Non-DB async tests LAST — this suite shares a session-scoped event_loop and
+# an async test that never touches the DB, defined before one that does, has
+# historically dragged the whole file down with it. See
+# tests/README or the ordering note in test_frontend_contract.py.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tone_lookup_fails_soft_to_the_house_voice():
+    """Tone shapes copy; it does not gate a send. A lookup that blows up must
+    return "no opinion" (-> house voice), never propagate and drop the touch."""
+    from app.services.ai_compose import _sequence_tone
+
+    class BrokenDB:
+        async def execute(self, *a, **k):
+            raise RuntimeError("db went away")
+
+    assert await _sequence_tone(BrokenDB(), uuid.uuid4()) is None
