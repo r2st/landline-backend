@@ -14,7 +14,13 @@ class OutreachEnrollment(Base):
     __tablename__ = "outreach_enrollments"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('active','paused','completed','replied','bounced','unsubscribed')",
+            # 'pending_review' = an AI-composed step is waiting on a human. Kept
+            # distinct from 'paused' (which already means no-email / bad-domain /
+            # consent-block) because the outreach queue only dispatches 'active',
+            # so "a reviewer needs to look at this" must be tellable apart from
+            # "never send this".
+            "status IN ('active','paused','completed','replied','bounced',"
+            "'unsubscribed','pending_review')",
             name="ck_enrollment_status",
         ),
     )

@@ -44,6 +44,7 @@ from app.models.sender_health import SenderHealth
 from app.models.danger_signal import DangerSignalEvent
 from app.models.domain_health import DomainHealth
 from app.models.bounce_record import BounceRecord
+from app.models.ai_email_draft import AiEmailDraft
 from app.models.ab_test import AbTest, AbTestVariant, AbTestAssignment
 from app.models.content_embedding import ContentEmbedding
 from app.models.call_recording import CallRecording
@@ -112,6 +113,7 @@ __all__ = [
     "DangerSignalEvent",
     "DomainHealth",
     "BounceRecord",
+    "AiEmailDraft",
     "AbTest",
     "AbTestVariant",
     "AbTestAssignment",

@@ -420,6 +420,40 @@ def send_sequence_step(self, enrollment_id: str):
                     template_context,
                 )
 
+                # --- AI composition (first touch) ---
+                # Replace the static mail-merge with copy grounded in the
+                # company's research brief. Fail-safe: any problem returns the
+                # static render untouched. On a first batch per sequence the copy
+                # is queued for a human instead of sent — cold outreach is
+                # irreversible and charged against the sending domain.
+                from app.services.ai_compose import compose_step
+
+                composed = await compose_step(
+                    db, enrollment, contact, company, step, subject, body
+                )
+                if composed.action == "review":
+                    # Park the enrollment. Deliberately NOT _advance_step: the
+                    # step has not been sent, and advancing would silently skip
+                    # the touch a reviewer is about to approve.
+                    enrollment.status = "pending_review"
+                    await db.commit()
+                    logger.info(
+                        "AI draft %s queued for review — enrollment %s step %d parked (%s)",
+                        composed.draft_id, enrollment_id, step.step_number, composed.reason,
+                    )
+                    return {
+                        "status": "pending_review",
+                        "step": step.step_number,
+                        "draft_id": str(composed.draft_id) if composed.draft_id else None,
+                        "reason": composed.reason,
+                    }
+                subject, body = composed.subject, composed.body
+                if composed.ai_generated:
+                    logger.info(
+                        "AI-composed step %d for enrollment %s (research=%s)",
+                        step.step_number, enrollment_id, composed.research_used,
+                    )
+
                 # --- AI-Optimized Sequence Engine (feature 1.2) ---
                 # Ask the optimizer what to do with this step before sending. It
                 # may adjust delay, rewrite content, switch channel, or skip. The
@@ -560,6 +594,20 @@ def send_sequence_step(self, enrollment_id: str):
                 db.add(event)
 
                 if event_type == "sent":
+                    # Close out an approved draft so it can't be re-proposed and
+                    # so the review queue reflects what actually shipped.
+                    if composed.draft_id is not None:
+                        from app.models.ai_email_draft import AiEmailDraft as _Draft
+
+                        draft = (
+                            await db.execute(
+                                select(_Draft).where(_Draft.id == composed.draft_id)
+                            )
+                        ).scalar_one_or_none()
+                        if draft is not None and draft.status == "approved":
+                            draft.status = "sent"
+                            draft.send_result = send_result
+
                     # A/B backfill: link the assignment to its send. The sequence
                     # path records no EmailSend row, so this is a no-op here
                     # (send_result carries none) and per-variant metrics attribute
