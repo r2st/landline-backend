@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
+from app.org_context import APPREND_ORG_ID
 from app.security import hash_password, create_access_token, create_refresh_token
 
 
@@ -28,6 +29,7 @@ async def admin_user(db_session: AsyncSession) -> User:
         role="admin",
         password_hash=hash_password("admin123"),
         is_active=True,
+        org_id=APPREND_ORG_ID,
     )
     db_session.add(user)
     await db_session.flush()
@@ -44,6 +46,7 @@ async def agent_user(db_session: AsyncSession) -> User:
         role="agent",
         password_hash=hash_password("agent123"),
         is_active=True,
+        org_id=APPREND_ORG_ID,
     )
     db_session.add(user)
     await db_session.flush()
@@ -60,6 +63,7 @@ async def inactive_user(db_session: AsyncSession) -> User:
         role="agent",
         password_hash=hash_password("password"),
         is_active=False,
+        org_id=APPREND_ORG_ID,
     )
     db_session.add(user)
     await db_session.flush()
@@ -255,7 +259,7 @@ async def test_admin_create_user(client: AsyncClient, admin_user: User):
         json={
             "email": "newagent@test.com",
             "name": "New Agent",
-            "role": "agent",
+            "role": "org_agent",
             "password": "secret123",
         },
         headers=_auth_header(admin_user),
@@ -263,7 +267,7 @@ async def test_admin_create_user(client: AsyncClient, admin_user: User):
     assert resp.status_code == 201
     data = resp.json()
     assert data["email"] == "newagent@test.com"
-    assert data["role"] == "agent"
+    assert data["role"] == "org_agent"
     assert data["is_active"] is True
 
 
@@ -291,13 +295,13 @@ async def test_admin_create_duplicate_email(client: AsyncClient, admin_user: Use
 async def test_admin_update_user(client: AsyncClient, admin_user: User, agent_user: User):
     resp = await client.put(
         f"/api/v1/admin/users/{agent_user.id}",
-        json={"name": "Updated Agent", "role": "manager"},
+        json={"name": "Updated Agent", "role": "org_manager"},
         headers=_auth_header(admin_user),
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["name"] == "Updated Agent"
-    assert data["role"] == "manager"
+    assert data["role"] == "org_manager"
 
 
 @pytest.mark.asyncio

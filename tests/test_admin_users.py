@@ -32,14 +32,14 @@ async def test_create_user(client: AsyncClient, admin_user, auth_headers):
         json={
             "email": "sam@landline.app",
             "name": "Sam Sales",
-            "role": "manager",
+            "role": "org_manager",
             "password": "initialpw123",
         },
     )
     assert resp.status_code == 201, resp.text
     data = resp.json()
     assert data["email"] == "sam@landline.app"
-    assert data["role"] == "manager"
+    assert data["role"] == "org_manager"
     assert data["must_change_password"] is True
     assert data["created_by"] == str(admin_user.id)
     assert "password_hash" not in data
@@ -96,10 +96,10 @@ async def test_update_user_role(client: AsyncClient, admin_user, agent_user, aut
     resp = await client.patch(
         _user_url(agent_user.id),
         headers=auth_headers(admin_user),
-        json={"role": "manager"},
+        json={"role": "org_manager"},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["role"] == "manager"
+    assert resp.json()["role"] == "org_manager"
 
 
 @pytest.mark.asyncio

@@ -152,8 +152,12 @@ async def test_non_admin_cannot_manage_tenants(client, db_engine):
 
 
 @pytest.mark.asyncio
-async def test_current_config_default_for_user_without_org(client):
-    resp = await client.get("/api/v1/tenants/current/config")
+async def test_current_config_default_for_user_without_org(client, make_user, auth_headers):
+    # A platform admin has no org_id → the endpoint returns the default marker.
+    from app.models.user import UserRole
+
+    user = await make_user("platform@x.com", role=UserRole.PLATFORM_ADMIN.value, org_id=None)
+    resp = await client.get("/api/v1/tenants/current/config", headers=auth_headers(user))
     assert resp.status_code == 200
     assert resp.json()["default"] is True
 

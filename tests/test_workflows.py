@@ -187,9 +187,11 @@ async def test_unknown_action_fails_step_not_run(db_session):
 async def test_dispatch_event_matches_trigger_conditions(db_session, db_engine):
     company_id = await _seed_company(db_engine)
     from app.models.workflow import Workflow
+    from app.org_context import APPREND_ORG_ID
 
     wf = Workflow(
         id=uuid.uuid4(),
+        org_id=APPREND_ORG_ID,
         name="On strong reply",
         trigger_event="lead.replied",
         trigger_conditions={"all": [{"field": "email_opens", "op": "gte", "value": 3}]},
@@ -198,12 +200,18 @@ async def test_dispatch_event_matches_trigger_conditions(db_session, db_engine):
     db_session.add(wf)
     await db_session.flush()
 
+    # Events are dispatched with the triggering org (as the API does via
+    # current_user.org_id); the workflow above belongs to Apprend.
     # Non-matching payload → no run.
-    miss = await get_workflow_engine().dispatch_event(db_session, "lead.replied", {"email_opens": 1})
+    miss = await get_workflow_engine().dispatch_event(
+        db_session, "lead.replied", {"email_opens": 1}, APPREND_ORG_ID
+    )
     assert miss["workflows_matched"] == 0
 
     # Matching payload → one run.
-    hit = await get_workflow_engine().dispatch_event(db_session, "lead.replied", {"email_opens": 9})
+    hit = await get_workflow_engine().dispatch_event(
+        db_session, "lead.replied", {"email_opens": 9}, APPREND_ORG_ID
+    )
     assert hit["workflows_matched"] == 1
     assert hit["runs"][0]["status"] == "completed"
 

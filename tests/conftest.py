@@ -123,6 +123,24 @@ def event_loop():
     loop.close()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_org_context():
+    """Clear the multi-tenant org contextvar around every test.
+
+    In production each request runs in its own asyncio task, so the org context
+    set by ``get_current_user`` is task-local and never leaks. Under pytest's
+    session-scoped loop, tests can share a context, so a prior API request's org
+    could bleed into a later direct-``db_session`` test and skew the global read
+    filter. Async (not sync) so the reset runs in the same task/context as the
+    test body. Resetting to ``None`` before and after keeps tests isolated.
+    """
+    from app.org_context import set_current_org_id
+
+    set_current_org_id(None)
+    yield
+    set_current_org_id(None)
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_engine():
     """Create a fresh test database engine per test."""
@@ -131,6 +149,20 @@ async def db_engine():
     engine = create_async_engine(TEST_DB_URL, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Seed the first-party "Apprend Technologies" org so the multi-tenant layer
+    # has a real org for fixtures/users to belong to (mirrors migration 078).
+    from app.models.tenant import Organization
+    from app.org_context import APPREND_ORG_ID, APPREND_ORG_SLUG
+
+    seed_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with seed_factory() as s:
+        s.add(Organization(
+            id=APPREND_ORG_ID, name="Apprend Technologies",
+            slug=APPREND_ORG_SLUG, is_active=True, billing_plan="pro",
+        ))
+        await s.commit()
+
     yield engine
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
@@ -198,6 +230,7 @@ async def client(db_engine):
 
     # Seed a default admin so the real get_current_user + middleware checks pass.
     async with session_factory() as session:
+        from app.org_context import APPREND_ORG_ID
         admin = User(
             id=uuid.uuid4(),
             email="_default_test_admin@landline.app",
@@ -205,6 +238,9 @@ async def client(db_engine):
             role=UserRole.ADMIN.value,
             password_hash=hash_password("defaultpass123"),
             is_active=True,
+            # Belong the default admin to the first-party org so rows it creates
+            # (org_id = Apprend) and its own org-scoped reads line up.
+            org_id=APPREND_ORG_ID,
         )
         session.add(admin)
         await session.commit()
@@ -332,6 +368,8 @@ async def canadian_contact(
 async def make_user(db_session: AsyncSession):
     """Factory to create a User with a real bcrypt-hashed password."""
 
+    from app.org_context import APPREND_ORG_ID
+
     async def _make(
         email: str,
         *,
@@ -341,6 +379,7 @@ async def make_user(db_session: AsyncSession):
         is_active: bool = True,
         must_change_password: bool = False,
         created_by=None,
+        org_id=APPREND_ORG_ID,
     ) -> User:
         user = User(
             id=uuid.uuid4(),
@@ -351,6 +390,7 @@ async def make_user(db_session: AsyncSession):
             is_active=is_active,
             must_change_password=must_change_password,
             created_by=created_by,
+            org_id=org_id,
         )
         db_session.add(user)
         # Commit (not just flush): a request that raises (e.g. a 403 from a role

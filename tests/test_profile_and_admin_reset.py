@@ -56,7 +56,7 @@ async def test_profile_update_cannot_change_role(client: AsyncClient, agent_user
         ME, json={"name": "Still Agent", "role": "admin"}, headers=auth_headers(agent_user)
     )
     assert resp.status_code == 200
-    assert resp.json()["role"] == "agent"
+    assert resp.json()["role"] == "org_agent"
 
 
 # ─── Admin password reset: POST /admin/users/{id}/reset-password ─────────────
