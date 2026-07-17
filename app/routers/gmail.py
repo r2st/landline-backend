@@ -27,12 +27,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
-from app.dependencies import UserScope, get_current_user_optional, get_scope
+from app.dependencies import (
+    UserScope,
+    get_current_user,
+    get_current_user_optional,
+    get_scope,
+    require_role,
+)
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.models.user import User
+from app.org_context import APPREND_ORG_ID
 from app.schemas.gmail import (
     AuthorizeResponse,
     GmailAccountRead,
@@ -137,6 +144,20 @@ async def oauth_callback(
         except (ValueError, TypeError):
             connecting_user_id = None
 
+    # This callback is public (no auth, no bound org context). Resolve the
+    # connecting user's organization from the signed state so a newly-connected
+    # account is stamped to the RIGHT tenant instead of falling back to the
+    # first-party org (its NOT NULL org_id would otherwise default to Apprend).
+    connecting_org_id: uuid.UUID | None = None
+    if connecting_user_id is not None:
+        connecting_org_id = (
+            await db.execute(
+                select(User.org_id)
+                .where(User.id == connecting_user_id)
+                .execution_options(skip_org_filter=True)
+            )
+        ).scalar_one_or_none()
+
     try:
         connected = google_oauth.exchange_code(code)
     except google_oauth.OAuthError as exc:
@@ -167,6 +188,9 @@ async def oauth_callback(
             owner_scope = owner_scope.where(GmailAccount.user_id == connecting_user_id)
         any_existing = (await db.execute(owner_scope.limit(1))).first()
         account = GmailAccount(
+            # Explicit so it isn't defaulted to Apprend by the org-stamp hook;
+            # fall back to the first-party org only when the org is unknown.
+            org_id=connecting_org_id or APPREND_ORG_ID,
             user_id=connecting_user_id,
             email=connected.email,
             google_sub=connected.google_sub,
@@ -443,51 +467,41 @@ async def purge_account(
 @router.delete("/cleanup-emails")
 async def cleanup_orphaned_emails(
     email: str = Query(..., description="Email address to clean up"),
+    current_user: User = Depends(require_role("org_admin")),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete all email_replies and email_sends associated with an email address.
 
     Use this after an account has already been removed to clean up orphaned emails
-    that were synced from that account.
+    that were synced from that account. Restricted to org admins and scoped to
+    the caller's organization: these are Core DELETE statements, which BYPASS the
+    ORM read filter, so the ``org_id`` predicate is added explicitly — without it
+    this endpoint would delete matching emails across every tenant.
     """
-    from sqlalchemy import or_
+    from sqlalchemy import and_, or_
+
+    org_id = current_user.org_id
+    reply_match = and_(
+        or_(EmailReply.from_email == email, EmailReply.to_email == email),
+        EmailReply.org_id == org_id,
+    )
+    send_match = and_(
+        or_(EmailSend.from_email == email, EmailSend.to_email == email),
+        EmailSend.org_id == org_id,
+    )
 
     # Count what we're about to delete
     replies_count = (await db.execute(
-        select(sa_func.count()).select_from(EmailReply).where(
-            or_(
-                EmailReply.from_email == email,
-                EmailReply.to_email == email,
-            )
-        )
+        select(sa_func.count()).select_from(EmailReply).where(reply_match)
     )).scalar() or 0
 
     sends_count = (await db.execute(
-        select(sa_func.count()).select_from(EmailSend).where(
-            or_(
-                EmailSend.from_email == email,
-                EmailSend.to_email == email,
-            )
-        )
+        select(sa_func.count()).select_from(EmailSend).where(send_match)
     )).scalar() or 0
 
     # Delete
-    await db.execute(
-        delete(EmailReply).where(
-            or_(
-                EmailReply.from_email == email,
-                EmailReply.to_email == email,
-            )
-        )
-    )
-    await db.execute(
-        delete(EmailSend).where(
-            or_(
-                EmailSend.from_email == email,
-                EmailSend.to_email == email,
-            )
-        )
-    )
+    await db.execute(delete(EmailReply).where(reply_match))
+    await db.execute(delete(EmailSend).where(send_match))
 
     logger.info("Cleaned up orphaned emails for %s: %d replies, %d sends", email, replies_count, sends_count)
     return {

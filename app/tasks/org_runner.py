@@ -23,7 +23,6 @@ Both deliberately keep the "read the organization list" query unfiltered — the
 """
 
 import logging
-from contextlib import asynccontextmanager
 from typing import Awaitable, Callable, Optional
 from uuid import UUID
 
@@ -32,7 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database_celery import celery_session
 from app.models.tenant import Organization
-from app.org_context import reset_current_org_id, set_current_org_id
+from app.org_context import (  # noqa: F401 — org_scope re-exported for tasks
+    org_scope,
+    reset_current_org_id,
+    set_current_org_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,20 +53,6 @@ async def active_org_ids(db: AsyncSession) -> list[UUID]:
         )
     ).scalars().all()
     return list(rows)
-
-
-@asynccontextmanager
-async def org_scope(org_id: Optional[UUID]):
-    """Bind *org_id* as the current org for the duration of the block.
-
-    Pair-safe: always restores the previous context on exit. ``None`` binds the
-    "no org" context (platform-wide / unfiltered), matching a platform admin.
-    """
-    token = set_current_org_id(org_id)
-    try:
-        yield
-    finally:
-        reset_current_org_id(token)
 
 
 async def for_each_org(

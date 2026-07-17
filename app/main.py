@@ -97,16 +97,26 @@ _auth = [Depends(get_current_user)]
 app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(admin.router, prefix=settings.api_prefix)
 app.include_router(companies.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(contacts.router, prefix=settings.api_prefix)
+# contacts: was mounted WITHOUT auth, so its endpoints (none of which take a
+# user/scope dependency) ran with no org context bound → the global read filter
+# was a no-op and they saw/wrote every tenant's contacts. Require auth so the
+# caller's org is bound on every request.
+app.include_router(contacts.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(leads.router, prefix=settings.api_prefix, dependencies=_auth)
-# outreach carries its own auth (its SES webhook must stay public — see router).
-app.include_router(outreach.router, prefix=settings.api_prefix)
+# The public SES webhook lives on outreach.public_router (stays unauthenticated);
+# the main outreach.router (sequences, enrollments, events, stats) is org-scoped
+# data and none of its endpoints take a user dependency, so it MUST require auth
+# to bind org context — otherwise it ran unscoped across all tenants.
+app.include_router(outreach.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(outreach.public_router, prefix=settings.api_prefix)
 app.include_router(dashboard.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(import_export.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(email_templates.router, prefix=settings.api_prefix)
+# email_templates/deals/emails/follow_ups/calls were all mounted WITHOUT auth
+# and have endpoints that take no user/scope dependency, so they ran unscoped
+# across all tenants. Require auth so org context is bound (see contacts above).
+app.include_router(email_templates.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(email_signatures.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(follow_ups.router, prefix=settings.api_prefix)
+app.include_router(follow_ups.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(gmail.router, prefix=settings.api_prefix)
 app.include_router(smtp.router, prefix=settings.api_prefix)
 app.include_router(discovery.router, prefix=settings.api_prefix, dependencies=_auth)
@@ -119,15 +129,15 @@ app.include_router(pipeline.router, prefix=settings.api_prefix, dependencies=_au
 app.include_router(activity.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(sequences.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(suggestions.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(deals.router, prefix=settings.api_prefix)
-app.include_router(tasks.router, prefix=settings.api_prefix)
-app.include_router(interactions.router, prefix=settings.api_prefix)
+app.include_router(deals.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(tasks.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(interactions.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(health.router, prefix=settings.api_prefix)
 app.include_router(clients.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(reports.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(emails.router, prefix=settings.api_prefix)
+app.include_router(emails.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(knowledge.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(calls.router, prefix=settings.api_prefix)
+app.include_router(calls.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(investors.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(sentiment.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(email_testing.router, prefix=settings.api_prefix, dependencies=_auth)

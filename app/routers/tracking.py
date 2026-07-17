@@ -16,6 +16,7 @@ from app.database import get_db
 from app.models.email_template import EmailSend
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.org_context import org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -140,36 +141,44 @@ async def _record_outreach_engagement(
     break the pixel response.
     """
     try:
+        # The pixel is public (no auth), so no org context is bound. Load the
+        # enrollment unfiltered to learn which tenant it belongs to, then bind
+        # that org so the OutreachEvent is stamped to the RIGHT organization —
+        # otherwise engagement would be misattributed to the first-party org and
+        # the real tenant's analytics / send-time optimizer would never see it.
         enrollment = (
             await db.execute(
-                select(OutreachEnrollment).where(OutreachEnrollment.id == uuid.UUID(str(enrollment_id)))
+                select(OutreachEnrollment)
+                .where(OutreachEnrollment.id == uuid.UUID(str(enrollment_id)))
+                .execution_options(skip_org_filter=True)
             )
         ).scalar_one_or_none()
         if enrollment is None:
             return False
 
-        existing = (
-            await db.execute(
-                select(OutreachEvent).where(
-                    OutreachEvent.enrollment_id == enrollment.id,
-                    OutreachEvent.step_number == int(step_number),
-                    OutreachEvent.event_type == event_type,
+        async with org_scope(enrollment.org_id):
+            existing = (
+                await db.execute(
+                    select(OutreachEvent).where(
+                        OutreachEvent.enrollment_id == enrollment.id,
+                        OutreachEvent.step_number == int(step_number),
+                        OutreachEvent.event_type == event_type,
+                    )
+                )
+            ).scalars().first()
+            if existing is not None:
+                return False
+
+            db.add(
+                OutreachEvent(
+                    enrollment_id=enrollment.id,
+                    step_number=int(step_number),
+                    event_type=event_type,
+                    occurred_at=datetime.now(timezone.utc),
+                    event_metadata={"source": "tracking_pixel"},
                 )
             )
-        ).scalars().first()
-        if existing is not None:
-            return False
-
-        db.add(
-            OutreachEvent(
-                enrollment_id=enrollment.id,
-                step_number=int(step_number),
-                event_type=event_type,
-                occurred_at=datetime.now(timezone.utc),
-                event_metadata={"source": "tracking_pixel"},
-            )
-        )
-        await db.commit()
+            await db.commit()
 
         # An open/click is an engagement signal — re-route the lead now.
         if enrollment.contact_id:

@@ -19,6 +19,7 @@ the read filter is skipped and writes fall back to the first-party
 """
 
 import uuid
+from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from typing import Optional
 
@@ -50,6 +51,22 @@ def set_current_org_id(org_id: Optional[uuid.UUID]) -> Token:
 def reset_current_org_id(token: Token) -> None:
     """Restore the previous org context (pair with :func:`set_current_org_id`)."""
     _current_org_id.reset(token)
+
+
+@asynccontextmanager
+async def org_scope(org_id: Optional[uuid.UUID]):
+    """Bind *org_id* as the current org for the duration of an ``async with``.
+
+    Pair-safe: always restores the previous context on exit. ``None`` binds the
+    "no org" context (unfiltered / platform-wide). Used by request handlers
+    (e.g. the public tracking pixel, which must attribute an event to the
+    enrollment's org) and by background tasks alike.
+    """
+    token = _current_org_id.set(org_id)
+    try:
+        yield
+    finally:
+        _current_org_id.reset(token)
 
 
 def org_id_for_insert() -> uuid.UUID:
