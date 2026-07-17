@@ -149,5 +149,85 @@ class SendTimingAnalyzer:
         }
 
 
+    async def get_heatmap(self, db: AsyncSession) -> dict:
+        """Full (day-of-week, hour) grid of send/open counts and open rates.
+
+        Unlike ``get_optimal_times`` (which returns only the top few combos),
+        this returns every populated cell so the Console can render a complete
+        7×24 heatmap. Days are 0=Sunday..6=Saturday to match the rest of the
+        send-timing surface.
+        """
+        sent_subq = (
+            select(
+                OutreachEvent.enrollment_id,
+                OutreachEvent.step_number,
+                OutreachEvent.occurred_at.label("sent_at"),
+            )
+            .where(OutreachEvent.event_type == "sent")
+            .subquery()
+        )
+        opened_subq = (
+            select(
+                OutreachEvent.enrollment_id,
+                OutreachEvent.step_number,
+            )
+            .where(OutreachEvent.event_type == "opened")
+            .distinct()
+            .subquery()
+        )
+        result = await db.execute(
+            select(
+                extract("dow", sent_subq.c.sent_at).label("day_of_week"),
+                extract("hour", sent_subq.c.sent_at).label("hour"),
+                func.count().label("total"),
+                func.count(opened_subq.c.enrollment_id).label("opened"),
+            )
+            .outerjoin(
+                opened_subq,
+                and_(
+                    sent_subq.c.enrollment_id == opened_subq.c.enrollment_id,
+                    sent_subq.c.step_number == opened_subq.c.step_number,
+                ),
+            )
+            .group_by("day_of_week", "hour")
+        )
+        rows = result.all()
+
+        cells = []
+        total_sent = 0
+        total_opened = 0
+        best = None
+        for row in rows:
+            sent = int(row.total)
+            opened = int(row.opened)
+            if sent <= 0:
+                continue
+            rate = round(opened / sent, 4)
+            cell = {
+                "dow": int(row.day_of_week),
+                "hour": int(row.hour),
+                "sent": sent,
+                "opened": opened,
+                "open_rate": rate,
+            }
+            cells.append(cell)
+            total_sent += sent
+            total_opened += opened
+            # Best cell needs enough sample to be meaningful, not a lucky 1/1.
+            if sent >= 3 and (best is None or rate > best["open_rate"]):
+                best = cell
+
+        cells.sort(key=lambda c: (c["dow"], c["hour"]))
+        return {
+            "has_data": total_sent > 0,
+            "cells": cells,
+            "total_sent": total_sent,
+            "total_opened": total_opened,
+            "overall_open_rate": round(total_opened / max(total_sent, 1), 4),
+            "best_cell": best,
+            "min_sample": 3,
+        }
+
+
 def get_send_timing() -> SendTimingAnalyzer:
     return SendTimingAnalyzer()

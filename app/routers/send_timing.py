@@ -28,12 +28,17 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.contact_engagement import ContactEngagementProfile
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.config import get_settings
 from app.schemas.send_timing import (
     ContactProfile,
     ContactSendTiming,
+    ContactWindowList,
+    ContactWindowSummary,
     ExperimentArm,
     OptimalWindow,
     SendTimingExperiment,
+    SendTimingHeatmap,
+    SendTimingStatus,
 )
 from app.services.ab_testing_service import _z_score_two_proportions, _z_to_confidence
 from app.services.send_time_optimizer import get_send_time_optimizer
@@ -49,6 +54,120 @@ _CONFIDENCE_TARGET = 0.95
 async def get_global_optimal_times(db: AsyncSession = Depends(get_db)):
     """Global optimal send times from historical opens (wraps get_optimal_times)."""
     return await get_send_timing().get_optimal_times(db)
+
+
+@router.get("/send-timing/heatmap", response_model=SendTimingHeatmap)
+async def get_send_timing_heatmap(db: AsyncSession = Depends(get_db)):
+    """Full (day-of-week, hour) grid of open rates for the results heatmap."""
+    data = await get_send_timing().get_heatmap(db)
+    return SendTimingHeatmap(**data)
+
+
+@router.get("/send-timing/status", response_model=SendTimingStatus)
+async def get_send_timing_status(db: AsyncSession = Depends(get_db)):
+    """Overall optimizer status: is it on, and how much has it learned so far."""
+    s = get_settings()
+    min_opens = max(1, s.smart_timing_min_opens)
+
+    profiles_total = (
+        await db.execute(select(func.count(ContactEngagementProfile.id)))
+    ).scalar() or 0
+    profiles_with_opens = (
+        await db.execute(
+            select(func.count(ContactEngagementProfile.id)).where(
+                ContactEngagementProfile.opens_total > 0
+            )
+        )
+    ).scalar() or 0
+    profiles_with_signal = (
+        await db.execute(
+            select(func.count(ContactEngagementProfile.id)).where(
+                ContactEngagementProfile.opens_total >= min_opens
+            )
+        )
+    ).scalar() or 0
+    contacts_with_tz = (
+        await db.execute(
+            select(func.count(Contact.id)).where(Contact.timezone.isnot(None))
+        )
+    ).scalar() or 0
+    last_computed = (
+        await db.execute(select(func.max(ContactEngagementProfile.last_computed)))
+    ).scalar()
+
+    return SendTimingStatus(
+        enabled=s.smart_send_timing_enabled,
+        optimized_fraction=s.smart_timing_optimized_fraction,
+        min_opens=s.smart_timing_min_opens,
+        max_delay_hours=s.max_smart_delay_hours,
+        reply_weight=s.smart_timing_reply_weight,
+        default_dows=list(s.smart_timing_default_dows),
+        default_hour_start=s.smart_timing_default_hour_start,
+        default_hour_end=s.smart_timing_default_hour_end,
+        business_hour_start=s.send_window_start_hour,
+        business_hour_end=s.send_window_end_hour,
+        weekdays_only=s.send_window_weekdays_only,
+        profiles_total=profiles_total,
+        profiles_with_signal=profiles_with_signal,
+        profiles_with_opens=profiles_with_opens,
+        contacts_with_timezone=contacts_with_tz,
+        last_computed=last_computed,
+    )
+
+
+@router.get("/send-timing/contacts", response_model=ContactWindowList)
+async def list_contact_windows(
+    limit: int = 20, db: AsyncSession = Depends(get_db)
+):
+    """Top learned contacts (by opens) with their computed optimal windows."""
+    limit = max(1, min(int(limit), 100))
+    optimizer = get_send_time_optimizer()
+
+    total = (
+        await db.execute(select(func.count(ContactEngagementProfile.id)))
+    ).scalar() or 0
+
+    rows = (
+        await db.execute(
+            select(ContactEngagementProfile, Contact)
+            .join(Contact, Contact.id == ContactEngagementProfile.contact_id)
+            .order_by(
+                ContactEngagementProfile.opens_total.desc(),
+                ContactEngagementProfile.confidence.desc(),
+            )
+            .limit(limit)
+        )
+    ).all()
+
+    contacts = []
+    for profile, contact in rows:
+        tz = profile.tz or contact.timezone or "America/Toronto"
+        window = optimizer.compute_optimal_window(
+            tz=tz,
+            best_dow=profile.best_dow,
+            best_hour=profile.best_hour,
+            opens_total=profile.opens_total,
+        )
+        name = " ".join(
+            p for p in [contact.first_name, contact.last_name] if p
+        ).strip() or None
+        contacts.append(
+            ContactWindowSummary(
+                contact_id=str(contact.id),
+                name=name,
+                email=contact.email,
+                timezone=tz,
+                tz_source=profile.tz_source,
+                best_dow=profile.best_dow,
+                best_hour=profile.best_hour,
+                opens_total=profile.opens_total,
+                confidence=profile.confidence,
+                window=OptimalWindow(**window),
+                last_computed=profile.last_computed,
+            )
+        )
+
+    return ContactWindowList(contacts=contacts, total=total)
 
 
 @router.get("/send-timing/contacts/{contact_id}", response_model=ContactSendTiming)

@@ -514,3 +514,106 @@ async def test_experiment_endpoint(
         assert a["opens"] == 1
         assert a["open_rate"] == 1.0
     assert "confidence_target" in body
+
+
+@pytest.mark.asyncio
+async def test_heatmap_endpoint_empty(client: AsyncClient):
+    resp = await client.get("/api/v1/dialtone/send-timing/heatmap")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["has_data"] is False
+    assert body["cells"] == []
+    assert body["best_cell"] is None
+
+
+@pytest.mark.asyncio
+async def test_heatmap_endpoint_aggregates_cells(
+    client: AsyncClient, db_session: AsyncSession, sample_company, sample_contact
+):
+    # Two sends in the same (dow, hour) bucket, one opened → a single cell at 0.5.
+    when = datetime(2026, 7, 14, 15, 0, 0, tzinfo=UTC)  # Tuesday 15:00 UTC
+    enr = await _make_enrollment(db_session, sample_contact, timing_arm="optimized")
+    db_session.add_all([
+        OutreachEvent(id=_uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+                      event_type="sent", occurred_at=when),
+        OutreachEvent(id=_uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+                      event_type="opened", occurred_at=when),
+        OutreachEvent(id=_uuid.uuid4(), enrollment_id=enr.id, step_number=2,
+                      event_type="sent", occurred_at=when),
+    ])
+    await db_session.flush()
+
+    resp = await client.get("/api/v1/dialtone/send-timing/heatmap")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["has_data"] is True
+    assert body["total_sent"] == 2
+    assert body["total_opened"] == 1
+    assert body["overall_open_rate"] == 0.5
+    cell = body["cells"][0]
+    # 2026-07-14 is a Tuesday; DOW is 0=Sunday so Tuesday=2, hour=15 UTC.
+    assert cell["dow"] == 2 and cell["hour"] == 15
+    assert cell["sent"] == 2 and cell["opened"] == 1
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_reports_profiles(
+    client: AsyncClient, db_session: AsyncSession, sample_contact
+):
+    db_session.add(
+        ContactEngagementProfile(
+            id=_uuid.uuid4(),
+            contact_id=sample_contact.id,
+            tz="America/New_York",
+            tz_source="company_geo",
+            buckets={"3_10": {"sends": 5, "opens": 4, "replies": 1}},
+            opens_total=5,
+            best_dow=3,
+            best_hour=10,
+            confidence=0.8,
+            last_computed=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    resp = await client.get("/api/v1/dialtone/send-timing/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body["enabled"], bool)
+    assert body["profiles_total"] >= 1
+    assert body["profiles_with_signal"] >= 1  # opens_total 5 >= min_opens 3
+    assert body["profiles_with_opens"] >= 1
+    assert body["min_opens"] >= 1
+    assert body["business_hour_start"] < body["business_hour_end"]
+
+
+@pytest.mark.asyncio
+async def test_contact_windows_list_endpoint(
+    client: AsyncClient, db_session: AsyncSession, sample_contact
+):
+    db_session.add(
+        ContactEngagementProfile(
+            id=_uuid.uuid4(),
+            contact_id=sample_contact.id,
+            tz="America/New_York",
+            tz_source="company_geo",
+            buckets={"3_10": {"sends": 6, "opens": 5}},
+            opens_total=5,
+            best_dow=3,
+            best_hour=10,
+            confidence=0.8,
+            last_computed=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    resp = await client.get("/api/v1/dialtone/send-timing/contacts?limit=10")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] >= 1
+    row = body["contacts"][0]
+    assert row["contact_id"] == str(sample_contact.id)
+    assert row["opens_total"] == 5
+    assert row["best_hour"] == 10
+    assert row["window"]["hour_start"] < row["window"]["hour_end"]
+    assert row["window"]["source"] == "personal"  # 5 opens >= min_opens 3
