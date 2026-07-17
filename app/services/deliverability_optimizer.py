@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.email_template import EmailSend
-from app.models.sender_health import SenderHealth
+from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.services.email_dispatch import get_sending_accounts, _transport_for
 
 logger = logging.getLogger(__name__)
@@ -138,6 +138,28 @@ class DeliverabilityOptimizer:
         row.details = metrics
         row.last_assessed = now
         await db.flush()
+
+        # Append an immutable history point so the dashboard can trend reputation
+        # over time. Best-effort: a snapshot failure must never sink the
+        # assessment itself (which throttling depends on).
+        try:
+            db.add(SenderHealthSnapshot(
+                account_id=account.id,
+                account_type=account_type,
+                account_email=account.email,
+                sent_7d=metrics["sent_7d"],
+                bounce_rate_7d=metrics["bounce_rate_7d"],
+                complaint_rate_7d=metrics["complaint_rate_7d"],
+                open_rate_7d=metrics["open_rate_7d"],
+                reputation_score=rep,
+                throttle_factor=throttle,
+                status=status,
+                captured_at=now,
+            ))
+            await db.flush()
+        except Exception:
+            logger.exception("Sender-health snapshot failed for %s", account.email)
+
         return row
 
     async def assess_all(self, db: AsyncSession) -> list[dict]:

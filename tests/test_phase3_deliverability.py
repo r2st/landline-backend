@@ -131,3 +131,56 @@ async def test_deliverability_api(client):
     r = await client.get("/api/v1/deliverability/senders")
     assert r.status_code == 200
     assert isinstance(r.json(), list)
+
+
+async def test_assess_writes_history_snapshot(db_session):
+    from app.models.sender_health import SenderHealthSnapshot
+    from sqlalchemy import select
+
+    acct = await _gmail_account(db_session)
+    for _ in range(20):
+        await _email(db_session, acct, status="sent", opened=True)
+    await db_session.flush()
+
+    # Two assessments should leave two dated points for this account.
+    await get_deliverability_optimizer().assess_account(db_session, acct)
+    await get_deliverability_optimizer().assess_account(db_session, acct)
+    await db_session.flush()
+
+    snaps = (
+        await db_session.execute(
+            select(SenderHealthSnapshot).where(SenderHealthSnapshot.account_id == acct.id)
+        )
+    ).scalars().all()
+    assert len(snaps) == 2
+    assert all(s.account_email == acct.email for s in snaps)
+    assert all(s.reputation_score >= 80 for s in snaps)
+
+
+async def test_sender_history_endpoint(client, db_session):
+    acct = await _gmail_account(db_session, email="hist@apprend.co")
+    for _ in range(20):
+        await _email(db_session, acct, status="sent", opened=True)
+    await db_session.flush()
+    await get_deliverability_optimizer().assess_account(db_session, acct)
+    await db_session.commit()
+
+    r = await client.get("/api/v1/deliverability/senders/history?days=30")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body, list)
+    series = next((s for s in body if s["account_email"] == "hist@apprend.co"), None)
+    assert series is not None
+    assert series["account_id"] == str(acct.id)
+    assert len(series["points"]) >= 1
+    pt = series["points"][0]
+    assert set(pt) >= {
+        "captured_at", "reputation_score", "bounce_rate_7d",
+        "complaint_rate_7d", "throttle_factor", "status",
+    }
+
+
+async def test_sender_history_rejects_bad_window(client):
+    # days is bounded 1..365; a nonsense window is a 422, not a silent clamp.
+    r = await client.get("/api/v1/deliverability/senders/history?days=0")
+    assert r.status_code == 422

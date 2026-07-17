@@ -6,16 +6,17 @@ pre-send content spam-risk scanner.
 
 import asyncio
 import logging
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import desc, select
+from sqlalchemy import asc, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.sender_health import SenderHealth
+from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.services.deliverability_optimizer import get_deliverability_optimizer
 from app.services import domain_auth
 from app.services.bounce_handler import record_bounce
@@ -66,6 +67,75 @@ async def list_sender_health(db: AsyncSession = Depends(get_db)):
             last_assessed=r.last_assessed,
         )
         for r in rows
+    ]
+
+
+class SenderHistoryPoint(BaseModel):
+    captured_at: datetime
+    reputation_score: int
+    bounce_rate_7d: float
+    complaint_rate_7d: float
+    throttle_factor: float
+    status: str
+
+
+class SenderHistoryRead(BaseModel):
+    account_id: str
+    account_type: str
+    account_email: Optional[str] = None
+    points: list[SenderHistoryPoint]
+
+
+@router.get("/senders/history", response_model=list[SenderHistoryRead])
+async def sender_health_history(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reputation trend per sending account over the last ``days`` days.
+
+    One series per account, oldest point first, drawn from the append-only
+    snapshot table. Accounts with no snapshots in the window are simply absent —
+    the caller renders "not enough history yet" rather than a flat line.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = (
+        await db.execute(
+            select(SenderHealthSnapshot)
+            .where(SenderHealthSnapshot.captured_at >= since)
+            .order_by(asc(SenderHealthSnapshot.captured_at))
+        )
+    ).scalars().all()
+
+    by_account: dict[str, dict] = {}
+    grouped: dict[str, list] = defaultdict(list)
+    for r in rows:
+        key = str(r.account_id)
+        by_account.setdefault(key, {
+            "account_type": r.account_type,
+            "account_email": r.account_email,
+        })
+        # Later snapshots carry the freshest email label for the account.
+        if r.account_email:
+            by_account[key]["account_email"] = r.account_email
+        grouped[key].append(
+            SenderHistoryPoint(
+                captured_at=r.captured_at,
+                reputation_score=r.reputation_score,
+                bounce_rate_7d=r.bounce_rate_7d,
+                complaint_rate_7d=r.complaint_rate_7d,
+                throttle_factor=r.throttle_factor,
+                status=r.status,
+            )
+        )
+
+    return [
+        SenderHistoryRead(
+            account_id=key,
+            account_type=by_account[key]["account_type"],
+            account_email=by_account[key]["account_email"],
+            points=points,
+        )
+        for key, points in grouped.items()
     ]
 
 

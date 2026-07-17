@@ -63,3 +63,43 @@ class SenderHealth(Base):
             f"<SenderHealth {self.account_type}:{self.account_email} "
             f"rep={self.reputation_score} throttle={self.throttle_factor}>"
         )
+
+
+class SenderHealthSnapshot(Base):
+    """A dated point in an account's deliverability history.
+
+    ``SenderHealth`` holds only the *current* reputation for each account, so the
+    Sender Health dashboard has no way to show whether an account is recovering
+    or sliding. Each assessment appends one immutable row here, giving a real
+    time series (reputation, bounce/complaint rate, throttle) to trend on.
+
+    Deliberately append-only and de-normalised: an old snapshot must reflect the
+    numbers as they were, even after the parent ``SenderHealth`` row moves on or
+    the account is deleted.
+    """
+
+    __tablename__ = "sender_health_snapshot"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    account_type: Mapped[str] = mapped_column(String(10), nullable=False, default="gmail")
+    account_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    sent_7d: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    bounce_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    complaint_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    open_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    reputation_score: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    throttle_factor: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="healthy")
+    captured_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SenderHealthSnapshot {self.account_type}:{self.account_email} "
+            f"rep={self.reputation_score} at={self.captured_at}>"
+        )
