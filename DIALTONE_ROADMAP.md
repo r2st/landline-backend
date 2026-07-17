@@ -18,11 +18,21 @@ Every claim below was checked against `origin/main` with file:line evidence. Tha
 
 The best-value work here is mostly *connecting things that already exist*, not building new ones. I would resist the instinct to add LinkedIn until P0/P1 are done, for reasons in **P3-1**.
 
-**If you read one thing, read P0-1.** It is not a roadmap item so much as a live finding: the safety system this product's launch readiness was argued on has never worked.
+**P0-1 was the live finding and is now fixed** (`bb60fd6`, deployed): the safety system this product's launch readiness was argued on had never worked. Its complaint half is still blind — see **P1-4**.
 
 ---
 
 ## P0 — The auto-pause rail cannot fire. At all.
+
+> **✅ FIXED 2026-07-17 in `bb60fd6`, deployed.** The rail now unions the three places outbound mail actually lives (`EmailSend` + `OutreachEvent` + `BounceRecord`) and trips on Dialtone's own bounces. The acceptance test below is committed as
+> `tests/test_danger_monitor_populations.py::test_total_bounce_catastrophe_trips_the_breaker`
+> and was verified by mutation — it fails against the old aggregation.
+>
+> Confirmed against live prod: the rail's denominator went from **14 → 31 sends**, the 17 new ones being Dialtone's sequence sends, which it had never been able to see.
+>
+> **Root cause was deeper than this section said.** It is not only that nothing writes `EmailSend.status = "bounced"` — the sequence path writes **no `EmailSend` row at all** (`tasks/outreach.py:562`). The numerator *and the denominator* were zero for autonomous sends.
+>
+> **Still open:** `complaint_rate` remains structurally 0. Nothing writes a complaint status anywhere and Gmail gives no complaint signal without a feedback loop — that needs ingestion, not a query change. Tracked in **P1-4** below. The section is kept intact as the record of the finding.
 
 **Severity: critical. Dialtone's only automatic brake is decorative — every metric it evaluates reads a column nothing ever writes.**
 
@@ -169,6 +179,21 @@ Similarly `sequence_optimizer.decide` can recommend `switch_channel` (`sequence_
 
 **Effort:** small. **Value:** medium-high — it stops the cadence lying about what happened.
 
+### P1-4. Complaint ingestion — the rail's last dead metric
+
+With P0-1 fixed the rail trips on bounces, but `complaint_rate` is still always 0: no code path anywhere writes a complaint status, so there is nothing to count. This is not a query bug — **we have no complaint signal at all.**
+
+Gmail does not tell you when a recipient clicks "Report spam". Getting that requires one of:
+
+- **Google Postmaster Tools** — domain-level spam-rate reporting. Free, but aggregate-only (no per-recipient attribution) and needs DNS verification on the sending domain. Would give a real `complaint_rate` for the rail, which is the metric that matters most for reputation.
+- **A proper ESP with a feedback loop** (SES/SendGrid/Postmark) — per-message complaint webhooks, but that's a transport change, not a feature.
+
+Recommend Postmaster Tools: it is the only option that doesn't change how mail is sent, and complaint rate is the signal Gmail actually throttles on. Note `domain_health.py` already has a "not checked automatically" note pointing at Postmaster Tools, so the gap is known.
+
+Until then the rail is protected on bounces and blind on complaints — worth stating plainly on `/dialtone/health` rather than showing a green `complaint_rate: 0.0%` that is really "we don't know".
+
+**Effort:** medium (vendor/DNS + ingestion). **Value:** high — it's the other half of the brake.
+
 ### P1-3. `cadence_pattern` is dead config
 
 `OutreachSequence.cadence_pattern` (`models/sequence.py:48`, default `"single_channel"`) is **read by nothing** — grep returns only the model definition. Either wire it or drop it; a column that looks like it configures behaviour and doesn't is the same trap as the Settings badges fixed last session.
@@ -258,7 +283,7 @@ Real intent from a visit ("someone at Acme read your pricing page twice") requir
 
 | Phase | Work | Why first |
 |---|---|---|
-| 1 | **P0-1** danger metrics | The rail cannot fire on any metric. It reports "Healthy" unconditionally. Everything else is optional; this isn't. |
+| ~~1~~ | ~~**P0-1** danger metrics~~ | ✅ **Done** (`bb60fd6`) — rail now trips on bounces. Complaints still blind → **P1-4**. |
 | 2 | **P0-2** attribution | Until this exists, every item below is ranked on vibes — including by the ICP learner. |
 | 3 | **P1-1** intent → action | Highest value per hour: the capability is built and idle. |
 | 4 | **P1-2** honest channel steps | Stops the funnel counting touches nobody made. Small. |
