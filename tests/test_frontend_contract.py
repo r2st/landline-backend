@@ -79,6 +79,14 @@ FRONTEND_ROUTES = [
     ("POST", "/api/v1/prospecting/icp/learn"),
     # CompanyDetail.jsx — Dialtone provenance
     ("GET", "/api/v1/prospecting/companies/{company_id}/provenance"),
+    # OrganizationSettings.jsx / TeamManagement.jsx / UsageDashboard.jsx (Phase 3)
+    ("GET", "/api/v1/org/settings"),
+    ("PUT", "/api/v1/org/settings"),
+    ("GET", "/api/v1/org/members"),
+    ("POST", "/api/v1/org/members/invite"),
+    ("PUT", "/api/v1/org/members/{member_id}/role"),
+    ("DELETE", "/api/v1/org/members/{member_id}"),
+    ("GET", "/api/v1/org/usage"),
 ]
 
 
