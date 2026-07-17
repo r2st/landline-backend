@@ -18,6 +18,7 @@ the read filter is skipped and writes fall back to the first-party
 "Apprend Technologies" organization — see :data:`APPREND_ORG_ID`.
 """
 
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
@@ -67,6 +68,21 @@ async def org_scope(org_id: Optional[uuid.UUID]):
         yield
     finally:
         _current_org_id.reset(token)
+
+
+class OrgContextLogFilter(logging.Filter):
+    """Stamp every log record with the current org id for tenant-aware logs.
+
+    Attach to the root handler so every line — request handler or background
+    task — carries ``org=<id>`` (or ``org=-`` when unscoped). Because it always
+    sets the attribute, a format string referencing ``%(org_id)s`` never
+    KeyErrors on third-party records routed through the same handler.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        org = _current_org_id.get()
+        record.org_id = str(org) if org is not None else "-"
+        return True
 
 
 def org_id_for_insert() -> uuid.UUID:

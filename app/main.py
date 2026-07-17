@@ -34,12 +34,17 @@ def require_secret_key() -> None:
             "(or JWT_SECRET_KEY / TOKEN_ENCRYPTION_KEY) in the environment."
         )
 
-# Configure logging
+# Configure logging — every line is tagged with the current org (multi-tenant
+# observability), so a stray cross-tenant read/write is traceable to a request.
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)-8s | org=%(org_id)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+from app.org_context import OrgContextLogFilter  # noqa: E402
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(OrgContextLogFilter())
 logger = logging.getLogger(__name__)
 
 
