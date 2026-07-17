@@ -111,22 +111,63 @@ def check_spf(domain: str) -> dict:
             "record": spf, "policy": policy, "issues": issues}
 
 
+def recommended_dmarc_record(domain: str, current_policy: Optional[str] = None) -> Optional[str]:
+    """The exact TXT value to publish at ``_dmarc.<domain>``, or None.
+
+    * No record / no policy → a safe *monitoring* starter (``p=none``) with an
+      aggregate-report address, so the operator can watch alignment before
+      enforcing. Relaxed alignment (the default) is used deliberately — strict
+      alignment can quarantine legitimate mail on day one.
+    * ``p=none`` already published → the next step: tighten to ``p=quarantine``.
+    * ``p=quarantine`` → the final step: ``p=reject``.
+    * ``p=reject`` → None (already at the strongest policy).
+
+    The host to publish it at is always ``_dmarc.<domain>`` (see
+    :func:`dmarc_host`).
+    """
+    policy = (current_policy or "").lower()
+    rua = f"rua=mailto:dmarc@{domain}"
+    if not policy or policy == "none-missing":
+        return f"v=DMARC1; p=none; {rua}; fo=1; pct=100"
+    if policy == "none":
+        return f"v=DMARC1; p=quarantine; {rua}; fo=1; pct=100"
+    if policy == "quarantine":
+        return f"v=DMARC1; p=reject; {rua}; fo=1; pct=100"
+    return None
+
+
+def dmarc_host(domain: str) -> str:
+    """The DNS host a DMARC TXT record must be published at."""
+    return f"_dmarc.{domain}"
+
+
 def check_dmarc(domain: str) -> dict:
     """Look up the domain's DMARC record at ``_dmarc.<domain>``."""
-    txts, err = _txt_records(f"_dmarc.{domain}")
+    host = dmarc_host(domain)
+    txts, err = _txt_records(host)
     if err == "nxdomain":
         return {"type": "dmarc", "present": False, "valid": False, "status": "fail",
-                "record": None, "policy": None,
-                "issues": ["no DMARC record — add a TXT at _dmarc with 'v=DMARC1; p=none'"]}
+                "record": None, "policy": None, "host": host,
+                "recommended_record": recommended_dmarc_record(domain),
+                "issues": [
+                    f"no DMARC record — add a TXT at {host} with "
+                    f"'{recommended_dmarc_record(domain)}'"
+                ]}
     if err:
         return {"type": "dmarc", "present": False, "valid": False, "status": "unknown",
-                "record": None, "policy": None, "issues": [err]}
+                "record": None, "policy": None, "host": host,
+                "recommended_record": recommended_dmarc_record(domain),
+                "issues": [err]}
 
     dmarc = next((t for t in txts if t.lower().startswith("v=dmarc1")), None)
     if not dmarc:
         return {"type": "dmarc", "present": False, "valid": False, "status": "fail",
-                "record": None, "policy": None,
-                "issues": ["no DMARC record — add 'v=DMARC1; p=none'"]}
+                "record": None, "policy": None, "host": host,
+                "recommended_record": recommended_dmarc_record(domain),
+                "issues": [
+                    f"no DMARC record — add a TXT at {host} with "
+                    f"'{recommended_dmarc_record(domain)}'"
+                ]}
 
     # Parse tag=value pairs.
     tags = {}
@@ -136,8 +177,12 @@ def check_dmarc(domain: str) -> dict:
             tags[k.strip().lower()] = v.strip()
     policy = tags.get("p", "none").lower()
     issues: list[str] = []
+    recommended = recommended_dmarc_record(domain, policy)
     if policy == "none":
-        issues.append("DMARC policy is 'p=none' (monitor only) — tighten to quarantine/reject once aligned")
+        issues.append(
+            "DMARC policy is 'p=none' (monitor only) — once your reports look "
+            f"clean, tighten it by publishing '{recommended}'"
+        )
     if "rua" not in tags:
         issues.append("no aggregate reporting address (rua=) — you won't receive DMARC reports")
 
@@ -145,7 +190,8 @@ def check_dmarc(domain: str) -> dict:
     valid = policy in ("quarantine", "reject")
     return {"type": "dmarc", "present": True, "valid": valid,
             "status": "pass" if valid else "warn",
-            "record": dmarc, "policy": policy, "issues": issues}
+            "record": dmarc, "policy": policy, "host": host,
+            "recommended_record": recommended, "issues": issues}
 
 
 def check_dkim(domain: str, selectors: Optional[list[str]] = None) -> dict:

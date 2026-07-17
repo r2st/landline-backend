@@ -85,6 +85,42 @@ def test_dmarc_missing_fails(monkeypatch):
     assert not r["present"] and r["status"] == "fail"
 
 
+def test_dmarc_missing_recommends_monitor_record(monkeypatch):
+    monkeypatch.setattr(domain_auth, "_txt_records",
+                        _fake_dns({"_dmarc.acme.com": ([], "nxdomain")}))
+    r = domain_auth.check_dmarc("acme.com")
+    assert r["host"] == "_dmarc.acme.com"
+    rec = r["recommended_record"]
+    assert rec.startswith("v=DMARC1; p=none;")
+    assert "rua=mailto:dmarc@acme.com" in rec
+    # The concrete record is embedded in the operator-facing issue text.
+    assert any(rec in i for i in r["issues"])
+
+
+def test_dmarc_monitor_recommends_next_step_quarantine(monkeypatch):
+    monkeypatch.setattr(domain_auth, "_txt_records", _fake_dns({
+        "_dmarc.acme.com": (["v=DMARC1; p=none; rua=mailto:d@acme.com"], None),
+    }))
+    r = domain_auth.check_dmarc("acme.com")
+    assert r["recommended_record"].startswith("v=DMARC1; p=quarantine;")
+
+
+def test_dmarc_quarantine_recommends_reject(monkeypatch):
+    monkeypatch.setattr(domain_auth, "_txt_records", _fake_dns({
+        "_dmarc.acme.com": (["v=DMARC1; p=quarantine; rua=mailto:d@acme.com"], None),
+    }))
+    r = domain_auth.check_dmarc("acme.com")
+    assert r["recommended_record"].startswith("v=DMARC1; p=reject;")
+
+
+def test_dmarc_reject_has_no_further_recommendation(monkeypatch):
+    monkeypatch.setattr(domain_auth, "_txt_records", _fake_dns({
+        "_dmarc.acme.com": (["v=DMARC1; p=reject; rua=mailto:d@acme.com"], None),
+    }))
+    r = domain_auth.check_dmarc("acme.com")
+    assert r["recommended_record"] is None
+
+
 # --- DKIM ---
 
 def test_dkim_found_selector(monkeypatch):
