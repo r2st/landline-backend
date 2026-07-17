@@ -52,6 +52,46 @@ from app.services.ingestion import (
 
 logger = logging.getLogger(__name__)
 
+# The ICP fields a human is allowed to take ownership of. Everything here is
+# scoring input; `learned_from_deal_count`, `model_used` and the timestamps
+# describe how the profile was produced and are not an operator's to set.
+#
+# An allowlist rather than "any attribute": an override naming a field that
+# doesn't exist would sit in the JSON being silently skipped forever, which is
+# the same failure mode as the review queue reading fields the API never sent.
+OVERRIDABLE_ICP_FIELDS = frozenset(
+    {
+        "industry_weights",
+        "size_range",
+        "location_preferences",
+        "technology_signals",
+        "pain_point_indicators",
+        "exclusion_criteria",
+    }
+)
+
+
+def apply_manual_overrides(profile: IcpProfile) -> None:
+    """Overlay a profile's pinned fields onto its learned values, in place.
+
+    Called after every fit, so the parts nobody pinned keep tracking what
+    actually closes while explicit human choices survive the Monday re-learn.
+    Unknown keys are dropped with a warning rather than ignored quietly — they
+    can only come from a field that was renamed or removed, and a silently
+    inert override is exactly the bug this whole mechanism exists to prevent.
+    """
+    overrides = profile.manual_overrides or {}
+    for field, value in overrides.items():
+        if field not in OVERRIDABLE_ICP_FIELDS:
+            logger.warning(
+                "ICP profile %s pins unknown field %r — ignoring. It was probably "
+                "renamed; the override will never apply until it is corrected.",
+                profile.id,
+                field,
+            )
+            continue
+        setattr(profile, field, value)
+
 # Matches ``places_discovery.PROVIDER``. Imported lazily at call sites (the
 # service pulls in httpx and the ingestion graph), so the string is pinned here
 # and asserted against the real one in tests.
@@ -158,11 +198,22 @@ class AutonomousProspector:
             "min_employees": 5,
         }
 
-        # Deactivate previous profiles.
+        # Deactivate previous profiles, and inherit whatever a human pinned on
+        # the one that was active. This runs weekly off the beat schedule, so
+        # without the carry-forward an operator's hand-tuned ICP would revert
+        # every Monday with nothing to explain why the agent started chasing the
+        # wrong companies again.
+        prior_overrides: dict = {}
+        prior_edited_at = None
+        prior_edited_by = None
         for prev in (
             await db.execute(select(IcpProfile).where(IcpProfile.is_active == True))  # noqa: E712
         ).scalars().all():
             prev.is_active = False
+            if prev.manual_overrides:
+                prior_overrides = dict(prev.manual_overrides)
+                prior_edited_at = prev.edited_at
+                prior_edited_by = prev.edited_by
 
         profile = IcpProfile(
             name=name,
@@ -178,7 +229,13 @@ class AutonomousProspector:
             exclusion_criteria=exclusion_criteria,
             learned_from_deal_count=len(companies),
             model_used="heuristic-v1",
+            manual_overrides=prior_overrides,
+            edited_at=prior_edited_at,
+            edited_by=prior_edited_by,
         )
+        # Pinned fields win over the fresh fit. Everything else keeps tracking
+        # what actually closes, which is the point of re-learning at all.
+        apply_manual_overrides(profile)
         db.add(profile)
         await db.flush()
         return profile

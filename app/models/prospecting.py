@@ -59,6 +59,16 @@ class IcpProfile(Base):
     exclusion_criteria: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     learned_from_deal_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     model_used: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # {field_name: value} for fields a human has taken ownership of. `learn_icp`
+    # recomputes everything from won deals, then re-applies these on top and
+    # carries them onto the profile it creates — otherwise the Monday re-learn
+    # would silently revert every hand-tuned weight. Field-level, so "you own
+    # industry_weights" is a rule an operator can actually hold in their head.
+    manual_overrides: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    edited_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    edited_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

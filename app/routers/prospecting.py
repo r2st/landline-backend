@@ -1,7 +1,8 @@
 """Autonomous prospecting API (feature 3.1).
 
-Trigger runs, inspect run history, view/learn the ICP, and work the human
-review queue (approve → enroll, or reject) for borderline candidates.
+Trigger runs, inspect run history, view/edit/learn the ICP, work the human
+review queue (approve → enroll, or reject) for borderline candidates, and trace
+a company back to the candidate that put it in the pipeline.
 """
 
 import logging
@@ -15,6 +16,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.company import Company
 from app.models.prospecting import (
     CANDIDATE_STATUSES,
@@ -22,8 +24,13 @@ from app.models.prospecting import (
     ProspectCandidate,
     ProspectingRun,
 )
+from app.models.user import User
 from app.services import api_credits
-from app.services.autonomous_prospector import get_prospector
+from app.services.autonomous_prospector import (
+    OVERRIDABLE_ICP_FIELDS,
+    apply_manual_overrides,
+    get_prospector,
+)
 from app.services.company_contacts import display_name, resolve_primary_contacts
 
 logger = logging.getLogger(__name__)
@@ -149,9 +156,33 @@ class IcpRead(BaseModel):
     learned_from_deal_count: int
     model_used: Optional[str] = None
     updated_at: datetime
+    # Which fields a human pinned, and who. The UI needs these to answer "will
+    # Monday's re-learn undo what I just set?" — without them, an operator has
+    # no way to tell a learned weight from one they chose.
+    manual_overrides: dict = {}
+    edited_at: Optional[datetime] = None
+    edited_by: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class IcpUpdate(BaseModel):
+    """Pin one or more ICP fields to human-chosen values.
+
+    Every field is optional and only what's sent is pinned — omitting a field
+    leaves it learned and free to keep improving. To hand a field back to the
+    learner, send it in ``unpin`` rather than guessing a value to write.
+    """
+
+    industry_weights: Optional[dict] = None
+    size_range: Optional[dict] = None
+    location_preferences: Optional[dict] = None
+    technology_signals: Optional[list] = None
+    pain_point_indicators: Optional[list] = None
+    exclusion_criteria: Optional[dict] = None
+    # Field names to release back to the learner, applied after any pins above.
+    unpin: list[str] = Field(default_factory=list)
 
 
 @router.post("/run", response_model=RunRead)
@@ -348,6 +379,107 @@ async def credit_usage(db: AsyncSession = Depends(get_db)):
     return status.as_dict()
 
 
+class ProvenanceRun(BaseModel):
+    """The run that surfaced a company, trimmed to what a detail page needs."""
+
+    id: uuid.UUID
+    trigger: str
+    status: str
+    started_at: datetime
+    sources_queried: list = []
+
+
+class CompanyProvenance(BaseModel):
+    """Why a company is in the pipeline at all.
+
+    Answers the question a company detail page could not: an agent-discovered
+    lead showed a `source` string and nothing else — no fit score, no rationale,
+    no link to the run that found it.
+    """
+
+    company_id: uuid.UUID
+    # False when nothing in prospecting created this company — a manual add, a
+    # CSV import, a business card. Distinguishing that from "the agent found it
+    # but we lost the record" matters: only one of them is a bug.
+    discovered_by_agent: bool
+    candidate_id: Optional[uuid.UUID] = None
+    source: Optional[str] = None
+    fit_score: Optional[int] = None
+    qualification: dict = {}
+    reasoning: Optional[str] = None
+    status: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    discovered_at: Optional[datetime] = None
+    dedup_confidence: Optional[str] = None
+    run: Optional[ProvenanceRun] = None
+
+
+@router.get("/companies/{company_id}/provenance", response_model=CompanyProvenance)
+async def company_provenance(company_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Trace a company back to the prospect candidate that created it.
+
+    Returns ``discovered_by_agent: false`` rather than 404 for a company the
+    agent never touched — "this lead came in some other way" is a real answer,
+    and a 404 would make the caller guess between that and a broken lookup.
+    """
+    company = (
+        await db.execute(select(Company).where(Company.id == company_id))
+    ).scalar_one_or_none()
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    # Newest first: a company can be re-surfaced by later runs, and the most
+    # recent decision is the one that explains its current state.
+    candidate = (
+        await db.execute(
+            select(ProspectCandidate)
+            .where(ProspectCandidate.company_id == company_id)
+            .order_by(desc(ProspectCandidate.created_at))
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if candidate is None:
+        return CompanyProvenance(company_id=company_id, discovered_by_agent=False)
+
+    # run_id is NOT NULL with ON DELETE CASCADE, so an existing candidate always
+    # has its run. Still tolerate a miss rather than 500 a detail page over
+    # provenance trivia.
+    row = (
+        await db.execute(
+            select(ProspectingRun).where(ProspectingRun.id == candidate.run_id)
+        )
+    ).scalar_one_or_none()
+    run = (
+        ProvenanceRun(
+            id=row.id,
+            trigger=row.trigger,
+            status=row.status,
+            started_at=row.started_at,
+            sources_queried=row.sources_queried or [],
+        )
+        if row is not None
+        else None
+    )
+
+    return CompanyProvenance(
+        company_id=company_id,
+        discovered_by_agent=True,
+        candidate_id=candidate.id,
+        source=candidate.source,
+        fit_score=candidate.fit_score,
+        qualification=candidate.qualification or {},
+        reasoning=candidate.reasoning,
+        status=candidate.status,
+        reviewed_by=candidate.reviewed_by,
+        reviewed_at=candidate.reviewed_at,
+        discovered_at=candidate.created_at,
+        dedup_confidence=candidate.dedup_confidence,
+        run=run,
+    )
+
+
 @router.get("/icp", response_model=Optional[IcpRead])
 async def get_icp(db: AsyncSession = Depends(get_db)):
     """The active learned ICP (or null if none learned yet)."""
@@ -355,9 +487,72 @@ async def get_icp(db: AsyncSession = Depends(get_db)):
     return icp
 
 
+@router.put("/icp", response_model=IcpRead)
+async def update_icp(
+    payload: IcpUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Pin ICP fields to human-chosen values.
+
+    Writes the value *and* records the field as manually owned, so the weekly
+    re-learn re-applies it instead of reverting it. Fields left alone stay
+    learned and keep tracking won deals; fields listed in ``unpin`` are handed
+    back to the learner and take their learned value at the next fit.
+
+    Updates the active profile in place rather than creating one: a pin is a
+    correction to the current ICP, not a new hypothesis, and inserting a profile
+    per edit would make ``learned_from_deal_count`` meaningless.
+    """
+    prospector = get_prospector()
+    # An edit needs something to edit. `ensure_icp` fits a profile from won
+    # deals (or the defaults) rather than 404ing on a fresh install.
+    icp = await prospector.ensure_icp(db)
+
+    pins = payload.model_dump(exclude_none=True, exclude={"unpin"})
+    unknown_unpin = set(payload.unpin) - OVERRIDABLE_ICP_FIELDS
+    if unknown_unpin:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot unpin unknown field(s): {sorted(unknown_unpin)}. "
+                f"Overridable fields are {sorted(OVERRIDABLE_ICP_FIELDS)}."
+            ),
+        )
+
+    overrides = dict(icp.manual_overrides or {})
+    for field, value in pins.items():
+        overrides[field] = value
+    for field in payload.unpin:
+        overrides.pop(field, None)
+
+    icp.manual_overrides = overrides
+    if pins or payload.unpin:
+        icp.edited_at = datetime.now(timezone.utc)
+        icp.edited_by = user.email
+
+    # Re-apply so the response reflects what the agent will actually score on,
+    # not what was learned before this edit.
+    apply_manual_overrides(icp)
+    # An unpinned field keeps its last value until the next fit — say so in the
+    # log rather than implying the learned value comes back instantly.
+    if payload.unpin:
+        logger.info(
+            "ICP %s: %s released to the learner by %s; they keep their current "
+            "values until the next re-learn.",
+            icp.id, sorted(payload.unpin), user.email,
+        )
+    await db.flush()
+    return icp
+
+
 @router.post("/icp/learn", response_model=IcpRead)
 async def learn_icp(db: AsyncSession = Depends(get_db)):
-    """Refit the ICP from won-deal characteristics."""
+    """Refit the ICP from won-deal characteristics.
+
+    Pinned fields survive: the fit is recomputed in full, then any manual
+    overrides are re-applied on top and carried onto the new profile.
+    """
     icp = await get_prospector().learn_icp(db)
     await db.flush()
     return icp

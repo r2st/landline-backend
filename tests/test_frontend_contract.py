@@ -33,6 +33,7 @@ FRONTEND_ROUTES = [
     ("GET", "/api/v1/system/sending-status"),
     ("POST", "/api/v1/system/sending-toggle"),
     ("GET", "/api/v1/system/automation"),
+    ("POST", "/api/v1/system/reset-warmup"),
     # DialtoneHealth.jsx + ResumeDialog.jsx — the auto-pause rail.
     ("GET", "/api/v1/dialtone/health/signals"),
     ("GET", "/api/v1/dialtone/health/signals/events"),
@@ -68,9 +69,16 @@ FRONTEND_ROUTES = [
     # Prospecting.jsx
     ("GET", "/api/v1/prospecting/review-queue"),
     ("GET", "/api/v1/prospecting/runs"),
-    ("GET", "/api/v1/prospecting/icp"),
+    ("GET", "/api/v1/prospecting/runs/{run_id}/candidates"),
+    ("POST", "/api/v1/prospecting/run"),
     ("POST", "/api/v1/prospecting/candidates/{candidate_id}/approve"),
     ("POST", "/api/v1/prospecting/candidates/{candidate_id}/reject"),
+    # Icp.jsx
+    ("GET", "/api/v1/prospecting/icp"),
+    ("PUT", "/api/v1/prospecting/icp"),
+    ("POST", "/api/v1/prospecting/icp/learn"),
+    # CompanyDetail.jsx — Dialtone provenance
+    ("GET", "/api/v1/prospecting/companies/{company_id}/provenance"),
 ]
 
 
