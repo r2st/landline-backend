@@ -95,7 +95,9 @@ def upgrade() -> None:
 
     # 3. Role enum values: admin→org_admin, manager→org_manager, agent→org_agent,
     #    and permit platform_admin.
-    op.drop_constraint("ck_users_role", "users", type_="check")
+    # IF EXISTS: some environments' ``users`` table was created without a named
+    # role CHECK (schema drift), so an unconditional DROP would fail there.
+    op.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS ck_users_role")
     op.execute("UPDATE users SET role = 'org_admin'   WHERE role = 'admin'")
     op.execute("UPDATE users SET role = 'org_manager' WHERE role = 'manager'")
     op.execute("UPDATE users SET role = 'org_agent'   WHERE role = 'agent'")
@@ -147,7 +149,7 @@ def downgrade() -> None:
         op.alter_column(table, "org_id", existing_type=postgresql.UUID(as_uuid=True), nullable=True)
 
     # 3. Revert role values.
-    op.drop_constraint("ck_users_role", "users", type_="check")
+    op.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS ck_users_role")
     op.execute("UPDATE users SET role = 'admin'   WHERE role IN ('org_admin','platform_admin')")
     op.execute("UPDATE users SET role = 'manager' WHERE role = 'org_manager'")
     op.execute("UPDATE users SET role = 'agent'   WHERE role = 'org_agent'")
