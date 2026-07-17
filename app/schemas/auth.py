@@ -31,6 +31,18 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class RegisterRequest(BaseModel):
+    """Public organization sign-up: create an org + its first admin user."""
+
+    org_name: str = Field(..., min_length=2, max_length=255)
+    admin_email: EmailStr
+    password: str = Field(..., min_length=8)
+    # Optional display name for the first user; defaults to the email local-part.
+    admin_name: Optional[str] = Field(None, min_length=1, max_length=255)
+    # Optional preferred slug; auto-derived from ``org_name`` when omitted.
+    slug: Optional[str] = Field(None, min_length=2, max_length=63)
+
+
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=6)

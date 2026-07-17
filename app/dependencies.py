@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models.tenant import Organization
 from app.models.user import User, UserRole, normalize_role
 from app.org_context import set_current_org_id
 from app.security import decode_token
@@ -87,6 +88,23 @@ async def get_current_user(
             detail="Account is deactivated",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Reject users whose *organization* has been deactivated. Enforced here (the
+    # single dependency every authenticated route runs through) so a suspended
+    # tenant is locked out everywhere, not just at login. Platform admins carry
+    # ``org_id = NULL`` and are exempt. ``Organization`` is not org-scoped, and
+    # no org context is bound yet, so this select is not self-filtered.
+    if user.org_id is not None:
+        org_active = (
+            await db.execute(
+                select(Organization.is_active).where(Organization.id == user.org_id)
+            )
+        ).scalar_one_or_none()
+        if not org_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Organization is deactivated",
+            )
 
     # Bind the caller's org for the rest of the request: drives the automatic
     # ``org_id`` on inserts and the global read filter (see app.org_context /

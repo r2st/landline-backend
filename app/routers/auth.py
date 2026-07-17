@@ -1,6 +1,8 @@
-"""Authentication endpoints — login, token refresh, current user, password change."""
+"""Authentication endpoints — login, registration, token refresh, current user."""
 
 import logging
+import re
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jose import JWTError
@@ -17,6 +19,7 @@ from app.schemas.auth import (
     LoginRequest,
     ProfileUpdateRequest,
     RefreshRequest,
+    RegisterRequest,
     TokenResponse,
     UserRead,
 )
@@ -30,6 +33,101 @@ from app.security import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _slugify(value: str) -> str:
+    """Best-effort URL-safe slug from a free-text org name."""
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug[:63] or "org"
+
+
+async def _unique_slug(db: AsyncSession, base: str) -> str:
+    """Return ``base`` (or ``base-<suffix>``) that no organization uses yet."""
+    slug = base
+    for _ in range(5):
+        exists = (
+            await db.execute(select(Organization.id).where(Organization.slug == slug))
+        ).scalar_one_or_none()
+        if exists is None:
+            return slug
+        slug = f"{base[:55]}-{uuid.uuid4().hex[:6]}"
+    # Extremely unlikely; fall back to a fully random slug.
+    return f"org-{uuid.uuid4().hex[:12]}"
+
+
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit(AUTH_RATE_LIMIT)
+async def register(
+    request: Request, payload: RegisterRequest, db: AsyncSession = Depends(get_db)
+):
+    """Public self-service sign-up: create an organization + its first admin.
+
+    Creates the ``Organization`` (on the free plan) and a single ``org_admin``
+    user, then returns access/refresh tokens so the caller is logged straight
+    in. Rate-limited like login to blunt abuse. Neither ``Organization`` nor
+    ``User`` is org-scoped, so the writes are safe without a bound org context;
+    the new user's ``org_id`` is set explicitly.
+    """
+    email = payload.admin_email.lower().strip()
+
+    # Global email uniqueness — surfaced as 409 rather than a DB IntegrityError.
+    clash = (
+        await db.execute(select(User.id).where(User.email == email))
+    ).scalar_one_or_none()
+    if clash is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists",
+        )
+
+    # Resolve a unique, valid slug.
+    if payload.slug:
+        slug = payload.slug.lower().strip()
+        if not _SLUG_RE.match(slug):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="slug must be 2-63 chars: lowercase letters, digits, hyphens",
+            )
+        taken = (
+            await db.execute(select(Organization.id).where(Organization.slug == slug))
+        ).scalar_one_or_none()
+        if taken is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"An organization with slug {slug!r} already exists",
+            )
+    else:
+        slug = await _unique_slug(db, _slugify(payload.org_name))
+
+    org = Organization(name=payload.org_name.strip(), slug=slug, is_active=True, billing_plan="free")
+    db.add(org)
+    await db.flush()  # assign org.id
+
+    admin = User(
+        email=email,
+        name=(payload.admin_name or email.split("@")[0]).strip(),
+        role=UserRole.ORG_ADMIN.value,
+        password_hash=hash_password(payload.password),
+        is_active=True,
+        must_change_password=False,
+        org_id=org.id,
+    )
+    db.add(admin)
+    await db.flush()
+
+    access = create_access_token(admin.id, admin.role, admin.org_id)
+    refresh = create_refresh_token(admin.id)
+    logger.info("New organization registered: %s (%s) admin=%s", org.name, slug, email)
+    return TokenResponse(
+        access_token=access,
+        refresh_token=refresh,
+        must_change_password=False,
+        role=admin.role,
+        org_id=admin.org_id,
+        org_name=org.name,
+    )
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -52,17 +150,24 @@ async def login(request: Request, payload: LoginRequest, db: AsyncSession = Depe
             detail="Account is deactivated",
         )
 
-    access = create_access_token(user.id, user.role, user.org_id)
-    refresh = create_refresh_token(user.id)
-
-    # Resolve the org name for the login response (skip for platform admins).
+    # Resolve the org (name for the response + active check). Members of a
+    # deactivated organization cannot log in; platform admins have no org.
     org_name = None
     if user.org_id is not None:
-        org_name = (
+        org = (
             await db.execute(
-                select(Organization.name).where(Organization.id == user.org_id)
+                select(Organization).where(Organization.id == user.org_id)
             )
         ).scalar_one_or_none()
+        if org is None or not org.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Organization is deactivated",
+            )
+        org_name = org.name
+
+    access = create_access_token(user.id, user.role, user.org_id)
+    refresh = create_refresh_token(user.id)
 
     logger.info("User %s logged in (org=%s)", user.email, user.org_id)
     return TokenResponse(
@@ -105,6 +210,20 @@ async def refresh(request: Request, payload: RefreshRequest, db: AsyncSession = 
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or deactivated",
         )
+
+    # A refresh must also fail once the user's organization is deactivated,
+    # otherwise a suspended tenant could mint fresh access tokens indefinitely.
+    if user.org_id is not None:
+        org_active = (
+            await db.execute(
+                select(Organization.is_active).where(Organization.id == user.org_id)
+            )
+        ).scalar_one_or_none()
+        if not org_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Organization is deactivated",
+            )
 
     access = create_access_token(user.id, user.role, user.org_id)
     new_refresh = create_refresh_token(user.id)

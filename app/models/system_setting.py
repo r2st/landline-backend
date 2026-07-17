@@ -13,7 +13,7 @@ when, and why) alongside its primary value.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, func
+from sqlalchemy import String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,12 +23,18 @@ from app.models.mixins import OrgScopedMixin
 
 class SystemSetting(Base, OrgScopedMixin):
     __tablename__ = "system_settings"
+    # Settings are per-organization: each tenant has its own kill switch,
+    # warm-up date, etc. Uniqueness is on (org_id, key), NOT key alone —
+    # otherwise only one org could ever hold a given setting (see migration 080).
+    __table_args__ = (
+        UniqueConstraint("org_id", "key", name="uq_system_settings_org_key"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     # Stable machine key, e.g. "sending_enabled" or "warmup_start_date".
-    key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     # The setting payload. For the kill switch: {"enabled": bool, "reason": str,
     # "updated_by": str}. For warm-up: {"date": "2026-07-15"}.
     value: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
