@@ -23,12 +23,13 @@ from datetime import date as date_cls, datetime, time, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
 from app.models.ab_test import AbTest, AbTestVariant
+from app.models.company import Company
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
 from app.models.email_reply import EmailReply
@@ -48,6 +49,8 @@ from app.schemas.dialtone import (
     DialtoneSending,
     DialtoneTodayCounts,
     DialtoneWarmup,
+    PhoneEnrichmentRecent,
+    PhoneEnrichmentSummary,
 )
 from app.services import system_settings
 from app.services.booking import validate_booking_url
@@ -683,6 +686,86 @@ async def get_dialtone_console(db: AsyncSession = Depends(get_db)):
         warmup=warmup,
         today=today_counts,
         senders=senders,
+    )
+
+
+# ─── Phone enrichment summary ────────────────────────────────────────────────
+
+# The warm-lead sweep only ever stamps these two sources; a 'card'/'manual'
+# number is a human action, not an enrichment.
+_ENRICHED_SOURCES = ("apollo", "company")
+_SOURCE_LABELS = {"apollo": "direct dial", "company": "company line"}
+
+
+@router.get("/phone-enrichment/summary", response_model=PhoneEnrichmentSummary)
+async def phone_enrichment_summary(
+    recent_limit: int = Query(8, ge=0, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """Roll-up of the warm-lead phone-enrichment sweep: how many contacts were
+    enriched, the hit rate against attempts, the Apollo-vs-company-line split,
+    and the most recent finds — the numbers behind the Console's enrichment card.
+    """
+    # Attempts: every contact the sweep has looked up (hit or miss).
+    attempts = (
+        await db.execute(
+            select(func.count())
+            .select_from(Contact)
+            .where(Contact.phone_enriched_at.isnot(None))
+        )
+    ).scalar() or 0
+
+    # Enriched, split by source, in one grouped pass.
+    by_source_rows = (
+        await db.execute(
+            select(Contact.phone_source, func.count())
+            .where(
+                Contact.phone_enriched_at.isnot(None),
+                Contact.phone_source.in_(_ENRICHED_SOURCES),
+            )
+            .group_by(Contact.phone_source)
+        )
+    ).all()
+    by_source = {src: count for src, count in by_source_rows}
+    apollo = by_source.get("apollo", 0)
+    company = by_source.get("company", 0)
+    enriched = apollo + company
+    hit_rate = round(enriched / attempts, 4) if attempts else 0.0
+
+    recent: list[PhoneEnrichmentRecent] = []
+    if recent_limit:
+        rows = (
+            await db.execute(
+                select(Contact, Company)
+                .outerjoin(Company, Contact.company_id == Company.id)
+                .where(
+                    Contact.phone_enriched_at.isnot(None),
+                    Contact.phone_source.in_(_ENRICHED_SOURCES),
+                )
+                .order_by(Contact.phone_enriched_at.desc())
+                .limit(recent_limit)
+            )
+        ).all()
+        for contact, company_row in rows:
+            recent.append(
+                PhoneEnrichmentRecent(
+                    contact_id=str(contact.id),
+                    contact_name=contact.full_name,
+                    company_name=company_row.name if company_row is not None else None,
+                    phone=contact.mobile or contact.phone,
+                    source=contact.phone_source,
+                    source_label=_SOURCE_LABELS.get(contact.phone_source, ""),
+                    enriched_at=_aware(contact.phone_enriched_at),
+                )
+            )
+
+    return PhoneEnrichmentSummary(
+        enriched=enriched,
+        attempts=attempts,
+        hit_rate=hit_rate,
+        apollo=apollo,
+        company=company,
+        recent=recent,
     )
 
 

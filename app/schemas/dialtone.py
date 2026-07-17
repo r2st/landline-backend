@@ -124,3 +124,35 @@ class DialtoneConsole(BaseModel):
     warmup: DialtoneWarmup
     today: DialtoneTodayCounts
     senders: list[DialtoneSenderStatus] = []
+
+
+# ─── Phone enrichment summary ────────────────────────────────────────────────
+
+
+class PhoneEnrichmentRecent(BaseModel):
+    """One recently phone-enriched contact for the activity strip."""
+
+    contact_id: str
+    contact_name: Optional[str] = None
+    company_name: Optional[str] = None
+    phone: Optional[str] = None
+    source: Optional[str] = None       # 'apollo' | 'company'
+    source_label: str = ""             # 'direct dial' | 'company line'
+    enriched_at: Optional[datetime] = None
+
+
+class PhoneEnrichmentSummary(BaseModel):
+    """At-a-glance stats for the warm-lead phone-enrichment sweep.
+
+    ``attempts`` counts every contact the sweep has looked up (``phone_enriched_at``
+    stamped, hit or miss); ``enriched`` counts the ones it found an auto-number
+    for (``phone_source`` in apollo/company). ``hit_rate`` is their ratio.
+    """
+
+    enriched: int = 0
+    attempts: int = 0
+    hit_rate: float = 0.0
+    # Source breakdown among enriched contacts.
+    apollo: int = 0        # Apollo people-match direct dials
+    company: int = 0       # company main-line fallbacks
+    recent: list[PhoneEnrichmentRecent] = []
