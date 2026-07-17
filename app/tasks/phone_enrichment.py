@@ -14,13 +14,13 @@ helpers so it is unit-testable without Celery; this task is a thin
 import asyncio
 import logging
 
-from app.database_celery import celery_session
 from app.services.enrichment import ApolloEnrichmentService
 from app.services.phone_enrichment import (
     enrich_contact_phone,
     warm_contacts_needing_phone,
 )
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +46,28 @@ async def enrich_warm_lead_phones_async() -> dict:
         logger.info("Apollo API key not configured — skipping warm-lead phone enrichment")
         return {"status": "skipped", "reason": "no_api_key", "enriched": 0}
 
-    async with celery_session() as db:
-        contacts = await warm_contacts_needing_phone(db, limit=BATCH_SIZE)
+    # ``BATCH_SIZE`` bounds Apollo spend per sweep GLOBALLY, not per tenant, so a
+    # single shared remaining-counter is threaded across every org's body —
+    # otherwise each org would attempt a full batch and a busy platform could
+    # blow the credit budget in one tick.
+    remaining = {"n": BATCH_SIZE}
+
+    async def _body(db):
+        if remaining["n"] <= 0:
+            return {"status": "ok", "enriched": 0, "candidates": 0}
+        contacts = await warm_contacts_needing_phone(db, limit=remaining["n"])
         if not contacts:
-            logger.info("No warm leads need phone enrichment")
             return {"status": "ok", "enriched": 0, "candidates": 0}
 
         enriched = 0
         results = []
         for contact in contacts:
+            if remaining["n"] <= 0:
+                break
             try:
                 res = await enrich_contact_phone(db, contact, service=service)
                 results.append(res)
+                remaining["n"] -= 1
                 if res.get("source"):
                     enriched += 1
             except Exception as exc:
@@ -67,17 +77,26 @@ async def enrich_warm_lead_phones_async() -> dict:
                 continue
 
         await db.commit()
-        logger.info(
-            "Warm-lead phone enrichment: found %d / %d attempted",
-            enriched,
-            len(contacts),
-        )
         return {
             "status": "ok",
             "enriched": enriched,
             "candidates": len(contacts),
             "results": results,
         }
+
+    per_org = await for_each_org(_body, label="enrich_warm_lead_phones")
+    total_enriched = sum(r.get("enriched", 0) for r in per_org)
+    total_candidates = sum(r.get("candidates", 0) for r in per_org)
+    logger.info(
+        "Warm-lead phone enrichment: found %d / %d attempted across orgs",
+        total_enriched,
+        total_candidates,
+    )
+    return {
+        "status": "ok",
+        "enriched": total_enriched,
+        "candidates": total_candidates,
+    }
 
 
 @celery_app.task(name="app.tasks.phone_enrichment.enrich_warm_lead_phones")

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,6 +10,7 @@ from app.database_celery import celery_session
 from app.scrapers.thomasnet import ThomasNetScraper
 from app.scrapers.census import CensusBPScraper
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ def scrape_thomasnet(
     keyword: str = "press manufacturer",
     state: str = None,
     max_pages: int = 3,
+    org_id: str = None,
 ):
     """Scrape ThomasNet for manufacturing companies.
 
@@ -36,12 +39,15 @@ def scrape_thomasnet(
         keyword: Search keyword for ThomasNet
         state: Optional US state filter
         max_pages: Max pages to scrape (default 3)
+        org_id: Organization the scraped companies belong to. Passed explicitly
+            because Celery doesn't carry the request's org context over the wire;
+            when omitted, companies fall back to the first-party org.
     """
     logger.info("Starting ThomasNet scrape: keyword='%s', state='%s'", keyword, state)
 
     async def _run():
         scraper = ThomasNetScraper()
-        async with celery_session() as db:
+        async with celery_session() as db, org_scope(UUID(org_id) if org_id else None):
             try:
                 result = await scraper.run(
                     db, keyword=keyword, state=state, max_pages=max_pages
@@ -65,6 +71,7 @@ def scrape_census(
     naics_codes: list[str] = None,
     states: list[str] = None,
     min_employees: int = 50,
+    org_id: str = None,
 ):
     """Query Census Bureau CBP API for manufacturing establishment data.
 
@@ -72,12 +79,14 @@ def scrape_census(
         naics_codes: 4-digit NAICS codes to query
         states: FIPS state codes (e.g., ["39"] for Ohio)
         min_employees: Minimum employee count filter
+        org_id: Organization the scraped companies belong to (see
+            ``scrape_thomasnet``); falls back to the first-party org when omitted.
     """
     logger.info("Starting Census CBP scrape: naics=%s, states=%s", naics_codes, states)
 
     async def _run():
         scraper = CensusBPScraper()
-        async with celery_session() as db:
+        async with celery_session() as db, org_scope(UUID(org_id) if org_id else None):
             try:
                 result = await scraper.run(
                     db,

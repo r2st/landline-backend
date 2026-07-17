@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import func, select
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.models.call import CallNotification, CallTask
 from app.models.company import Company
 from app.models.contact import Contact
@@ -332,9 +332,13 @@ async def flag_missed_calls_for_session(db, now: datetime | None = None) -> dict
 
 
 def _beat(coro_factory, label: str):
-    """Run a *_for_session coroutine inside a committed Celery DB session."""
+    """Run a *_for_session coroutine per active org in a committed session.
+
+    Call notifications, contacts and scheduled calls are all org-scoped, so each
+    tenant's queue is built under its own org context.
+    """
     async def _run():
-        async with celery_session() as db:
+        async def _body(db):
             try:
                 result = await coro_factory(db)
                 await db.commit()
@@ -342,6 +346,8 @@ def _beat(coro_factory, label: str):
             except Exception:
                 await db.rollback()
                 raise
+
+        return await for_each_org(_body, label=label)
 
     try:
         return _run_async(_run())

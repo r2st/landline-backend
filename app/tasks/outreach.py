@@ -20,6 +20,7 @@ from app.services.email_compose import render, build_merge_context
 from app.services.email_dispatch import send_outreach_email
 from app.services.sequence_optimizer import get_sequence_optimizer, record_decision
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org, org_scope
 from app.services.send_limiter import get_send_limiter
 from app.services.send_time_optimizer import get_send_time_optimizer
 
@@ -151,6 +152,22 @@ def send_sequence_step(self, enrollment_id: str):
     logger.info("Processing sequence step for enrollment %s", enrollment_id)
 
     async def _run():
+        # This task is dispatched per-enrollment, so the org context set by the
+        # caller is lost over the Celery wire. Resolve the enrollment's org
+        # up front (unfiltered) and bind it for the whole send, so the kill
+        # switch, reads and the recorded event all belong to the right tenant.
+        async with celery_session() as db0:
+            org_id = (
+                await db0.execute(
+                    select(OutreachEnrollment.org_id)
+                    .where(OutreachEnrollment.id == UUID(enrollment_id))
+                    .execution_options(skip_org_filter=True)
+                )
+            ).scalar_one_or_none()
+        async with org_scope(org_id):
+            return await _run_inner()
+
+    async def _run_inner():
         async with celery_session() as db:
             try:
                 # Global kill switch — never send while sending is halted. Checked
@@ -699,7 +716,9 @@ def process_outreach_queue():
     logger.info("Processing outreach queue")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: enrollments/contacts are org-scoped and each org has its own
+        # kill switch, sending window and send limits.
+        async def _body(db):
             # Global kill switch pre-check — when engaged, dispatch nothing.
             from app.services import system_settings
 
@@ -846,6 +865,8 @@ def process_outreach_queue():
                 "held_for_optimal_window": scheduled_smart,
             }
 
+        return await for_each_org(_body, label="process_outreach_queue")
+
     try:
         return _run_async(_run())
     except Exception as exc:
@@ -867,7 +888,9 @@ def check_email_replies():
         from app.services.smart_reply import get_smart_reply_service
 
         service = get_smart_reply_service()
-        async with celery_session() as db:
+
+        # Per-org: replies / contacts / accounts are org-scoped.
+        async def _body(db):
             results = await service.process_replies(db)
             if results:
                 logger.info("Processed %d replies", len(results))
@@ -882,6 +905,8 @@ def check_email_replies():
             else:
                 logger.info("No new replies found")
             return results
+
+        return await for_each_org(_body, label="check_email_replies")
 
     try:
         return _run_async(_run())
@@ -898,9 +923,13 @@ def sync_email_replies():
         from app.services.email_history import EmailHistoryService
 
         service = EmailHistoryService()
-        async with celery_session() as db:
+
+        # Per-org: connected accounts and their history are org-scoped.
+        async def _body(db):
             result = await service.sync_all_accounts(db)
             return result
+
+        return await for_each_org(_body, label="sync_email_replies")
 
     try:
         return _run_async(_run())

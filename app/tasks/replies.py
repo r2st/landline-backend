@@ -27,7 +27,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.models.company import Company
 from app.models.consent import ConsentRecord
 from app.models.contact import Contact
@@ -411,10 +411,13 @@ def classify_new_replies():
     logger.info("Classifying new email replies")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: replies, contacts and suppression lists are org-scoped.
+        async def _body(db):
             report = await classify_new_replies_async(db)
             await db.commit()
             return report
+
+        return await for_each_org(_body, label="classify_new_replies")
 
     try:
         return _run_async(_run())

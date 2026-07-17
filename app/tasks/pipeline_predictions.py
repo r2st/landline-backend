@@ -8,7 +8,7 @@ weekly on the beat schedule and on-demand (e.g. after a deal changes stage).
 import asyncio
 import logging
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.services.pipeline_forecaster import rescore_active_deals
 from app.tasks.celery_app import celery_app
 
@@ -31,7 +31,8 @@ def rescore_deal_predictions(use_ai: bool = True):
     logger.info("Rescoring deal predictions")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: deals/pipeline are org-scoped; forecaster retrains per tenant.
+        async def _body(db):
             try:
                 result = await rescore_active_deals(db, use_ai=use_ai)
                 await db.commit()
@@ -39,6 +40,8 @@ def rescore_deal_predictions(use_ai: bool = True):
             except Exception:
                 await db.rollback()
                 raise
+
+        return await for_each_org(_body, label="rescore_deal_predictions")
 
     try:
         return _run_async(_run())

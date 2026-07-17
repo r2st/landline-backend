@@ -14,9 +14,9 @@ Never raises: an ingestion bug must not crash the worker.
 import asyncio
 import logging
 
-from app.database_celery import celery_session
 from app.services.bounce_ingestion import get_bounce_ingestion_service
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,10 @@ def ingest_bounces():
 
     async def _run():
         service = get_bounce_ingestion_service()
-        async with celery_session() as db:
+
+        # Per-org: each tenant's connected mailboxes / bounce records are
+        # isolated, so the sweep runs once per organization with its context.
+        async def _body(db):
             result = await service.ingest_all_accounts(db)
             if result.get("bounces_ingested"):
                 logger.info(
@@ -45,6 +48,8 @@ def ingest_bounces():
                     result["accounts_scanned"],
                 )
             return result
+
+        return await for_each_org(_body, label="ingest_bounces")
 
     try:
         return _run_async(_run())

@@ -25,6 +25,7 @@ from app.models.contact import Contact
 from app.models.rep_profile import RepProfile
 from app.services import lead_router
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org, org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,19 @@ def enqueue_signal_rescore(*, contact_id: Optional[uuid.UUID] = None, company_id
 
 
 async def _rescore_company(db, company_id: uuid.UUID) -> dict:
-    company = (await db.execute(select(Company).where(Company.id == company_id))).scalar_one_or_none()
+    # Loaded unfiltered because this runs from the per-record signal task where
+    # no org context is bound yet; the company's own org is bound before scoring.
+    company = (
+        await db.execute(
+            select(Company)
+            .where(Company.id == company_id)
+            .execution_options(skip_org_filter=True)
+        )
+    ).scalar_one_or_none()
     if company is None:
         return {"status": "not_found", "company_id": str(company_id)}
-    ls = await lead_router.score_and_route(db, company)
+    async with org_scope(company.org_id):
+        ls = await lead_router.score_and_route(db, company)
     return {
         "status": "ok",
         "company_id": str(company_id),
@@ -98,7 +108,8 @@ def update_lead_score_on_signal(contact_id: Optional[str] = None, company_id: Op
 def refresh_propensity_scores(limit: int = 200):
     """Beat task: re-route active-pipeline companies to refresh propensity/velocity."""
     async def _run():
-        async with celery_session() as db:
+        # Per-org: companies are org-scoped.
+        async def _body(db):
             try:
                 rows = await db.execute(
                     select(Company)
@@ -120,6 +131,8 @@ def refresh_propensity_scores(limit: int = 200):
                 await db.rollback()
                 raise
 
+        return await for_each_org(_body, label="refresh_propensity_scores")
+
     try:
         return _run_async(_run())
     except Exception as exc:
@@ -131,7 +144,8 @@ def refresh_propensity_scores(limit: int = 200):
 def recompute_rep_profiles():
     """Beat task: refresh every rep profile's win rates, velocity, and load."""
     async def _run():
-        async with celery_session() as db:
+        # Per-org: rep profiles are org-scoped.
+        async def _body(db):
             try:
                 profiles = list((await db.execute(select(RepProfile))).scalars().all())
                 for p in profiles:
@@ -141,6 +155,8 @@ def recompute_rep_profiles():
             except Exception:
                 await db.rollback()
                 raise
+
+        return await for_each_org(_body, label="recompute_rep_profiles")
 
     try:
         return _run_async(_run())

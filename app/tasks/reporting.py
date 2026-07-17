@@ -9,7 +9,7 @@ import asyncio
 import logging
 
 from app.config import get_settings
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.services.daily_summary import (
     DEFAULT_REPORT_TZ,
     generate_and_store_summary,
@@ -35,7 +35,8 @@ def generate_daily_summary():
     settings = get_settings()
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: the daily activity summary is computed per tenant.
+        async def _body(db):
             summary = await generate_and_store_summary(
                 db,
                 tz_name=getattr(settings, "daily_summary_timezone", DEFAULT_REPORT_TZ),
@@ -75,6 +76,8 @@ def generate_daily_summary():
 
             logger.info("Daily summary generated: %s", result)
             return result
+
+        return await for_each_org(_body, label="generate_daily_summary")
 
     try:
         return _run_async(_run())

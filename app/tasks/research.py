@@ -11,6 +11,7 @@ from app.models.company import Company
 from app.models.company_research import CompanyResearch
 from app.services.research_agent import get_research_agent
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org, org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -39,22 +40,29 @@ def research_company(self, company_id: str, force: bool = False):
         agent = get_research_agent()
         async with celery_session() as db:
             try:
+                # Per-record: bind the company's org (context is lost over the
+                # Celery wire) so the research brief lands in the owning tenant.
                 company = (
-                    await db.execute(select(Company).where(Company.id == UUID(company_id)))
+                    await db.execute(
+                        select(Company)
+                        .where(Company.id == UUID(company_id))
+                        .execution_options(skip_org_filter=True)
+                    )
                 ).scalar_one_or_none()
                 if not company:
                     return {"status": "not_found", "company_id": company_id}
 
-                research = await agent.research_company(db, company, force=force)
-                if research is None:
-                    return {"status": "failed", "company_id": company_id}
-                return {
-                    "status": "researched",
-                    "company_id": company_id,
-                    "pain_points": len(research.pain_points or []),
-                    "angles": len(research.outreach_angles or []),
-                    "sources": research.sources_used,
-                }
+                async with org_scope(company.org_id):
+                    research = await agent.research_company(db, company, force=force)
+                    if research is None:
+                        return {"status": "failed", "company_id": company_id}
+                    return {
+                        "status": "researched",
+                        "company_id": company_id,
+                        "pain_points": len(research.pain_points or []),
+                        "angles": len(research.outreach_angles or []),
+                        "sources": research.sources_used,
+                    }
             except Exception:
                 await db.rollback()
                 raise
@@ -77,7 +85,8 @@ def research_stale_companies(limit: int = 20):
     logger.info("Scanning for companies needing research (limit=%d)", limit)
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: companies and research briefs are org-scoped.
+        async def _body(db):
             # Companies with a non-stale research brief already.
             researched = (
                 await db.execute(
@@ -110,6 +119,8 @@ def research_stale_companies(limit: int = 20):
                 if dispatched >= limit:
                     break
             return {"scanned": len(companies), "dispatched": dispatched}
+
+        return await for_each_org(_body, label="research_stale_companies")
 
     try:
         return _run_async(_run())

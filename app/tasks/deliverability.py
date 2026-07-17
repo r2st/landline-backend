@@ -3,9 +3,9 @@
 import asyncio
 import logging
 
-from app.database_celery import celery_session
 from app.services.deliverability_optimizer import get_deliverability_optimizer
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,9 @@ def assess_sender_health():
 
     async def _run():
         optimizer = get_deliverability_optimizer()
-        async with celery_session() as db:
+
+        # Per-org: sending accounts and their reputation are org-scoped.
+        async def _body(db):
             results = await optimizer.assess_all(db)
             await db.commit()
             throttled = [r for r in results if r["status"] in ("throttled", "critical")]
@@ -34,5 +36,7 @@ def assess_sender_health():
                 logger.warning("%d sender account(s) throttled: %s",
                                len(throttled), [r["email"] for r in throttled])
             return {"accounts_assessed": len(results), "throttled": len(throttled), "results": results}
+
+        return await for_each_org(_body, label="assess_sender_health")
 
     return _run_async(_run())

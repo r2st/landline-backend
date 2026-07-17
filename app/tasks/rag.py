@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.services.rag_service import get_rag_service
 from app.tasks.celery_app import celery_app
 
@@ -26,10 +26,14 @@ def index_new_content(since_days: int = 7):
 
     async def _run():
         rag = get_rag_service()
-        async with celery_session() as db:
+
+        # Per-org: content indexed into the knowledge base is org-scoped.
+        async def _body(db):
             counts = await rag.index_new_content(db, since_days=since_days)
             await db.commit()
             logger.info("RAG indexing complete: %s", counts)
             return counts
+
+        return await for_each_org(_body, label="index_new_content")
 
     return _run_async(_run())

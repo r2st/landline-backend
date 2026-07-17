@@ -15,10 +15,10 @@ import logging
 
 from sqlalchemy import select
 
-from app.database_celery import celery_session
 from app.models.ab_test import AbTest
 from app.services.ab_test_resolver import evaluate_test
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,8 @@ def evaluate_ab_tests():
 
     async def _run():
         try:
-            async with celery_session() as db:
+            # Per-org: A/B tests and their step templates are org-scoped.
+            async def _body(db):
                 tests = list(
                     (
                         await db.execute(
@@ -60,6 +61,8 @@ def evaluate_ab_tests():
                         )
                 await db.commit()
                 return {"evaluated": len(tests), "concluded": concluded}
+
+            return await for_each_org(_body, label="evaluate_ab_tests")
         except Exception as exc:  # never raise out of a scheduled evaluation
             logger.exception("evaluate_ab_tests failed")
             return {"error": str(exc)}

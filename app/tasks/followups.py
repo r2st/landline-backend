@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func
 
 from app.config import get_settings
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
@@ -146,7 +146,8 @@ def generate_stale_lead_followups():
     logger.info("Scanning for stale active-pipeline leads needing follow-up")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: leads / follow-ups are org-scoped.
+        async def _body(db):
             try:
                 result = await generate_stale_lead_followups_for_session(db)
                 await db.commit()
@@ -154,6 +155,8 @@ def generate_stale_lead_followups():
             except Exception:
                 await db.rollback()
                 raise
+
+        return await for_each_org(_body, label="generate_stale_lead_followups")
 
     try:
         return _run_async(_run())
@@ -175,7 +178,8 @@ def generate_weekly_lead_quality_report():
     async def _run():
         from app.routers.reports import build_lead_quality_report
 
-        async with celery_session() as db:
+        # Per-org: the lead-quality report is computed per tenant.
+        async def _body(db):
             report = await build_lead_quality_report(db, days=7)
             grades = report.get("grade_distribution", {})
             logger.info(
@@ -188,6 +192,8 @@ def generate_weekly_lead_quality_report():
                 report.get("average_fit_score"), report.get("new_leads_in_window"),
             )
             return report
+
+        return await for_each_org(_body, label="generate_weekly_lead_quality_report")
 
     try:
         return _run_async(_run())
@@ -202,7 +208,8 @@ def rescore_active_leads():
     logger.info("Re-scoring active-pipeline leads")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: active-pipeline companies are org-scoped.
+        async def _body(db):
             try:
                 result = await rescore_active_leads_for_session(db)
                 await db.commit()
@@ -210,6 +217,8 @@ def rescore_active_leads():
             except Exception:
                 await db.rollback()
                 raise
+
+        return await for_each_org(_body, label="rescore_active_leads")
 
     try:
         return _run_async(_run())

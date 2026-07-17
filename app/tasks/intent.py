@@ -3,9 +3,9 @@
 import asyncio
 import logging
 
-from app.database_celery import celery_session
 from app.services.intent_monitor import get_intent_monitor
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,9 @@ def scan_intent_signals(limit: int = 15):
 
     async def _run():
         monitor = get_intent_monitor()
-        async with celery_session() as db:
+
+        # Per-org: companies scanned for intent signals are org-scoped.
+        async def _body(db):
             results = await monitor.scan_all_companies(db, limit=limit)
             total = sum(r["signals_found"] for r in results)
             if total > 0:
@@ -35,5 +37,7 @@ def scan_intent_signals(limit: int = 15):
                     "Intent scan: found %d signals across %d companies", total, len(results)
                 )
             return {"companies_with_signals": len(results), "total_signals": total, "results": results}
+
+        return await for_each_org(_body, label="scan_intent_signals")
 
     return _run_async(_run())

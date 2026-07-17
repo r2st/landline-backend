@@ -11,6 +11,7 @@ from app.database_celery import celery_session
 from app.models.company import Company
 from app.services.enrichment import ApolloEnrichmentService
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org, org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +39,22 @@ def enrich_company(self, company_id: str):
         service = ApolloEnrichmentService()
         async with celery_session() as db:
             try:
+                # Per-record task: context is lost over the Celery wire, so load
+                # the company unfiltered and bind ITS org before enriching, so
+                # contacts/writes land in the owning tenant.
                 result = await db.execute(
-                    select(Company).where(Company.id == UUID(company_id))
+                    select(Company)
+                    .where(Company.id == UUID(company_id))
+                    .execution_options(skip_org_filter=True)
                 )
                 company = result.scalar_one_or_none()
                 if not company:
                     return {"status": "not_found", "company_id": company_id}
 
-                enrich_result = await service.enrich_company(db, company)
-                contacts = await service.find_contacts(db, company)
-                await db.commit()
+                async with org_scope(company.org_id):
+                    enrich_result = await service.enrich_company(db, company)
+                    contacts = await service.find_contacts(db, company)
+                    await db.commit()
 
                 return {
                     "company_id": company_id,
@@ -87,7 +94,9 @@ def auto_enrich_companies():
 
     async def _run():
         service = ApolloEnrichmentService()
-        async with celery_session() as db:
+
+        # Per-org: companies are org-scoped.
+        async def _body(db):
             # Find companies missing key data that have a domain (needed for Apollo)
             result = await db.execute(
                 select(Company)
@@ -121,6 +130,8 @@ def auto_enrich_companies():
             logger.info("Auto-enriched %d / %d companies", enriched, len(companies))
             return {"enriched": enriched, "total_candidates": len(companies)}
 
+        return await for_each_org(_body, label="auto_enrich_companies")
+
     return _run_async(_run())
 
 
@@ -134,7 +145,9 @@ def auto_score_leads():
         from app.models.lead_score import LeadScore
 
         ai = get_ai_service()
-        async with celery_session() as db:
+
+        # Per-org: companies and their lead scores are org-scoped.
+        async def _body(db):
             # Get IDs of companies that already have AI scores
             scored_result = await db.execute(
                 select(LeadScore.company_id).where(
@@ -200,5 +213,7 @@ def auto_score_leads():
             await db.commit()
             logger.info("Auto-scored %d / %d companies", scored, len(companies))
             return {"scored": scored, "total_candidates": len(companies)}
+
+        return await for_each_org(_body, label="auto_score_leads")
 
     return _run_async(_run())

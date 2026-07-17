@@ -11,6 +11,7 @@ from app.database_celery import celery_session
 from app.models.email_reply import EmailReply
 from app.services.conversation_intelligence import get_conversation_intelligence_service
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org, org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +34,28 @@ def analyze_thread(gmail_thread_id: str):
     async def _run():
         service = get_conversation_intelligence_service()
         async with celery_session() as db:
-            analysis = await service.analyze_thread(db, gmail_thread_id)
-            if analysis is None:
-                return {"status": "no_analysis", "thread_id": gmail_thread_id}
-            return {
-                "status": "analyzed",
-                "thread_id": gmail_thread_id,
-                "momentum": analysis.momentum_score,
-                "label": analysis.momentum_label,
-            }
+            # This task is dispatched per-thread, so the org context set by the
+            # scheduler is lost over the Celery wire. Re-derive the owning org
+            # from the thread's reply (unfiltered) and bind it before analyzing,
+            # so the ConversationAnalysis is read/written in the right tenant.
+            org_id = (
+                await db.execute(
+                    select(EmailReply.org_id)
+                    .where(EmailReply.gmail_thread_id == gmail_thread_id)
+                    .limit(1)
+                    .execution_options(skip_org_filter=True)
+                )
+            ).scalar_one_or_none()
+            async with org_scope(org_id):
+                analysis = await service.analyze_thread(db, gmail_thread_id)
+                if analysis is None:
+                    return {"status": "no_analysis", "thread_id": gmail_thread_id}
+                return {
+                    "status": "analyzed",
+                    "thread_id": gmail_thread_id,
+                    "momentum": analysis.momentum_score,
+                    "label": analysis.momentum_label,
+                }
 
     try:
         return _run_async(_run())
@@ -66,7 +80,9 @@ def analyze_active_threads(limit: int = 25):
     logger.info("Scanning for active threads to analyze (limit=%d)", limit)
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: replies / threads are org-scoped. Each org's active threads
+        # are found and dispatched under that org's context.
+        async def _body(db):
             cutoff = datetime.now(timezone.utc) - timedelta(
                 days=settings.conversation_active_days
             )
@@ -93,6 +109,8 @@ def analyze_active_threads(limit: int = 25):
                 except Exception as exc:  # pragma: no cover - broker-dependent
                     logger.warning("Could not dispatch analysis for %s: %s", tid, exc)
             return {"active_threads": len(thread_ids), "dispatched": dispatched}
+
+        return await for_each_org(_body, label="analyze_active_threads")
 
     try:
         return _run_async(_run())

@@ -3,9 +3,9 @@
 import asyncio
 import logging
 
-from app.database_celery import celery_session
 from app.services.competitive_intelligence import get_competitive_intelligence
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,9 @@ def monitor_competitor_news(limit: int = 10):
 
     async def _run():
         ci = get_competitive_intelligence()
-        async with celery_session() as db:
+
+        # Per-org: tracked competitors are org-scoped.
+        async def _body(db):
             results = await ci.monitor_competitor_news(db, limit=limit)
             total = sum(r["news_mentions"] for r in results)
             if total > 0:
@@ -34,5 +36,7 @@ def monitor_competitor_news(limit: int = 10):
                     "Competitor news: %d new mentions across %d competitors", total, len(results)
                 )
             return {"competitors_with_news": len(results), "total_mentions": total, "results": results}
+
+        return await for_each_org(_body, label="monitor_competitor_news")
 
     return _run_async(_run())

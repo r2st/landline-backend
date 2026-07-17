@@ -5,10 +5,10 @@ import logging
 
 from sqlalchemy import select
 
-from app.database_celery import celery_session
 from app.models.user import User
 from app.services.sales_coach import compute_team_benchmarks, generate_rep_performance, period_bounds
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,8 @@ def generate_weekly_coaching(period_type: str = "weekly"):
     logger.info("Starting weekly coaching generation")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: reps (users) and their performance data are org-scoped.
+        async def _body(db):
             period_start, period_end = period_bounds(period_type)
             benchmarks = await compute_team_benchmarks(db, period_start, period_end)
 
@@ -52,5 +53,7 @@ def generate_weekly_coaching(period_type: str = "weekly"):
             await db.commit()
             logger.info("Weekly coaching: generated %d rep snapshots", generated)
             return {"reps_processed": generated, "period_type": period_type}
+
+        return await for_each_org(_body, label="generate_weekly_coaching")
 
     return _run_async(_run())

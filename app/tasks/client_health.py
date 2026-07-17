@@ -11,13 +11,13 @@ import logging
 
 from sqlalchemy import select
 
-from app.database_celery import celery_session
 from app.models.client_health import ClientHealthSnapshot
 from app.models.company import Company
 from app.services.churn_predictor import get_churn_predictor
 from app.services.expansion_detector import get_expansion_detector
 from app.services.health import compute_company_health
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,8 @@ def predict_client_health(limit: int = 500, use_ai: bool = True):
     logger.info("Starting predictive client-health pass")
 
     async def _run():
-        async with celery_session() as db:
+        # Per-org: clients (companies in the ``client`` stage) are org-scoped.
+        async def _body(db):
             clients = list(
                 (
                     await db.execute(
@@ -90,6 +91,8 @@ def predict_client_health(limit: int = 500, use_ai: bool = True):
                     logger.exception("Client-health assessment failed for %s", company.id)
             await db.commit()
             return {"clients_assessed": len(clients), "high_churn_risk": high_risk}
+
+        return await for_each_org(_body, label="predict_client_health")
 
     return _run_async(_run())
 

@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.services.orchestrator import get_orchestrator
 from app.tasks.celery_app import celery_app
 
@@ -26,7 +26,9 @@ def run_orchestrator(limit: int = 50):
 
     async def _run():
         orch = get_orchestrator()
-        async with celery_session() as db:
+
+        # Per-org: autonomous enrollments are org-scoped.
+        async def _body(db):
             results = await orch.run_all_autonomous(db, limit=limit)
             actions = {}
             for r in results:
@@ -36,5 +38,7 @@ def run_orchestrator(limit: int = 50):
                     "Orchestration run: %d enrollments processed (%s)", len(results), actions
                 )
             return {"processed": len(results), "actions": actions, "results": results}
+
+        return await for_each_org(_body, label="run_orchestrator")
 
     return _run_async(_run())

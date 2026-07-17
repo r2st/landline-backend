@@ -11,7 +11,7 @@ import asyncio
 import logging
 import uuid
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.models.suggestion_outcome import SuggestionOutcome
 from app.services.smart_suggestions import generate_ai_suggestions
 from app.tasks.celery_app import celery_app
@@ -53,7 +53,8 @@ async def generate_daily_suggestions_for_session(db, *, limit: int = 25, use_ai:
 def generate_daily_suggestions(use_ai: bool = True):
     """Beat task: produce and persist the prioritized daily action plan."""
     async def _run():
-        async with celery_session() as db:
+        # Per-org: the daily action plan / suggestions are org-scoped.
+        async def _body(db):
             try:
                 result = await generate_daily_suggestions_for_session(db, use_ai=use_ai)
                 await db.commit()
@@ -61,6 +62,8 @@ def generate_daily_suggestions(use_ai: bool = True):
             except Exception:
                 await db.rollback()
                 raise
+
+        return await for_each_org(_body, label="generate_daily_suggestions")
 
     try:
         return _run_async(_run())

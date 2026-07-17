@@ -14,7 +14,7 @@ The task stays thin; all the aggregation/resolution logic lives in
 import asyncio
 import logging
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.services.send_time_optimizer import get_send_time_optimizer
 from app.tasks.celery_app import celery_app
 
@@ -37,7 +37,9 @@ def refresh_engagement_profiles():
 
     async def _run():
         optimizer = get_send_time_optimizer()
-        async with celery_session() as db:
+
+        # Per-org: contacts and their engagement profiles are org-scoped.
+        async def _body(db):
             report = await optimizer.refresh_profiles(db)
             await db.commit()
             logger.info(
@@ -46,5 +48,7 @@ def refresh_engagement_profiles():
                 report.get("timezones_backfilled", 0),
             )
             return report
+
+        return await for_each_org(_body, label="refresh_engagement_profiles")
 
     return _run_async(_run())

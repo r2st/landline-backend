@@ -29,11 +29,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import or_, select
 
 from app.config import get_settings
-from app.database_celery import celery_session
 from app.models.discovered_business import DiscoveredBusiness
 from app.models.discovery_search import DiscoverySearch
 from app.services.places_discovery import get_places_service
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,10 @@ async def _run_scheduled_discoveries() -> dict:
         "errors": 0,
     }
 
-    async with celery_session() as db:
+    # Per-org: saved Places searches are org-scoped. The daily credit budget is
+    # global and enforced inside places.discover(), so a per-org sweep still
+    # honours the platform-wide cap — a later org just gets budget_exhausted.
+    async def _body(db):
         candidates = (
             await db.execute(
                 select(DiscoverySearch)
@@ -145,6 +148,8 @@ async def _run_scheduled_discoveries() -> dict:
                 summary["status"] = "budget_exhausted"
                 break
 
+    await for_each_org(_body, label="run_scheduled_discoveries")
+
     logger.info("Places discovery sweep: %s", summary)
     return summary
 
@@ -165,7 +170,9 @@ async def _enrich_discovered_emails() -> dict:
     }
     places = get_places_service()
 
-    async with celery_session() as db:
+    # Per-org: discovered businesses are org-scoped. Hunter credit checks live
+    # inside places.extract_email(), so the global budget still holds.
+    async def _body(db):
         rows = (
             await db.execute(
                 select(DiscoveredBusiness)
@@ -200,6 +207,8 @@ async def _enrich_discovered_emails() -> dict:
             # doesn't end the sweep — extract_email falls through to the free
             # scraper, which is still worth running for every remaining row.
             await db.commit()
+
+    await for_each_org(_body, label="enrich_discovered_emails")
 
     # Plain dict: the task result is JSON-serialized by Celery.
     summary["by_source"] = dict(summary["by_source"])

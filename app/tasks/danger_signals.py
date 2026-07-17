@@ -14,10 +14,10 @@ import asyncio
 import logging
 
 from app.config import get_settings
-from app.database_celery import celery_session
 from app.services import system_settings
 from app.services.danger_monitor import get_danger_monitor
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,10 @@ def monitor_danger_signals():
             return {"skipped": "danger_signals_disabled"}
         try:
             monitor = get_danger_monitor()
-            async with celery_session() as db:
+
+            # Per-org: each organization's 24h metrics and kill switch are
+            # independent — a spike in one tenant must not pause another.
+            async def _body(db):
                 report = await monitor.evaluate(db)
                 tripped = False
                 # Only trip when sending is still enabled — no point (and no
@@ -62,6 +65,8 @@ def monitor_danger_signals():
                         len(report.warnings),
                     )
                 return summary
+
+            return await for_each_org(_body, label="monitor_danger_signals")
         except Exception as exc:  # never raise out of monitoring
             logger.exception("monitor_danger_signals failed")
             return {"error": str(exc), "tripped": False}

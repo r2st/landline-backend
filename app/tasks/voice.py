@@ -14,6 +14,7 @@ from app.database_celery import celery_session
 from app.models.call_recording import CallRecording
 from app.services.voice_intelligence import get_voice_intelligence
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import org_scope
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +34,20 @@ def process_call_recording(recording_id: str, context: str = "", use_ai: bool = 
     async def _run():
         vi = get_voice_intelligence()
         async with celery_session() as db:
+            # Per-record: bind the recording's org (context is lost over the
+            # Celery wire) before analysis so writes land in the owning tenant.
             recording = (
                 await db.execute(
-                    select(CallRecording).where(CallRecording.id == uuid.UUID(str(recording_id)))
+                    select(CallRecording)
+                    .where(CallRecording.id == uuid.UUID(str(recording_id)))
+                    .execution_options(skip_org_filter=True)
                 )
             ).scalar_one_or_none()
             if recording is None:
                 return {"error": "recording not found", "recording_id": recording_id}
-            await vi.process_recording(db, recording, context=context, use_ai=use_ai)
-            await db.commit()
-            return {"recording_id": recording_id, "status": recording.status}
+            async with org_scope(recording.org_id):
+                await vi.process_recording(db, recording, context=context, use_ai=use_ai)
+                await db.commit()
+                return {"recording_id": recording_id, "status": recording.status}
 
     return _run_async(_run())

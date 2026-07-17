@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from app.database_celery import celery_session
+from app.tasks.org_runner import for_each_org
 from app.services.news_monitor import get_news_monitor
 from app.tasks.celery_app import celery_app
 
@@ -27,11 +27,15 @@ def check_company_news_batch():
 
     async def _run():
         monitor = get_news_monitor()
-        async with celery_session() as db:
+
+        # Per-org: tracked companies are org-scoped.
+        async def _body(db):
             results = await monitor.check_all_companies(db, limit=5)
             total = sum(r["news_found"] for r in results)
             if total > 0:
                 logger.info("News check: found %d articles across %d companies", total, len(results))
             return {"companies_with_news": len(results), "total_articles": total, "results": results}
+
+        return await for_each_org(_body, label="check_company_news_batch")
 
     return _run_async(_run())

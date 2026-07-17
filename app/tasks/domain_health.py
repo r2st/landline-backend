@@ -10,9 +10,9 @@ DMARC + DNSBL + scoring + upsert + change-alert logic lives in
 import asyncio
 import logging
 
-from app.database_celery import celery_session
 from app.services.domain_health_service import get_domain_health_checker
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,9 @@ def check_domain_health():
 
     async def _run():
         checker = get_domain_health_checker()
-        async with celery_session() as db:
+
+        # Per-org: sending domains are org-scoped.
+        async def _body(db):
             report = await checker.check_all(db)
             await db.commit()
             at_risk = [r for r in report.get("results", []) if r["band"] == "at_risk"]
@@ -41,5 +43,7 @@ def check_domain_health():
                 logger.warning("%d domain(s) at risk: %s",
                                len(at_risk), [r["domain"] for r in at_risk])
             return report
+
+        return await for_each_org(_body, label="check_domain_health")
 
     return _run_async(_run())

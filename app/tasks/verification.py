@@ -22,6 +22,7 @@ from collections import Counter
 from app.database_celery import celery_session
 from app.services.hunter_verification import get_hunter_service
 from app.tasks.celery_app import celery_app
+from app.tasks.org_runner import for_each_org
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +57,20 @@ async def _sweep(select_fn, limit: int, label: str) -> dict:
         logger.info("%s: no Hunter API key configured — skipping", label)
         return {"status": "skipped", "reason": "no_api_key", "checked": 0}
 
+    # The Hunter credit budget is a SINGLE shared account, not per-tenant, so it
+    # is computed once (from an unscoped session that sees every org's usage) and
+    # threaded through the per-org sweep — otherwise each org would think it had
+    # the full daily budget and we'd overspend. verify_batch decrements the
+    # shared object as it goes, so the global cap holds across all tenants.
     async with celery_session() as db:
         budget = await service.make_budget(db)
-        if budget.exhausted:
-            logger.warning("%s: daily Hunter credit budget exhausted", label)
-            return {"status": "skipped", "reason": "budget_exhausted", "checked": 0}
+    if budget.exhausted:
+        logger.warning("%s: daily Hunter credit budget exhausted", label)
+        return {"status": "skipped", "reason": "budget_exhausted", "checked": 0}
 
+    async def _body(db):
+        if budget.exhausted:
+            return {"status": "ok", "checked": 0, "breakdown": {}}
         # Only select what the budget can pay for — selecting 200 rows to skip
         # 190 of them would look like a completed sweep in the logs.
         capped = budget.cap(limit)
@@ -77,14 +86,23 @@ async def _sweep(select_fn, limit: int, label: str) -> dict:
             "%s: verified %d contact(s) — %s (budget left: %s)",
             label, len(results), breakdown, budget.remaining,
         )
-        return {
-            "status": "ok",
-            "checked": len(results),
-            "breakdown": breakdown,
-            "budget_remaining": (
-                None if budget.remaining == float("inf") else int(budget.remaining)
-            ),
-        }
+        return {"status": "ok", "checked": len(results), "breakdown": breakdown}
+
+    per_org = await for_each_org(_body, label=label)
+
+    total = sum(r.get("checked", 0) for r in per_org)
+    merged: dict = {}
+    for r in per_org:
+        for k, v in (r.get("breakdown") or {}).items():
+            merged[k] = merged.get(k, 0) + v
+    return {
+        "status": "ok",
+        "checked": total,
+        "breakdown": merged,
+        "budget_remaining": (
+            None if budget.remaining == float("inf") else int(budget.remaining)
+        ),
+    }
 
 
 @celery_app.task(name="app.tasks.verification.verify_pending_contacts")
