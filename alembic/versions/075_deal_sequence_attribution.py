@@ -77,20 +77,24 @@ def upgrade() -> None:
     # enrollment among its company's contacts. LATERAL keeps it to one enrollment
     # per deal (the first the company was ever put into), which is the one that
     # "brought them in". Deals whose company was never enrolled stay NULL.
+    # Postgres forbids referencing the UPDATE target (``deals d``) from a FROM
+    # LATERAL subquery, so precompute the earliest enrollment per company first
+    # (DISTINCT ON keeps one row per company — the enrollment that first put it
+    # in front of us) and join that to ``deals``.
     op.execute(
         """
         UPDATE deals d
         SET source_enrollment_id = e.id,
             source_sequence_id   = e.sequence_id
-        FROM LATERAL (
-            SELECT en.id, en.sequence_id
+        FROM (
+            SELECT DISTINCT ON (c.company_id)
+                   c.company_id, en.id, en.sequence_id
             FROM outreach_enrollments en
             JOIN contacts c ON c.id = en.contact_id
-            WHERE c.company_id = d.company_id
-            ORDER BY en.enrolled_at ASC
-            LIMIT 1
+            ORDER BY c.company_id, en.enrolled_at ASC
         ) e
-        WHERE d.source_enrollment_id IS NULL
+        WHERE e.company_id = d.company_id
+          AND d.source_enrollment_id IS NULL
         """
     )
 
