@@ -15,14 +15,15 @@ auditable and idempotent:
   for the same contact twice. Indexed because the sweep selects ``IS NULL`` (the
   never-attempted set), mirroring the ``email_verified_at`` pattern.
 
-Chains off ``074_honest_legacy_copy`` (the single head at author time).
+Chains off ``075_deal_sequence_attribution`` (re-pointed from 074 after a
+parallel 075 migration landed on main, to keep a single Alembic head).
 """
 
 from alembic import op
 import sqlalchemy as sa
 
-revision = "075_phone_enrichment"
-down_revision = "074_honest_legacy_copy"
+revision = "076_phone_enrichment"
+down_revision = "075_deal_sequence_attribution"
 branch_labels = None
 depends_on = None
 
