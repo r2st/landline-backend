@@ -28,6 +28,7 @@ tests/test_ai_compose.py for the same layout.
 import pytest
 from httpx import AsyncClient
 
+from app.config import Settings
 from app.models.sequence import DEFAULT_SEQUENCE_TONE, SEQUENCE_TONES
 from app.services.ai_email_generator import (
     DEFAULT_TONE,
@@ -139,8 +140,17 @@ async def test_listing_sequences_reports_tone(client: AsyncClient, admin_user, a
 # ---------------------------------------------------------------------------
 
 def _capture_prompt(monkeypatch, reply='{"subject": "s", "body": "b"}'):
-    """Stub the Anthropic client, returning a dict that captures the call."""
+    """Stub the LLM transport, returning a dict that captures the call.
+
+    Pins the Anthropic backend on purpose — these tests assert on the
+    Anthropic call shape (``messages`` carrying the user turn, ``system``
+    out-of-band), and the OpenRouter equivalents live in
+    tests/test_email_generator_openrouter.py. The stub sits on ``ai_service``
+    because that module owns the transport; ``ai_email_generator`` no longer
+    holds an SDK client of its own.
+    """
     import app.services.ai_email_generator as gen
+    import app.services.ai_service as ai
 
     captured: dict = {}
 
@@ -156,16 +166,26 @@ def _capture_prompt(monkeypatch, reply='{"subject": "s", "body": "b"}'):
             return _Msg()
 
     class _FakeClient:
-        def __init__(self, **kwargs):
+        def __init__(self, *args, **kwargs):
             self.messages = _Messages()
 
-    monkeypatch.setattr(gen.anthropic, "AsyncAnthropic", _FakeClient)
-    monkeypatch.setattr(gen, "get_settings", lambda: _Settings())
+    settings = _settings(anthropic_api_key="sk-test")
+    monkeypatch.setattr(ai.anthropic, "AsyncAnthropic", _FakeClient)
+    monkeypatch.setattr(ai, "get_settings", lambda: settings)
+    monkeypatch.setattr(gen, "get_settings", lambda: settings)
     return captured
 
 
-class _Settings:
-    anthropic_api_key = "sk-test"
+def _settings(**overrides):
+    """Real Settings, pinned to Anthropic, so these stubs can't drift from config."""
+    kwargs = dict(
+        ai_provider="anthropic",
+        anthropic_api_key="sk-test",
+        openrouter_api_key="",
+        secret_key="test-secret-key-not-for-production",
+    )
+    kwargs.update(overrides)
+    return Settings(**kwargs)
 
 
 @pytest.mark.asyncio
@@ -218,11 +238,12 @@ async def test_template_fallback_reports_no_tone(monkeypatch):
     requested tone would be a lie told exactly where someone is debugging why
     the voice looks wrong."""
     import app.services.ai_email_generator as gen
+    import app.services.ai_service as ai
 
-    class _NoKey:
-        anthropic_api_key = ""
-
-    monkeypatch.setattr(gen, "get_settings", lambda: _NoKey())
+    # No credential for ANY backend — the only state that still means "template".
+    no_key = _settings(anthropic_api_key="", openrouter_api_key="", ai_provider="auto")
+    monkeypatch.setattr(ai, "get_settings", lambda: no_key)
+    monkeypatch.setattr(gen, "get_settings", lambda: no_key)
 
     result = await generate_email({"company_name": "Acme"}, tone="urgent")
     assert result["ai_generated"] is False

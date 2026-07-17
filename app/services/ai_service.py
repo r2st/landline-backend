@@ -172,7 +172,13 @@ class AIService:
     which create a new event loop, so the await is resolved there too.
     """
 
-    def __init__(self):
+    def __init__(self, *, openrouter_model: str | None = None):
+        """``openrouter_model`` overrides the model **only on the OpenRouter
+        backend** — the name says so because an OpenRouter model id is
+        meaningless to Anthropic. Callers that need a stronger model for one job
+        (see ``ai_email_generator``) pass it here and still get plain
+        claude-sonnet-4-6 if the backend resolves to Anthropic.
+        """
         settings = get_settings()
 
         # Resolve the backend. "auto" prefers OpenRouter when a key is present
@@ -181,19 +187,33 @@ class AIService:
         if provider == "auto":
             provider = "openrouter" if settings.openrouter_api_key else "anthropic"
         self.provider = provider
+        self._anthropic_key = settings.anthropic_api_key
 
         if self.provider == "openrouter":
             self._openrouter_key = settings.openrouter_api_key
             self._openrouter_base = settings.openrouter_base_url.rstrip("/")
-            self.model = settings.openrouter_model
+            self.model = openrouter_model or settings.openrouter_model
             # AsyncAnthropic is still constructed lazily-free (no network) so any
             # stray direct references don't explode; it is simply never called.
             self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key or "unused")
             logger.info("AIService using OpenRouter backend, model=%s", self.model)
         else:
+            self._openrouter_key = ""
             self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
             self.model = "claude-sonnet-4-6"
             logger.info("AIService using Anthropic backend, model=%s", self.model)
+
+    @property
+    def is_configured(self) -> bool:
+        """True when the *active* backend has the credential it needs.
+
+        Callers gate on this instead of on ``anthropic_api_key`` directly: with
+        AI_PROVIDER=openrouter the Anthropic key is legitimately absent, and
+        checking the wrong one silently degrades a working backend to templates.
+        """
+        if self.provider == "openrouter":
+            return bool(self._openrouter_key)
+        return bool(self._anthropic_key)
 
     # ------------------------------------------------------------------
     # Backend transport
@@ -203,20 +223,27 @@ class AIService:
         messages: list,
         max_tokens: int = 1024,
         temperature: float | None = None,
+        system: str | None = None,
     ) -> str:
         """Send chat ``messages`` to the active backend and return the reply text.
 
         ``messages`` use the Anthropic/OpenAI-common shape
         ``[{"role": "user", "content": <str | list-of-blocks>}]``. For the
         OpenRouter backend, Anthropic-style image blocks are translated to the
-        OpenAI ``image_url`` form. Raises on transport/HTTP errors so callers
-        keep their existing try/except degradation.
+        OpenAI ``image_url`` form. ``system`` is a system prompt, which the two
+        APIs carry differently: Anthropic takes a top-level ``system`` kwarg,
+        while OpenAI-compatible endpoints want a leading ``role: "system"``
+        message. Raises on transport/HTTP errors so callers keep their existing
+        try/except degradation.
         """
         if self.provider == "openrouter":
+            openai_messages = [self._to_openai_message(m) for m in messages]
+            if system:
+                openai_messages.insert(0, {"role": "system", "content": system})
             payload = {
                 "model": self.model,
                 "max_tokens": max_tokens,
-                "messages": [self._to_openai_message(m) for m in messages],
+                "messages": openai_messages,
             }
             if temperature is not None:
                 payload["temperature"] = temperature
@@ -241,6 +268,8 @@ class AIService:
         kwargs = {"model": self.model, "max_tokens": max_tokens, "messages": messages}
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if system:
+            kwargs["system"] = system
         message = await self.client.messages.create(**kwargs)
         return message.content[0].text
 
@@ -271,10 +300,19 @@ class AIService:
                 })
         return {"role": message.get("role", "user"), "content": blocks}
 
-    async def _chat(self, prompt: str, max_tokens: int = 1024, temperature: float | None = None) -> str:
+    async def _chat(
+        self,
+        prompt: str,
+        max_tokens: int = 1024,
+        temperature: float | None = None,
+        system: str | None = None,
+    ) -> str:
         """Convenience wrapper: send a single user-text prompt, return reply text."""
         return await self._chat_completion(
-            [{"role": "user", "content": prompt}], max_tokens=max_tokens, temperature=temperature
+            [{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
         )
 
     def _parse_json_response(self, response_text: str) -> dict:
@@ -297,25 +335,30 @@ class AIService:
                 return json.loads(text[start : end + 1])
             raise
 
-    async def complete_json(self, prompt: str, max_tokens: int = 1024) -> dict:
+    async def complete_json(
+        self, prompt: str, max_tokens: int = 1024, system: str | None = None
+    ) -> dict:
         """Public single-shot JSON completion.
 
         Thin wrapper over :meth:`_complete_json` for other services (deal
-        forecasting, smart suggestions) that need a structured Claude reply and
-        want the same fence-tolerant parsing + never-raises contract.
+        forecasting, smart suggestions, cold-email copy) that need a structured
+        reply and want the same fence-tolerant parsing + never-raises contract.
         """
-        return await self._complete_json(prompt, max_tokens=max_tokens)
+        return await self._complete_json(prompt, max_tokens=max_tokens, system=system)
 
-    async def _complete_json(self, prompt: str, max_tokens: int = 1024) -> dict:
-        """Send a single-shot prompt to Claude and parse the JSON reply.
+    async def _complete_json(
+        self, prompt: str, max_tokens: int = 1024, system: str | None = None
+    ) -> dict:
+        """Send a single-shot prompt to the backend and parse the JSON reply.
 
-        Centralizes the messages.create + markdown-fence-tolerant JSON parse used
-        by the playbook/tactics helpers. Returns ``{"error": ...}`` on any
-        failure so callers never raise into the request handler.
+        Centralizes the chat + markdown-fence-tolerant JSON parse used by the
+        playbook/tactics helpers. Returns ``{"error": ...}`` on any failure so
+        callers never raise into the request handler; on a parse failure the
+        offending reply is returned under ``"raw"`` so the caller can log it.
         """
         response_text = ""
         try:
-            response_text = await self._chat(prompt, max_tokens=max_tokens)
+            response_text = await self._chat(prompt, max_tokens=max_tokens, system=system)
             return self._parse_json_response(response_text)
         except json.JSONDecodeError as e:
             logger.error("Failed to parse AI JSON response: %s", str(e))

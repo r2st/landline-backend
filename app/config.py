@@ -66,7 +66,21 @@ class Settings(BaseSettings):
     # free-tier model so scoring keeps working at zero cost.
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
+    # NOTE: a ":free" model id is only valid while OpenRouter actually serves that
+    # variant, and they retire them without notice — the previous default here
+    # (meta-llama/llama-3.1-8b-instruct:free) had already stopped existing, which
+    # 404s every call and looks exactly like an outage: silent template fallback.
+    # Check a candidate against https://openrouter.ai/api/v1/models before setting.
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    # Cold-email copy is the quality-sensitive call, so it gets its own knob. It
+    # currently resolves to the same model as everything else: on the free tier the
+    # daily quota is per-account and shared across models, so a smaller model buys
+    # no headroom, and the email system prompt is a long list of *negative*
+    # constraints (no buzzwords, no fabricated proof, hold a tone) that small
+    # models comply with poorly — an 8B will happily invent the customer story the
+    # guardrail bans. Kept separate so email can move to a paid model without
+    # dragging scoring/classification along.
+    openrouter_email_model: str = "meta-llama/llama-3.3-70b-instruct:free"
 
     # Apollo.io
     apollo_api_key: str = ""

@@ -1,7 +1,14 @@
 """AI-powered email generation for personalized outreach.
 
-Uses Anthropic Claude to generate highly personalized cold outreach emails
-for manufacturing leads. Falls back to template-based rendering on failure.
+Generates highly personalized cold outreach emails for manufacturing leads,
+falling back to template-based rendering on failure.
+
+The LLM call goes through :class:`app.services.ai_service.AIService`, which owns
+backend selection: OpenRouter (OpenAI-compatible, free-tier models) when an
+OPENROUTER_API_KEY is set, else Anthropic. This module used to hold its own
+hardcoded ``anthropic.AsyncAnthropic`` client, which meant that when the
+Anthropic credits ran out every send here silently degraded to a static
+template while the rest of the app had already failed over.
 
 Key features:
 - Dynamic demo link selection based on target company's industry
@@ -10,13 +17,11 @@ Key features:
 - Graceful fallback to static templates
 """
 
-import json
 import logging
 from typing import Optional
 
-import anthropic
-
 from app.config import get_settings
+from app.services.ai_service import AIService
 
 logger = logging.getLogger(__name__)
 
@@ -337,8 +342,18 @@ async def generate_email(
     settings = get_settings()
     resolved_tone = resolve_tone(tone)
 
-    if not settings.anthropic_api_key:
-        logger.warning("No Anthropic API key — falling back to template")
+    # Email copy gets the larger free model on OpenRouter; on the Anthropic
+    # backend this argument is ignored and the service stays on claude-sonnet-4-6.
+    service = AIService(openrouter_model=settings.openrouter_email_model)
+
+    # Gate on the ACTIVE backend's credential, not on Anthropic's specifically.
+    # The old check here asked for an Anthropic key no matter which backend was
+    # live, so an OpenRouter-only deployment answered every compose with a static
+    # template and reported nothing worse than a warning.
+    if not service.is_configured:
+        logger.warning(
+            "No API key for AI provider %r — falling back to template", service.provider
+        )
         return _fallback_response(lead_data, template_type)
 
     # Resolve the best demo link for this lead
@@ -377,45 +392,39 @@ EMAIL TYPE: {template_type}
     if custom_instructions:
         user_prompt += f"\nADDITIONAL INSTRUCTIONS: {custom_instructions}\n"
 
-    try:
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    # complete_json owns transport, fence-tolerant parsing and error capture, and
+    # never raises — it reports failure as {"error": ..., "raw": ...}. max_tokens
+    # is generous relative to the 60-160 word body because open models tend to
+    # spend tokens on a preamble before the JSON, and a body truncated
+    # mid-sentence is unparseable and costs the whole send.
+    result = await service.complete_json(user_prompt, max_tokens=800, system=SYSTEM_PROMPT)
 
-        message = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
+    if result.get("error"):
+        logger.error(
+            "AI email generation failed (provider=%s model=%s): %s — raw: %s",
+            service.provider,
+            service.model,
+            result["error"],
+            str(result.get("raw", ""))[:200],
         )
-
-        response_text = message.content[0].text.strip()
-
-        # Parse JSON response
-        # Handle potential markdown wrapping
-        if response_text.startswith("```"):
-            response_text = response_text.split("\n", 1)[1]
-            response_text = response_text.rsplit("```", 1)[0].strip()
-
-        result = json.loads(response_text)
-
-        return {
-            "subject": result.get("subject", f"Quick thought for {company_name}"),
-            "body": result.get("body", ""),
-            "demo_link": demo_link,
-            "ai_generated": True,
-            "model": "claude-sonnet-4-6",
-            "template_type": template_type,
-            "tone": resolved_tone,
-        }
-
-    except json.JSONDecodeError as e:
-        logger.error("Failed to parse AI response as JSON: %s — raw: %s", e, response_text[:200])
         return _fallback_response(lead_data, template_type)
-    except anthropic.APIError as e:
-        logger.error("Anthropic API error generating email: %s", e)
+
+    body = (result.get("body") or "").strip()
+    if not body:
+        logger.error(
+            "AI returned no email body (provider=%s model=%s)", service.provider, service.model
+        )
         return _fallback_response(lead_data, template_type)
-    except Exception as e:
-        logger.error("Unexpected error generating AI email: %s", e)
-        return _fallback_response(lead_data, template_type)
+
+    return {
+        "subject": (result.get("subject") or f"Quick thought for {company_name}").strip(),
+        "body": body,
+        "demo_link": demo_link,
+        "ai_generated": True,
+        "model": service.model,
+        "template_type": template_type,
+        "tone": resolved_tone,
+    }
 
 
 def _fallback_response(lead_data: dict, template_type: str) -> dict:
