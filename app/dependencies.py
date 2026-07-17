@@ -11,13 +11,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.user import User
+from app.models.user import User, UserRole, normalize_role
+from app.org_context import set_current_org_id
 from app.security import decode_token
 
 logger = logging.getLogger(__name__)
 
-# Roles allowed to view other users' data via ``?view_as_user_id=``.
-PRIVILEGED_ROLES = ("admin", "manager")
+# Roles allowed to view other users' data via ``?view_as_user_id=``. Includes the
+# legacy names so pre-multi-tenancy tokens/fixtures keep working alongside the
+# new org_* / platform_admin roles.
+PRIVILEGED_ROLES = (
+    "admin",
+    "manager",
+    UserRole.ORG_ADMIN.value,
+    UserRole.ORG_MANAGER.value,
+    UserRole.PLATFORM_ADMIN.value,
+)
 
 # Optional so endpoints can gracefully handle missing tokens
 _bearer = HTTPBearer(auto_error=False)
@@ -78,6 +87,11 @@ async def get_current_user(
             detail="Account is deactivated",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Bind the caller's org for the rest of the request: drives the automatic
+    # ``org_id`` on inserts and the global read filter (see app.org_context /
+    # app.models.mixins). ``platform_admin`` has org_id=None → not filtered.
+    set_current_org_id(user.org_id)
     return user
 
 
@@ -102,10 +116,18 @@ async def get_current_user_optional(
 
 
 def require_role(*roles: str):
-    """FastAPI dependency that enforces one or more allowed roles."""
+    """FastAPI dependency enforcing a minimum role in the privilege hierarchy.
+
+    The caller passes the role(s) that may access the route; access is granted
+    to anyone whose role is at least as privileged as the *least* privileged of
+    them. So ``require_role("org_admin")`` also admits ``platform_admin``, and a
+    higher role is never locked out of a lower-privilege route. Legacy role
+    names (``admin``/``manager``/``agent``) are normalized first.
+    """
+    min_required = min(UserRole.rank(normalize_role(r)) for r in roles)
 
     async def _check(user: User = Depends(get_current_user)) -> User:
-        if user.role not in roles:
+        if UserRole.rank(normalize_role(user.role)) < min_required:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Role '{user.role}' is not allowed. Required: {', '.join(roles)}",
@@ -113,6 +135,52 @@ def require_role(*roles: str):
         return user
 
     return _check
+
+
+class OrgScope:
+    """Resolved per-request organization scope + role-hierarchy gate.
+
+    Injected into routes that want to be explicit about org scoping (reads are
+    already filtered globally — see :mod:`app.models.mixins`). ``query(model)``
+    returns a SELECT pre-filtered to the caller's org (a no-op extra safety net
+    for platform admins, who see everything). ``check_permission`` enforces the
+    role hierarchy.
+    """
+
+    def __init__(self, user: User, db: AsyncSession) -> None:
+        self.user = user
+        self.org_id = user.org_id
+        self.role = normalize_role(user.role)
+        self.db = db
+
+    @property
+    def is_platform_admin(self) -> bool:
+        return self.role == UserRole.PLATFORM_ADMIN.value
+
+    def query(self, model):
+        """A SELECT for *model*, filtered to this org unless a platform admin."""
+        from sqlalchemy import select
+
+        stmt = select(model)
+        if not self.is_platform_admin and hasattr(model, "org_id"):
+            stmt = stmt.where(model.org_id == self.org_id)
+        return stmt
+
+    def check_permission(self, required_role: str) -> None:
+        """Raise 403 unless the caller's role meets *required_role* or higher."""
+        if UserRole.rank(self.role) < UserRole.rank(normalize_role(required_role)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+
+
+async def get_org_scope(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrgScope:
+    """Resolve the :class:`OrgScope` for the authenticated caller."""
+    return OrgScope(current_user, db)
 
 
 class UserScope:

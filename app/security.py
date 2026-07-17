@@ -70,12 +70,24 @@ def _secret_key() -> str:
     return key
 
 
-def create_access_token(user_id: UUID, role: str, *, expires_delta: Optional[timedelta] = None) -> str:
-    """Create a short-lived JWT access token."""
+def create_access_token(
+    user_id: UUID,
+    role: str,
+    org_id: "UUID | None" = None,
+    *,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    """Create a short-lived JWT access token.
+
+    ``org_id`` is the caller's organization (``None`` for platform admins). It is
+    carried as a claim so the API can bind the request's org scope without an
+    extra DB lookup; it is still validated against the DB user on each request.
+    """
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     payload = {
         "sub": str(user_id),
         "role": role,
+        "org_id": str(org_id) if org_id is not None else None,
         "type": "access",
         "exp": expire,
     }

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import require_role
-from app.models.user import User
+from app.models.user import User, UserRole, normalize_role
 from app.schemas.auth import (
     AdminResetPasswordRequest,
     UserCreate,
@@ -24,19 +24,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+def _is_platform_admin(user: User) -> bool:
+    return normalize_role(user.role) == UserRole.PLATFORM_ADMIN.value
+
+
+def _scope_users_to_org(query, admin: User):
+    """Restrict a User query to the admin's org (no-op for a platform admin)."""
+    if not _is_platform_admin(admin):
+        query = query.where(User.org_id == admin.org_id)
+    return query
+
+
 @router.get("/users", response_model=list[UserRead])
 async def list_users(
-    role: str | None = Query(None, pattern="^(admin|manager|agent)$"),
+    role: str | None = Query(
+        None, pattern="^(platform_admin|org_admin|org_manager|org_agent|admin|manager|agent)$"
+    ),
     is_active: bool | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     _admin: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all users. Admin only."""
-    query = select(User)
+    """List users in the admin's org (all users for a platform admin)."""
+    query = _scope_users_to_org(select(User), _admin)
     if role is not None:
-        query = query.where(User.role == role)
+        query = query.where(User.role == normalize_role(role))
     if is_active is not None:
         query = query.where(User.is_active == is_active)
     query = query.order_by(User.created_at.desc())
@@ -66,10 +79,21 @@ async def create_user(
             detail="A user with this email already exists",
         )
 
+    role = normalize_role(payload.role)
+    # New users join the creating admin's org. Only platform admins are allowed
+    # a null org_id; an org admin can't create org-less (platform) users.
+    if role != UserRole.PLATFORM_ADMIN.value and _admin.org_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot create an org user without a target organization",
+        )
+    org_id = _admin.org_id if role != UserRole.PLATFORM_ADMIN.value else None
+
     user = User(
         email=payload.email,
         name=payload.name,
-        role=payload.role,
+        role=role,
+        org_id=org_id,
         password_hash=hash_password(payload.password),
         must_change_password=payload.must_change_password,
         created_by=_admin.id,
@@ -96,9 +120,9 @@ async def get_user(
     _admin: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single user by ID. Admin only."""
+    """Get a single user by ID (within the admin's org). Admin only."""
     user = (
-        await db.execute(select(User).where(User.id == user_id))
+        await db.execute(_scope_users_to_org(select(User).where(User.id == user_id), _admin))
     ).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -115,12 +139,14 @@ async def _apply_user_update(
     account).
     """
     user = (
-        await db.execute(select(User).where(User.id == user_id))
+        await db.execute(_scope_users_to_org(select(User).where(User.id == user_id), admin))
     ).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     update_data = payload.model_dump(exclude_unset=True)
+    if "role" in update_data and update_data["role"] is not None:
+        update_data["role"] = normalize_role(update_data["role"])
 
     # Self-protection: an admin cannot deactivate or demote themselves.
     if user.id == admin.id:
@@ -198,7 +224,7 @@ async def reset_password(
     change it on next login.
     """
     user = (
-        await db.execute(select(User).where(User.id == user_id))
+        await db.execute(_scope_users_to_org(select(User).where(User.id == user_id), _admin))
     ).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -230,7 +256,7 @@ async def delete_user(
         )
 
     user = (
-        await db.execute(select(User).where(User.id == user_id))
+        await db.execute(_scope_users_to_org(select(User).where(User.id == user_id), admin))
     ).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

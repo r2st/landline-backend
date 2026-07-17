@@ -20,6 +20,11 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     # Surfaced so the client can force a password-change flow on first login.
     must_change_password: bool = False
+    # Org context of the authenticated user (multi-tenancy). ``org_id`` is None
+    # for platform admins. ``role`` lets the client render role-based UI.
+    role: Optional[str] = None
+    org_id: Optional[uuid.UUID] = None
+    org_name: Optional[str] = None
 
 
 class RefreshRequest(BaseModel):
@@ -47,13 +52,23 @@ class AdminResetPasswordRequest(BaseModel):
 
 # --- User CRUD (admin) -------------------------------------------------------
 
-VALID_ROLES = ("admin", "manager", "agent")
+# Canonical roles + legacy aliases (normalized on write). Ordered high→low is
+# not important here; membership is what UserCreate/UserUpdate validate against.
+VALID_ROLES = (
+    "platform_admin",
+    "org_admin",
+    "org_manager",
+    "org_agent",
+    "admin",
+    "manager",
+    "agent",
+)
 
 
 class UserCreate(BaseModel):
     email: EmailStr
     name: str = Field(..., min_length=1, max_length=255)
-    role: str = "agent"
+    role: str = "org_agent"
     password: str = Field(..., min_length=6)
     # Admin-created accounts get a temporary password by default, so the user
     # is required to change it on first login.
@@ -90,6 +105,7 @@ class UserRead(BaseModel):
     email: str
     name: str
     role: str
+    org_id: Optional[uuid.UUID] = None
     is_active: bool
     must_change_password: bool
     created_by: Optional[uuid.UUID] = None

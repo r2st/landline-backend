@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.dependencies import PRIVILEGED_ROLES, get_current_user
 from app.rate_limit import AUTH_RATE_LIMIT, limiter
-from app.models.user import User
+from app.models.tenant import Organization
+from app.models.user import User, UserRole, normalize_role
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
@@ -51,13 +52,26 @@ async def login(request: Request, payload: LoginRequest, db: AsyncSession = Depe
             detail="Account is deactivated",
         )
 
-    access = create_access_token(user.id, user.role)
+    access = create_access_token(user.id, user.role, user.org_id)
     refresh = create_refresh_token(user.id)
-    logger.info("User %s logged in", user.email)
+
+    # Resolve the org name for the login response (skip for platform admins).
+    org_name = None
+    if user.org_id is not None:
+        org_name = (
+            await db.execute(
+                select(Organization.name).where(Organization.id == user.org_id)
+            )
+        ).scalar_one_or_none()
+
+    logger.info("User %s logged in (org=%s)", user.email, user.org_id)
     return TokenResponse(
         access_token=access,
         refresh_token=refresh,
         must_change_password=user.must_change_password,
+        role=user.role,
+        org_id=user.org_id,
+        org_name=org_name,
     )
 
 
@@ -92,9 +106,14 @@ async def refresh(request: Request, payload: RefreshRequest, db: AsyncSession = 
             detail="User not found or deactivated",
         )
 
-    access = create_access_token(user.id, user.role)
+    access = create_access_token(user.id, user.role, user.org_id)
     new_refresh = create_refresh_token(user.id)
-    return TokenResponse(access_token=access, refresh_token=new_refresh)
+    return TokenResponse(
+        access_token=access,
+        refresh_token=new_refresh,
+        role=user.role,
+        org_id=user.org_id,
+    )
 
 
 @router.get("/me", response_model=UserRead)
@@ -119,9 +138,12 @@ async def team_members(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins and managers can list team members",
         )
-    result = await db.execute(
-        select(User).where(User.is_active.is_(True)).order_by(User.name.asc())
-    )
+    stmt = select(User).where(User.is_active.is_(True))
+    # Org admins/managers see only their own org's members; a platform admin
+    # (org_id is None) sees everyone.
+    if normalize_role(user.role) != UserRole.PLATFORM_ADMIN.value and user.org_id is not None:
+        stmt = stmt.where(User.org_id == user.org_id)
+    result = await db.execute(stmt.order_by(User.name.asc()))
     return list(result.scalars().all())
 
 
