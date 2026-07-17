@@ -48,9 +48,11 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.models.bounce_record import BounceRecord
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
 from app.models.email_template import EmailSend
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import system_settings
 
 logger = logging.getLogger(__name__)
@@ -223,37 +225,123 @@ class DangerMonitor:
     ) -> dict:
         """Aggregate sends / bounces / complaints / hard-bounces over the window.
 
-        ``account`` restricts to one sending account (by FK or from_email match);
-        ``None`` computes the global aggregate.
+        ``account`` restricts to one sending account; ``None`` is the global
+        aggregate.
+
+        **Outbound mail lives in three places, and this rail has to watch all of
+        them.** It previously counted only ``EmailSend``, which meant it was
+        blind to the exact thing it exists to restrain:
+
+        * ``EmailSend`` — manual campaigns (``routers/email_templates.py``) and
+          auto-replies (``services/smart_reply.py``).
+        * ``OutreachEvent`` — **Dialtone's autonomous sequence sends**. That path
+          writes no EmailSend row at all (see ``tasks/outreach.py:562`` — "there
+          is no EmailSend row here"), so both the numerator *and the denominator*
+          were zero for every email the agent sent unattended. The rail could not
+          have tripped on Dialtone's traffic under any circumstances.
+        * ``BounceRecord`` — asynchronous DSNs swept out of the mailbox. This is
+          where *most* real bounces land: Gmail accepts the message and reports
+          the failure minutes later, so a hard bounce almost never appears as a
+          synchronous send failure.
+
+        The three are unioned rather than one replacing another: a bounce hurts
+        the sending domain's reputation identically whoever queued it, and
+        watching only Dialtone would re-blind the rail to manual campaigns.
+
+        Double counting is avoided by construction, not by a DISTINCT:
+        ``OutreachEvent('bounced')`` is a *synchronous* failure, so the message
+        was never accepted and no DSN can exist for it; a ``BounceRecord``
+        implies the send was accepted, i.e. ``OutreachEvent('sent')``. The two
+        are mutually exclusive per send. ``EmailSend.status == 'bounced'`` is
+        included for completeness but is provably never written today — if that
+        ever changes it must not *also* create a BounceRecord, or bounces will
+        be counted twice here.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        filters = [EmailSend.sent_at >= cutoff]
+
+        # --- Population 1: EmailSend (manual campaigns, auto-replies) ---
+        es_filters = [EmailSend.sent_at >= cutoff]
         if account is not None:
-            filters.append(
+            es_filters.append(
                 or_(
                     EmailSend.sender_account_id == account.id,
                     EmailSend.from_email == account.email,
                 )
             )
-        base = select(func.count(EmailSend.id)).where(and_(*filters))
+        es_base = select(func.count(EmailSend.id)).where(and_(*es_filters))
 
-        sent = (await db.execute(base.where(EmailSend.status != "skipped"))).scalar() or 0
-        bounces = (await db.execute(base.where(EmailSend.status == "bounced"))).scalar() or 0
+        es_sent = (await db.execute(es_base.where(EmailSend.status != "skipped"))).scalar() or 0
+        es_bounces = (await db.execute(es_base.where(EmailSend.status == "bounced"))).scalar() or 0
         complaints = (
-            await db.execute(base.where(EmailSend.status.in_(_COMPLAINT_STATUSES)))
+            await db.execute(es_base.where(EmailSend.status.in_(_COMPLAINT_STATUSES)))
         ).scalar() or 0
 
-        # Hard bounces: a bounced send whose contact was classified 'hard' by the
-        # bounce handler. Join to Contact for the classification (which lives on
-        # the contact, not the send).
-        hard_q = (
-            select(func.count(EmailSend.id))
-            .join(Contact, EmailSend.contact_id == Contact.id)
-            .where(and_(*filters))
-            .where(EmailSend.status == "bounced")
-            .where(Contact.last_bounce_type == "hard")
+        es_hard = (
+            await db.execute(
+                select(func.count(EmailSend.id))
+                .join(Contact, EmailSend.contact_id == Contact.id)
+                .where(and_(*es_filters))
+                .where(EmailSend.status == "bounced")
+                .where(Contact.last_bounce_type == "hard")
+            )
+        ).scalar() or 0
+
+        # --- Population 2: OutreachEvent (Dialtone's sequence sends) ---
+        # Scoped through the enrollment, which is where this path records the
+        # sending account (`tasks/outreach.py:556`).
+        oe_filters = [OutreachEvent.occurred_at >= cutoff]
+        oe_base = (
+            select(func.count(OutreachEvent.id))
+            .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
         )
-        hard_bounces = (await db.execute(hard_q)).scalar() or 0
+        if account is not None:
+            oe_filters.append(OutreachEnrollment.sender_account_id == account.id)
+
+        # The denominator is ATTEMPTS, not successes. `tasks/outreach.py:587`
+        # writes exactly one event per attempt — 'sent' or 'bounced' — so a
+        # synchronous failure never appears as 'sent'. Counting only 'sent' would
+        # leave the worst possible case (every attempt bouncing) with a
+        # denominator of zero, and `bounce_rate` would divide to 0.0 and read
+        # healthy. That is the original bug wearing a different hat.
+        oe_attempts = (
+            await db.execute(
+                oe_base.where(and_(*oe_filters, OutreachEvent.event_type.in_(("sent", "bounced"))))
+            )
+        ).scalar() or 0
+        oe_bounces = (
+            await db.execute(oe_base.where(and_(*oe_filters, OutreachEvent.event_type == "bounced")))
+        ).scalar() or 0
+
+        oe_hard = (
+            await db.execute(
+                select(func.count(OutreachEvent.id))
+                .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+                .join(Contact, OutreachEnrollment.contact_id == Contact.id)
+                .where(and_(*oe_filters))
+                .where(OutreachEvent.event_type == "bounced")
+                .where(Contact.last_bounce_type == "hard")
+            )
+        ).scalar() or 0
+
+        # --- Population 3: BounceRecord (async DSNs — most real bounces) ---
+        # `processed_at` is when the sweep read the DSN rather than when the
+        # bounce happened. The sweep runs every 15 minutes, so against a 24h
+        # window the skew is immaterial; where it does bite, it counts a bounce
+        # slightly late, which errs toward pausing. That is the right direction
+        # for a brake.
+        br_filters = [BounceRecord.processed_at >= cutoff]
+        if account is not None:
+            br_filters.append(BounceRecord.gmail_account_id == account.id)
+        br_base = select(func.count(BounceRecord.id)).where(and_(*br_filters))
+
+        br_bounces = (await db.execute(br_base)).scalar() or 0
+        br_hard = (
+            await db.execute(br_base.where(BounceRecord.bounce_kind == "hard"))
+        ).scalar() or 0
+
+        sent = es_sent + oe_attempts
+        bounces = es_bounces + oe_bounces + br_bounces
+        hard_bounces = es_hard + oe_hard + br_hard
 
         bounce_rate = round(bounces / sent, 6) if sent else 0.0
         complaint_rate = round(complaints / sent, 6) if sent else 0.0
@@ -264,6 +352,16 @@ class DangerMonitor:
             "hard_bounces": hard_bounces,
             "bounce_rate": bounce_rate,
             "complaint_rate": complaint_rate,
+            # Which population each number came from. An operator staring at a
+            # paused agent needs to know whether the bounces are the agent's or
+            # a manual campaign's — they call for opposite responses.
+            "sources": {
+                "sent_sequence": oe_attempts,
+                "sent_email": es_sent,
+                "bounces_sequence": oe_bounces,
+                "bounces_email": es_bounces,
+                "bounces_dsn": br_bounces,
+            },
         }
 
     # ------------------------------------------------------------------
