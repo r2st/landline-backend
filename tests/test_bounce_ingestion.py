@@ -244,3 +244,120 @@ async def test_soft_bounce_does_not_suppress_on_first_occurrence(db_session, sam
     assert result["suppressed"] == 0
     assert sample_contact.unsubscribed is False
     assert sample_contact.bounce_count == 1
+
+
+# --- Credentials ----------------------------------------------------------
+
+
+@pytest.fixture
+def crypto_key():
+    """A valid Fernet key for the duration of one test.
+
+    Deliberately not autouse: the DSN-parsing tests above are pure and must keep
+    passing without crypto configured, the way they do in CI today.
+    """
+    from cryptography.fernet import Fernet
+
+    from app.config import get_settings
+    from app.services import crypto
+
+    settings = get_settings()
+    prev = settings.token_encryption_key
+    settings.token_encryption_key = Fernet.generate_key().decode()
+    crypto._fernet.cache_clear()
+    yield
+    settings.token_encryption_key = prev
+    crypto._fernet.cache_clear()
+
+# The sweep read `account.access_token` / `account.refresh_token`. Those
+# attributes do not exist — GmailAccount stores `*_encrypted` — so every sweep
+# raised AttributeError, which `_scan_account` caught, logged and turned into
+# "0 bounces". Gmail has no bounce webhook, so this sweep is the only automatic
+# path to the bounce handler: it silently ingested nothing, forever.
+
+
+@pytest.mark.asyncio
+async def test_build_credentials_decrypts_the_stored_tokens(db_session, crypto_key):
+    from app.models.gmail_account import GmailAccount
+    from app.services import crypto
+
+    account = GmailAccount(
+        id=uuid.uuid4(),
+        email="sender@apprend.tech",
+        google_sub=f"sub-{uuid.uuid4()}",
+        refresh_token_encrypted=crypto.encrypt("refresh-abc"),
+        access_token_encrypted=crypto.encrypt("access-xyz"),
+        is_active=True,
+    )
+    db_session.add(account)
+    await db_session.flush()
+
+    creds = get_bounce_ingestion_service()._build_credentials(account)
+
+    # Plaintext reaches Google, not ciphertext — and not an AttributeError.
+    assert creds.refresh_token == "refresh-abc"
+    assert creds.token == "access-xyz"
+
+
+@pytest.mark.asyncio
+async def test_build_credentials_works_without_a_stored_access_token(db_session, crypto_key):
+    """access_token_encrypted is nullable; the refresh token mints a new one."""
+    from app.models.gmail_account import GmailAccount
+    from app.services import crypto
+
+    account = GmailAccount(
+        id=uuid.uuid4(),
+        email="sender2@apprend.tech",
+        google_sub=f"sub-{uuid.uuid4()}",
+        refresh_token_encrypted=crypto.encrypt("refresh-only"),
+        access_token_encrypted=None,
+        is_active=True,
+    )
+    db_session.add(account)
+    await db_session.flush()
+
+    creds = get_bounce_ingestion_service()._build_credentials(account)
+
+    assert creds.refresh_token == "refresh-only"
+    assert creds.token is None
+
+
+@pytest.mark.asyncio
+async def test_build_credentials_survives_an_undecryptable_access_token(db_session, crypto_key):
+    """A key rotation leaves old access tokens unreadable.
+
+    That must not take out bounce ingestion: the refresh token still works, and
+    a dead sweep means we keep mailing addresses that are already bouncing.
+    """
+    from app.models.gmail_account import GmailAccount
+    from app.services import crypto
+
+    account = GmailAccount(
+        id=uuid.uuid4(),
+        email="sender3@apprend.tech",
+        google_sub=f"sub-{uuid.uuid4()}",
+        refresh_token_encrypted=crypto.encrypt("refresh-good"),
+        access_token_encrypted="not-decryptable-ciphertext",
+        is_active=True,
+    )
+    db_session.add(account)
+    await db_session.flush()
+
+    creds = get_bounce_ingestion_service()._build_credentials(account)
+
+    assert creds.refresh_token == "refresh-good"
+    assert creds.token is None
+
+
+@pytest.mark.asyncio
+async def test_build_credentials_does_not_read_plaintext_attributes(db_session):
+    """Pin the regression by name.
+
+    GmailAccount has no `access_token`/`refresh_token`. If either name comes
+    back, someone has reintroduced the plaintext columns — at which point the
+    encryption-at-rest guarantee is gone and this file's fix is moot.
+    """
+    from app.models.gmail_account import GmailAccount
+
+    assert not hasattr(GmailAccount, "access_token")
+    assert not hasattr(GmailAccount, "refresh_token")

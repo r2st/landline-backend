@@ -146,12 +146,29 @@ class BounceIngestionService:
     """Sweeps connected mailboxes for DSNs and routes them to the bounce handler."""
 
     def _build_credentials(self, account: GmailAccount) -> Credentials:
+        """Build OAuth credentials from the account's encrypted tokens.
+
+        The tokens live in ``*_encrypted`` columns — there is no plaintext
+        ``access_token``/``refresh_token`` attribute on the model. Reading those
+        names raised AttributeError on every sweep, which the caller caught,
+        logged and turned into "0 bounces", so this never ingested anything.
+
+        A stale access token is survivable (the refresh token mints a new one),
+        so it degrades to None rather than failing the sweep — matching
+        ``email_history._build_credentials``.
+        """
         from app.services.crypto import decrypt
 
         settings = get_settings()
+        access_token = None
+        if account.access_token_encrypted:
+            try:
+                access_token = decrypt(account.access_token_encrypted)
+            except Exception:
+                access_token = None
         return Credentials(
-            token=decrypt(account.access_token) if account.access_token else None,
-            refresh_token=decrypt(account.refresh_token) if account.refresh_token else None,
+            token=access_token,
+            refresh_token=decrypt(account.refresh_token_encrypted),
             token_uri="https://oauth2.googleapis.com/token",
             client_id=settings.google_client_id,
             client_secret=settings.google_client_secret,
