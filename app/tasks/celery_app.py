@@ -44,6 +44,7 @@ celery_app.conf.update(
         "app.tasks.prospecting.*": {"queue": "enrichment"},
         "app.tasks.client_health.*": {"queue": "enrichment"},
         "app.tasks.deliverability.*": {"queue": "enrichment"},
+        "app.tasks.bounces.*": {"queue": "enrichment"},
         "app.tasks.danger_signals.*": {"queue": "enrichment"},
         "app.tasks.domain_health.*": {"queue": "enrichment"},
         "app.tasks.rag.*": {"queue": "enrichment"},
@@ -179,6 +180,15 @@ celery_app.conf.update(
             "task": "app.tasks.deliverability.assess_sender_health",
             "schedule": 3600.0,  # hourly
         },
+        # Ingest delivery-failure notifications from the mailbox. Gmail is the
+        # primary transport and has no bounce webhook — a DSN just lands in the
+        # inbox — so this sweep is the only thing that reaches bounce_handler
+        # automatically. Every 15 minutes: fast enough to stop mailing a dead
+        # address early in a run, cheap because it dedups on message id.
+        "ingest-bounces": {
+            "task": "app.tasks.bounces.ingest_bounces",
+            "schedule": 900.0,  # every 15 minutes
+        },
         # Feature 2: auto-pause on danger signals — 24h bounce/complaint monitor.
         # Every 5 minutes so an acute spike (bad list, burning domain) is stopped
         # fast and cheaply.
@@ -287,6 +297,7 @@ import app.tasks.smart_suggestions_task  # noqa: F401
 import app.tasks.prospecting  # noqa: F401
 import app.tasks.client_health  # noqa: F401
 import app.tasks.deliverability  # noqa: F401
+import app.tasks.bounces  # noqa: F401
 import app.tasks.danger_signals  # noqa: F401
 import app.tasks.domain_health  # noqa: F401
 import app.tasks.rag  # noqa: F401
