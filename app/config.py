@@ -183,6 +183,12 @@ class Settings(BaseSettings):
 
     # Base URL for email tracking pixel / click-redirect endpoints
     tracking_base_url: str = "http://localhost:8000"
+    # Instrument outreach *sequence* sends with an open pixel + wrapped links.
+    # Without this the sequence path emits no engagement events at all, so the
+    # send_condition branches, the optimizer, and per-variant A/B stats all read
+    # counts that are structurally zero. Kept behind a flag because a pixel is a
+    # (small) deliverability cost: turning it off restores the prior behaviour.
+    sequence_tracking_enabled: bool = True
 
     # --- CAN-SPAM sender identity ---
     # Legal sender name + a FULL physical postal address are required on every

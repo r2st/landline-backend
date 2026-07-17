@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.models.email_template import EmailSend
 from app.models.contact import Contact
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +94,109 @@ def generate_click_url(send_id: str, original_url: str) -> str:
     return f"{base}/api/v1/track/click/{token}"
 
 
+# ---------------------------------------------------------------------------
+# Sequence (outreach) tracking
+# ---------------------------------------------------------------------------
+# The sequence path records no ``EmailSend`` row — its send log is
+# ``OutreachEvent`` keyed by (enrollment_id, step_number). So sequence tokens
+# carry that pair instead of a send id, and resolve to an ``OutreachEvent``
+# rather than an ``EmailSend`` update. Both token shapes share the endpoints and
+# salts below; they're told apart by payload type (str → EmailSend, dict with
+# ``eid`` → enrollment), which keeps existing links working unchanged.
+
+
+def generate_sequence_pixel_url(enrollment_id: str, step_number: int) -> str:
+    """Tracking pixel URL for one sequence step send."""
+    serializer = _get_serializer()
+    token = serializer.dumps(
+        {"eid": str(enrollment_id), "step": int(step_number)}, salt="open-track"
+    )
+    base = get_settings().tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/open/{token}"
+
+
+def generate_sequence_click_url(enrollment_id: str, step_number: int, original_url: str) -> str:
+    """Wrap a URL for click tracking within a sequence step send."""
+    serializer = _get_serializer()
+    token = serializer.dumps(
+        {"eid": str(enrollment_id), "step": int(step_number), "url": original_url},
+        salt="click-track",
+    )
+    base = get_settings().tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/click/{token}"
+
+
+async def _record_outreach_engagement(
+    db: AsyncSession, enrollment_id: str, step_number: int, event_type: str
+) -> bool:
+    """Record an ``opened``/``clicked`` OutreachEvent for a sequence step.
+
+    Deduplicated per (enrollment, step, event_type): a pixel is fetched once per
+    open but mail clients re-fetch it on every re-render, and the optimizer reads
+    these as *counts*, so writing one row per fetch would inflate engagement.
+    First occurrence wins; repeats are dropped.
+
+    Returns True when a new row was written. Never raises — tracking must not
+    break the pixel response.
+    """
+    try:
+        enrollment = (
+            await db.execute(
+                select(OutreachEnrollment).where(OutreachEnrollment.id == uuid.UUID(str(enrollment_id)))
+            )
+        ).scalar_one_or_none()
+        if enrollment is None:
+            return False
+
+        existing = (
+            await db.execute(
+                select(OutreachEvent).where(
+                    OutreachEvent.enrollment_id == enrollment.id,
+                    OutreachEvent.step_number == int(step_number),
+                    OutreachEvent.event_type == event_type,
+                )
+            )
+        ).scalars().first()
+        if existing is not None:
+            return False
+
+        db.add(
+            OutreachEvent(
+                enrollment_id=enrollment.id,
+                step_number=int(step_number),
+                event_type=event_type,
+                occurred_at=datetime.now(timezone.utc),
+                event_metadata={"source": "tracking_pixel"},
+            )
+        )
+        await db.commit()
+
+        # An open/click is an engagement signal — re-route the lead now.
+        if enrollment.contact_id:
+            _enqueue_signal_rescore(contact_id=enrollment.contact_id)
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to record %s for enrollment %s: %s", event_type, enrollment_id, exc)
+        return False
+
+
 @router.get("/open/{token}")
 async def track_open(token: str, db: AsyncSession = Depends(get_db)):
     """Record an email open event and return a 1x1 transparent GIF."""
     try:
         serializer = _get_serializer()
-        send_id = serializer.loads(token, salt="open-track", max_age=86400 * 90)  # 90 days
+        payload = serializer.loads(token, salt="open-track", max_age=86400 * 90)  # 90 days
+
+        # Sequence-step token → record an OutreachEvent and stop here.
+        if isinstance(payload, dict) and payload.get("eid"):
+            await _record_outreach_engagement(
+                db, payload["eid"], payload.get("step", 1), "opened"
+            )
+            return Response(content=PIXEL_GIF, media_type="image/gif", headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            })
+
+        send_id = payload
 
         # Fetch current record to check status before updating
         result = await db.execute(
@@ -145,8 +243,18 @@ async def track_click(token: str, db: AsyncSession = Depends(get_db)):
     try:
         serializer = _get_serializer()
         data = serializer.loads(token, salt="click-track", max_age=86400 * 90)
-        send_id = data["send_id"]
         original_url = data["url"]
+
+        # Sequence-step token → record OutreachEvents and redirect. A click
+        # implies an open, and mail clients that block images mean the open
+        # pixel may never have fired — so record both.
+        if data.get("eid"):
+            step = data.get("step", 1)
+            await _record_outreach_engagement(db, data["eid"], step, "opened")
+            await _record_outreach_engagement(db, data["eid"], step, "clicked")
+            return RedirectResponse(url=original_url, status_code=302)
+
+        send_id = data["send_id"]
 
         # Fetch current record to check status before updating
         result = await db.execute(

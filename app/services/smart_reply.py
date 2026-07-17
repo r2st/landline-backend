@@ -442,12 +442,14 @@ class SmartReplyService:
             if enrollment:
                 enrollment.status = "replied"
                 enrollment.completed_at = datetime.now(timezone.utc)
-                reply_event = OutreachEvent(
-                    enrollment_id=enrollment.id,
-                    step_number=enrollment.current_step,
-                    event_type="replied",
-                    occurred_at=datetime.now(timezone.utc),
-                    event_metadata={
+                # Attributed to the step actually sent, not current_step — the
+                # send path advances the counter before the reply arrives.
+                from app.services.outreach_events import build_reply_event
+
+                reply_event = await build_reply_event(
+                    db,
+                    enrollment,
+                    metadata={
                         "from_email": from_email,
                         "subject": subject,
                         "receiving_account": gmail_account.email,

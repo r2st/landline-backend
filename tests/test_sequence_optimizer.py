@@ -153,7 +153,7 @@ async def test_decide_uses_ai_and_context(db_session, sample_company, sample_con
     db_session.add_all([step, enrollment])
     await db_session.flush()
 
-    # Seed two sent events, zero opens → consecutive_unopened == 2.
+    # Seed two sent events with no reply → unanswered_sends == 2.
     for _ in range(2):
         db_session.add(
             OutreachEvent(
@@ -202,7 +202,7 @@ async def test_decide_uses_ai_and_context(db_session, sample_company, sample_con
     assert decision["subject"] == "adapted subject"
     # The gathered context must have reached the prompt.
     assert "too expensive" in captured["prompt"]
-    assert "consecutive_unopened_sends" in captured["prompt"]
+    assert "unanswered_sends" in captured["prompt"]
 
 
 @pytest.mark.asyncio

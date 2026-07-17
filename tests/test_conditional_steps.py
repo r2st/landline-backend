@@ -29,10 +29,17 @@ async def _setup(db, send_condition="always", step_number=2):
     return enr, step
 
 
-async def _event(db, enr, step_number, event_type):
+async def _event(db, enr, step_number, event_type, metadata=None):
     db.add(OutreachEvent(id=uuid.uuid4(), enrollment_id=enr.id,
-                         step_number=step_number, event_type=event_type))
+                         step_number=step_number, event_type=event_type,
+                         event_metadata=metadata or {}))
     await db.flush()
+
+
+# A ``sent`` event carrying an open pixel. Steps gated on a positive open signal
+# can only reach a real verdict when the prior send was actually instrumented —
+# an untracked send means "open state unknown", not "not opened".
+_TRACKED = {"tracked": True}
 
 
 async def test_always_sends(db_session):
@@ -73,11 +80,22 @@ async def test_if_opened_no_reply_skips_when_replied(db_session):
 
 
 async def test_if_opened_no_reply_skips_when_not_opened(db_session):
+    # Tracked send + no open recorded = a genuine negative, so skipping is right.
     enr, step = await _setup(db_session, "if_opened_no_reply")
-    await _event(db_session, enr, 1, "sent")  # not opened
+    await _event(db_session, enr, 1, "sent", _TRACKED)
     should, reason = await evaluate_step_condition(db_session, enr, step)
     assert should is False
     assert "not opened" in reason
+
+
+async def test_if_opened_no_reply_sends_when_prior_send_was_untracked(db_session):
+    # Untracked send: no open could ever have been recorded, so gating on a
+    # positive open signal would strand this step permanently. Send instead.
+    enr, step = await _setup(db_session, "if_opened_no_reply")
+    await _event(db_session, enr, 1, "sent")  # no pixel — open state unknown
+    should, reason = await evaluate_step_condition(db_session, enr, step)
+    assert should is True
+    assert "without open tracking" in reason
 
 
 async def test_click_counts_as_opened(db_session):

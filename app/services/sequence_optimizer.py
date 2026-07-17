@@ -49,6 +49,12 @@ VALID_CHANNELS = {"email", "call", "linkedin", "video", "direct_mail"}
 # huge number can't park an enrollment for a year.
 MAX_DELAY_DAYS = 14
 
+# How many sends may go unanswered before a non-email touch is worth suggesting.
+# Keyed on replies rather than opens: an unopened-but-delivered email is a claim
+# we cannot actually substantiate (see the prompt's signal-reliability note),
+# whereas "we have emailed them N times and they have never replied" is a fact.
+SWITCH_CHANNEL_MIN_UNANSWERED = 3
+
 
 def _send_decision(reason: str = "optimizer disabled — sending static step") -> dict:
     """The safe default decision: send the step exactly as authored."""
@@ -94,10 +100,26 @@ class SequenceOptimizer:
                 last_event_at = last_event_at.replace(tzinfo=timezone.utc)
             days_since_last = (now - last_event_at).days
 
-        # Consecutive unopened sends (drives channel-switch suggestions).
-        consecutive_unopened = 0
-        if counts["opened"] == 0 and counts["sent"] > 0:
-            consecutive_unopened = counts["sent"]
+        # Sends with no reply — the primary "this isn't landing" signal.
+        #
+        # This used to be ``consecutive_unopened``, which was unusable twice
+        # over. Structurally: nothing wrote ``opened`` events, so the count was
+        # always ``sent`` and the optimizer was told "they never open" on every
+        # single enrollment — reliably over-recommending switch_channel. And
+        # substantively: opens are weak evidence even when instrumented, because
+        # Apple MPP pre-fetches images (phantom opens) while other clients block
+        # them (missed opens). A reply is unambiguous and un-spoofable, so the
+        # no-reply streak is what drives channel switching now.
+        unanswered_sends = counts["sent"] if counts["replied"] == 0 else 0
+
+        # Opens are still surfaced, but only as corroboration — never as the
+        # sole basis for a decision. See the prompt's signal-reliability note.
+        tracked_sends = sum(
+            1
+            for e in events
+            if e.event_type == "sent" and bool((e.event_metadata or {}).get("tracked"))
+        )
+        open_signal_reliable = tracked_sends > 0
 
         # Latest reply sentiment for this contact (if any).
         sentiment = None
@@ -138,7 +160,8 @@ class SequenceOptimizer:
             },
             "engagement": counts,
             "days_since_last_event": days_since_last,
-            "consecutive_unopened_sends": consecutive_unopened,
+            "unanswered_sends": unanswered_sends,
+            "open_signal_reliable": open_signal_reliable,
             "latest_sentiment": sentiment,
         }
 
@@ -182,12 +205,22 @@ Subject: {rendered_subject}
 Body:
 {rendered_body[:1200]}
 
+SIGNAL RELIABILITY — read this before weighing the context:
+- A REPLY is the only unambiguous signal. Weigh it above everything else.
+- A CLICK is strong: it took a deliberate human action.
+- An OPEN is WEAK and must never be the sole basis for a decision. Apple Mail
+  Privacy Protection pre-fetches images, inventing opens nobody performed; other
+  clients block images, hiding opens that did happen. When
+  "open_signal_reliable" is false the send carried no pixel at all, so
+  engagement.opened == 0 means "not measured", NOT "not opened" — do not read a
+  zero there as disinterest.
+
 DECISION RULES:
 - "send": engagement is normal / early; send the step unchanged. This is the default — prefer it unless a signal clearly justifies otherwise.
 - "skip": they already replied positively (intent interested / meeting_request) — don't send a scheduled follow-up on top of a live conversation.
 - "delay": send later. Provide delay_days (1-{MAX_DELAY_DAYS}). Use for timing optimization only when justified.
-- "switch_channel": {3}+ consecutive unopened email sends — recommend a non-email touch. Provide channel ∈ ["call","linkedin"]. The email is held for a human to action the switch.
-- "rewrite": send now, but adapt the copy. Use when they opened but didn't reply (shift angle), clicked the demo link (reference it), or a prior reply raised an objection (address it). Provide new subject and body. Keep Apprend's voice: short, concrete, no buzzwords, no exclamation marks, one ask.
+- "switch_channel": {SWITCH_CHANNEL_MIN_UNANSWERED}+ sends with no reply ("unanswered_sends") — recommend a non-email touch. Provide channel ∈ ["call","linkedin"]. The email is held for a human to action the switch. Base this on the absence of REPLIES, never on the absence of opens.
+- "rewrite": send now, but adapt the copy. Use when they clicked but didn't reply (reference the click), a prior reply raised an objection (address it), or several sends have gone unanswered and the angle deserves a shift. Provide new subject and body. Keep Apprend's voice: short, concrete, no buzzwords, no exclamation marks, one ask.
 
 Return ONLY valid JSON:
 {{

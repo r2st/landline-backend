@@ -212,13 +212,15 @@ class ReplyTracker:
                 enrollment.status = "replied"
                 enrollment.completed_at = datetime.now(timezone.utc)
 
-                # Record a reply event on the enrollment timeline
-                reply_event = OutreachEvent(
-                    enrollment_id=enrollment.id,
-                    step_number=enrollment.current_step,
-                    event_type="replied",
-                    occurred_at=datetime.now(timezone.utc),
-                    event_metadata={
+                # Record a reply event on the enrollment timeline, attributed to
+                # the step that was actually sent (NOT current_step, which the
+                # send path has already advanced past — see outreach_events).
+                from app.services.outreach_events import build_reply_event
+
+                reply_event = await build_reply_event(
+                    db,
+                    enrollment,
+                    metadata={
                         "from_email": from_email,
                         "subject": subject,
                     },

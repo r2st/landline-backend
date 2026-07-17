@@ -71,19 +71,31 @@ async def _prior_step_engagement(
     event on ``prior_step_number`` means the prior touch was opened; a
     ``replied`` event on any step means they responded. Used to evaluate a
     step's ``send_condition``.
+
+    Also returns ``prior_tracked``: whether the prior step's send actually
+    carried an open pixel. Absence of an open only means "not opened" if we were
+    looking — for a step sent untracked (tracking disabled, or sent before
+    tracking existed) a missing open means *unknown*, and the caller must not
+    read it as a negative.
     """
     rows = (
         await db.execute(
-            select(OutreachEvent.event_type, OutreachEvent.step_number).where(
-                OutreachEvent.enrollment_id == enrollment.id
-            )
+            select(
+                OutreachEvent.event_type,
+                OutreachEvent.step_number,
+                OutreachEvent.event_metadata,
+            ).where(OutreachEvent.enrollment_id == enrollment.id)
         )
     ).all()
     opened = any(
-        et in ("opened", "clicked") and sn == prior_step_number for et, sn in rows
+        et in ("opened", "clicked") and sn == prior_step_number for et, sn, _ in rows
     )
-    replied = any(et == "replied" for et, _ in rows)
-    return {"opened": opened, "replied": replied}
+    replied = any(et == "replied" for et, _, _ in rows)
+    prior_tracked = any(
+        et == "sent" and sn == prior_step_number and bool((md or {}).get("tracked"))
+        for et, sn, md in rows
+    )
+    return {"opened": opened, "replied": replied, "prior_tracked": prior_tracked}
 
 
 async def evaluate_step_condition(
@@ -99,6 +111,13 @@ async def evaluate_step_condition(
     The first step (no prior touch) has nothing to branch on: ``if_not_opened``
     sends (nothing was opened yet); ``if_opened_no_reply`` does not (nothing was
     opened yet). Returns ``(should_send, reason)``.
+
+    **Fails open on untracked sends.** ``if_opened_no_reply`` gates on a positive
+    open signal, so if the prior step went out with no pixel there is no way for
+    that gate to ever pass and the step would be skipped silently, forever — the
+    exact failure this branch had before sequence tracking existed. When the
+    prior send was untracked we send instead of skipping: a step that goes out
+    when it maybe shouldn't is recoverable; one that can never go out is not.
     """
     condition = getattr(step, "send_condition", "always") or "always"
     if condition == "always":
@@ -113,6 +132,11 @@ async def evaluate_step_condition(
         if eng["replied"]:
             return False, "contact already replied — skipping"
         if not eng["opened"]:
+            if not eng["prior_tracked"]:
+                return True, (
+                    "prior step was sent without open tracking — open state unknown, "
+                    "sending rather than skipping a step that could never fire"
+                )
             return False, "prior step not opened — skipping the opened-no-reply branch"
         return True, "prior step opened, no reply yet"
     return True, "unknown condition — defaulting to send"
@@ -497,6 +521,21 @@ def send_sequence_step(self, enrollment_id: str):
                 if enrollment.sender_account_id:
                     send_account_id = enrollment.sender_account_id
 
+                # --- Engagement tracking ---
+                # Instrument the final copy (after any optimizer rewrite) so the
+                # body that actually ships is the body we measure. Keyed by
+                # (enrollment, step), which is this path's send identity — there
+                # is no EmailSend row here. Applied last so nothing downstream
+                # rewrites the pixel or the wrapped links.
+                from app.config import get_settings as _get_settings
+                from app.services.email_tracking import apply_tracking
+
+                tracking_applied = _get_settings().sequence_tracking_enabled
+                body = apply_tracking(
+                    body, str(enrollment.id), enrollment.current_step,
+                    enabled=tracking_applied,
+                )
+
                 send_result = await send_outreach_email(
                     db,
                     to_email=contact.email,
@@ -508,13 +547,15 @@ def send_sequence_step(self, enrollment_id: str):
                     references=references,
                 )
 
-                # Record event
+                # Record event. ``tracked`` records whether this send carried an
+                # open pixel — ``evaluate_step_condition`` reads it to decide
+                # whether a missing open means "not opened" or "we never looked".
                 event_type = "sent" if send_result["status"] == "sent" else "bounced"
                 event = OutreachEvent(
                     enrollment_id=enrollment.id,
                     step_number=enrollment.current_step,
                     event_type=event_type,
-                    event_metadata=send_result,
+                    event_metadata={**send_result, "tracked": bool(tracking_applied)},
                 )
                 db.add(event)
 
