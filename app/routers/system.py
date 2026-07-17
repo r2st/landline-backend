@@ -1,9 +1,14 @@
-"""System control API — global sending kill switch + warm-up reset.
+"""System control API — global sending kill switch, warm-up reset, automation state.
 
 The kill switch is the launch-blocker safety valve: one toggle that immediately
 halts ALL autonomous outbound email and pauses active enrollments, plus its
 inverse to resume. Reads are public-to-authenticated; writes capture who flipped
 it and why for the audit trail.
+
+``/system/automation`` reports which autonomous behaviours are actually on. It
+exists because the Settings page used to hardcode those badges, and two of the
+three were wrong — follow-up generation and lead re-scoring both run on the beat
+schedule while the UI displayed them as OFF.
 """
 
 import logging
@@ -13,6 +18,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user_optional
 from app.models.user import User
@@ -83,6 +89,106 @@ async def sending_toggle(
     )
     await db.commit()
     return status
+
+
+class AutomationFlag(BaseModel):
+    """One autonomous behaviour, and whether it is actually running."""
+
+    key: str
+    label: str
+    enabled: bool
+    # How it's controlled, so the UI can say whether an operator can change it:
+    # "env" = a config/environment flag, "schedule" = a Celery beat task that
+    # runs unconditionally and is tuned by cadence rather than switched off.
+    source: str
+    # The cadence or setting behind `enabled` — a bare ON tells an operator
+    # nothing about how often, or what would change it.
+    detail: Optional[str] = None
+
+
+class AutomationResponse(BaseModel):
+    """What the agent does on its own, without anyone asking.
+
+    A list rather than fixed fields: the vocabulary belongs to the backend, so
+    adding a behaviour here surfaces it in the UI without a frontend change —
+    and, more importantly, nothing renders unless the server actually reported
+    it. The previous UI invented these values client-side.
+    """
+
+    flags: list[AutomationFlag]
+    scheduling_link: str = ""
+
+
+@router.get("/automation", response_model=AutomationResponse)
+async def automation_settings():
+    """Report the real state of each autonomous behaviour.
+
+    Every value here is read from config or from the beat schedule. Nothing is
+    defaulted for display: if a flag can't be determined it does not appear.
+    """
+    settings = get_settings()
+    flags = [
+        AutomationFlag(
+            key="auto_reply",
+            label="Auto-reply to interested replies",
+            enabled=settings.auto_reply_enabled,
+            source="env",
+            detail=(
+                "AI drafts a reply and sends it for clear positive intent."
+                if settings.auto_reply_enabled
+                else "Replies are classified but never answered automatically."
+            ),
+        ),
+        AutomationFlag(
+            key="ai_compose",
+            label="AI-composed first touches",
+            enabled=settings.ai_compose_enabled,
+            source="env",
+            detail=(
+                (
+                    f"First {settings.ai_compose_review_batch_size} per sequence go to human "
+                    "review; "
+                    + ("every step is composed." if settings.ai_compose_all_steps else "step 1 only.")
+                )
+                if settings.ai_compose_enabled
+                else "Sequences send their static templates."
+            ),
+        ),
+        AutomationFlag(
+            key="auto_research",
+            label="Auto-research new companies",
+            enabled=settings.auto_research_enabled,
+            source="env",
+            detail=(
+                "A research brief is generated before first outreach."
+                if settings.auto_research_enabled
+                else "Briefs are only generated on request."
+            ),
+        ),
+        # These two are beat tasks with no on/off switch — they run. The old UI
+        # showed both as OFF, which was simply false.
+        AutomationFlag(
+            key="auto_followups",
+            label="Stale-lead follow-ups",
+            enabled=True,
+            source="schedule",
+            detail=(
+                f"Every 4h, up to {settings.auto_followup_batch_limit} reminders for leads untouched "
+                f"for {settings.stale_lead_followup_days}+ days."
+            ),
+        ),
+        AutomationFlag(
+            key="auto_scoring",
+            label="Lead scoring & re-scoring",
+            enabled=True,
+            source="schedule",
+            detail=(
+                f"New leads scored every 30m; active leads re-scored twice daily, up to "
+                f"{settings.rescore_batch_limit} per run."
+            ),
+        ),
+    ]
+    return AutomationResponse(flags=flags, scheduling_link=settings.scheduling_link or "")
 
 
 class WarmupResetResponse(BaseModel):
