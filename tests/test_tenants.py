@@ -7,6 +7,7 @@ billing aggregation, and the admin tenant API + current-tenant endpoints.
 import uuid
 
 import pytest
+import pytest_asyncio
 
 from app.models.tenant import PLAN_AI_CALL_LIMITS, Tenant
 from app.models.user import User, UserRole
@@ -73,8 +74,17 @@ async def test_within_ai_limit(db_session):
 # --- API tests -------------------------------------------------------------
 
 
+@pytest_asyncio.fixture
+async def pa_headers(make_user, auth_headers):
+    """Auth header for a platform_admin — cross-tenant CRUD requires it."""
+    admin = await make_user(
+        "pa-tenants@x.com", role=UserRole.PLATFORM_ADMIN.value, org_id=None
+    )
+    return auth_headers(admin)
+
+
 @pytest.mark.asyncio
-async def test_create_and_get_tenant(client):
+async def test_create_and_get_tenant(client, pa_headers):
     resp = await client.post(
         "/api/v1/tenants",
         json={
@@ -84,6 +94,7 @@ async def test_create_and_get_tenant(client):
             "branding": {"primary_color": "#ff0000"},
             "config": {"enabled_verticals": ["cnc_machining"]},
         },
+        headers=pa_headers,
     )
     assert resp.status_code == 201, resp.text
     data = resp.json()
@@ -91,29 +102,38 @@ async def test_create_and_get_tenant(client):
     assert data["effective_ai_call_limit"] == PLAN_AI_CALL_LIMITS["growth"]
     tenant_id = data["id"]
 
-    got = await client.get(f"/api/v1/tenants/{tenant_id}")
+    got = await client.get(f"/api/v1/tenants/{tenant_id}", headers=pa_headers)
     assert got.status_code == 200
     assert got.json()["branding"]["primary_color"] == "#ff0000"
 
 
 @pytest.mark.asyncio
-async def test_create_tenant_rejects_bad_slug_and_dup(client):
-    bad = await client.post("/api/v1/tenants", json={"name": "X", "slug": "Bad Slug!"})
+async def test_create_tenant_rejects_bad_slug_and_dup(client, pa_headers):
+    bad = await client.post(
+        "/api/v1/tenants", json={"name": "X", "slug": "Bad Slug!"}, headers=pa_headers
+    )
     assert bad.status_code == 400
 
-    await client.post("/api/v1/tenants", json={"name": "One", "slug": "dup"})
-    dup = await client.post("/api/v1/tenants", json={"name": "Two", "slug": "dup"})
+    await client.post(
+        "/api/v1/tenants", json={"name": "One", "slug": "dup"}, headers=pa_headers
+    )
+    dup = await client.post(
+        "/api/v1/tenants", json={"name": "Two", "slug": "dup"}, headers=pa_headers
+    )
     assert dup.status_code == 409
 
 
 @pytest.mark.asyncio
-async def test_update_tenant_config_and_plan(client):
-    created = await client.post("/api/v1/tenants", json={"name": "Acme", "slug": "acme2"})
+async def test_update_tenant_config_and_plan(client, pa_headers):
+    created = await client.post(
+        "/api/v1/tenants", json={"name": "Acme", "slug": "acme2"}, headers=pa_headers
+    )
     tid = created.json()["id"]
 
     resp = await client.patch(
         f"/api/v1/tenants/{tid}",
         json={"billing_plan": "enterprise", "config": {"feature_flags": {"workflows": True}}},
+        headers=pa_headers,
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -123,13 +143,23 @@ async def test_update_tenant_config_and_plan(client):
 
 
 @pytest.mark.asyncio
-async def test_deactivate_tenant(client):
-    created = await client.post("/api/v1/tenants", json={"name": "Acme", "slug": "acme3"})
+async def test_deactivate_tenant(client, pa_headers):
+    created = await client.post(
+        "/api/v1/tenants", json={"name": "Acme", "slug": "acme3"}, headers=pa_headers
+    )
     tid = created.json()["id"]
-    resp = await client.delete(f"/api/v1/tenants/{tid}")
+    resp = await client.delete(f"/api/v1/tenants/{tid}", headers=pa_headers)
     assert resp.status_code == 200
-    got = await client.get(f"/api/v1/tenants/{tid}")
+    got = await client.get(f"/api/v1/tenants/{tid}", headers=pa_headers)
     assert got.json()["is_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_org_admin_cannot_manage_tenants(client, make_user, auth_headers):
+    """Cross-tenant CRUD is platform_admin only — an org_admin is rejected."""
+    org_admin = await make_user("oa@acme.test", role=UserRole.ORG_ADMIN.value)
+    resp = await client.get("/api/v1/tenants", headers=auth_headers(org_admin))
+    assert resp.status_code == 403
 
 
 @pytest.mark.asyncio

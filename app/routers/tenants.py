@@ -5,9 +5,12 @@ prompt customization, branding), usage-based billing summaries, and a
 ``current`` view any authenticated user can read to drive white-label branding
 and feature gating in the frontend.
 
-Tenant management is restricted to ``admin`` users. The ``/tenants/current/*``
-endpoints resolve the tenant from the caller's ``org_id`` and are readable by
-any authenticated user.
+Cross-tenant management (create/list/get/update/deactivate any tenant, and its
+usage) is restricted to ``platform_admin`` — ``Organization`` is the tenant
+boundary itself and is NOT org-scoped, so gating these at ``org_admin`` would let
+any org's admin enumerate, reconfigure, or deactivate every other organization.
+The ``/tenants/current/*`` endpoints resolve the tenant from the caller's
+``org_id`` and are readable by any authenticated user.
 """
 
 import logging
@@ -93,7 +96,7 @@ def _to_read(t: Tenant) -> TenantRead:
 async def create_tenant(
     body: TenantCreate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_role("admin")),
+    _: User = Depends(require_role("platform_admin")),
 ):
     """Provision a new tenant organization (admin only)."""
     slug = body.slug.lower().strip()
@@ -124,7 +127,7 @@ async def create_tenant(
 async def list_tenants(
     active_only: bool = Query(False),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_role("admin")),
+    _: User = Depends(require_role("platform_admin")),
 ):
     """List all tenants (admin only)."""
     query = select(Tenant).order_by(Tenant.created_at.desc())
@@ -145,7 +148,7 @@ async def _get_tenant_or_404(db: AsyncSession, tenant_id: uuid.UUID) -> Tenant:
 async def get_tenant(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_role("admin")),
+    _: User = Depends(require_role("platform_admin")),
 ):
     return _to_read(await _get_tenant_or_404(db, tenant_id))
 
@@ -155,7 +158,7 @@ async def update_tenant(
     tenant_id: uuid.UUID,
     body: TenantUpdate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_role("admin")),
+    _: User = Depends(require_role("platform_admin")),
 ):
     """Update tenant config, branding, plan, or active state (admin only)."""
     tenant = await _get_tenant_or_404(db, tenant_id)
@@ -183,7 +186,7 @@ async def update_tenant(
 async def deactivate_tenant(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_role("admin")),
+    _: User = Depends(require_role("platform_admin")),
 ):
     """Deactivate a tenant (soft — data is retained). Admin only."""
     tenant = await _get_tenant_or_404(db, tenant_id)
@@ -196,7 +199,7 @@ async def deactivate_tenant(
 async def tenant_usage(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_role("admin")),
+    _: User = Depends(require_role("platform_admin")),
 ):
     """Current-period usage-based billing summary for a tenant (admin only)."""
     tenant = await _get_tenant_or_404(db, tenant_id)

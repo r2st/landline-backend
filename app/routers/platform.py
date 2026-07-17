@@ -25,6 +25,7 @@ Endpoints (mounted under the API prefix, e.g. ``/api/v1/platform``):
 import logging
 import re
 import uuid
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -121,9 +122,17 @@ class PlatformStats(BaseModel):
     total_emails_sent: int
 
 
+# Impersonation tokens are deliberately short-lived: a platform admin only needs
+# them long enough to reproduce/inspect a user's view, and no refresh token is
+# issued, so the session cannot be silently extended.
+IMPERSONATION_TOKEN_TTL = timedelta(minutes=15)
+
+
 class ImpersonationToken(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    # Lifetime of the token in seconds, so the client can surface / auto-expire.
+    expires_in: int = int(IMPERSONATION_TOKEN_TTL.total_seconds())
     user_id: uuid.UUID
     email: str
     role: str
@@ -479,7 +488,9 @@ async def impersonate_user(
         ).scalar_one_or_none()
         org_name = org.name if org is not None else None
 
-    token = create_access_token(target.id, target.role, target.org_id)
+    token = create_access_token(
+        target.id, target.role, target.org_id, expires_delta=IMPERSONATION_TOKEN_TTL
+    )
     logger.info(
         "Platform admin %s is impersonating user %s (org=%s)",
         scope.user.email,
