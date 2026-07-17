@@ -359,6 +359,91 @@ class ApolloEnrichmentService:
             raw=person,
         )
 
+    @staticmethod
+    def _extract_phones(person: dict) -> tuple[Optional[str], Optional[str]]:
+        """Pull the best (direct, mobile) pair out of an Apollo person record.
+
+        Apollo returns numbers in a few shapes: a ``phone_numbers`` list where
+        each entry has a ``type`` ('mobile' | 'work_hq' | 'other' | …) and a
+        ``sanitized_number``, plus a top-level ``sanitized_phone`` and the org's
+        main line under ``organization.phone``. We prefer a personal/direct line
+        for ``phone`` and keep any explicit mobile separately so a rep can pick.
+        """
+        direct: Optional[str] = None
+        mobile: Optional[str] = None
+        numbers = person.get("phone_numbers") or []
+        for entry in numbers:
+            if not isinstance(entry, dict):
+                continue
+            num = (entry.get("sanitized_number") or entry.get("raw_number") or "").strip()
+            if not num:
+                continue
+            kind = (entry.get("type") or "").lower()
+            if "mobile" in kind and not mobile:
+                mobile = num
+            elif not direct:
+                direct = num
+        if not direct:
+            direct = (person.get("sanitized_phone") or "").strip() or None
+        if not direct:
+            org = person.get("organization") or {}
+            direct = (org.get("phone") or org.get("sanitized_phone") or "").strip() or None
+        return direct, mobile
+
+    async def match_person_phone(
+        self,
+        db: Optional[AsyncSession],
+        *,
+        first_name: Optional[str],
+        last_name: Optional[str],
+        email: Optional[str],
+        domain: Optional[str],
+        organization_name: Optional[str] = None,
+    ) -> dict:
+        """Look up a single person's phone via Apollo's ``/people/match``.
+
+        Returns ``{"phone": str|None, "mobile": str|None, "status": ...}``. The
+        match is identity-scoped (name + company/email), so it spends one Apollo
+        credit to resolve *this* person rather than a broad people search. A
+        missing key / missing identity short-circuits without a call.
+        """
+        if not self.api_key:
+            return {"status": "skipped", "reason": "no_api_key", "phone": None, "mobile": None}
+        if not ((first_name or last_name) and (domain or email or organization_name)):
+            return {"status": "skipped", "reason": "insufficient_identity", "phone": None, "mobile": None}
+
+        params: dict = {
+            # Ask Apollo to include phone numbers in the match response. Apollo
+            # bills a credit for a revealed number; the credit gate in
+            # ``_apollo_request`` still governs whether we spend it.
+            "reveal_phone_number": False,
+        }
+        if first_name:
+            params["first_name"] = first_name
+        if last_name:
+            params["last_name"] = last_name
+        if email:
+            params["email"] = email
+        if domain:
+            params["domain"] = domain
+        if organization_name:
+            params["organization_name"] = organization_name
+
+        call = await self._apollo_request(
+            db, "/people/match", params, operation="people_match"
+        )
+        if not call.ok:
+            return {"status": call.status, "detail": call.error, "phone": None, "mobile": None}
+
+        person = (call.data or {}).get("person") or {}
+        if not person:
+            return {"status": "not_found", "phone": None, "mobile": None}
+
+        direct, mobile = self._extract_phones(person)
+        if not (direct or mobile):
+            return {"status": "no_phone", "phone": None, "mobile": None}
+        return {"status": "found", "phone": direct, "mobile": mobile}
+
     async def _search_people(
         self,
         db: AsyncSession,

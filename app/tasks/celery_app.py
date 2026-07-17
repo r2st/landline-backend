@@ -54,6 +54,7 @@ celery_app.conf.update(
         "app.tasks.send_timing.*": {"queue": "enrichment"},
         "app.tasks.verification.*": {"queue": "enrichment"},
         "app.tasks.places_discovery.*": {"queue": "enrichment"},
+        "app.tasks.phone_enrichment.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -272,6 +273,15 @@ celery_app.conf.update(
             "task": "app.tasks.places_discovery.enrich_discovered_emails",
             "schedule": crontab(hour=5, minute=0),
         },
+        # Warm-lead phone enrichment: find prospects showing real interest (3+
+        # opens or any click/reply) that have no phone on file and enrich them via
+        # Apollo, so the operator can call while the lead is warm. Every 30 min —
+        # fast enough to catch a warm lead the same day, and each contact is
+        # attempted at most once (phone_enriched_at), so the cadence is cheap.
+        "enrich-warm-lead-phones": {
+            "task": "app.tasks.phone_enrichment.enrich_warm_lead_phones",
+            "schedule": 1800.0,  # every 30 minutes
+        },
     },
 )
 
@@ -307,3 +317,4 @@ import app.tasks.ab_testing  # noqa: F401
 import app.tasks.send_timing  # noqa: F401
 import app.tasks.verification  # noqa: F401
 import app.tasks.places_discovery  # noqa: F401
+import app.tasks.phone_enrichment  # noqa: F401

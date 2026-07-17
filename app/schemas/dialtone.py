@@ -39,6 +39,9 @@ DIALTONE_EVENT_TYPES = (
     "reply_classified",
     # Feature 3: an A/B test concluded (a winner was declared and promoted).
     "ab_test_concluded",
+    # Warm-lead phone enrichment: a phone number was auto-found for a prospect
+    # showing repeated engagement, so the operator can follow up by phone.
+    "phone_enriched",
 )
 
 

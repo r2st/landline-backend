@@ -321,7 +321,7 @@ async def _collect_events(
             title=f"Reply from {who} classified: {category}",
             description=(reply.classification_meta or {}).get("reason") or reply.subject,
             source="reply",
-            severity="warn" if category in ("unsubscribe", "unknown") else "ok",
+            severity="warn" if category in ("unsubscribe", "bounce", "unknown") else "ok",
             metadata={
                 "reply_id": str(reply.id),
                 "contact_id": str(reply.contact_id) if reply.contact_id else None,
@@ -332,6 +332,48 @@ async def _collect_events(
                 "confidence": reply.classification_confidence,
                 "priority_flag": bool(reply.priority_flag),
                 "handled_action": reply.handled_action,
+            },
+        ))
+
+    # --- Phone enrichment (warm leads) ---------------------------------------
+    # Surface every phone number the warm-lead sweep auto-found, so the feed
+    # tells the operator "this engaged lead now has a number — call them". Only
+    # sweep-sourced numbers ('apollo'/'company') appear; a hand-typed or scanned
+    # number is not a Dialtone action.
+    phone_query = (
+        select(Contact)
+        .where(
+            Contact.phone_enriched_at.isnot(None),
+            Contact.phone_source.in_(("apollo", "company")),
+        )
+        .order_by(Contact.phone_enriched_at.desc())
+        .limit(cap)
+    )
+    if contact_id is not None:
+        phone_query = phone_query.where(Contact.id == contact_id)
+    for contact in (await db.execute(phone_query)).scalars().all():
+        who = contact.full_name
+        number = contact.mobile or contact.phone
+        if not number:
+            continue
+        if q_lower and q_lower not in who.lower() and q_lower not in number.lower():
+            continue
+        src_label = "direct dial" if contact.phone_source == "apollo" else "company line"
+        items.append(DialtoneEvent(
+            id=f"phone_enriched:{contact.id}",
+            type="phone_enriched",
+            timestamp=_aware(contact.phone_enriched_at),
+            title=f"Phone found for {who}",
+            description=f"{number} ({src_label}) — warm lead, worth a call",
+            source="enrichment",
+            severity="ok",
+            metadata={
+                "contact_id": str(contact.id),
+                "company_id": str(contact.company_id) if contact.company_id else None,
+                "contact_name": who,
+                "phone": contact.phone,
+                "mobile": contact.mobile,
+                "phone_source": contact.phone_source,
             },
         ))
 

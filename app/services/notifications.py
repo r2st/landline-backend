@@ -46,6 +46,24 @@ That's a strong signal. Good time to follow up while they're actively looking. C
 """
         await self._send_notification(subject, body)
 
+    async def notify_phone_found(
+        self, contact_name: str, company_name: str, phone: str
+    ):
+        """Notify when a warm lead's phone number was auto-enriched.
+
+        Fired only when the enrichment sweep actually found a number for a lead
+        that was already showing repeated engagement — the whole point is to hand
+        the operator a warm number to dial while interest is fresh.
+        """
+        subject = f"📞 Phone found for {contact_name} at {company_name}"
+        body = f"""{contact_name} at {company_name} has been engaging with your emails, and Dialtone just found a phone number for them:
+
+{phone}
+
+They're warm — a personal call now could move this forward. Open the company in Landline for the full picture.
+"""
+        await self._send_notification(subject, body)
+
     async def notify_domain_health_change(
         self, domain: str, summary: str, details: str = ""
     ):

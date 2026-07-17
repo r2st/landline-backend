@@ -30,6 +30,18 @@ class Contact(Base):
     # Any phone numbers beyond phone/mobile/fax, as a list of {"label","number"}.
     # Ensures a card with several numbers never loses any of them.
     additional_phones: Mapped[list | None] = mapped_column(JSONB)
+    # --- Phone enrichment for warm leads ---
+    # Where phone/mobile came from: 'apollo' (people match), 'company' (the org's
+    # main line, fallback), 'card' (scanned business card), or 'manual'. Lets the
+    # UI badge an auto-found number and stops a sweep from clobbering a hand-edit.
+    phone_source: Mapped[str | None] = mapped_column(String(20))
+    # When the warm-lead sweep last *attempted* to find a phone. Set on every
+    # attempt (hit or miss) so the sweep is idempotent and never re-charges the
+    # enrichment API for the same contact. NULL = never attempted (the sweep's
+    # selection set), mirroring ``email_verified_at``.
+    phone_enriched_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), index=True
+    )
     linkedin_url: Mapped[str | None] = mapped_column(Text)
     website: Mapped[str | None] = mapped_column(Text)
     # Full postal address captured from a scanned card (kept on the contact so the

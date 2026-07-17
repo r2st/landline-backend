@@ -165,6 +165,12 @@ class CompanyContact(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     mobile: Optional[str] = None
+    # Where the phone came from — 'apollo'/'company' mark an auto-enriched number
+    # (warm-lead enrichment) the UI can badge; 'card'/'manual' are human-entered.
+    phone_source: Optional[str] = None
+    # When the warm-lead sweep last found a number for this contact (null if
+    # never auto-enriched). Lets the detail view flag "phone found — call them".
+    phone_enriched_at: Optional[datetime] = None
     linkedin_url: Optional[str] = None
     is_primary: bool = False
     # True when this contact can never be emailed again (opt-out/suppression),
