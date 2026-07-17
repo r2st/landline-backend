@@ -5,19 +5,23 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import UserScope, get_scope
 from app.models.company import Company
+from app.models.contact import Contact
 from app.models.deal import Deal
 from app.models.deal_activity import DealActivity
 from app.models.deal_note import DealNote
+from app.models.outreach import OutreachEnrollment
+from app.models.sequence import OutreachSequence
 from app.schemas.deal_prediction import DealForecast, DealPredictionRead
 from app.services import pipeline_forecaster
 from app.schemas.deal import (
     DEAL_STAGE_PROBABILITIES,
+    AttributionSummary,
     DealActivityRead,
     DealCreate,
     DealMetrics,
@@ -28,6 +32,7 @@ from app.schemas.deal import (
     DealStatusBreakdown,
     DealSummary,
     DealUpdate,
+    SequenceAttribution,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,16 +44,61 @@ def _f(value) -> float:
     return float(value) if value is not None else 0.0
 
 
+async def _infer_attribution(
+    db: AsyncSession, company_id: uuid.UUID
+) -> tuple[Optional[uuid.UUID], Optional[uuid.UUID]]:
+    """Trace a company back to the enrollment that first brought it in.
+
+    Returns ``(enrollment_id, sequence_id)`` for the earliest enrollment among
+    any of the company's contacts, or ``(None, None)`` if the company was never
+    enrolled. This is the "which outreach produced this deal" link.
+    """
+    row = (
+        await db.execute(
+            select(OutreachEnrollment.id, OutreachEnrollment.sequence_id)
+            .join(Contact, Contact.id == OutreachEnrollment.contact_id)
+            .where(Contact.company_id == company_id)
+            .order_by(OutreachEnrollment.enrolled_at.asc())
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return None, None
+    return row[0], row[1]
+
+
 @router.post("", response_model=DealRead, status_code=201)
 async def create_deal(payload: DealCreate, db: AsyncSession = Depends(get_db)):
-    """Create a deal for a company."""
+    """Create a deal for a company.
+
+    When the caller doesn't pin a sequence, we infer attribution by tracing the
+    company back to the earliest enrollment among its contacts, so a won deal
+    can always credit the outreach that started the conversation.
+    """
     company = (
         await db.execute(select(Company.id).where(Company.id == payload.company_id))
     ).scalar_one_or_none()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    deal = Deal(**payload.model_dump())
+    values = payload.model_dump()
+    # Infer attribution only when the caller hasn't set it. If they passed an
+    # enrollment but no sequence, backfill the sequence from that enrollment.
+    if values.get("source_enrollment_id") is None and values.get("source_sequence_id") is None:
+        enr_id, seq_id = await _infer_attribution(db, payload.company_id)
+        values["source_enrollment_id"] = enr_id
+        values["source_sequence_id"] = seq_id
+    elif values.get("source_enrollment_id") is not None and values.get("source_sequence_id") is None:
+        enr = (
+            await db.execute(
+                select(OutreachEnrollment.sequence_id).where(
+                    OutreachEnrollment.id == values["source_enrollment_id"]
+                )
+            )
+        ).scalar_one_or_none()
+        values["source_sequence_id"] = enr
+
+    deal = Deal(**values)
     db.add(deal)
     await db.flush()
     await db.refresh(deal)
@@ -212,6 +262,104 @@ async def deal_metrics(
         win_rate=win_rate,
         avg_days_to_close=avg_days_to_close,
         by_stage=by_stage,
+    )
+
+
+@router.get("/attribution", response_model=AttributionSummary)
+async def deal_attribution(db: AsyncSession = Depends(get_db)):
+    """Sequence attribution: deals and revenue credited to each outreach sequence.
+
+    Answers "which sequences are producing results" by rolling deals up on their
+    ``source_sequence_id``. Deals with no attribution land in an ``unattributed``
+    bucket (``sequence_id: null``) rather than being dropped, so the totals still
+    reconcile against the overall won-revenue figure.
+    """
+    # One grouped pass over deals: per crediting sequence, count by status and
+    # sum won revenue / open pipeline.
+    agg_rows = (
+        await db.execute(
+            select(
+                Deal.source_sequence_id,
+                func.count(Deal.id),
+                func.count(case((Deal.status == "won", Deal.id))),
+                func.count(case((Deal.status == "pending", Deal.id))),
+                func.count(case((Deal.status == "lost", Deal.id))),
+                func.coalesce(func.sum(case((Deal.status == "won", Deal.value), else_=0)), 0),
+                func.coalesce(func.sum(case((Deal.status == "pending", Deal.value), else_=0)), 0),
+            ).group_by(Deal.source_sequence_id)
+        )
+    ).all()
+
+    # Sequence names/status for the attributed buckets.
+    seq_ids = [r[0] for r in agg_rows if r[0] is not None]
+    seq_meta: dict = {}
+    if seq_ids:
+        for sid, name, status in (
+            await db.execute(
+                select(OutreachSequence.id, OutreachSequence.name, OutreachSequence.status)
+                .where(OutreachSequence.id.in_(seq_ids))
+            )
+        ).all():
+            seq_meta[sid] = (name, status)
+
+    # Enrollment counts per sequence — the top of the funnel for each row.
+    enroll_counts = {
+        sid: cnt
+        for sid, cnt in (
+            await db.execute(
+                select(OutreachEnrollment.sequence_id, func.count(OutreachEnrollment.id))
+                .group_by(OutreachEnrollment.sequence_id)
+            )
+        ).all()
+    }
+
+    by_sequence: list[SequenceAttribution] = []
+    total_won_revenue = 0.0
+    total_attributed_won_revenue = 0.0
+    attributed_won_deals = 0
+    unattributed_won_deals = 0
+
+    for sid, total, won, pending, lost, won_rev, pipeline in agg_rows:
+        won_rev_f = _f(won_rev)
+        total_won_revenue += won_rev_f
+        name, status = seq_meta.get(sid, (None, None))
+        if sid is not None:
+            total_attributed_won_revenue += won_rev_f
+            attributed_won_deals += won
+        else:
+            unattributed_won_deals += won
+        by_sequence.append(
+            SequenceAttribution(
+                sequence_id=sid,
+                sequence_name=name,
+                sequence_status=status,
+                enrollments=enroll_counts.get(sid) if sid is not None else None,
+                total_deals=total,
+                won_deals=won,
+                pending_deals=pending,
+                lost_deals=lost,
+                won_revenue=won_rev_f,
+                pipeline_value=_f(pipeline),
+            )
+        )
+
+    # Best sequences first: won revenue, then open pipeline, then deal volume.
+    # Keep the unattributed bucket last regardless of its size.
+    by_sequence.sort(
+        key=lambda a: (
+            a.sequence_id is None,
+            -a.won_revenue,
+            -a.pipeline_value,
+            -a.total_deals,
+        )
+    )
+
+    return AttributionSummary(
+        by_sequence=by_sequence,
+        total_won_revenue=round(total_won_revenue, 2),
+        total_attributed_won_revenue=round(total_attributed_won_revenue, 2),
+        attributed_won_deals=attributed_won_deals,
+        unattributed_won_deals=unattributed_won_deals,
     )
 
 

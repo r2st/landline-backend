@@ -27,6 +27,10 @@ class DealCreate(BaseModel):
     deal_stage: str = "qualification"
     lost_reason: Optional[str] = Field(None, max_length=255)
     notes: Optional[str] = None
+    # Sequence attribution. Usually omitted — create_deal traces it from the
+    # company's enrollments. Pass explicitly to override that inference.
+    source_enrollment_id: Optional[uuid.UUID] = None
+    source_sequence_id: Optional[uuid.UUID] = None
 
     @field_validator("status")
     @classmethod
@@ -91,6 +95,8 @@ class DealRead(BaseModel):
     deal_stage: str
     lost_reason: Optional[str] = None
     notes: Optional[str] = None
+    source_enrollment_id: Optional[uuid.UUID] = None
+    source_sequence_id: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
     company_name: Optional[str] = None
@@ -154,3 +160,32 @@ class DealMetrics(BaseModel):
     win_rate: float
     avg_days_to_close: float
     by_stage: list[DealStageBreakdown]
+
+
+class SequenceAttribution(BaseModel):
+    """Revenue and deal counts credited to one outreach sequence.
+
+    ``sequence_id`` is None for the "unattributed" bucket — deals with no
+    ``source_sequence_id`` (predate attribution, or a purely manual deal).
+    """
+
+    sequence_id: Optional[uuid.UUID] = None
+    sequence_name: Optional[str] = None
+    sequence_status: Optional[str] = None
+    # How many contacts this sequence enrolled (the top of the funnel). None for
+    # the unattributed bucket, which has no sequence to count enrollments for.
+    enrollments: Optional[int] = None
+    total_deals: int
+    won_deals: int
+    pending_deals: int
+    lost_deals: int
+    won_revenue: float
+    pipeline_value: float  # sum of pending deal values credited to this sequence
+
+
+class AttributionSummary(BaseModel):
+    by_sequence: list[SequenceAttribution]
+    total_won_revenue: float
+    total_attributed_won_revenue: float  # excludes the unattributed bucket
+    attributed_won_deals: int
+    unattributed_won_deals: int

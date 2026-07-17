@@ -25,12 +25,31 @@ from app.models.contact import Contact
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
+from app.models.outreach import OutreachEnrollment
 from app.services import crypto, google_oauth
 from app.services.gmail_sender import GmailSender
 
 logger = logging.getLogger(__name__)
 
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def _parse_message_ids(*header_values: Optional[str]) -> set[str]:
+    """Pull individual RFC-2822 Message-IDs out of In-Reply-To / References
+    header values. Each is a space-separated list of ``<id@host>`` tokens; we
+    return them both bracket-stripped and raw so a match works whichever form
+    the sent message stored."""
+    ids: set[str] = set()
+    for value in header_values:
+        if not value:
+            continue
+        for token in value.split():
+            token = token.strip()
+            if not token:
+                continue
+            ids.add(token)
+            ids.add(token.strip("<>"))
+    return ids
 
 
 class EmailHistoryService:
@@ -69,6 +88,105 @@ class EmailHistoryService:
     # Reply syncing
     # ------------------------------------------------------------------
 
+    async def _is_outreach_reply(
+        self,
+        db: AsyncSession,
+        from_email: str,
+        thread_id: Optional[str],
+        in_reply_to: Optional[str],
+        references: Optional[str],
+    ) -> bool:
+        """Decide whether an inbound message is a reply to *our* outreach.
+
+        The Dialtone inbox exists to surface prospect replies, not the whole
+        Gmail inbox (newsletters, Kaggle digests, receipts). A message counts as
+        an outreach reply if ANY of these hold — cheapest / strongest first:
+
+        1. **Thread match** — it sits in a Gmail thread we started (an EmailSend
+           or an enrollment carries that ``gmail_thread_id``). Replies stay in
+           the same thread, so this catches essentially every genuine reply.
+        2. **Header match** — its ``In-Reply-To`` / ``References`` name a
+           message id we recorded when sending (best-effort: covers SMTP sends
+           whose RFC Message-ID we stored).
+        3. **Known outreach contact** — it's *from* an address we've actually
+           emailed (a manual EmailSend, or a contact we enrolled — sequence
+           sends land on OutreachEvent, not EmailSend, so the enrollment join is
+           what catches those). This catches replies that broke threading.
+
+        Anything else is inbox noise and is skipped (no EmailReply row created).
+        """
+        # 1. Thread match.
+        if thread_id:
+            hit = (
+                await db.execute(
+                    select(EmailSend.id)
+                    .where(EmailSend.gmail_thread_id == thread_id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if hit is not None:
+                return True
+            hit = (
+                await db.execute(
+                    select(OutreachEnrollment.id)
+                    .where(OutreachEnrollment.gmail_thread_id == thread_id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if hit is not None:
+                return True
+
+        # 2. In-Reply-To / References header match against stored sent-message ids.
+        ref_ids = _parse_message_ids(in_reply_to, references)
+        if ref_ids:
+            hit = (
+                await db.execute(
+                    select(EmailSend.id)
+                    .where(
+                        or_(
+                            EmailSend.gmail_message_id.in_(ref_ids),
+                            EmailSend.provider_message_id.in_(ref_ids),
+                        )
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if hit is not None:
+                return True
+            hit = (
+                await db.execute(
+                    select(OutreachEnrollment.id)
+                    .where(OutreachEnrollment.gmail_message_id.in_(ref_ids))
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if hit is not None:
+                return True
+
+        # 3. Sender is a known outreach contact (we've emailed them).
+        if from_email:
+            hit = (
+                await db.execute(
+                    select(EmailSend.id)
+                    .where(func.lower(EmailSend.to_email) == from_email)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if hit is not None:
+                return True
+            hit = (
+                await db.execute(
+                    select(OutreachEnrollment.id)
+                    .join(Contact, Contact.id == OutreachEnrollment.contact_id)
+                    .where(func.lower(Contact.email) == from_email)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if hit is not None:
+                return True
+
+        return False
+
     async def sync_replies_for_account(
         self, db: AsyncSession, account: GmailAccount
     ) -> dict:
@@ -76,11 +194,15 @@ class EmailHistoryService:
 
         Queries Gmail for messages received in the last 24 hours that are not
         from the account owner.  For each message, if the gmail_message_id is
-        not already in email_replies, creates a new EmailReply record and
-        attempts to match the sender to a known contact.
+        not already in email_replies AND the message is a reply to our outreach
+        (see ``_is_outreach_reply``), creates a new EmailReply record and
+        attempts to match the sender to a known contact. Inbox noise that isn't
+        a reply to outreach (newsletters, receipts, digests) is skipped so the
+        Dialtone inbox stays a prospect-reply surface, not a mail mirror.
         """
         synced = 0
         errors = 0
+        skipped = 0
 
         try:
             service = self._build_gmail_service(account)
@@ -138,6 +260,20 @@ class EmailHistoryService:
                     if from_email in connected_emails:
                         continue
 
+                    gmail_thread_id = msg.get("threadId")
+
+                    # Gate: only genuine replies to our outreach reach the inbox.
+                    # Everything else (newsletters, Kaggle, receipts) is noise.
+                    if not await self._is_outreach_reply(
+                        db,
+                        from_email,
+                        gmail_thread_id,
+                        headers.get("in-reply-to"),
+                        headers.get("references"),
+                    ):
+                        skipped += 1
+                        continue
+
                     if "<" in to_email and ">" in to_email:
                         to_email = to_email.split("<")[1].split(">")[0].strip()
                     to_email = to_email.strip().lower()
@@ -154,8 +290,6 @@ class EmailHistoryService:
                         )
                     else:
                         received_at = datetime.now(timezone.utc)
-
-                    gmail_thread_id = msg.get("threadId")
 
                     # Match to a contact by email
                     contact = (
@@ -217,7 +351,12 @@ class EmailHistoryService:
             logger.error("Gmail sync error for %s: %s", account.email, str(e))
             errors += 1
 
-        return {"synced": synced, "errors": errors, "account": account.email}
+        return {
+            "synced": synced,
+            "errors": errors,
+            "skipped": skipped,
+            "account": account.email,
+        }
 
     async def sync_all_accounts(self, db: AsyncSession, user_id=None) -> dict:
         """Sync replies for all active, connected Gmail accounts.
@@ -232,6 +371,7 @@ class EmailHistoryService:
 
         total_synced = 0
         total_errors = 0
+        total_skipped = 0
 
         deactivated = 0
 
@@ -240,6 +380,7 @@ class EmailHistoryService:
                 r = await self.sync_replies_for_account(db, account)
                 total_synced += r["synced"]
                 total_errors += r["errors"]
+                total_skipped += r.get("skipped", 0)
             except RefreshError as e:
                 # Self-heal: the OAuth refresh token has been revoked
                 # (invalid_grant), so this account can never sync again until
@@ -263,6 +404,7 @@ class EmailHistoryService:
         return {
             "synced": total_synced,
             "errors": total_errors,
+            "skipped": total_skipped,
             "deactivated": deactivated,
         }
 

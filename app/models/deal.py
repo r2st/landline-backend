@@ -29,6 +29,26 @@ class Deal(Base):
     company_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=False
     )
+    # --- Sequence attribution (which outreach produced this deal) ---
+    # The enrollment that first brought this company into the pipeline. Set at
+    # deal-create time by tracing the company's contacts back to their earliest
+    # enrollment (see deals.create_deal), or passed in explicitly. SET NULL on
+    # enrollment delete so the deal — and its revenue — survives, it just loses
+    # the finer-grained link. ``source_sequence_id`` is denormalized alongside so
+    # attribution rollups don't have to join through enrollments (and so the
+    # credited sequence is stable even if the enrollment is later pruned).
+    source_enrollment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("outreach_enrollments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_sequence_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("outreach_sequences.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     value: Mapped[float | None] = mapped_column(Numeric(14, 2))
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
