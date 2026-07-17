@@ -291,18 +291,24 @@ class Settings(BaseSettings):
     # timing, rewrite content, switch channel, or skip a step before each send.
     # Falls back to sending the static step verbatim on any failure.
     sequence_optimizer_enabled: bool = True
-    # AI-composed first touches: ground step 1 in the company's research brief
+    # AI-composed outreach: ground the copy in the company's research brief
     # instead of sending static mail-merge. Always falls back to the static
     # template on any failure, so this can be turned off at any time without
     # stalling outreach.
     ai_compose_enabled: bool = True
-    # Compose every step, not just the first touch. Off by default: later steps
-    # already get the optimizer's rewrite, and step 1 is where the static
-    # template hurts most (the optimizer needs engagement history it lacks).
-    ai_compose_all_steps: bool = False
-    # How many AI-composed emails per sequence go to a human before that sequence
-    # is trusted to send them unattended. Cold outreach is irreversible and
-    # charged against the sending domain, so the first batch gets read.
+    # Compose every step, not just the first touch. On: the sequence's ``tone``
+    # only shapes copy the copywriter writes, so with this off a sequence spoke
+    # in its own voice for one email and in the static templates' voice for the
+    # other three. Each step writes under its own prompt hint (see
+    # ``ai_compose.STEP_TEMPLATE_TYPES``) so the arc survives — a follow-up is
+    # still written as a follow-up, not as a second first touch. The optimizer
+    # still rewrites off engagement history afterwards.
+    ai_compose_all_steps: bool = True
+    # How many AI-composed emails per sequence *step* go to a human before that
+    # step is trusted to send them unattended. Cold outreach is irreversible and
+    # charged against the sending domain, so the first batch gets read. Counted
+    # per step, not per sequence: a quota the first touch can exhaust on its own
+    # would let every follow-up the model has ever written send unread.
     ai_compose_review_batch_size: int = 10
     # 1.4 AI Company Research Agent: auto-trigger a research brief when a company
     # is created / before first outreach.

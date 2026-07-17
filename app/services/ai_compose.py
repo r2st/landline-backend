@@ -1,4 +1,4 @@
-"""AI composition for sequence first touches, with a human review gate.
+"""AI composition for sequence emails, with a human review gate.
 
 Connects three things that already existed but were never joined up:
 
@@ -17,12 +17,18 @@ Design constraints, in the order they matter:
    mirrors ``sequence_optimizer``'s fail-safe contract. AI composition is an
    improvement on the copy, never a dependency of the sequence.
 2. **Review before autonomy.** The first ``ai_compose_review_batch_size`` AI
-   emails per sequence are queued for a human instead of sent. Cold outreach is
-   irreversible and reputation-linked; an LLM writing something off-key at
-   volume costs the sending domain, not just the campaign.
-3. **First touch only, by default.** Step 1 is where the static template hurts
-   most and where the optimizer cannot help (it rewrites off engagement history,
-   and step 1 has none). Later steps already have the optimizer.
+   emails per sequence *step* are queued for a human instead of sent. Cold
+   outreach is irreversible and reputation-linked; an LLM writing something
+   off-key at volume costs the sending domain, not just the campaign.
+3. **Every step writes as itself.** Composition covers the whole sequence
+   (``ai_compose_all_steps``), because ``outreach_sequences.tone`` only shapes
+   copy this module generates: with step 1 composed and steps 2-4 rendered from
+   Jinja, a sequence spoke in its chosen voice for one email and in the static
+   templates' voice for the rest. But a step is not interchangeable with any
+   other — step 4 is a breakup, step 2 is the cost argument — so each one is
+   composed under its own prompt hint (``STEP_TEMPLATE_TYPES``) rather than all
+   of them under "first_touch", which would introduce the sender four times to
+   someone who has already heard from them three times.
 
 The spam-word scan is applied to generated copy before it is ever proposed:
 ``deliverability_optimizer.scan_content`` existed but only ran on demand from a
@@ -52,6 +58,46 @@ logger = logging.getLogger(__name__)
 # static templates are human-written and already trusted, so falling back costs
 # only personalization.
 MAX_SPAM_SCORE = 50.0
+
+# Which prompt hint each step writes under — keys of
+# ``ai_email_generator.TEMPLATE_HINTS``, pinned by ``test_ai_compose``.
+#
+# Composition used to be step 1 only, so the ``template_type="first_touch"`` it
+# passed was a constant and correct by construction. Extending composition to
+# the rest of the sequence makes it a lie for three emails out of four: a step-4
+# breakup composed as a first touch opens by introducing a stranger who has
+# already written three times, and drops the pilot offer the step exists for.
+#
+# The mapping follows the arc every seeded sequence is built on (see
+# ``outreach_templates``: personal stakes -> the real cost of scrap ->
+# tribal-knowledge loss -> breakup + free pilot). Step 1 keeps "first_touch"
+# rather than the arc's "pain_point": that copy is already live and reviewed,
+# and this change is about the steps that had no voice, not about relitigating
+# the one that did.
+STEP_TEMPLATE_TYPES: dict[int, str] = {
+    1: "first_touch",
+    2: "scrap_math",
+    3: "follow_up_2",
+    4: "free_pilot",
+}
+
+# Steps past the seeded arc's fourth. "follow_up_2" is the deliberate choice for
+# an unknown position: it is the one hint that asks for a *new angle* without
+# assuming what came before, and it forbids customer stories outright. The
+# alternative, "follow_up_3", is a breakup — wrong for any step that has more
+# emails after it, and unrecoverable, since the recipient has been told goodbye.
+LATER_STEP_TEMPLATE_TYPE = "follow_up_2"
+
+
+def template_type_for(step_number: int) -> str:
+    """The prompt hint step ``step_number`` writes under.
+
+    Total: an out-of-range or malformed step number degrades to a generic
+    follow-up rather than raising. Composition is fail-safe end to end, and the
+    one thing that must never happen is a step number the map has no opinion
+    about turning into a dropped touch.
+    """
+    return STEP_TEMPLATE_TYPES.get(step_number, LATER_STEP_TEMPLATE_TYPE)
 
 
 class ComposeResult:
@@ -91,16 +137,27 @@ class ComposeResult:
         return f"<ComposeResult {self.action} ai={self.ai_generated} ({self.reason})>"
 
 
-async def _reviewed_count(db: AsyncSession, sequence_id) -> int:
-    """AI drafts already raised for this sequence.
+async def _reviewed_count(db: AsyncSession, sequence_id, step_number: int) -> int:
+    """AI drafts already raised for this sequence *and step*.
 
     Counts every draft ever created, not just pending ones: the quota is "the
-    first N this sequence produced got human eyes", so approving them must not
+    first N this step produced got human eyes", so approving them must not
     re-open the gate and send the next N unreviewed.
+
+    Per step, not per sequence. The quota is a sample of what the model writes
+    here, and each step asks it for a different email under a different hint —
+    a step-4 breakup shares nothing with a step-1 intro but the sequence id.
+    Counting per sequence, once composition covers every step, means the first
+    touch alone exhausts the quota (it runs on every enrollment, and it runs
+    first), and every follow-up the model has ever written then sends with no
+    human having read one — the exact autonomy this gate exists to withhold.
     """
     return (
         await db.execute(
-            select(func.count(AiEmailDraft.id)).where(AiEmailDraft.sequence_id == sequence_id)
+            select(func.count(AiEmailDraft.id)).where(
+                AiEmailDraft.sequence_id == sequence_id,
+                AiEmailDraft.step_number == step_number,
+            )
         )
     ).scalar() or 0
 
@@ -201,6 +258,8 @@ async def compose_step(
     if not settings.anthropic_api_key:
         return static.because("no API key")
 
+    template_type = template_type_for(step.step_number)
+
     # Honour any decision already made about this step. This must come before
     # generating anything: a reviewer's verdict is terminal for the step, and
     # re-composing would either loop a rejected step through review forever or
@@ -250,7 +309,7 @@ async def compose_step(
         from app.services.ai_email_generator import generate_email
 
         generated = await generate_email(
-            lead_data, template_type="first_touch", research_context=research_context,
+            lead_data, template_type=template_type, research_context=research_context,
             tone=tone,
         )
     except Exception as exc:
@@ -270,8 +329,8 @@ async def compose_step(
     if not await _scan_is_safe(db, subject, body):
         return static.because("AI copy failed the spam scan")
 
-    # Review gate: the first N per sequence go to a human.
-    already = await _reviewed_count(db, enrollment.sequence_id)
+    # Review gate: the first N per sequence step go to a human.
+    already = await _reviewed_count(db, enrollment.sequence_id, step.step_number)
     if already < settings.ai_compose_review_batch_size:
         draft = AiEmailDraft(
             enrollment_id=enrollment.id,
@@ -290,8 +349,8 @@ async def compose_step(
         db.add(draft)
         await db.flush()
         logger.info(
-            "AI draft %s queued for review (%d/%d for this sequence)",
-            draft.id, already + 1, settings.ai_compose_review_batch_size,
+            "AI draft %s queued for review (%d/%d for step %d of this sequence)",
+            draft.id, already + 1, settings.ai_compose_review_batch_size, step.step_number,
         )
         return ComposeResult(
             "review", subject, body,
@@ -303,5 +362,5 @@ async def compose_step(
     return ComposeResult(
         "send", subject, body,
         ai_generated=True, research_used=bool(research_context),
-        reason="AI-composed (sequence past its review quota)",
+        reason=f"AI-composed as {template_type} (step past its review quota)",
     )

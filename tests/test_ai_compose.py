@@ -179,9 +179,15 @@ async def test_spammy_copy_is_rejected_for_static(
 
 
 @pytest.mark.asyncio
-async def test_later_steps_are_left_to_the_optimizer(
+async def test_later_steps_are_left_to_the_optimizer_when_all_steps_is_off(
     db_session, sample_company, sample_contact, ai_on, monkeypatch
 ):
+    """``ai_compose_all_steps`` off still means step 1 only.
+
+    The flag ships on, but it is the off-switch for the whole feature's blast
+    radius, so the path it selects has to keep working.
+    """
+    monkeypatch.setattr(ai_on, "ai_compose_all_steps", False)
     _patch_generator(monkeypatch, AI_REPLY)
     _, step, enr = await _setup(db_session, sample_company, sample_contact, step_number=3)
 
@@ -191,6 +197,110 @@ async def test_later_steps_are_left_to_the_optimizer(
     assert result.action == "send"
     assert result.subject == STATIC_SUBJECT
     assert "first touch" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# Every step writes as itself
+# ---------------------------------------------------------------------------
+
+def test_all_steps_composition_is_on_by_default():
+    """The whole sequence speaks in the sequence's voice, not just step 1.
+
+    Pinned as a default rather than left to the env: with this off, ``tone`` is
+    a column that shapes one email in four and silently does nothing to the
+    other three.
+    """
+    from app.config import Settings
+
+    assert Settings.model_fields["ai_compose_all_steps"].default is True
+
+
+def test_every_step_template_type_is_a_real_prompt_hint():
+    """The map and the copywriter's hints cannot drift apart.
+
+    A key ``TEMPLATE_HINTS`` lacks doesn't raise — ``generate_email`` silently
+    falls back to the first_touch hint — so a typo here would quietly reintroduce
+    the exact bug this map exists to fix, with nothing in the logs to say so.
+    """
+    from app.services.ai_compose import LATER_STEP_TEMPLATE_TYPE, STEP_TEMPLATE_TYPES
+    from app.services.ai_email_generator import TEMPLATE_HINTS
+
+    for step_number, template_type in STEP_TEMPLATE_TYPES.items():
+        assert template_type in TEMPLATE_HINTS, f"step {step_number} -> unknown hint {template_type!r}"
+    assert LATER_STEP_TEMPLATE_TYPE in TEMPLATE_HINTS
+
+
+@pytest.mark.parametrize(
+    "step_number, expected",
+    [(1, "first_touch"), (2, "scrap_math"), (3, "follow_up_2"), (4, "free_pilot")],
+)
+@pytest.mark.asyncio
+async def test_each_step_is_composed_under_its_own_hint(
+    db_session, sample_company, sample_contact, ai_on, monkeypatch, step_number, expected
+):
+    """The sequence arc survives composition: stakes -> cost -> pattern -> pilot."""
+    monkeypatch.setattr(ai_on, "ai_compose_all_steps", True)
+    calls = _patch_generator(monkeypatch, AI_REPLY)
+    _, step, enr = await _setup(
+        db_session, sample_company, sample_contact, step_number=step_number
+    )
+
+    await compose_step(
+        db_session, enr, sample_contact, sample_company, step, STATIC_SUBJECT, STATIC_BODY
+    )
+    assert calls["template_type"] == expected
+
+
+@pytest.mark.parametrize("step_number", [2, 3, 4])
+@pytest.mark.asyncio
+async def test_a_follow_up_is_never_composed_as_a_first_touch(
+    db_session, sample_company, sample_contact, ai_on, monkeypatch, step_number
+):
+    """The regression that turning the flag on would otherwise have shipped.
+
+    ``compose_step`` passed a hardcoded "first_touch" because it only ever ran on
+    step 1. Enabling every step without this map means each follow-up opens by
+    introducing a stranger the recipient has already heard from — and step 4
+    drops the pilot offer it exists to make.
+    """
+    monkeypatch.setattr(ai_on, "ai_compose_all_steps", True)
+    calls = _patch_generator(monkeypatch, AI_REPLY)
+    _, step, enr = await _setup(
+        db_session, sample_company, sample_contact, step_number=step_number
+    )
+
+    await compose_step(
+        db_session, enr, sample_contact, sample_company, step, STATIC_SUBJECT, STATIC_BODY
+    )
+    assert calls["template_type"] != "first_touch"
+
+
+def test_a_step_past_the_arc_degrades_to_a_generic_follow_up():
+    """A longer sequence than the seeded four must not break, or say goodbye early."""
+    from app.services.ai_compose import template_type_for
+
+    assert template_type_for(7) == "follow_up_2"
+    assert template_type_for(0) == "follow_up_2"
+    # Never the breakup: a step with emails after it cannot un-say goodbye.
+    assert template_type_for(9) != "follow_up_3"
+
+
+@pytest.mark.parametrize("step_number", [1, 2, 3, 4])
+@pytest.mark.asyncio
+async def test_tone_reaches_every_step_not_just_the_first(
+    db_session, sample_company, sample_contact, ai_on, monkeypatch, step_number
+):
+    """The point of the change: one voice across the whole sequence."""
+    monkeypatch.setattr(ai_on, "ai_compose_all_steps", True)
+    calls = _patch_generator(monkeypatch, AI_REPLY)
+    _, step, enr = await _setup(
+        db_session, sample_company, sample_contact, step_number=step_number, tone="empathetic"
+    )
+
+    await compose_step(
+        db_session, enr, sample_contact, sample_company, step, STATIC_SUBJECT, STATIC_BODY
+    )
+    assert calls["tone"] == "empathetic"
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +413,49 @@ async def test_sends_unattended_once_quota_is_cleared(
         select(AiEmailDraft).where(AiEmailDraft.enrollment_id == enr2.id)
     )).scalars().all()
     assert drafts == []
+
+
+@pytest.mark.asyncio
+async def test_quota_is_counted_per_step_not_per_sequence(
+    db_session, sample_company, sample_contact, ai_on, monkeypatch
+):
+    """A step-1 quota must not buy autonomy for step 2.
+
+    Step 1 runs on every enrollment and it runs first, so a per-sequence quota is
+    one the first touch always exhausts alone. Composition now covers every step,
+    and each writes a different email under a different hint — so without this,
+    the model's follow-ups would send from the very first one with no human
+    having ever read one.
+    """
+    monkeypatch.setattr(ai_on, "ai_compose_all_steps", True)
+    _patch_generator(monkeypatch, AI_REPLY)
+    seq, _, enr = await _setup(db_session, sample_company, sample_contact)
+
+    # Quota (2 here) fully consumed by step 1.
+    for _ in range(2):
+        db_session.add(
+            AiEmailDraft(
+                id=uuid.uuid4(), enrollment_id=enr.id, sequence_id=seq.id,
+                step_number=1, subject="s", body="b", status="approved",
+                ai_generated=True,
+            )
+        )
+    step2 = SequenceStep(
+        id=uuid.uuid4(), sequence_id=seq.id, step_number=2, delay_days=3,
+        subject_template=STATIC_SUBJECT, body_template=STATIC_BODY,
+    )
+    enr2 = OutreachEnrollment(
+        id=uuid.uuid4(), contact_id=sample_contact.id, sequence_id=seq.id,
+        current_step=2, status="active",
+    )
+    db_session.add_all([step2, enr2])
+    await db_session.flush()
+
+    result = await compose_step(
+        db_session, enr2, sample_contact, sample_company, step2, STATIC_SUBJECT, STATIC_BODY
+    )
+    assert result.action == "review", "step 2's first AI copy sent without a human reading it"
+    assert result.draft_id is not None
 
 
 @pytest.mark.asyncio

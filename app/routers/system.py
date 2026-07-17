@@ -141,14 +141,18 @@ async def automation_settings():
         ),
         AutomationFlag(
             key="ai_compose",
-            label="AI-composed first touches",
+            label="AI-composed outreach",
             enabled=settings.ai_compose_enabled,
             source="env",
             detail=(
                 (
-                    f"First {settings.ai_compose_review_batch_size} per sequence go to human "
-                    "review; "
-                    + ("every step is composed." if settings.ai_compose_all_steps else "step 1 only.")
+                    f"First {settings.ai_compose_review_batch_size} per sequence step go to "
+                    "human review; "
+                    + (
+                        "every step is composed in the sequence's tone."
+                        if settings.ai_compose_all_steps
+                        else "step 1 only — steps 2+ send their static templates."
+                    )
                 )
                 if settings.ai_compose_enabled
                 else "Sequences send their static templates."
