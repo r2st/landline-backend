@@ -219,40 +219,50 @@ class SendTimeOptimizer:
     def build_profile_fields(
         self, events: Iterable, tz: str
     ) -> dict:
-        """Bucket a contact's send/open events into a local (dow, hour) grid.
+        """Bucket a contact's send/open/reply events into a local (dow, hour) grid.
 
         ``events`` is any iterable of objects with ``event_type`` and
-        ``occurred_at``. ``sent`` events are bucketed by send time, ``opened`` /
-        ``clicked`` by engagement time — the latter is what "when are they
-        active" means. Returns the profile fields ready to persist.
+        ``occurred_at``. ``sent`` events are bucketed by send time; ``opened`` /
+        ``clicked`` / ``replied`` by engagement time — when they were active. A
+        reply is the strongest signal that a recipient is engaged at a given local
+        time, so the peak (dow, hour) is chosen by a weighted engagement score
+        (``opens + reply_weight * replies``) while ``opens_total`` stays a raw
+        count of positive-engagement events (opens + clicks + replies) that drives
+        the min-opens trust threshold. Returns the profile fields ready to persist.
         """
         try:
             zone = ZoneInfo(tz)
         except (ZoneInfoNotFoundError, ValueError, OSError):
             zone = ZoneInfo(DEFAULT_TZ)
 
+        reply_weight = max(1, self.settings.smart_timing_reply_weight)
         buckets: dict[str, dict[str, int]] = {}
         opens_total = 0
         for ev in events:
             et = getattr(ev, "event_type", None)
             occurred = _aware(getattr(ev, "occurred_at", None))
-            if occurred is None or et not in ("sent", "opened", "clicked"):
+            if occurred is None or et not in ("sent", "opened", "clicked", "replied"):
                 continue
             local = occurred.astimezone(zone)
             key = f"{dow_sunday0(local)}_{local.hour}"
-            slot = buckets.setdefault(key, {"sends": 0, "opens": 0})
+            slot = buckets.setdefault(key, {"sends": 0, "opens": 0, "replies": 0})
             if et == "sent":
                 slot["sends"] += 1
+            elif et == "replied":
+                slot["replies"] += 1
+                opens_total += 1
             else:  # opened / clicked
                 slot["opens"] += 1
                 opens_total += 1
 
         best_dow: Optional[int] = None
         best_hour: Optional[int] = None
-        best_opens = 0
+        best_score = 0
         for key, slot in buckets.items():
-            if slot["opens"] > best_opens:
-                best_opens = slot["opens"]
+            # A reply outweighs a mere open when locating the peak engagement hour.
+            score = slot["opens"] + reply_weight * slot.get("replies", 0)
+            if score > best_score:
+                best_score = score
                 d, h = key.split("_")
                 best_dow, best_hour = int(d), int(h)
 

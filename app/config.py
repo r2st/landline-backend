@@ -456,6 +456,11 @@ class Settings(BaseSettings):
     smart_timing_default_hour_end: int = 11            # exclusive
     # Width (hours) of the window built around a recipient's personal best hour.
     smart_timing_personal_window_hours: int = 2
+    # How many opens one reply is worth when picking a recipient's best (dow, hour)
+    # bucket. A reply is a far stronger "they were engaged at this local time"
+    # signal than an open, so it dominates the peak selection. Raw event counts
+    # (not this weight) still drive the smart_timing_min_opens trust threshold.
+    smart_timing_reply_weight: int = 3
     # Fraction of newly-scheduled enrollments assigned to the 'optimized' arm; the
     # rest are 'control' (naive timing) so the lift can be measured. 0.5 = even.
     smart_timing_optimized_fraction: float = 0.5

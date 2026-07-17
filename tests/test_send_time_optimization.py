@@ -311,6 +311,48 @@ async def test_build_profile_fields_no_opens_zero_confidence():
     assert fields["confidence"] == 0.0
 
 
+@pytest.mark.asyncio
+async def test_build_profile_fields_reply_outweighs_opens():
+    """A single reply beats more opens at another hour: replies are the strongest
+    engagement signal for locating a recipient's best send time."""
+    opt = SendTimeOptimizer()
+    tue_1400 = _next_weekday(1, 14)   # Tue 14:00 UTC → 10:00 EDT
+    wed_1500 = _next_weekday(2, 15)   # Wed 15:00 UTC → 11:00 EDT
+    events = [
+        _Ev("opened", tue_1400),
+        _Ev("opened", tue_1400 + timedelta(days=7)),  # 2 opens in the Tue 10 bucket
+        _Ev("replied", wed_1500),                     # 1 reply in the Wed 11 bucket
+    ]
+    fields = opt.build_profile_fields(events, "America/New_York")
+    # reply_weight (default 3): Wed score 3 beats Tue score 2.
+    wed_local = wed_1500.astimezone(ZoneInfo("America/New_York"))
+    assert fields["best_hour"] == 11
+    assert fields["best_dow"] == dow_sunday0(wed_local)
+    # Replies count toward the raw engagement total alongside opens/clicks.
+    assert fields["opens_total"] == 3  # 2 opens + 1 reply
+    # The reply is bucketed and observable.
+    wed_key = f"{dow_sunday0(wed_local)}_11"
+    assert fields["buckets"][wed_key]["replies"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_profile_fields_reply_reaches_trust_threshold():
+    """Replies raise opens_total so a reply-active contact clears the min-opens
+    trust threshold and gets a personal (not default) window."""
+    opt = SendTimeOptimizer()
+    wed_1500 = _next_weekday(2, 15)  # Wed 15:00 UTC → 11:00 EDT
+    events = [_Ev("replied", wed_1500 + timedelta(days=7 * i)) for i in range(3)]
+    fields = opt.build_profile_fields(events, "America/New_York")
+    assert fields["opens_total"] == 3  # 3 replies
+    window = opt.compute_optimal_window(
+        tz="America/New_York",
+        best_dow=fields["best_dow"],
+        best_hour=fields["best_hour"],
+        opens_total=fields["opens_total"],
+    )
+    assert window["source"] == "personal"
+
+
 # ─── should_defer scheduling gate (DB) ───────────────────────────────────────
 
 

@@ -10,10 +10,11 @@ per-recipient send time.
   window; this profile stores the richer bucket data and the resolution source
   for debuggability.
 * ``buckets`` — counts per (day-of-week, hour) bucket in the recipient's LOCAL
-  time, e.g. ``{"2_10": {"sends": 3, "opens": 2}, ...}`` where the key is
-  ``"<dow>_<hour>"`` and ``dow`` is 0=Sunday..6=Saturday (matching
+  time, e.g. ``{"2_10": {"sends": 3, "opens": 2, "replies": 1}, ...}`` where the
+  key is ``"<dow>_<hour>"`` and ``dow`` is 0=Sunday..6=Saturday (matching
   ``send_timing``'s day indexing).
-* ``best_dow`` / ``best_hour`` — the recipient's peak local open bucket.
+* ``best_dow`` / ``best_hour`` — the recipient's peak local engagement bucket,
+  chosen by a reply-weighted score (a reply outweighs an open).
 * ``confidence`` — 0..1, how much personal signal backs the window (rises with
   ``opens_total``); a thin profile blends toward the cohort/best-practice default.
 
