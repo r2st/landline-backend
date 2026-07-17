@@ -11,6 +11,8 @@ dispatches the per-category auto-action:
 * ``out_of_office``  → re-queue the next step until the return date (or +7d).
 * ``wrong_person``   → mark the contact for list cleanup + stash any referral.
 * ``unsubscribe``    → suppress the contact everywhere + write a consent record.
+* ``bounce``         → record the failed recipient in the bounce pipeline (hard
+  bounce → suppressed), so a DSN that lands as a reply is handled like any other.
 * ``unknown``        → no auto-action (surfaced for manual review).
 
 The heavy lifting lives in plain ``async`` helpers so it is unit-testable
@@ -30,7 +32,9 @@ from app.models.company import Company
 from app.models.consent import ConsentRecord
 from app.models.contact import Contact
 from app.models.email_reply import EmailReply
+from app.models.email_template import EmailSend
 from app.models.outreach import OutreachEnrollment
+from app.services import bounce_handler
 from app.services.ai_service import get_ai_service
 from app.services.notifications import get_notification_service
 from app.tasks.celery_app import celery_app
@@ -215,6 +219,40 @@ async def route_auto_action(
         }
         return "requeued"
 
+    if effective_category == "bounce":
+        # A delivery-failure notice for a dead address. Route it into the shared
+        # bounce pipeline so the *failed recipient* (not the mail daemon that
+        # sent the DSN) is recorded and suppressed on a hard bounce. The address
+        # to suppress is the contact we resolved, else the original send's
+        # recipient — never ``reply.from_email`` (that's mailer-daemon@…).
+        target_email = contact.email if contact is not None else None
+        if not target_email and reply.email_send_id is not None:
+            send = (
+                await db.execute(
+                    select(EmailSend).where(EmailSend.id == reply.email_send_id)
+                )
+            ).scalars().first()
+            if send is not None:
+                target_email = send.to_email
+        if not target_email:
+            # Couldn't tie the bounce to a recipient — surface for manual review
+            # rather than guess.
+            return "none"
+        summary = await bounce_handler.record_bounce(
+            db,
+            target_email,
+            diagnostic=f"{reply.subject or ''} {(reply.body_text or reply.snippet or '')[:500]}",
+        )
+        reply.classification_meta = {
+            **(reply.classification_meta or {}),
+            "bounce": {
+                "recipient": target_email,
+                "kind": summary.get("kind"),
+                "suppressed": summary.get("suppressed"),
+            },
+        }
+        return "bounced"
+
     if effective_category == "not_interested":
         # Remove from active sequences (complete), no notification.
         enrollments = await _enrollments_for_contact(db, reply.contact_id)
@@ -287,6 +325,7 @@ async def classify_reply_record(
         original_subject=reply.subject or "",
         contact_name=contact_name,
         company_name=company_name,
+        from_email=reply.from_email,
     )
 
     raw_category = result.get("category", "unknown")

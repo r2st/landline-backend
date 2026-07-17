@@ -34,6 +34,7 @@ REPLY_CATEGORIES = (
     "out_of_office",
     "wrong_person",
     "unsubscribe",
+    "bounce",
     "unknown",
 )
 
@@ -59,6 +60,53 @@ _UNSUBSCRIBE_PATTERNS = [
         r"\bdon'?t (?:email|contact) me\b",
     )
 ]
+
+# Delivery-status / bounce markers. A bounce is machine-generated and, unlike a
+# human reply, ECHOES OUR ORIGINAL EMAIL — including its unsubscribe footer — so
+# it MUST be detected before the unsubscribe pass or a dead address gets logged
+# as an opt-out. Detection is deliberately high-precision: the sender is a mail
+# daemon, or the subject is an unambiguous DSN subject.
+_BOUNCE_SENDER_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"mailer-daemon@",
+        r"postmaster@",
+        r"^mail delivery (?:subsystem|system)\b",
+        r"no-?reply@.*(?:mailer|postmaster)",
+    )
+]
+_BOUNCE_SUBJECT_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"delivery status notification",
+        r"undelivered mail returned to sender",
+        r"mail delivery fail(?:ed|ure)",
+        r"delivery (?:has )?failed",
+        r"returned mail",
+        r"\bfailure notice\b",
+        r"\bundeliverable\b",
+        r"delivery incomplete",
+        r"could not be delivered",
+    )
+]
+
+
+def is_bounce(
+    subject: Optional[str], body_text: Optional[str], from_email: Optional[str]
+) -> bool:
+    """True when a message is a delivery-status / bounce notification.
+
+    High precision: the sender is a mail daemon/postmaster, OR the subject is an
+    unambiguous DSN subject. Body text is deliberately NOT scanned for phrases
+    like "550" because a forwarded/quoted thread can contain them innocently.
+    """
+    sender = (from_email or "").strip()
+    if any(p.search(sender) for p in _BOUNCE_SENDER_PATTERNS):
+        return True
+    if subject and any(p.search(subject) for p in _BOUNCE_SUBJECT_PATTERNS):
+        return True
+    return False
+
 
 # Automated out-of-office / vacation autoresponder markers.
 _OOO_PATTERNS = [
@@ -86,15 +134,26 @@ _MONTHS = {
 }
 
 
-def keyword_prefilter(subject: Optional[str], body_text: Optional[str]) -> Optional[str]:
+def keyword_prefilter(
+    subject: Optional[str],
+    body_text: Optional[str],
+    from_email: Optional[str] = None,
+) -> Optional[str]:
     """Return a high-precision category from keywords alone, or ``None``.
 
-    Runs before any LLM call. Returns ``"unsubscribe"`` for explicit opt-out
-    language (which always wins), ``"out_of_office"`` for autoresponder markers,
-    or ``None`` when nothing matched (the caller then asks the LLM). Unsubscribe
-    is checked first so an OOO message that also says "unsubscribe" is treated as
-    the compliance-critical opt-out.
+    Runs before any LLM call. Returns ``"bounce"`` for delivery-status
+    notifications, ``"unsubscribe"`` for explicit opt-out language, or
+    ``"out_of_office"`` for autoresponder markers; ``None`` when nothing matched
+    (the caller then asks the LLM).
+
+    Order matters: **bounce is checked first**, because a DSN echoes our original
+    email — footer and all — so scanning it for "unsubscribe" would suppress a
+    dead address as if it had opted out. Unsubscribe is checked before OOO so an
+    autoreply that also says "unsubscribe" is treated as the compliance-critical
+    opt-out.
     """
+    if is_bounce(subject, body_text, from_email):
+        return "bounce"
     text = f"{subject or ''}\n{body_text or ''}"
     if any(p.search(text) for p in _UNSUBSCRIBE_PATTERNS):
         return "unsubscribe"
@@ -725,6 +784,7 @@ Auto-send: true ONLY for "interested" and "question". false for everything else.
         original_subject: str = "",
         contact_name: str = "",
         company_name: str = "",
+        from_email: Optional[str] = None,
     ) -> dict:
         """Classify an incoming reply into one routing category. Never raises.
 
@@ -737,7 +797,7 @@ Auto-send: true ONLY for "interested" and "question". false for everything else.
 
             {
               "category": "interested|not_interested|out_of_office|"
-                          "wrong_person|unsubscribe|unknown",
+                          "wrong_person|unsubscribe|bounce|unknown",
               "confidence": 0.0-1.0,
               "reason": "one-line justification",
               "return_date": "YYYY-MM-DD" | None,   # OOO only
@@ -751,7 +811,18 @@ Auto-send: true ONLY for "interested" and "question". false for everything else.
 
         # 1. Keyword pre-filter — high precision, no LLM, guarantees the
         #    compliance-critical categories survive an AI outage.
-        kw = keyword_prefilter(subject, body_text)
+        kw = keyword_prefilter(subject, body_text, from_email)
+        if kw == "bounce":
+            return {
+                "category": "bounce",
+                "confidence": 1.0,
+                "reason": "Delivery-status notification detected (mail daemon / DSN subject).",
+                "return_date": None,
+                "referral": {"name": None, "email": None},
+                "unsubscribe_explicit": False,
+                "source": "keyword",
+                "model": None,
+            }
         if kw == "unsubscribe":
             return {
                 "category": "unsubscribe",
@@ -785,12 +856,14 @@ CATEGORIES:
 - out_of_office: an automated out-of-office / vacation autoresponder (even if the body sounds positive).
 - wrong_person: the recipient is not the right contact ("I don't handle this", "try our CTO", "no longer with the company").
 - unsubscribe: an explicit opt-out request ("unsubscribe", "remove me", "take me off your list").
+- bounce: an automated delivery-failure / bounce notification from a mail server (mailer-daemon, "delivery status notification", "address not found", "user unknown"). NOT a human reply.
 - unknown: genuinely unclear.
 
 TIE-BREAKERS (apply in order):
-1. Explicit opt-out / unsubscribe language ALWAYS wins over not_interested.
-2. An autoresponder is ALWAYS out_of_office even if the wording sounds interested.
-3. If it points you to a different person/role, it is wrong_person (capture the referral).
+1. A mail-server delivery-failure notice is ALWAYS bounce, even if it quotes our original email (footer included).
+2. Explicit opt-out / unsubscribe language ALWAYS wins over not_interested.
+3. An autoresponder is ALWAYS out_of_office even if the wording sounds interested.
+4. If it points you to a different person/role, it is wrong_person (capture the referral).
 
 THE REPLY:
 Subject: {subject or ''}
@@ -802,7 +875,7 @@ Who they are: {contact_name or 'unknown'} at {company_name or 'unknown'}
 
 Return ONLY valid JSON:
 {{
-  "category": "interested|not_interested|out_of_office|wrong_person|unsubscribe|unknown",
+  "category": "interested|not_interested|out_of_office|wrong_person|unsubscribe|bounce|unknown",
   "confidence": 0.0,
   "reason": "one-line justification",
   "return_date": null,
