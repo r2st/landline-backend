@@ -290,6 +290,10 @@ async def _collect_events(
                 "step_number": event.step_number,
                 "event_type": event.event_type,
                 "error": meta.get("error"),
+                # The sent copy itself, when the send task recorded it. Lets the
+                # Console show *what* Dialtone sent, not just who/when.
+                "subject": meta.get("subject"),
+                "body_html": meta.get("body_html"),
             },
         ))
 

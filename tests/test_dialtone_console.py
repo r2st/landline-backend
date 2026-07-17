@@ -91,6 +91,12 @@ async def test_activity_includes_outreach_and_leads(
         step_number=2,
         event_type="sent",
         occurred_at=now - timedelta(hours=1),
+        event_metadata={
+            "status": "sent",
+            "to_email": sample_contact.email,
+            "subject": "Following up on your CNC line",
+            "body_html": "<p>Hi — quick question about your machining capacity.</p>",
+        },
     ))
 
     run = ProspectingRun(id=_uuid.uuid4(), status="completed")
@@ -118,6 +124,11 @@ async def test_activity_includes_outreach_and_leads(
         i for i in items if i["type"] == "email_sent" and i["source"] == "outreach"
     )
     assert outreach_sent["metadata"]["step_number"] == 2
+    # The sequence path has no EmailSend row, so the feed is the only place the
+    # sent copy is readable — surface the subject + body it recorded.
+    assert outreach_sent["description"] == "Following up on your CNC line"
+    assert outreach_sent["metadata"]["subject"] == "Following up on your CNC line"
+    assert "machining capacity" in outreach_sent["metadata"]["body_html"]
 
     lead = next(i for i in items if i["type"] == "lead_discovered")
     assert lead["metadata"]["company_name"] == "Discovered Widgets Inc"

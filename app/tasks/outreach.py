@@ -564,6 +564,11 @@ def send_sequence_step(self, enrollment_id: str):
                 from app.config import get_settings as _get_settings
                 from app.services.email_tracking import apply_tracking
 
+                # The human copy, before the open-pixel / link-wrapping is baked
+                # in. Stored on the event so the operator can read back exactly
+                # what Dialtone said, without the tracking artifacts.
+                human_body = body
+
                 tracking_applied = _get_settings().sequence_tracking_enabled
                 body = apply_tracking(
                     body, str(enrollment.id), enrollment.current_step,
@@ -589,7 +594,17 @@ def send_sequence_step(self, enrollment_id: str):
                     enrollment_id=enrollment.id,
                     step_number=enrollment.current_step,
                     event_type=event_type,
-                    event_metadata={**send_result, "tracked": bool(tracking_applied)},
+                    event_metadata={
+                        **send_result,
+                        "tracked": bool(tracking_applied),
+                        # Persist what actually went out. The sequence path has
+                        # no EmailSend row, so without this the sent copy lives
+                        # only in the sender's Gmail — the Console feed can show
+                        # who/when but never *what*. These make the send readable.
+                        "to_email": contact.email,
+                        "subject": subject,
+                        "body_html": human_body,
+                    },
                 )
                 db.add(event)
 
