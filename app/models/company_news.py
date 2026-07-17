@@ -7,9 +7,10 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class CompanyNews(Base):
+class CompanyNews(Base, OrgScopedMixin):
     __tablename__ = "company_news"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

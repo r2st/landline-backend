@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Canonical signal types. Kept as a plain tuple (not a DB enum) so new signal
 # categories can be added without a migration.
@@ -37,7 +38,7 @@ SIGNAL_TYPES = (
 )
 
 
-class IntentSignal(Base):
+class IntentSignal(Base, OrgScopedMixin):
     __tablename__ = "intent_signals"
 
     id: Mapped[uuid.UUID] = mapped_column(

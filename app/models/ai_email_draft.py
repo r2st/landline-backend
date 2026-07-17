@@ -25,11 +25,12 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 DRAFT_STATUSES = ("pending", "approved", "rejected", "sent", "failed")
 
 
-class AiEmailDraft(Base):
+class AiEmailDraft(Base, OrgScopedMixin):
     __tablename__ = "ai_email_drafts"
     __table_args__ = (
         CheckConstraint(

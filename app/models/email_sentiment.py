@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class EmailSentimentScore(Base):
+class EmailSentimentScore(Base, OrgScopedMixin):
     """Sentiment analysis result for an email reply.
 
     Stores both the overall sentiment score and granular emotion/intent
@@ -76,7 +77,7 @@ class EmailSentimentScore(Base):
         return f"<EmailSentimentScore score={self.sentiment_score} intent={self.intent}>"
 
 
-class ABTestExperiment(Base):
+class ABTestExperiment(Base, OrgScopedMixin):
     """A/B test experiment with statistical tracking.
 
     Goes beyond the basic ab_variant column on EmailSend to provide
@@ -123,7 +124,7 @@ class ABTestExperiment(Base):
         return f"<ABTestExperiment name={self.name} winner={self.winner}>"
 
 
-class EmailTestExchange(Base):
+class EmailTestExchange(Base, OrgScopedMixin):
     """Simulated email exchange for testing email content and sentiment analysis.
 
     Allows testing email sequences by simulating conversations with

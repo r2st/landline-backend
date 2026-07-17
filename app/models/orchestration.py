@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # The channels the orchestrator understands. Kept in code (not a DB enum) so the
 # escalation ladder and policy validation share one source of truth.
@@ -28,7 +29,7 @@ ORCHESTRATION_CHANNELS = ("email", "linkedin", "phone")
 DEFAULT_HUMAN_REVIEW_TRIGGERS = ("pricing_request", "complex_objection", "referral", "legal")
 
 
-class OrchestrationPolicy(Base):
+class OrchestrationPolicy(Base, OrgScopedMixin):
     __tablename__ = "orchestration_policies"
 
     id: Mapped[uuid.UUID] = mapped_column(

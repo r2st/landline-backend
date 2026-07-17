@@ -30,9 +30,10 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class ContactEngagementProfile(Base):
+class ContactEngagementProfile(Base, OrgScopedMixin):
     __tablename__ = "contact_engagement_profiles"
     __table_args__ = (
         UniqueConstraint("contact_id", name="uq_engagement_profile_contact"),

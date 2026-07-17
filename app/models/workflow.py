@@ -42,12 +42,13 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Terminal + in-flight run states.
 RUN_STATUSES = ("pending", "running", "completed", "failed", "skipped")
 
 
-class Workflow(Base):
+class Workflow(Base, OrgScopedMixin):
     """A user-defined event-triggered automation."""
 
     __tablename__ = "workflows"
@@ -55,9 +56,7 @@ class Workflow(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True
-    )
+    # org_id (NOT NULL FK → organizations) is provided by OrgScopedMixin.
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -92,7 +91,7 @@ class Workflow(Base):
         return f"<Workflow {self.name!r} on={self.trigger_event} active={self.is_active}>"
 
 
-class WorkflowRun(Base):
+class WorkflowRun(Base, OrgScopedMixin):
     """One execution of a workflow against a specific triggering event."""
 
     __tablename__ = "workflow_runs"
@@ -103,9 +102,7 @@ class WorkflowRun(Base):
     workflow_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("workflows.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    # org_id (NOT NULL FK → organizations) is provided by OrgScopedMixin.
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
     # The event payload that triggered this run.
     trigger_payload: Mapped[dict] = mapped_column(

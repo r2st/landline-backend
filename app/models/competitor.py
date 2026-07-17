@@ -18,11 +18,12 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 MENTION_SOURCES = ("email", "call", "news", "manual")
 
 
-class Competitor(Base):
+class Competitor(Base, OrgScopedMixin):
     __tablename__ = "competitors"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -62,7 +63,7 @@ class Competitor(Base):
         return f"<Competitor {self.name}>"
 
 
-class CompetitorMention(Base):
+class CompetitorMention(Base, OrgScopedMixin):
     __tablename__ = "competitor_mentions"
 
     id: Mapped[uuid.UUID] = mapped_column(

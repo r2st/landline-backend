@@ -27,6 +27,7 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Allowed variant labels (up to 4 variants per step).
 VARIANT_LABELS = ("A", "B", "C", "D")
@@ -38,7 +39,7 @@ AB_STATUSES = ("running", "insufficient_data", "completed")
 AB_METRICS = ("replied", "opened", "clicked")
 
 
-class AbTest(Base):
+class AbTest(Base, OrgScopedMixin):
     """One A/B test — one sequence step under test.
 
     Test-level config and state. Metrics are not stored here (computed from the
@@ -90,7 +91,7 @@ class AbTest(Base):
         return f"<AbTest step={self.sequence_step_id} status={self.status}>"
 
 
-class AbTestVariant(Base):
+class AbTestVariant(Base, OrgScopedMixin):
     """A single copy variant for a sequence step.
 
     ``subject_template`` / ``body_template`` override the step's templates; a
@@ -129,7 +130,7 @@ class AbTestVariant(Base):
         return f"<AbTestVariant step={self.sequence_step_id} label={self.label}>"
 
 
-class AbTestAssignment(Base):
+class AbTestAssignment(Base, OrgScopedMixin):
     """Which variant an enrollment got at a step — written before the send.
 
     The ``(enrollment_id, sequence_step_id)`` unique constraint guarantees an

@@ -15,9 +15,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class IndustryContact(Base):
+class IndustryContact(Base, OrgScopedMixin):
     """A single decision-maker contact at a target manufacturing company.
 
     One company usually has several rows (one per contact), matching the
@@ -52,7 +53,7 @@ class IndustryContact(Base):
         return f"<IndustryContact {self.contact_name} @ {self.company_name}>"
 
 
-class KnowledgeDocument(Base):
+class KnowledgeDocument(Base, OrgScopedMixin):
     """An editable reference document (markdown), keyed by a stable slug.
 
     Holds the sales-psychology guidelines and contact-approach strategy that

@@ -17,9 +17,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class GmailAccount(Base):
+class GmailAccount(Base, OrgScopedMixin):
     """A Gmail account connected via OAuth that can send outreach email."""
 
     __tablename__ = "gmail_accounts"

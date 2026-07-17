@@ -15,12 +15,13 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Forward reference for type hints
 # from app.models.user import User  # imported lazily via string ref
 
 
-class FollowUp(Base):
+class FollowUp(Base, OrgScopedMixin):
     __tablename__ = "follow_ups"
     __table_args__ = (
         CheckConstraint(

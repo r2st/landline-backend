@@ -33,7 +33,7 @@ from app.models.conversation_analysis import ConversationAnalysis
 from app.models.deal_prediction import DealPrediction
 from app.models.rep_profile import RepProfile
 from app.models.suggestion_outcome import SuggestionOutcome
-from app.models.tenant import Tenant, TenantUsage
+from app.models.tenant import Organization, Tenant, TenantUsage
 from app.models.integration import Integration, WebhookSubscription, WebhookEvent
 from app.models.workflow import Workflow, WorkflowRun
 from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
@@ -96,6 +96,7 @@ __all__ = [
     "DealPrediction",
     "RepProfile",
     "SuggestionOutcome",
+    "Organization",
     "Tenant",
     "TenantUsage",
     "Integration",

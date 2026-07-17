@@ -17,11 +17,12 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 MEETING_BRIEF_STATUSES = ("draft", "ready", "completed")
 
 
-class MeetingBrief(Base):
+class MeetingBrief(Base, OrgScopedMixin):
     __tablename__ = "meeting_briefs"
 
     id: Mapped[uuid.UUID] = mapped_column(

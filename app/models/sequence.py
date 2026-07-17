@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Channel types for multi-channel cadence (from combo-prospecting research)
 STEP_CHANNELS = ("email", "call", "linkedin", "video", "direct_mail")
@@ -42,7 +43,7 @@ SEQUENCE_TONES = ("friendly", "professional", "urgent", "empathetic", "conversat
 DEFAULT_SEQUENCE_TONE = "conversational"
 
 
-class OutreachSequence(Base):
+class OutreachSequence(Base, OrgScopedMixin):
     __tablename__ = "outreach_sequences"
     __table_args__ = (
         CheckConstraint(
@@ -92,7 +93,7 @@ class OutreachSequence(Base):
         return f"<OutreachSequence {self.name}>"
 
 
-class SequenceStep(Base):
+class SequenceStep(Base, OrgScopedMixin):
     __tablename__ = "sequence_steps"
     __table_args__ = (
         UniqueConstraint("sequence_id", "step_number", name="uq_sequence_step"),

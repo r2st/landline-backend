@@ -23,12 +23,13 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Score → band boundaries. Mirrored by domain_health_service.band_for().
 DOMAIN_HEALTH_BANDS = ("healthy", "watch", "at_risk")
 
 
-class DomainHealth(Base):
+class DomainHealth(Base, OrgScopedMixin):
     __tablename__ = "domain_health"
     __table_args__ = (
         UniqueConstraint("domain", name="uq_domain_health_domain"),

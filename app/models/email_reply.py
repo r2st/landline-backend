@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class EmailReply(Base):
+class EmailReply(Base, OrgScopedMixin):
     """A reply received from a contact via Gmail.
 
     Links back to the original EmailSend (when matched) and to the contact

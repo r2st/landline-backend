@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class Deal(Base):
+class Deal(Base, OrgScopedMixin):
     __tablename__ = "deals"
     __table_args__ = (
         CheckConstraint(

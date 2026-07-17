@@ -20,9 +20,10 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class BounceRecord(Base):
+class BounceRecord(Base, OrgScopedMixin):
     __tablename__ = "bounce_records"
 
     id: Mapped[uuid.UUID] = mapped_column(

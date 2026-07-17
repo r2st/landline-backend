@@ -13,12 +13,13 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Lifecycle of a recording as it flows through transcription + analysis.
 RECORDING_STATUSES = ("uploaded", "transcribing", "transcribed", "analyzing", "analyzed", "failed")
 
 
-class CallRecording(Base):
+class CallRecording(Base, OrgScopedMixin):
     __tablename__ = "call_recordings"
 
     id: Mapped[uuid.UUID] = mapped_column(

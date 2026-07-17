@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Dimension of stored embeddings. Kept modest for the local feature-hashing
 # embedder in rag_service; swap the embedder + this constant together if you
@@ -85,7 +86,7 @@ class EmbeddingVector(TypeDecorator):
         return list(value)
 
 
-class ContentEmbedding(Base):
+class ContentEmbedding(Base, OrgScopedMixin):
     __tablename__ = "content_embeddings"
 
     id: Mapped[uuid.UUID] = mapped_column(

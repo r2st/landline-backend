@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class OutreachEnrollment(Base):
+class OutreachEnrollment(Base, OrgScopedMixin):
     __tablename__ = "outreach_enrollments"
     __table_args__ = (
         CheckConstraint(
@@ -97,7 +98,7 @@ class OutreachEnrollment(Base):
         return f"<OutreachEnrollment contact={self.contact_id} status={self.status}>"
 
 
-class OutreachEvent(Base):
+class OutreachEvent(Base, OrgScopedMixin):
     __tablename__ = "outreach_events"
     __table_args__ = (
         CheckConstraint(

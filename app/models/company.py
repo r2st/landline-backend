@@ -9,9 +9,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.constants import ALLOWED_COUNTRIES_SQL
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class Company(Base):
+class Company(Base, OrgScopedMixin):
     __tablename__ = "companies"
     __table_args__ = (
         # An allowlist rather than no validation: garbage like 'XX' still fails

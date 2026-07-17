@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Buying-committee roles the classifier assigns.
 STAKEHOLDER_ROLES = ("decision_maker", "champion", "coach", "blocker", "end_user", "unknown")
@@ -28,7 +29,7 @@ ENGAGEMENT_TRENDS = ("rising", "flat", "declining", "unknown")
 ORG_RELATIONSHIP_TYPES = ("reports_to", "peers_with", "manages")
 
 
-class StakeholderMap(Base):
+class StakeholderMap(Base, OrgScopedMixin):
     __tablename__ = "stakeholder_maps"
     __table_args__ = (
         UniqueConstraint("company_id", "contact_id", name="uq_stakeholder_company_contact"),
@@ -63,7 +64,7 @@ class StakeholderMap(Base):
         return f"<StakeholderMap contact={self.contact_id} role={self.inferred_role}>"
 
 
-class OrgRelationship(Base):
+class OrgRelationship(Base, OrgScopedMixin):
     __tablename__ = "org_relationships"
     __table_args__ = (
         UniqueConstraint(

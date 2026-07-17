@@ -24,6 +24,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Which metric tripped. Not a DB enum so new metrics don't need a migration.
 DANGER_METRICS = ("bounce_rate", "complaint_rate", "hard_bounce_count")
@@ -33,7 +34,7 @@ DANGER_SCOPES = ("global", "account")
 DANGER_ACTIONS = ("auto_paused", "warned")
 
 
-class DangerSignalEvent(Base):
+class DangerSignalEvent(Base, OrgScopedMixin):
     __tablename__ = "danger_signal_events"
 
     id: Mapped[uuid.UUID] = mapped_column(

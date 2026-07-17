@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class EmailSignature(Base):
+class EmailSignature(Base, OrgScopedMixin):
     """A reusable email signature appended to outreach emails.
 
     At most one signature is marked ``is_default``; this is enforced by a

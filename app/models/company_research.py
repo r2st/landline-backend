@@ -15,9 +15,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class CompanyResearch(Base):
+class CompanyResearch(Base, OrgScopedMixin):
     __tablename__ = "company_research"
 
     id: Mapped[uuid.UUID] = mapped_column(

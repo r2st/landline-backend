@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class Task(Base):
+class Task(Base, OrgScopedMixin):
     __tablename__ = "tasks"
     __table_args__ = (
         CheckConstraint(

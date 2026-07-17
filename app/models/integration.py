@@ -31,6 +31,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Auth styles a connector can use.
 AUTH_TYPES = ("oauth", "api_key", "webhook")
@@ -39,7 +40,7 @@ AUTH_TYPES = ("oauth", "api_key", "webhook")
 INTEGRATION_STATUSES = ("configured", "connected", "error", "disconnected")
 
 
-class Integration(Base):
+class Integration(Base, OrgScopedMixin):
     """A tenant's configured connection to one external provider."""
 
     __tablename__ = "integrations"
@@ -50,10 +51,7 @@ class Integration(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    # Tenant that owns this integration. NULL = the default first-party tenant.
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True
-    )
+    # org_id (NOT NULL FK → organizations) is provided by OrgScopedMixin.
     # Provider key from the marketplace catalog, e.g. "slack", "hubspot".
     provider: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
     auth_type: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -79,7 +77,7 @@ class Integration(Base):
         return f"<Integration {self.provider} org={self.org_id} status={self.status}>"
 
 
-class WebhookSubscription(Base):
+class WebhookSubscription(Base, OrgScopedMixin):
     """A tenant's subscription delivering internal events to an external URL."""
 
     __tablename__ = "webhook_subscriptions"
@@ -87,9 +85,7 @@ class WebhookSubscription(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True
-    )
+    # org_id (NOT NULL FK → organizations) is provided by OrgScopedMixin.
     target_url: Mapped[str] = mapped_column(String(1000), nullable=False)
     # Internal event types this subscription fires on, e.g.
     # ["lead.replied", "deal.stage_changed"]. Empty = all events.
@@ -113,7 +109,7 @@ class WebhookSubscription(Base):
         return f"<WebhookSubscription {self.target_url} events={self.event_types}>"
 
 
-class WebhookEvent(Base):
+class WebhookEvent(Base, OrgScopedMixin):
     """One delivery attempt of an internal event to a webhook subscription."""
 
     __tablename__ = "webhook_events"

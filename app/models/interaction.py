@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class Interaction(Base):
+class Interaction(Base, OrgScopedMixin):
     __tablename__ = "interactions"
 
     id: Mapped[uuid.UUID] = mapped_column(

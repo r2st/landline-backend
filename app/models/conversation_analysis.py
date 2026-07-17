@@ -15,9 +15,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class ConversationAnalysis(Base):
+class ConversationAnalysis(Base, OrgScopedMixin):
     __tablename__ = "conversation_analyses"
 
     id: Mapped[uuid.UUID] = mapped_column(

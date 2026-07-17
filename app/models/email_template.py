@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class EmailTemplate(Base):
+class EmailTemplate(Base, OrgScopedMixin):
     """A reusable outreach email template.
 
     The body is HTML and may contain merge fields rendered at send/preview time:
@@ -44,7 +45,7 @@ class EmailTemplate(Base):
         return f"<EmailTemplate {self.name} default={self.is_default}>"
 
 
-class EmailSend(Base):
+class EmailSend(Base, OrgScopedMixin):
     """A record of an outreach email composed and sent to a contact.
 
     Powers the "which contacts have been emailed and when" tracking view.

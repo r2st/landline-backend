@@ -18,13 +18,14 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # How often the Celery beat sweep re-runs a search. ``one_time`` runs once and
 # then stops re-running itself, but stays queryable as provenance.
 DISCOVERY_SCHEDULES = ("one_time", "daily", "weekly")
 
 
-class DiscoverySearch(Base):
+class DiscoverySearch(Base, OrgScopedMixin):
     """A saved category x location Places search."""
 
     __tablename__ = "discovery_searches"

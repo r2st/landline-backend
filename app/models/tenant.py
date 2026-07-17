@@ -1,19 +1,23 @@
-"""Tenant model — multi-tenant white-label platform (feature 4.1).
+"""Organization model — the multi-tenant boundary (SaaS multi-tenancy, migr 078).
 
-A ``Tenant`` is an organization that uses Landline as a white-labeled B2B CRM.
-Each tenant gets org-level data isolation (every user belongs to a tenant via
-``User.org_id``), tenant-specific configuration (industry verticals, AI prompt
-customization, feature flags), branding (logo, colors, custom domain), and a
-billing plan with a usage-based AI-call allowance.
+An ``Organization`` (formerly ``Tenant``) is a customer of Landline. Every
+tenant-owned row carries an ``org_id`` FK to ``organizations.id`` (see
+:class:`app.models.mixins.OrgScopedMixin`) and all reads/writes are isolated by
+org. Each org has its own configuration (industry verticals, AI prompt
+overrides, feature flags), branding (logo, colors, custom domain), and a billing
+plan with a usage-based AI-call allowance.
 
-Isolation is enforced at the application layer through the existing
-``UserScope`` pattern, extended here with ``org_id`` (see
-``app.dependencies``). A ``NULL`` ``org_id`` on a user means "the default
-first-party tenant" (Apprend itself), preserving backward compatibility with
-every pre-4.1 user and row.
+Isolation is enforced globally: the org contextvar is set from the caller's JWT
+``org_id`` claim and drives both the per-insert ``org_id`` default and a
+session-wide read filter (see :mod:`app.org_context` and
+:mod:`app.models.mixins`). Platform admins carry ``org_id = NULL`` and are not
+filtered.
+
+The name :class:`Tenant` remains as a backward-compatible alias for
+:class:`Organization`.
 
 ``TenantUsage`` records per-call AI usage (feature, model, tokens, estimated
-cost) so AI features can be metered and billed per tenant.
+cost) so AI features can be metered and billed per organization.
 """
 
 import uuid
@@ -35,24 +39,26 @@ from app.database import Base
 
 # Billing plans and their default monthly AI-call allowances. Kept as a plain
 # mapping (not a DB enum) so plans can be re-priced without a migration.
-BILLING_PLANS = ("free", "starter", "growth", "enterprise")
+BILLING_PLANS = ("free", "starter", "growth", "pro", "enterprise")
+BILLING_PLANS_SQL = ", ".join(f"'{p}'" for p in BILLING_PLANS)
 
 PLAN_AI_CALL_LIMITS = {
     "free": 100,
     "starter": 2_000,
     "growth": 10_000,
+    "pro": 25_000,
     "enterprise": None,  # unlimited
 }
 
 
-class Tenant(Base):
-    """An organization using the white-label platform."""
+class Organization(Base):
+    """A customer organization — the multi-tenant isolation boundary."""
 
-    __tablename__ = "tenants"
+    __tablename__ = "organizations"
     __table_args__ = (
         CheckConstraint(
-            "billing_plan IN ('free','starter','growth','enterprise')",
-            name="ck_tenants_billing_plan",
+            f"billing_plan IN ({BILLING_PLANS_SQL})",
+            name="ck_organizations_billing_plan",
         ),
     )
 
@@ -88,7 +94,7 @@ class Tenant(Base):
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
-    users = relationship("User", back_populates="tenant", foreign_keys="User.org_id")
+    users = relationship("User", back_populates="organization", foreign_keys="User.org_id")
 
     @property
     def effective_ai_call_limit(self) -> int | None:
@@ -111,19 +117,24 @@ class Tenant(Base):
         return None
 
     def __repr__(self) -> str:
-        return f"<Tenant {self.slug} plan={self.billing_plan} active={self.is_active}>"
+        return f"<Organization {self.slug} plan={self.billing_plan} active={self.is_active}>"
+
+
+# Backward-compatible alias — a lot of services/routers still import ``Tenant``.
+Tenant = Organization
 
 
 class TenantUsage(Base):
-    """One metered AI call attributed to a tenant, for usage-based billing."""
+    """One metered AI call attributed to an organization, for usage billing."""
 
     __tablename__ = "tenant_usage"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    # Kept named ``tenant_id`` for backward compatibility; points at organizations.
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
     # Which AI feature drove the call (e.g. "email_generation", "workflow").
     feature: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
@@ -142,7 +153,7 @@ class TenantUsage(Base):
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), index=True
     )
 
-    tenant = relationship("Tenant")
+    tenant = relationship("Organization")
 
     def __repr__(self) -> str:
         return f"<TenantUsage tenant={self.tenant_id} feature={self.feature} cost={self.estimated_cost_usd}>"

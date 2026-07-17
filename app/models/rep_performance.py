@@ -20,9 +20,10 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class RepPerformance(Base):
+class RepPerformance(Base, OrgScopedMixin):
     __tablename__ = "rep_performance"
     __table_args__ = (
         # One snapshot per rep per period start — regenerating updates in place.

@@ -15,13 +15,14 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Which transport the account belongs to. Not a DB enum so new transports don't
 # need a migration.
 SENDER_ACCOUNT_TYPES = ("gmail", "smtp", "ses")
 
 
-class SenderHealth(Base):
+class SenderHealth(Base, OrgScopedMixin):
     __tablename__ = "sender_health"
     __table_args__ = (
         UniqueConstraint("account_type", "account_id", name="uq_sender_health_account"),
@@ -65,7 +66,7 @@ class SenderHealth(Base):
         )
 
 
-class SenderHealthSnapshot(Base):
+class SenderHealthSnapshot(Base, OrgScopedMixin):
     """A dated point in an account's deliverability history.
 
     ``SenderHealth`` holds only the *current* reputation for each account, so the

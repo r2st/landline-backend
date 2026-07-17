@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # A prospecting run moves through these states.
 PROSPECTING_RUN_STATUSES = ("running", "completed", "failed", "paused")
@@ -30,7 +31,7 @@ PROSPECTING_RUN_STATUSES = ("running", "completed", "failed", "paused")
 CANDIDATE_STATUSES = ("qualified", "review", "enrolled", "rejected", "skipped")
 
 
-class IcpProfile(Base):
+class IcpProfile(Base, OrgScopedMixin):
     """A learned Ideal Customer Profile.
 
     Only one profile is ``is_active`` at a time; the prospector uses the active
@@ -80,7 +81,7 @@ class IcpProfile(Base):
         return f"<IcpProfile {self.name} active={self.is_active} deals={self.learned_from_deal_count}>"
 
 
-class ProspectingRun(Base):
+class ProspectingRun(Base, OrgScopedMixin):
     __tablename__ = "prospecting_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -116,7 +117,7 @@ class ProspectingRun(Base):
         )
 
 
-class ProspectCandidate(Base):
+class ProspectCandidate(Base, OrgScopedMixin):
     """A company surfaced by a prospecting run.
 
     Links to a created ``Company`` row (``company_id``) once persisted. Borderline

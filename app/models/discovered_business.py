@@ -44,6 +44,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Lifecycle. ``new`` -> ``enriched`` (an email was recovered) -> ``imported``
 # (it became a company, and a contact if it had an email). ``skipped`` is a
@@ -57,7 +58,7 @@ DISCOVERY_STATUSES = ("new", "enriched", "imported", "skipped")
 EMAIL_SOURCES = ("hunter", "scrape", "places")
 
 
-class DiscoveredBusiness(Base):
+class DiscoveredBusiness(Base, OrgScopedMixin):
     """One business found by a Places search."""
 
     __tablename__ = "discovered_businesses"

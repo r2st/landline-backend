@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 CALL_STATUSES = ("pending", "completed", "skipped", "rescheduled")
 CALL_PRIORITIES = ("hot", "warm", "cold")
@@ -44,7 +45,7 @@ CALL_NOTIFICATION_TYPES = (
 )
 
 
-class CallTask(Base):
+class CallTask(Base, OrgScopedMixin):
     __tablename__ = "call_tasks"
     __table_args__ = (
         CheckConstraint(
@@ -117,7 +118,7 @@ class CallTask(Base):
         return f"<CallTask company={self.company_id} {self.status}/{self.priority}>"
 
 
-class CallScript(Base):
+class CallScript(Base, OrgScopedMixin):
     __tablename__ = "call_scripts"
     __table_args__ = (
         UniqueConstraint("industry", "script_type", name="uq_call_scripts_industry_type"),
@@ -154,7 +155,7 @@ class CallScript(Base):
         return f"<CallScript {self.industry}/{self.script_type}>"
 
 
-class CallNotification(Base):
+class CallNotification(Base, OrgScopedMixin):
     __tablename__ = "call_notifications"
     __table_args__ = (
         CheckConstraint(

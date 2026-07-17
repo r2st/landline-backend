@@ -8,9 +8,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class LeadScore(Base):
+class LeadScore(Base, OrgScopedMixin):
     __tablename__ = "lead_scores"
     __table_args__ = (
         CheckConstraint("score_type IN ('rule_based', 'ai')", name="ck_lead_scores_type"),

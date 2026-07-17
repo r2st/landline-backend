@@ -18,6 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 # Providers that draw down a paid credit budget.
 CREDIT_PROVIDERS = ("apollo", "hunter", "google_places")
@@ -27,7 +28,7 @@ CREDIT_PROVIDERS = ("apollo", "hunter", "google_places")
 CREDIT_STATUSES = ("ok", "rate_limited", "error")
 
 
-class ApiCreditLedger(Base):
+class ApiCreditLedger(Base, OrgScopedMixin):
     """One row per external API call."""
 
     __tablename__ = "api_credit_ledger"

@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 INVESTOR_STATUSES = (
     "researching",
@@ -45,7 +46,7 @@ INVESTOR_DOCUMENT_TYPES = (
 )
 
 
-class Investor(Base):
+class Investor(Base, OrgScopedMixin):
     __tablename__ = "investors"
     __table_args__ = (
         CheckConstraint(
@@ -106,7 +107,7 @@ class Investor(Base):
         return f"<Investor {self.name} ({self.firm}) {self.status}>"
 
 
-class InvestorInteraction(Base):
+class InvestorInteraction(Base, OrgScopedMixin):
     __tablename__ = "investor_interactions"
     __table_args__ = (
         CheckConstraint(
@@ -148,7 +149,7 @@ class InvestorInteraction(Base):
         return f"<InvestorInteraction {self.type}/{self.direction} investor={self.investor_id}>"
 
 
-class InvestorDocument(Base):
+class InvestorDocument(Base, OrgScopedMixin):
     __tablename__ = "investor_documents"
     __table_args__ = (
         CheckConstraint(

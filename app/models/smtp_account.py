@@ -23,9 +23,10 @@ from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+from app.models.mixins import OrgScopedMixin
 
 
-class SmtpAccount(Base):
+class SmtpAccount(Base, OrgScopedMixin):
     """A manually-configured SMTP account that can send outreach email."""
 
     __tablename__ = "smtp_accounts"
