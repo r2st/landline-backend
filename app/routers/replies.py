@@ -19,11 +19,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.models.bounce_record import BounceRecord
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.schemas.replies import (
+    BounceBreakdown,
     InboxList,
     InboxReply,
     InboxReplyDetail,
@@ -172,6 +174,64 @@ async def _load_reply_context(
     return reply, contact, company
 
 
+async def _bounce_breakdown(
+    db: AsyncSession, reply: EmailReply, contact: Optional[Contact]
+) -> Optional[BounceBreakdown]:
+    """Assemble the delivery-failure breakdown for a ``bounce`` reply.
+
+    Returns ``None`` for anything not classified as a bounce. The failed address
+    is the *contact* we emailed (or the original send's recipient) — never
+    ``reply.from_email``, which is the mail daemon. Diagnostic codes come from the
+    matching ``BounceRecord`` when the bounce sweep has ingested the same DSN;
+    otherwise we fall back to what the reply's auto-action stashed in
+    ``classification_meta`` and the contact's own bounce counters, so the section
+    is never blank on a bounce we recognised.
+    """
+    if reply.reply_classification != "bounce":
+        return None
+
+    meta_bounce = (reply.classification_meta or {}).get("bounce") or {}
+
+    # Resolve the address that bounced: contact → original send → stashed meta.
+    recipient = contact.email if contact is not None else None
+    if not recipient and reply.email_send_id is not None:
+        send = (
+            await db.execute(select(EmailSend).where(EmailSend.id == reply.email_send_id))
+        ).scalar_one_or_none()
+        if send is not None:
+            recipient = send.to_email
+    if not recipient:
+        recipient = meta_bounce.get("recipient")
+
+    # Prefer the authoritative BounceRecord (carries DSN status + diagnostic).
+    record = None
+    if recipient:
+        record = (
+            await db.execute(
+                select(BounceRecord)
+                .where(BounceRecord.recipient_email == recipient.lower())
+                .order_by(BounceRecord.processed_at.desc())
+            )
+        ).scalars().first()
+
+    category = (
+        record.bounce_kind
+        if record is not None
+        else meta_bounce.get("kind")
+        or (contact.last_bounce_type if contact is not None else None)
+    )
+
+    return BounceBreakdown(
+        category=category,
+        status_code=record.status_code if record is not None else None,
+        diagnostic=record.diagnostic if record is not None else None,
+        recipient=recipient,
+        bounce_count=contact.bounce_count if contact is not None else None,
+        last_bounced_at=contact.last_bounced_at if contact is not None else None,
+        suppressed=meta_bounce.get("suppressed"),
+    )
+
+
 @router.get("/inbox/{reply_id}", response_model=InboxReplyDetail)
 async def get_inbox_reply(reply_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Full reply detail. For ``interested`` replies, lazily draft a suggested
@@ -184,6 +244,7 @@ async def get_inbox_reply(reply_id: uuid.UUID, db: AsyncSession = Depends(get_db
         body_text=reply.body_text,
         body_html=reply.body_html,
         email_send_id=str(reply.email_send_id) if reply.email_send_id else None,
+        bounce=await _bounce_breakdown(db, reply, contact),
     )
 
     if reply.reply_classification == "interested":
@@ -262,6 +323,7 @@ async def reclassify_reply(
         body_text=reply.body_text,
         body_html=reply.body_html,
         email_send_id=str(reply.email_send_id) if reply.email_send_id else None,
+        bounce=await _bounce_breakdown(db, reply, contact),
     )
 
 

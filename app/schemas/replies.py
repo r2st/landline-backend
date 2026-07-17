@@ -44,6 +44,31 @@ class InboxList(BaseModel):
     page_size: int
 
 
+class BounceBreakdown(BaseModel):
+    """Delivery-failure detail for a ``bounce`` reply.
+
+    Surfaces what the bounce pipeline recorded about the dead address so the
+    operator can tell a hard bounce (dead mailbox — suppress and move on) from a
+    soft one (transient — worth a retry) without leaving the reply detail. The
+    ``category``/``status_code``/``diagnostic`` come from the matching
+    ``BounceRecord`` when one exists; otherwise from the reply's own
+    classification metadata and the contact's bounce counters.
+    """
+
+    # 'hard' | 'soft' — drives the severity colour (hard=red, soft=yellow).
+    category: Optional[str] = None
+    # DSN Status (e.g. "5.1.1") and the raw Diagnostic-Code, when available.
+    status_code: Optional[str] = None
+    diagnostic: Optional[str] = None
+    # The address that actually bounced (never mailer-daemon@…).
+    recipient: Optional[str] = None
+    # Contact-level bounce history for context.
+    bounce_count: Optional[int] = None
+    last_bounced_at: Optional[datetime] = None
+    # Whether the bounce pipeline suppressed the contact.
+    suppressed: Optional[bool] = None
+
+
 class InboxReplyDetail(InboxReply):
     """Full reply detail — adds the body and, for ``interested`` replies, a
     lazily-computed suggested draft (via ``analyze_reply``)."""
@@ -53,6 +78,8 @@ class InboxReplyDetail(InboxReply):
     email_send_id: Optional[str] = None
     # Only populated for interested replies (drafting is expensive, so it's lazy).
     suggested_draft: Optional[dict[str, Any]] = None
+    # Only populated for `bounce` replies — the delivery-failure breakdown.
+    bounce: Optional[BounceBreakdown] = None
 
 
 class InboxStats(BaseModel):
