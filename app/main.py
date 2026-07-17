@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform
 
 settings = get_settings()
 
@@ -137,6 +137,8 @@ app.include_router(competitive.router, prefix=settings.api_prefix, dependencies=
 app.include_router(routing.router, prefix=settings.api_prefix, dependencies=_auth)
 # Phase 4 — Platform & Ecosystem
 app.include_router(tenants.router, prefix=settings.api_prefix, dependencies=_auth)
+# SaaS Phase 2 — Platform Admin (cross-org management; platform_admin only).
+app.include_router(platform.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(integrations.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(workflows.router, prefix=settings.api_prefix, dependencies=_auth)
 # Phase 3 — Advanced AI & Autonomous Operations
