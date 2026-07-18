@@ -17,6 +17,7 @@ from app.models.company_news import CompanyNews
 from app.models.deal import Deal
 from app.models.deal_activity import DealActivity
 from app.models.deal_note import DealNote
+from app.models.deal_progression_agent import DealProgressionAgent, DealAction
 from app.models.task import Task
 from app.models.client_health import ClientHealthSnapshot
 from app.models.email_reply import EmailReply
@@ -76,6 +77,8 @@ __all__ = [
     "Deal",
     "DealActivity",
     "DealNote",
+    "DealProgressionAgent",
+    "DealAction",
     "Task",
     "ClientHealthSnapshot",
     "EmailSignature",

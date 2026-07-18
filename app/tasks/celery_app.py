@@ -55,6 +55,7 @@ celery_app.conf.update(
         "app.tasks.verification.*": {"queue": "enrichment"},
         "app.tasks.places_discovery.*": {"queue": "enrichment"},
         "app.tasks.phone_enrichment.*": {"queue": "enrichment"},
+        "app.tasks.deal_agent.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -282,6 +283,18 @@ celery_app.conf.update(
             "task": "app.tasks.phone_enrichment.enrich_warm_lead_phones",
             "schedule": 1800.0,  # every 30 minutes
         },
+        # --- Deal Progression Agent ---
+        # Daily sweep: find stalled deals and record the right nudge (follow-up,
+        # suggestion, at-risk flag, or manager escalation) per org.
+        "scan-deal-pipeline": {
+            "task": "app.tasks.deal_agent.scan_deal_pipeline",
+            "schedule": crontab(hour=7, minute=45),  # daily 7:45 AM UTC
+        },
+        # Hourly: send approved follow-ups and expire actions on closed deals.
+        "execute-deal-actions": {
+            "task": "app.tasks.deal_agent.execute_pending_actions",
+            "schedule": 3600.0,  # hourly
+        },
     },
 )
 
@@ -318,3 +331,4 @@ import app.tasks.send_timing  # noqa: F401
 import app.tasks.verification  # noqa: F401
 import app.tasks.places_discovery  # noqa: F401
 import app.tasks.phone_enrichment  # noqa: F401
+import app.tasks.deal_agent  # noqa: F401
