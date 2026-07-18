@@ -62,6 +62,20 @@ ACTION_TYPES = (
 # a human; expired = the deal moved on (won/lost/advanced) before it was actioned.
 ACTION_STATUSES = ("pending", "approved", "executed", "dismissed", "expired")
 
+# The OpenRouter free-tier model the agent uses for its AI touches by default.
+DEFAULT_LLM_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+
+# The models offered in the config dropdown. Kept here as the single source of
+# truth so the schema validator and the UI stay in step. All are free-tier on
+# OpenRouter; an org can still store any other id the API accepts (validation
+# allows any non-empty string, this list is just the curated shortlist).
+LLM_MODEL_CHOICES = (
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openai/gpt-oss-20b:free",
+    "openai/gpt-oss-120b:free",
+    "google/gemma-3-27b-it:free",
+)
+
 
 class DealProgressionAgent(Base, OrgScopedMixin):
     """Per-org configuration for the Deal Progression Agent."""
@@ -99,6 +113,17 @@ class DealProgressionAgent(Base, OrgScopedMixin):
     escalation_threshold_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=14, server_default="14"
     )
+    # The OpenRouter model the agent's AI touches (follow-ups, suggestions, deal
+    # analysis) run on. Defaults to a free-tier Llama.
+    llm_model: Mapped[str] = mapped_column(
+        String(128), nullable=False,
+        default=DEFAULT_LLM_MODEL, server_default=DEFAULT_LLM_MODEL,
+    )
+    # The org's own OpenRouter API key for this agent, stored as Fernet
+    # ciphertext (never plaintext). NULL → fall back to the org-level
+    # OPENROUTER_API_KEY in system_settings, then the global env key. Never
+    # serialized back to a client — the read schema exposes only a boolean.
+    llm_api_key: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

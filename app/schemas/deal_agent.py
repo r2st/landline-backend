@@ -6,7 +6,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models.deal_progression_agent import STAGE_ORDER
+from app.models.deal_progression_agent import LLM_MODEL_CHOICES, STAGE_ORDER
 
 
 class AgentConfigRead(BaseModel):
@@ -19,6 +19,13 @@ class AgentConfigRead(BaseModel):
     auto_followup_enabled: bool
     max_auto_followups_per_deal: int
     escalation_threshold_days: int
+    llm_model: str
+    # The API key itself is never serialized — only whether one is stored. The
+    # router computes this from the ciphertext column (see _config_read). The UI
+    # shows a "key set" indicator and a field to replace it.
+    has_llm_api_key: bool = False
+    # The curated model shortlist for the dropdown, so the UI needn't hardcode it.
+    llm_model_choices: list[str] = list(LLM_MODEL_CHOICES)
     created_at: datetime
     updated_at: datetime
 
@@ -32,6 +39,17 @@ class AgentConfigUpdate(BaseModel):
     auto_followup_enabled: Optional[bool] = None
     max_auto_followups_per_deal: Optional[int] = Field(None, ge=0, le=50)
     escalation_threshold_days: Optional[int] = Field(None, ge=1, le=365)
+    llm_model: Optional[str] = Field(None, min_length=1, max_length=128)
+    # Plaintext key on the way in (encrypted before storage). Empty string
+    # explicitly clears the stored key; None (omitted) leaves it unchanged.
+    llm_api_key: Optional[str] = Field(None, max_length=512)
+
+    @field_validator("llm_model")
+    @classmethod
+    def _validate_model(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("llm_model must be a non-empty model id")
+        return v
 
     @field_validator("stale_thresholds")
     @classmethod

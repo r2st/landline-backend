@@ -43,7 +43,9 @@ async def _make_deal(
 class _StubAI:
     """Deterministic AI stub — no network."""
 
-    model = "stub"
+    def __init__(self, model="stub", key=None):
+        self.model = model
+        self.key = key
 
     async def generate_followup(self, **kw):
         return {"subject": "quick nudge", "body": "Just floating this back up — still worth a chat?"}
@@ -54,10 +56,23 @@ class _StubAI:
 
 @pytest.fixture(autouse=True)
 def _stub_ai(monkeypatch):
-    """Route every AI touch through the stub so tests are offline + fast."""
+    """Route every AI touch through the stub so tests are offline + fast.
+
+    The agent builds its AIService via ``_ai_service(model, key)`` (pinned to
+    OpenRouter with the org's config), so patch that factory — capturing the
+    (model, key) each call resolves to for assertions.
+    """
+    calls = []
+
+    def _fake(model, key):
+        calls.append((model, key))
+        return _StubAI(model, key)
+
+    monkeypatch.setattr("app.services.deal_progression_agent._ai_service", _fake)
     monkeypatch.setattr(
         "app.services.ai_service.get_ai_service", lambda: _StubAI()
     )
+    return calls
 
 
 # --- Config -------------------------------------------------------------------
@@ -463,3 +478,139 @@ async def test_api_stats_shape(client: AsyncClient):
         "pending_actions", "suggestions", "escalations",
     ):
         assert key in data
+
+
+# --- LLM config: model + key resolution ---------------------------------------
+
+from cryptography.fernet import Fernet  # noqa: E402
+
+from app.config import get_settings  # noqa: E402
+from app.services import crypto  # noqa: E402
+from app.services import system_settings  # noqa: E402
+
+
+@pytest.fixture
+def _crypto_key():
+    """Give crypto a valid Fernet key for the duration of the test."""
+    settings = get_settings()
+    prev = settings.token_encryption_key
+    settings.token_encryption_key = Fernet.generate_key().decode()
+    crypto._fernet.cache_clear()
+    yield
+    settings.token_encryption_key = prev
+    crypto._fernet.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_config_defaults_include_llm_model(db_session):
+    config = await agent.get_or_create_config(db_session)
+    assert config.llm_model == "meta-llama/llama-3.3-70b-instruct:free"
+    assert config.llm_api_key is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_llm_prefers_agent_key(db_session, _crypto_key):
+    config = await agent.get_or_create_config(db_session)
+    config.llm_model = "openai/gpt-oss-20b:free"
+    config.llm_api_key = crypto.encrypt("sk-agent-key")
+    await db_session.flush()
+
+    model, key = await agent.resolve_llm(db_session, config)
+    assert model == "openai/gpt-oss-20b:free"
+    assert key == "sk-agent-key"
+
+
+@pytest.mark.asyncio
+async def test_resolve_llm_falls_back_to_org_setting(db_session):
+    config = await agent.get_or_create_config(db_session)
+    # No agent key → org-level system_settings OPENROUTER_API_KEY wins.
+    await system_settings.set_value(db_session, "OPENROUTER_API_KEY", "sk-org-key")
+    await db_session.flush()
+
+    model, key = await agent.resolve_llm(db_session, config)
+    assert key == "sk-org-key"
+    # Default model when the agent hasn't overridden it.
+    assert model == "meta-llama/llama-3.3-70b-instruct:free"
+
+
+@pytest.mark.asyncio
+async def test_resolve_llm_falls_back_to_env(db_session, monkeypatch):
+    config = await agent.get_or_create_config(db_session)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "openrouter_api_key", "sk-env-key", raising=False)
+    model, key = await agent.resolve_llm(db_session, config)
+    assert key == "sk-env-key"
+
+
+@pytest.mark.asyncio
+async def test_scan_uses_configured_model(db_session, sample_company, sample_contact, _stub_ai):
+    config = await agent.get_or_create_config(db_session)
+    config.llm_model = "google/gemma-3-27b-it:free"
+    await db_session.flush()
+    await _make_deal(db_session, sample_company.id, stage="discovery", stale_days=5)
+
+    await agent.scan_stale_deals(db_session)
+    # The follow-up AI touch was built with the configured model.
+    assert _stub_ai  # captured (model, key) tuples
+    assert any(model == "google/gemma-3-27b-it:free" for model, _ in _stub_ai)
+
+
+# --- LLM config: API surface --------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_api_config_exposes_model_and_key_flag(client: AsyncClient):
+    resp = await client.get("/api/v1/deal-agent/config")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["llm_model"] == "meta-llama/llama-3.3-70b-instruct:free"
+    assert data["has_llm_api_key"] is False
+    assert "meta-llama/llama-3.3-70b-instruct:free" in data["llm_model_choices"]
+    # The raw key is never serialized.
+    assert "llm_api_key" not in data
+
+
+@pytest.mark.asyncio
+async def test_api_update_model(client: AsyncClient):
+    resp = await client.put(
+        "/api/v1/deal-agent/config", json={"llm_model": "openai/gpt-oss-120b:free"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["llm_model"] == "openai/gpt-oss-120b:free"
+
+
+@pytest.mark.asyncio
+async def test_api_update_key_encrypts_and_masks(client: AsyncClient, db_session, _crypto_key):
+    resp = await client.put(
+        "/api/v1/deal-agent/config", json={"llm_api_key": "sk-secret-123"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["has_llm_api_key"] is True
+    assert "llm_api_key" not in body
+
+    # Stored ciphertext decrypts back to the original, and is not the plaintext.
+    config = (await db_session.execute(select(DealProgressionAgent))).scalars().first()
+    assert config.llm_api_key is not None
+    assert config.llm_api_key != "sk-secret-123"
+    assert crypto.decrypt(config.llm_api_key) == "sk-secret-123"
+
+
+@pytest.mark.asyncio
+async def test_api_clear_key_with_empty_string(client: AsyncClient, db_session, _crypto_key):
+    await client.put("/api/v1/deal-agent/config", json={"llm_api_key": "sk-secret-123"})
+    resp = await client.put("/api/v1/deal-agent/config", json={"llm_api_key": ""})
+    assert resp.status_code == 200
+    assert resp.json()["has_llm_api_key"] is False
+    config = (await db_session.execute(select(DealProgressionAgent))).scalars().first()
+    assert config.llm_api_key is None
+
+
+@pytest.mark.asyncio
+async def test_api_update_key_omitted_leaves_it(client: AsyncClient, db_session, _crypto_key):
+    await client.put("/api/v1/deal-agent/config", json={"llm_api_key": "sk-keep-me"})
+    # A later update that doesn't mention the key must not wipe it.
+    resp = await client.put("/api/v1/deal-agent/config", json={"escalation_threshold_days": 20})
+    assert resp.status_code == 200
+    assert resp.json()["has_llm_api_key"] is True
+    config = (await db_session.execute(select(DealProgressionAgent))).scalars().first()
+    assert crypto.decrypt(config.llm_api_key) == "sk-keep-me"

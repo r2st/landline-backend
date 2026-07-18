@@ -32,6 +32,7 @@ from app.models.contact import Contact
 from app.models.deal import Deal
 from app.models.deal_activity import DealActivity
 from app.models.deal_progression_agent import (
+    DEFAULT_LLM_MODEL,
     DEFAULT_STALE_THRESHOLDS,
     STAGE_ORDER,
     DealAction,
@@ -40,6 +41,10 @@ from app.models.deal_progression_agent import (
 from app.models.email_reply import EmailReply
 
 logger = logging.getLogger(__name__)
+
+# The org-level system_settings key the agent falls back to for its OpenRouter
+# credential when the agent config itself has no key.
+ORG_OPENROUTER_KEY_SETTING = "OPENROUTER_API_KEY"
 
 # Signal → the stage transitions it justifies. The agent only ever moves a deal
 # to the *right* (never regresses), and only along an explicitly-listed hop, so a
@@ -94,6 +99,69 @@ def _threshold_for_stage(config: DealProgressionAgent, stage: str) -> int:
     if stage in thresholds:
         return int(thresholds[stage])
     return DEFAULT_STALE_THRESHOLDS.get(stage, 7)
+
+
+# --- LLM resolution -----------------------------------------------------------
+
+async def resolve_llm(
+    db: AsyncSession, config: DealProgressionAgent
+) -> tuple[str, str | None]:
+    """Resolve the (model, api_key) the agent's AI calls should use.
+
+    Model: the agent's ``llm_model`` (falls back to the default). Key, in order:
+
+    1. the agent's own ``llm_api_key`` (decrypted from Fernet ciphertext);
+    2. the org-level ``OPENROUTER_API_KEY`` in ``system_settings``;
+    3. the global env ``OPENROUTER_API_KEY``.
+
+    Returns ``(model, key_or_None)``. A ``None`` key means no credential is
+    available — the AI touch will fail its request and degrade to a template.
+    """
+    model = config.llm_model or DEFAULT_LLM_MODEL
+
+    key: str | None = None
+    if config.llm_api_key:
+        try:
+            from app.services.crypto import decrypt
+
+            key = decrypt(config.llm_api_key)
+        except Exception as exc:  # bad/rotated key — fall through to fallbacks
+            logger.warning("Could not decrypt agent llm_api_key: %s", exc)
+            key = None
+
+    if not key:
+        try:
+            from app.services import system_settings
+
+            val = await system_settings.get_value(db, ORG_OPENROUTER_KEY_SETTING)
+            if isinstance(val, str) and val.strip():
+                key = val.strip()
+            elif isinstance(val, dict) and isinstance(val.get("value"), str):
+                key = val["value"].strip() or None
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Org OPENROUTER_API_KEY lookup failed: %s", exc)
+
+    if not key:
+        from app.config import get_settings
+
+        key = get_settings().openrouter_api_key or None
+
+    return model, key
+
+
+def _ai_service(model: str, key: str | None):
+    """Build an AIService pinned to OpenRouter with the agent's model + key."""
+    from app.services.ai_service import AIService
+
+    return AIService(
+        openrouter_model=model, openrouter_api_key=key, force_openrouter=True
+    )
+
+
+async def _resolve_config(
+    db: AsyncSession, config: DealProgressionAgent | None
+) -> DealProgressionAgent:
+    return config if config is not None else await get_or_create_config(db)
 
 
 # --- Activity / staleness -----------------------------------------------------
@@ -192,14 +260,17 @@ async def generate_followup(
     deal: Deal,
     contact: Optional[Contact],
     last_interaction: Optional[datetime],
+    config: DealProgressionAgent | None = None,
 ) -> dict:
     """AI-draft a contextual follow-up email for a stalled deal.
 
-    Returns ``{"subject", "body"}``. Degrades to a plain, non-empty template when
-    the AI backend is unavailable (out of credits, rate-limited) so a stalled
-    deal still gets a nudge the operator can send.
+    Runs on the org's configured OpenRouter model + key (see
+    :func:`resolve_llm`). Returns ``{"subject", "body"}``. Degrades to a plain,
+    non-empty template when the AI backend is unavailable (no key, out of
+    credits, rate-limited) so a stalled deal still gets a nudge the operator can
+    send.
     """
-    from app.services.ai_service import get_ai_service
+    config = await _resolve_config(db, config)
 
     company = (
         await db.execute(select(Company).where(Company.id == deal.company_id))
@@ -214,7 +285,8 @@ async def generate_followup(
     days_since = _days_since(_aware(last_interaction)) if last_interaction else 0
 
     try:
-        ai = get_ai_service()
+        model, key = await resolve_llm(db, config)
+        ai = _ai_service(model, key)
         result = await ai.generate_followup(
             original_subject=deal.title,
             original_body="",
@@ -247,12 +319,15 @@ async def generate_followup(
     }
 
 
-async def suggest_next_action(db: AsyncSession, deal: Deal) -> str:
+async def suggest_next_action(
+    db: AsyncSession, deal: Deal, config: DealProgressionAgent | None = None
+) -> str:
     """AI-suggest the single best next step for a deal (human-readable text).
 
-    Falls back to a stage-appropriate default when the AI backend is unavailable.
+    Runs on the org's configured OpenRouter model + key. Falls back to a
+    stage-appropriate default when the AI backend is unavailable.
     """
-    from app.services.ai_service import get_ai_service
+    config = await _resolve_config(db, config)
 
     company = (
         await db.execute(select(Company).where(Company.id == deal.company_id))
@@ -269,7 +344,8 @@ async def suggest_next_action(db: AsyncSession, deal: Deal) -> str:
         f"Value: {value_str}\n\nReturn only the sentence, no preamble."
     )
     try:
-        ai = get_ai_service()
+        model, key = await resolve_llm(db, config)
+        ai = _ai_service(model, key)
         text = (await ai.complete_text(prompt, max_tokens=120)).strip()
         if text:
             # Keep it to a single tidy line.
@@ -278,6 +354,52 @@ async def suggest_next_action(db: AsyncSession, deal: Deal) -> str:
         logger.warning("suggest_next_action AI call failed for deal %s: %s", deal.id, exc)
 
     return _default_suggestion(deal.deal_stage)
+
+
+async def analyze_deal(
+    db: AsyncSession,
+    deal: Deal,
+    days_stale: int,
+    threshold: int,
+    config: DealProgressionAgent | None = None,
+) -> str:
+    """AI risk analysis for a stalled deal (used to reason about at-risk /
+    escalation actions). Runs on the org's configured model + key.
+
+    Returns one or two sentences on *why* the deal is at risk and what it needs.
+    Falls back to a deterministic summary when the AI backend is unavailable, so
+    the action always has a reason.
+    """
+    config = await _resolve_config(db, config)
+
+    company = (
+        await db.execute(select(Company).where(Company.id == deal.company_id))
+    ).scalars().first()
+    company_name = company.name if company else "the company"
+    value_str = f"${float(deal.value):,.0f}" if deal.value is not None else "unknown value"
+    fallback = (
+        f"No activity for {days_stale} days on a '{deal.deal_stage}' deal "
+        f"(threshold {threshold}d)."
+    )
+
+    prompt = (
+        "You are a sales manager triaging a stalled B2B deal. In ONE or TWO "
+        "short sentences, say why it's at risk and what it needs to get moving. "
+        "No preamble.\n\n"
+        f"Deal: {deal.title}\nCompany: {company_name}\nStage: {deal.deal_stage}\n"
+        f"Value: {value_str}\nDays with no activity: {days_stale} "
+        f"(stage threshold {threshold}d)."
+    )
+    try:
+        model, key = await resolve_llm(db, config)
+        ai = _ai_service(model, key)
+        text = (await ai.complete_text(prompt, max_tokens=160)).strip()
+        if text:
+            return " ".join(text.split())
+    except Exception as exc:
+        logger.warning("analyze_deal AI call failed for deal %s: %s", deal.id, exc)
+
+    return fallback
 
 
 def _default_suggestion(stage: str) -> str:
@@ -467,12 +589,14 @@ async def scan_stale_deals(db: AsyncSession) -> dict:
         )
 
         if days_stale >= config.escalation_threshold_days:
-            await escalate_to_manager(db, deal, reason)
+            analysis = await analyze_deal(db, deal, days_stale, threshold, config)
+            await escalate_to_manager(db, deal, analysis)
             summary["escalations"] += 1
             continue
 
         if days_stale >= threshold * 2:
-            await flag_at_risk(db, deal, reason)
+            analysis = await analyze_deal(db, deal, days_stale, threshold, config)
+            await flag_at_risk(db, deal, analysis)
             summary["at_risk"] += 1
             continue
 
@@ -480,7 +604,7 @@ async def scan_stale_deals(db: AsyncSession) -> dict:
             await _auto_followup_count(db, deal.id) < config.max_auto_followups_per_deal
         ):
             contact = await _primary_contact(db, deal.company_id)
-            draft = await generate_followup(db, deal, contact, last_act)
+            draft = await generate_followup(db, deal, contact, last_act, config)
             db.add(
                 DealAction(
                     deal_id=deal.id,
@@ -499,7 +623,7 @@ async def scan_stale_deals(db: AsyncSession) -> dict:
             summary["followups"] += 1
             continue
 
-        suggestion = await suggest_next_action(db, deal)
+        suggestion = await suggest_next_action(db, deal, config)
         db.add(
             DealAction(
                 deal_id=deal.id,

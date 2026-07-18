@@ -34,12 +34,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/deal-agent", tags=["deal-agent"])
 
 
+def _config_read(config) -> AgentConfigRead:
+    """Serialize a config, collapsing the stored key ciphertext to a boolean.
+
+    The API key itself is never returned — the UI only needs to know whether one
+    is on file.
+    """
+    data = AgentConfigRead.model_validate(config)
+    data.has_llm_api_key = bool(config.llm_api_key)
+    return data
+
+
 @router.get("/config", response_model=AgentConfigRead)
 async def get_config(db: AsyncSession = Depends(get_db)):
     """Return the org's agent config (created with defaults on first read)."""
     config = await agent.get_or_create_config(db)
     await db.commit()
-    return config
+    return _config_read(config)
 
 
 @router.put("/config", response_model=AgentConfigRead)
@@ -53,17 +64,30 @@ async def update_config(
     config = await agent.get_or_create_config(db)
 
     updates = payload.model_dump(exclude_unset=True)
+
     if "stale_thresholds" in updates and updates["stale_thresholds"] is not None:
         # Merge onto existing so a partial threshold map doesn't drop stages.
         merged = dict(config.stale_thresholds or {})
         merged.update(updates.pop("stale_thresholds"))
         config.stale_thresholds = merged
+
+    # The API key is handled specially: encrypt a new value, "" clears it, and an
+    # omitted field leaves the stored key untouched.
+    if "llm_api_key" in updates:
+        raw = updates.pop("llm_api_key")
+        if raw is None or raw == "":
+            config.llm_api_key = None
+        else:
+            from app.services.crypto import encrypt
+
+            config.llm_api_key = encrypt(raw.strip())
+
     for field, value in updates.items():
         setattr(config, field, value)
 
     await db.commit()
     await db.refresh(config)
-    return config
+    return _config_read(config)
 
 
 async def _serialize_actions(

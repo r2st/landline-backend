@@ -236,6 +236,7 @@ class AIService:
         *,
         openrouter_model: str | None = None,
         openrouter_api_key: str | None = None,
+        force_openrouter: bool = False,
     ):
         """``openrouter_model`` overrides the model **only on the OpenRouter
         backend** — the name says so because an OpenRouter model id is
@@ -245,10 +246,15 @@ class AIService:
 
         ``openrouter_api_key`` lets a caller run this instance on a *specific*
         OpenRouter credential rather than the process-wide one — used by the
-        Social Listening Agent, which can carry its own per-org key. Passing a
-        non-empty key pins the backend to OpenRouter with that key + model,
-        regardless of ``AI_PROVIDER``; this instance is then a throwaway (not the
-        shared singleton).
+        Social Listening and Deal Progression agents, which carry their own
+        per-org key. Passing a non-empty key pins the backend to OpenRouter with
+        that key + model, regardless of ``AI_PROVIDER``.
+
+        ``force_openrouter`` pins OpenRouter even when no key is supplied here
+        (the global env key is then used as the fallback) — the Deal Progression
+        Agent uses this so its AI touches always route through OpenRouter's
+        OpenAI-compatible API. Either way, this instance is a throwaway, not the
+        shared singleton.
         """
         settings = get_settings()
 
@@ -258,7 +264,7 @@ class AIService:
 
         # Resolve the backend. "auto" prefers OpenRouter when a key is present
         # (e.g. Anthropic credits depleted) and otherwise stays on Anthropic.
-        if forced_key:
+        if forced_key or force_openrouter:
             provider = "openrouter"
         else:
             provider = (getattr(settings, "ai_provider", "auto") or "auto").lower()
