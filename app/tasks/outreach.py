@@ -57,7 +57,13 @@ async def _advance_step(db: AsyncSession, enrollment: OutreachEnrollment) -> Non
         )
     ).scalar_one_or_none()
     if next_step is not None:
-        enrollment.next_send_at = now + timedelta(days=next_step.delay_days)
+        # Adaptive Step Delays (Feature 3): scale the static delay by the
+        # enrollment's engagement-driven factor.
+        from app.services.adaptive_delay import effective_delay_days
+
+        enrollment.next_send_at = now + timedelta(
+            days=effective_delay_days(next_step.delay_days, enrollment.adaptive_delay_factor)
+        )
     else:
         enrollment.status = "completed"
         enrollment.completed_at = now
@@ -351,6 +357,27 @@ def send_sequence_step(self, enrollment_id: str):
                                     "reason": f"step not due until {due_at.isoformat()}",
                                     "step": enrollment.current_step,
                                 }
+
+                # --- Adaptive Step Delays (Feature 3): silence back-off ---
+                # This step is now due, so the PRIOR step's engagement window has
+                # fully elapsed. If that prior step was tracked and drew no
+                # open/click/reply, extend the cadence (×1.5) — the enrollment is
+                # cold, so back off rather than pile on. Engagement-driven
+                # shortening happens live on the open pixel; this handles the
+                # silent case, which has no event to hook. Applied once per step
+                # (it moves the factor used to schedule the NEXT send).
+                if enrollment.current_step > 1:
+                    from app.services import adaptive_delay
+
+                    prior_eng = await _prior_step_engagement(
+                        db, enrollment, enrollment.current_step - 1
+                    )
+                    if (
+                        prior_eng["prior_tracked"]
+                        and not prior_eng["opened"]
+                        and not prior_eng["replied"]
+                    ):
+                        adaptive_delay.register_silence(enrollment)
 
                 # --- Non-email channel step ---
                 # A "call"/"linkedin"/"video"/"direct_mail" step isn't an email:
@@ -699,8 +726,15 @@ def send_sequence_step(self, enrollment_id: str):
                     )
                     next_step = next_step_result.scalar_one_or_none()
                     if next_step:
+                        # Adaptive Step Delays (Feature 3): scale by the
+                        # enrollment's engagement-driven factor, clamped to a
+                        # sane [1, 14]-day window.
+                        from app.services.adaptive_delay import effective_delay_days
+
                         enrollment.next_send_at = datetime.now(timezone.utc) + timedelta(
-                            days=next_step.delay_days
+                            days=effective_delay_days(
+                                next_step.delay_days, enrollment.adaptive_delay_factor
+                            )
                         )
                     else:
                         enrollment.status = "completed"

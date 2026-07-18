@@ -65,9 +65,18 @@ async def build_reply_event(
     *,
     metadata: Optional[dict] = None,
 ) -> OutreachEvent:
-    """A ``replied`` event attributed to the step that was actually sent."""
+    """A ``replied`` event attributed to the step that was actually sent.
+
+    Side effect (Feature 3): a reply is the strongest engagement signal, so this
+    also shortens the enrollment's adaptive delay factor and reschedules any
+    pending step. The caller commits the enrollment along with the event.
+    """
     step = await last_sent_step(db, enrollment)
     from datetime import datetime, timezone
+
+    from app.services import adaptive_delay
+
+    await adaptive_delay.register_engagement(db, enrollment)
 
     return OutreachEvent(
         enrollment_id=enrollment.id,

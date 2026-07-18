@@ -178,6 +178,12 @@ async def _record_outreach_engagement(
                     event_metadata={"source": "tracking_pixel"},
                 )
             )
+
+            # Adaptive Step Delays (Feature 3): an open/click is a warm signal —
+            # shorten the enrollment's cadence and pull in the pending next step.
+            from app.services import adaptive_delay
+
+            await adaptive_delay.register_engagement(db, enrollment)
             await db.commit()
 
         # An open/click is an engagement signal — re-route the lead now.

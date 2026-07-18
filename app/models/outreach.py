@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -86,6 +86,16 @@ class OutreachEnrollment(Base, OrgScopedMixin):
     # the lift can be measured — assigned once, then stable.
     scheduled_send_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     timing_arm: Mapped[str | None] = mapped_column(String(20))  # 'optimized' | 'control'
+
+    # Adaptive Step Delays (Feature 3). A per-enrollment multiplier applied to
+    # each step's base ``delay_days`` when scheduling the next send. Engagement
+    # shortens the cadence (an open/click/reply halves it, floored); silence after
+    # a step's window extends it (×1.5). The effective delay is clamped to
+    # [1, 14] days so the factor can never stall or spam a sequence. 1.0 = the
+    # sequence's own static delays, unchanged.
+    adaptive_delay_factor: Mapped[float] = mapped_column(
+        Float, nullable=False, default=1.0, server_default="1.0"
+    )
 
     # Relationships
     contact: Mapped["Contact"] = relationship("Contact", back_populates="enrollments")
