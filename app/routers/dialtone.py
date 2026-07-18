@@ -32,6 +32,7 @@ from app.models.ab_test import AbTest, AbTestVariant
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
+from app.models.deal import Deal
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
@@ -39,9 +40,11 @@ from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate
 from app.models.sender_health import SenderHealth
 from app.models.sender_warmup import SenderWarmupPlan
+from app.models.sequence import OutreachSequence, SequenceStep
 from app.models.smtp_account import SmtpAccount
 from app.models.suppression import SuppressionEntry
 from app.schemas.booking import BookingConfig, BookingConfigUpdate
+from app.schemas.sequence_analytics import SequenceAnalytics, SequenceStepAnalytics
 from app.schemas.suppression import (
     SuppressionEntryCreate,
     SuppressionEntryRead,
@@ -1031,3 +1034,117 @@ async def delete_suppression(entry_id: uuid.UUID, db: AsyncSession = Depends(get
         raise HTTPException(status_code=404, detail="Suppression entry not found")
     await db.delete(entry)
     await db.commit()
+
+
+# ─── Per-sequence analytics (Feature 4) ──────────────────────────────────────
+
+
+def _rate(numerator: int, denominator: int) -> float:
+    """Fraction (0..1), 0 when the denominator is 0 (never divide by zero)."""
+    return round(numerator / denominator, 4) if denominator else 0.0
+
+
+@router.get("/sequences/{sequence_id}/analytics", response_model=SequenceAnalytics)
+async def sequence_analytics(sequence_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Per-step funnel + outcome analytics for one sequence.
+
+    For each step: sent / opened / clicked / replied / bounced counts and the
+    corresponding rates (as a fraction of that step's sends). Plus enrollment
+    outcomes and the enrolled → deal conversion rate.
+    """
+    sequence = (
+        await db.execute(
+            select(OutreachSequence).where(OutreachSequence.id == sequence_id)
+        )
+    ).scalar_one_or_none()
+    if sequence is None:
+        raise HTTPException(status_code=404, detail="Sequence not found")
+
+    # Per-(step, event_type) counts for this sequence's enrollments, in one pass.
+    event_rows = (
+        await db.execute(
+            select(
+                OutreachEvent.step_number,
+                OutreachEvent.event_type,
+                func.count(OutreachEvent.id),
+            )
+            .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+            .where(OutreachEnrollment.sequence_id == sequence_id)
+            .group_by(OutreachEvent.step_number, OutreachEvent.event_type)
+        )
+    ).all()
+    # counts[step_number][event_type] = n
+    counts: dict[int, dict[str, int]] = {}
+    for step_number, event_type, n in event_rows:
+        counts.setdefault(step_number, {})[event_type] = n
+
+    # Step definitions (channel/delay/label), plus any step numbers that only
+    # appear in events (defensive — a step deleted after sending).
+    steps = (
+        await db.execute(
+            select(SequenceStep)
+            .where(SequenceStep.sequence_id == sequence_id)
+            .order_by(SequenceStep.step_number)
+        )
+    ).scalars().all()
+    step_defs = {s.step_number: s for s in steps}
+    all_step_numbers = sorted(set(step_defs) | set(counts))
+
+    step_analytics: list[SequenceStepAnalytics] = []
+    for sn in all_step_numbers:
+        c = counts.get(sn, {})
+        sent = c.get("sent", 0)
+        opened = c.get("opened", 0)
+        clicked = c.get("clicked", 0)
+        replied = c.get("replied", 0)
+        bounced = c.get("bounced", 0)
+        sdef = step_defs.get(sn)
+        label = None
+        if sdef is not None and sdef.subject_template:
+            label = sdef.subject_template[:80]
+        step_analytics.append(SequenceStepAnalytics(
+            step_number=sn,
+            channel=sdef.channel if sdef is not None else "email",
+            delay_days=sdef.delay_days if sdef is not None else 0,
+            label=label,
+            sent=sent,
+            opened=opened,
+            clicked=clicked,
+            replied=replied,
+            bounced=bounced,
+            open_rate=_rate(opened, sent),
+            click_rate=_rate(clicked, sent),
+            reply_rate=_rate(replied, sent),
+            bounce_rate=_rate(bounced, sent),
+        ))
+
+    # Enrollment outcomes, grouped by status in one pass.
+    status_rows = (
+        await db.execute(
+            select(OutreachEnrollment.status, func.count(OutreachEnrollment.id))
+            .where(OutreachEnrollment.sequence_id == sequence_id)
+            .group_by(OutreachEnrollment.status)
+        )
+    ).all()
+    by_status = {status: n for status, n in status_rows}
+    total_enrollments = sum(by_status.values())
+
+    # Enrolled → deal: deals credited to this sequence (attribution, migration 075).
+    deals_attributed = (
+        await db.execute(
+            select(func.count(Deal.id)).where(Deal.source_sequence_id == sequence_id)
+        )
+    ).scalar() or 0
+
+    return SequenceAnalytics(
+        sequence_id=sequence_id,
+        name=sequence.name,
+        total_enrollments=total_enrollments,
+        active_enrollments=by_status.get("active", 0),
+        completed_enrollments=by_status.get("completed", 0),
+        replied_enrollments=by_status.get("replied", 0),
+        bounced_enrollments=by_status.get("bounced", 0),
+        deals_attributed=deals_attributed,
+        conversion_rate=_rate(deals_attributed, total_enrollments),
+        steps=step_analytics,
+    )
