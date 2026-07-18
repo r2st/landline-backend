@@ -55,6 +55,11 @@ from app.models.meeting import MeetingBrief
 from app.models.agent_daily_summary import AgentDailySummary
 from app.models.system_setting import SystemSetting
 from app.models.referral import ReferralAgent, Referral, ReferralAction
+from app.models.social_listening_agent import (
+    SocialListeningAgent,
+    SignalEvent,
+    MonitoredCompany,
+)
 
 __all__ = [
     "SystemSetting",
@@ -132,4 +137,7 @@ __all__ = [
     "ReferralAgent",
     "Referral",
     "ReferralAction",
+    "SocialListeningAgent",
+    "SignalEvent",
+    "MonitoredCompany",
 ]

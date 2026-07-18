@@ -231,25 +231,44 @@ class AIService:
     which create a new event loop, so the await is resolved there too.
     """
 
-    def __init__(self, *, openrouter_model: str | None = None):
+    def __init__(
+        self,
+        *,
+        openrouter_model: str | None = None,
+        openrouter_api_key: str | None = None,
+    ):
         """``openrouter_model`` overrides the model **only on the OpenRouter
         backend** — the name says so because an OpenRouter model id is
         meaningless to Anthropic. Callers that need a stronger model for one job
         (see ``ai_email_generator``) pass it here and still get plain
         claude-sonnet-4-6 if the backend resolves to Anthropic.
+
+        ``openrouter_api_key`` lets a caller run this instance on a *specific*
+        OpenRouter credential rather than the process-wide one — used by the
+        Social Listening Agent, which can carry its own per-org key. Passing a
+        non-empty key pins the backend to OpenRouter with that key + model,
+        regardless of ``AI_PROVIDER``; this instance is then a throwaway (not the
+        shared singleton).
         """
         settings = get_settings()
 
+        # An explicit per-caller OpenRouter key always pins the OpenRouter
+        # backend — the caller has chosen the credential and the model.
+        forced_key = (openrouter_api_key or "").strip()
+
         # Resolve the backend. "auto" prefers OpenRouter when a key is present
         # (e.g. Anthropic credits depleted) and otherwise stays on Anthropic.
-        provider = (getattr(settings, "ai_provider", "auto") or "auto").lower()
-        if provider == "auto":
-            provider = "openrouter" if settings.openrouter_api_key else "anthropic"
+        if forced_key:
+            provider = "openrouter"
+        else:
+            provider = (getattr(settings, "ai_provider", "auto") or "auto").lower()
+            if provider == "auto":
+                provider = "openrouter" if settings.openrouter_api_key else "anthropic"
         self.provider = provider
         self._anthropic_key = settings.anthropic_api_key
 
         if self.provider == "openrouter":
-            self._openrouter_key = settings.openrouter_api_key
+            self._openrouter_key = forced_key or settings.openrouter_api_key
             self._openrouter_base = settings.openrouter_base_url.rstrip("/")
             self.model = openrouter_model or settings.openrouter_model
             # AsyncAnthropic is still constructed lazily-free (no network) so any

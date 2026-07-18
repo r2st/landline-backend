@@ -56,6 +56,7 @@ celery_app.conf.update(
         "app.tasks.places_discovery.*": {"queue": "enrichment"},
         "app.tasks.phone_enrichment.*": {"queue": "enrichment"},
         "app.tasks.deal_agent.*": {"queue": "enrichment"},
+        "app.tasks.social_listening.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -312,6 +313,20 @@ celery_app.conf.update(
             "task": "app.tasks.referral_agent.check_referral_conversions",
             "schedule": crontab(hour=10, minute=0),  # daily 10 AM UTC
         },
+        # Social Listening Agent: hourly per-org signal scan. Each org's own
+        # scan_frequency_hours gates whether it's actually due this tick, so a
+        # daily-cadence org isn't re-scanned every hour — the beat just wakes the
+        # sweep often enough to honour the shortest configured cadence.
+        "scan-social-signals": {
+            "task": "app.tasks.social_listening.scan_signals",
+            "schedule": 3600.0,  # hourly
+        },
+        # Escalate stored high-relevance signals to warm leads (hourly), covering
+        # signals stored before an org flipped auto-create / changed thresholds.
+        "process-new-social-signals": {
+            "task": "app.tasks.social_listening.process_new_signals",
+            "schedule": 3600.0,  # hourly
+        },
     },
 )
 
@@ -350,3 +365,4 @@ import app.tasks.places_discovery  # noqa: F401
 import app.tasks.phone_enrichment  # noqa: F401
 import app.tasks.deal_agent  # noqa: F401
 import app.tasks.referral_agent  # noqa: F401
+import app.tasks.social_listening  # noqa: F401
