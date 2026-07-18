@@ -1,6 +1,6 @@
 """Meeting Booking Agent — per-org config + booked meetings.
 
-Chains off ``083_social_listening_agent`` (the current head).
+Chains off ``084_deal_agent_llm_config`` (the current head).
 
 Adds two org-scoped tables backing the autonomous scheduling agent that runs
 once Dialtone gets a positive reply:
@@ -20,8 +20,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "084_meeting_booking_agent"
-down_revision = "083_social_listening_agent"
+revision = "085_meeting_booking_agent"
+down_revision = "084_deal_agent_llm_config"
 branch_labels = None
 depends_on = None
 
