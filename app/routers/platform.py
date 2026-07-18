@@ -29,7 +29,7 @@ from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -138,6 +138,29 @@ class ImpersonationToken(BaseModel):
     role: str
     org_id: Optional[uuid.UUID] = None
     org_name: Optional[str] = None
+
+
+class PlatformAdminUser(BaseModel):
+    """A platform_admin account, for the dashboard's admin roster."""
+
+    id: uuid.UUID
+    email: str
+    name: str
+    role: str
+    is_active: bool
+    created_at: str
+
+
+class PromoteAdminRequest(BaseModel):
+    # The email of an existing user to elevate to platform_admin.
+    email: EmailStr
+
+
+class DemoteAdminRequest(BaseModel):
+    # The platform_admin to demote, and the org to reassign them to (as org_admin).
+    # A platform_admin has org_id NULL, so a demote MUST name a destination org.
+    user_id: uuid.UUID
+    org_id: uuid.UUID
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -505,6 +528,109 @@ async def impersonate_user(
         org_id=target.org_id,
         org_name=org_name,
     )
+
+
+# --- Platform admin management ---------------------------------------------
+
+
+def _admin_user(u: User) -> PlatformAdminUser:
+    return PlatformAdminUser(
+        id=u.id,
+        email=u.email,
+        name=u.name,
+        role=u.role,
+        is_active=u.is_active,
+        created_at=u.created_at.isoformat() if u.created_at else "",
+    )
+
+
+@router.get("/admins", response_model=list[PlatformAdminUser])
+async def list_platform_admins(
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """List every platform_admin account (platform admin only)."""
+    scope.check_permission(UserRole.PLATFORM_ADMIN.value)
+    rows = (
+        await db.execute(
+            select(User)
+            .where(User.role == UserRole.PLATFORM_ADMIN.value)
+            .order_by(User.created_at.asc())
+        )
+    ).scalars().all()
+    return [_admin_user(u) for u in rows]
+
+
+@router.post("/promote-admin", response_model=PlatformAdminUser)
+async def promote_admin(
+    body: PromoteAdminRequest,
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Elevate an existing user to platform_admin (org_id cleared to NULL).
+
+    A platform_admin is not bound to any org, so promotion detaches the user
+    from their current org. Requires the caller to be a platform_admin.
+    """
+    scope.check_permission(UserRole.PLATFORM_ADMIN.value)
+
+    email = body.email.lower().strip()
+    user = (
+        await db.execute(select(User).where(User.email == email))
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="No user found with that email")
+    if normalize_role(user.role) == UserRole.PLATFORM_ADMIN.value:
+        raise HTTPException(status_code=409, detail="User is already a platform admin")
+
+    user.role = UserRole.PLATFORM_ADMIN.value
+    user.org_id = None  # platform admins are org-unbound
+    await db.flush()
+    await db.refresh(user)
+    logger.info("Platform admin %s promoted %s to platform_admin", scope.user.email, user.email)
+    return _admin_user(user)
+
+
+@router.post("/demote-admin", response_model=PlatformAdminUser)
+async def demote_admin(
+    body: DemoteAdminRequest,
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Demote a platform_admin back to org_admin, reassigning them to an org.
+
+    A platform_admin carries no org, so a destination org is required. The
+    caller cannot demote themselves — that would risk locking the platform out
+    of its last admin, and always leaves at least one platform_admin standing.
+    """
+    scope.check_permission(UserRole.PLATFORM_ADMIN.value)
+
+    if body.user_id == scope.user.id:
+        raise HTTPException(status_code=400, detail="You cannot demote yourself")
+
+    target = (
+        await db.execute(select(User).where(User.id == body.user_id))
+    ).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if normalize_role(target.role) != UserRole.PLATFORM_ADMIN.value:
+        raise HTTPException(status_code=400, detail="User is not a platform admin")
+
+    org = (
+        await db.execute(select(Organization).where(Organization.id == body.org_id))
+    ).scalar_one_or_none()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Destination organization not found")
+
+    target.role = UserRole.ORG_ADMIN.value
+    target.org_id = org.id
+    await db.flush()
+    await db.refresh(target)
+    logger.info(
+        "Platform admin %s demoted %s to org_admin in org %s",
+        scope.user.email, target.email, org.slug,
+    )
+    return _admin_user(target)
 
 
 # --- Detail assembly -------------------------------------------------------

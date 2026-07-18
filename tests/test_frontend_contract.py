@@ -102,6 +102,10 @@ FRONTEND_ROUTES = [
     ("POST", "/api/v1/client-success-agent/actions/{action_id}/dismiss"),
     ("GET", "/api/v1/client-success-agent/stats"),
     ("GET", "/api/v1/client-success-agent/health-overview"),
+    # Platform.jsx — platform-admin promote/demote management.
+    ("GET", "/api/v1/platform/admins"),
+    ("POST", "/api/v1/platform/promote-admin"),
+    ("POST", "/api/v1/platform/demote-admin"),
 ]
 
 

@@ -265,3 +265,156 @@ async def test_impersonate_404_for_unknown_user(client, platform_admin, auth_hea
         f"/api/v1/platform/impersonate/{uuid.uuid4()}", headers=auth_headers(platform_admin)
     )
     assert resp.status_code == 404
+
+
+# --- Platform admin promote / demote ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_platform_admins(client, platform_admin, make_user, auth_headers):
+    """The admins roster returns every platform_admin, not org users."""
+    await make_user("orgadmin2@alpha.com", role=UserRole.ORG_ADMIN.value)
+    resp = await client.get("/api/v1/platform/admins", headers=auth_headers(platform_admin))
+    assert resp.status_code == 200, resp.text
+    emails = {u["email"] for u in resp.json()}
+    assert "root@landline.app" in emails
+    assert "orgadmin2@alpha.com" not in emails
+    assert all(u["role"] == "platform_admin" for u in resp.json())
+
+
+@pytest.mark.asyncio
+async def test_promote_admin_success(client, db_session, platform_admin, make_user, auth_headers, org_b):
+    """An org user promoted by email becomes platform_admin with org_id cleared."""
+    user = await make_user("promote.me@beta.com", role=UserRole.ORG_ADMIN.value, org_id=org_b.id)
+    resp = await client.post(
+        "/api/v1/platform/promote-admin",
+        json={"email": "promote.me@beta.com"},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["role"] == "platform_admin"
+    assert body["email"] == "promote.me@beta.com"
+
+    await db_session.refresh(user)
+    assert user.role == UserRole.PLATFORM_ADMIN.value
+    assert user.org_id is None
+
+
+@pytest.mark.asyncio
+async def test_promote_admin_is_case_insensitive_on_email(client, platform_admin, make_user, auth_headers):
+    await make_user("mixed.case@alpha.com", role=UserRole.ORG_AGENT.value)
+    resp = await client.post(
+        "/api/v1/platform/promote-admin",
+        json={"email": "Mixed.Case@Alpha.com"},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["role"] == "platform_admin"
+
+
+@pytest.mark.asyncio
+async def test_promote_admin_user_not_found(client, platform_admin, auth_headers):
+    resp = await client.post(
+        "/api/v1/platform/promote-admin",
+        json={"email": "ghost@nowhere.com"},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_promote_admin_already_platform_admin(client, platform_admin, auth_headers):
+    resp = await client.post(
+        "/api/v1/platform/promote-admin",
+        json={"email": "root@landline.app"},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_promote_admin_requires_platform_admin(client, make_user, auth_headers):
+    """An org_admin cannot promote anyone — 403."""
+    admin = await make_user("orgadmin@alpha.com", role=UserRole.ORG_ADMIN.value)
+    await make_user("victim@alpha.com", role=UserRole.ORG_AGENT.value)
+    resp = await client.post(
+        "/api/v1/platform/promote-admin",
+        json={"email": "victim@alpha.com"},
+        headers=auth_headers(admin),
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_demote_admin_success(client, db_session, platform_admin, make_user, auth_headers, org_b):
+    """Demoting a platform_admin sets org_admin + the chosen org."""
+    target = await make_user("demote.me@landline.app", role=UserRole.PLATFORM_ADMIN.value, org_id=None)
+    resp = await client.post(
+        "/api/v1/platform/demote-admin",
+        json={"user_id": str(target.id), "org_id": str(org_b.id)},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["role"] == "org_admin"
+
+    await db_session.refresh(target)
+    assert target.role == UserRole.ORG_ADMIN.value
+    assert target.org_id == org_b.id
+
+
+@pytest.mark.asyncio
+async def test_demote_admin_cannot_demote_self(client, platform_admin, auth_headers, org_b):
+    """The caller can't demote themselves — always leaves one platform_admin."""
+    resp = await client.post(
+        "/api/v1/platform/demote-admin",
+        json={"user_id": str(platform_admin.id), "org_id": str(org_b.id)},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_demote_admin_not_platform_admin(client, platform_admin, make_user, auth_headers, org_b):
+    """Target must currently be a platform_admin — 400 otherwise."""
+    target = await make_user("plain@beta.com", role=UserRole.ORG_ADMIN.value, org_id=org_b.id)
+    resp = await client.post(
+        "/api/v1/platform/demote-admin",
+        json={"user_id": str(target.id), "org_id": str(org_b.id)},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_demote_admin_user_not_found(client, platform_admin, auth_headers, org_b):
+    resp = await client.post(
+        "/api/v1/platform/demote-admin",
+        json={"user_id": str(uuid.uuid4()), "org_id": str(org_b.id)},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_demote_admin_org_not_found(client, platform_admin, make_user, auth_headers):
+    target = await make_user("demote2@landline.app", role=UserRole.PLATFORM_ADMIN.value, org_id=None)
+    resp = await client.post(
+        "/api/v1/platform/demote-admin",
+        json={"user_id": str(target.id), "org_id": str(uuid.uuid4())},
+        headers=auth_headers(platform_admin),
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_demote_admin_requires_platform_admin(client, make_user, auth_headers, org_b):
+    admin = await make_user("orgadmin3@alpha.com", role=UserRole.ORG_ADMIN.value)
+    target = await make_user("demote3@landline.app", role=UserRole.PLATFORM_ADMIN.value, org_id=None)
+    resp = await client.post(
+        "/api/v1/platform/demote-admin",
+        json={"user_id": str(target.id), "org_id": str(org_b.id)},
+        headers=auth_headers(admin),
+    )
+    assert resp.status_code == 403
