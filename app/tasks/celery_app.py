@@ -196,6 +196,12 @@ celery_app.conf.update(
             "task": "app.tasks.deliverability.assess_sender_health",
             "schedule": 3600.0,  # hourly
         },
+        # Feature 1: step every sender warm-up plan forward one day so the ramped
+        # daily cap reflects today. Just after the UTC date rollover.
+        "advance-warmup-progress": {
+            "task": "app.tasks.warmup.advance_warmup_progress",
+            "schedule": crontab(hour=0, minute=10),  # daily 00:10 UTC
+        },
         # Ingest delivery-failure notifications from the mailbox. Gmail is the
         # primary transport and has no bounce webhook — a DSN just lands in the
         # inbox — so this sweep is the only thing that reaches bounce_handler
@@ -363,6 +369,7 @@ celery_app.autodiscover_tasks(["app.tasks"], force=True)
 
 # Force-import all task modules to guarantee registration
 import app.tasks.outreach  # noqa: F401
+import app.tasks.warmup  # noqa: F401
 import app.tasks.news  # noqa: F401
 import app.tasks.scraping  # noqa: F401
 import app.tasks.enrichment  # noqa: F401

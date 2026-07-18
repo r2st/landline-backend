@@ -38,8 +38,10 @@ from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate
 from app.models.sender_health import SenderHealth
+from app.models.sender_warmup import SenderWarmupPlan
 from app.models.smtp_account import SmtpAccount
 from app.schemas.booking import BookingConfig, BookingConfigUpdate
+from app.schemas.warmup import WarmupPlanCreate, WarmupPlanRead
 from app.schemas.dialtone import (
     DIALTONE_EVENT_TYPES,
     DialtoneActivityFeed,
@@ -52,7 +54,7 @@ from app.schemas.dialtone import (
     PhoneEnrichmentRecent,
     PhoneEnrichmentSummary,
 )
-from app.services import system_settings
+from app.services import system_settings, warmup
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
@@ -834,7 +836,7 @@ async def set_sender_booking(
     if account is None:
         raise HTTPException(status_code=404, detail="Sender account not found")
 
-    fields = payload.model_dump(exclude_unset=True)
+    fields = payload.model_dump(exclude_unset=True)  # booking update fields
 
     if "booking_url" in fields:
         url = fields["booking_url"]
@@ -854,3 +856,85 @@ async def set_sender_booking(
     await db.commit()
     await db.refresh(account)
     return _booking_config(account, transport)
+
+
+# ─── Automated warm-up plans (Feature 1) ─────────────────────────────────────
+
+
+def _warmup_read(plan: SenderWarmupPlan, account) -> WarmupPlanRead:
+    """Serialise a plan, adding today's usage from the account when available."""
+    used = warmup.used_today(account) if account is not None else 0
+    return WarmupPlanRead(
+        id=plan.id,
+        account_id=plan.account_id,
+        account_type=plan.account_type,
+        account_email=plan.account_email,
+        start_date=plan.start_date,
+        current_day=plan.current_day,
+        daily_limit=plan.daily_limit,
+        status=plan.status,
+        used_today=used,
+        remaining_today=max(0, plan.daily_limit - used),
+        created_at=plan.created_at,
+        updated_at=plan.updated_at,
+    )
+
+
+@router.get("/warmup", response_model=list[WarmupPlanRead])
+async def list_warmup_plans(db: AsyncSession = Depends(get_db)):
+    """List every sender's warm-up plan, newest first, with today's usage.
+
+    The Sender Health page merges these onto each account row (by ``account_id``)
+    to show the warm-up day, daily cap, and progress toward it.
+    """
+    plans = (
+        await db.execute(
+            select(SenderWarmupPlan).order_by(SenderWarmupPlan.created_at.desc())
+        )
+    ).scalars().all()
+
+    # Index accounts so each plan's used-today reflects the live daily counter.
+    gmail = {a.id: a for a in (await db.execute(select(GmailAccount))).scalars().all()}
+    smtp = {a.id: a for a in (await db.execute(select(SmtpAccount))).scalars().all()}
+
+    out: list[WarmupPlanRead] = []
+    for plan in plans:
+        account = (gmail if plan.account_type == "gmail" else smtp).get(plan.account_id)
+        out.append(_warmup_read(plan, account))
+    return out
+
+
+@router.post("/warmup", response_model=WarmupPlanRead, status_code=201)
+async def create_warmup_plan(
+    payload: WarmupPlanCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create (or return the existing) warm-up plan for a sending account.
+
+    ``account_type`` is inferred from which table the account lives in when not
+    supplied. Idempotent: a sender that already has a plan gets it back with a
+    409 so the caller knows it wasn't newly created.
+    """
+    account, transport = await _load_sender(db, str(payload.account_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Sender account not found")
+
+    account_type = payload.account_type or transport
+    existing = await warmup.get_plan(db, payload.account_id, account_type)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A warm-up plan already exists for this sender.",
+        )
+
+    plan = await warmup.ensure_warmup_plan(
+        db,
+        account_id=payload.account_id,
+        account_type=account_type,
+        account_email=getattr(account, "email", None),
+        start=payload.start_date,
+        org_id=getattr(account, "org_id", None),
+    )
+    await db.commit()
+    await db.refresh(plan)
+    return _warmup_read(plan, account)

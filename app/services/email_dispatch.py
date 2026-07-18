@@ -234,6 +234,7 @@ async def _filter_by_sender_health(db: AsyncSession, accounts: list) -> list:
     with non-numeric send counts (mocks) or no data are never excluded.
     """
     from app.models.sender_health import SenderHealth  # local import avoids a cycle
+    from app.services import warmup as warmup_svc
     from app.services.send_limiter import get_send_limiter
 
     if not accounts:
@@ -253,7 +254,10 @@ async def _filter_by_sender_health(db: AsyncSession, accounts: list) -> list:
             continue
         throttle = h.throttle_factor if h is not None else 1.0
         effective = max(1, round(base_limit * throttle))
-        warmup = limiter.account_warmup_limit(a)
+        # Persisted warm-up plan (Feature 1) is authoritative; else config ramp.
+        warmup = await warmup_svc.plan_daily_limit(db, a)
+        if warmup is None:
+            warmup = limiter.account_warmup_limit(a)
         if warmup is not None:
             effective = min(effective, warmup)
         try:
@@ -409,6 +413,27 @@ async def send_outreach_email(
     # Last resort: the primary active account (even if sending_enabled is False)
     if account is None:
         account = await get_active_account(db)
+
+    # --- Warm-up gate (Feature 1) ---------------------------------------------
+    # A new mailbox on a warm-up ramp must not exceed today's ramped cap. This is
+    # the definitive per-account gate: it runs on the resolved account regardless
+    # of how it was chosen (explicit id, rotation, or fallback). Graduated / no
+    # plan → no constraint. Skipped for internal bypass callers.
+    if account is not None and not bypass_kill_switch:
+        from app.services import warmup
+
+        allowed, warmup_reason = await warmup.check_send_allowed(db, account)
+        if not allowed:
+            logger.info(
+                "Send to %s held by warm-up on %s: %s",
+                to_email, account.email, warmup_reason,
+            )
+            return {
+                "status": "skipped",
+                "reason": warmup_reason,
+                "transport": _transport_for(account),
+                "sender": account.email,
+            }
 
     # Append email signature (specific or default)
     signature = None

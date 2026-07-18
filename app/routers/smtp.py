@@ -148,6 +148,21 @@ async def add_account(
     db.add(account)
     await db.flush()
     await db.refresh(account)
+
+    # Feature 1: start the new mailbox on the warm-up ramp (day 1). Best-effort.
+    try:
+        from app.services import warmup
+
+        await warmup.ensure_warmup_plan(
+            db,
+            account_id=account.id,
+            account_type="smtp",
+            account_email=account.email,
+            org_id=account.org_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not create warm-up plan for %s: %s", account.email, exc)
+
     logger.info("Added SMTP sender %s (%s:%s)", account.email, account.host, account.port)
     return account
 

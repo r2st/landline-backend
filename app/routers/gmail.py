@@ -175,6 +175,7 @@ async def oauth_callback(
     expiry = datetime.now(timezone.utc) + timedelta(seconds=connected.expires_in)
     access_enc = crypto.encrypt(connected.access_token)
 
+    is_new_account = account is None
     if account is None:
         if not connected.refresh_token:
             return HTMLResponse(_callback_html(
@@ -218,6 +219,24 @@ async def oauth_callback(
             account.refresh_token_encrypted = crypto.encrypt(connected.refresh_token)
 
     await db.flush()
+
+    # Feature 1: a brand-new mailbox starts on day 1 of the warm-up ramp so it
+    # never dumps full cold volume. Idempotent and best-effort — a warm-up hiccup
+    # must not fail the OAuth connection itself.
+    if is_new_account:
+        try:
+            from app.services import warmup
+
+            await warmup.ensure_warmup_plan(
+                db,
+                account_id=account.id,
+                account_type="gmail",
+                account_email=account.email,
+                org_id=account.org_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not create warm-up plan for %s: %s", account.email, exc)
+
     logger.info(
         "Connected Gmail account %s (active=%s, sending=%s)",
         account.email, account.is_active, account.sending_enabled,

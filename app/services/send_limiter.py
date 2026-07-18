@@ -244,7 +244,14 @@ class SendLimiter:
         base = self.settings.max_emails_per_day
         effective = max(1, round(base * throttle))
 
-        warmup_limit = self.account_warmup_limit(account)
+        # Warm-up cap: a persisted SenderWarmupPlan (Feature 1) is authoritative
+        # for the account when present; otherwise fall back to the config-only
+        # per-account ramp keyed off connected_at.
+        from app.services import warmup
+
+        warmup_limit = await warmup.plan_daily_limit(db, account)
+        if warmup_limit is None:
+            warmup_limit = self.account_warmup_limit(account)
         if warmup_limit is not None:
             effective = min(effective, warmup_limit)
 
