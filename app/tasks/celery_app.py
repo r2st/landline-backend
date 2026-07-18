@@ -57,6 +57,7 @@ celery_app.conf.update(
         "app.tasks.phone_enrichment.*": {"queue": "enrichment"},
         "app.tasks.deal_agent.*": {"queue": "enrichment"},
         "app.tasks.social_listening.*": {"queue": "enrichment"},
+        "app.tasks.meeting_booking.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -327,6 +328,21 @@ celery_app.conf.update(
             "task": "app.tasks.social_listening.process_new_signals",
             "schedule": 3600.0,  # hourly
         },
+        # Meeting Booking Agent: poll proposed meetings for the prospect's slot
+        # pick and confirm/re-offer. Every 15 minutes — fast enough to reply while
+        # the prospect is still engaged, and idempotent (acts only on replies
+        # newer than the last logged turn).
+        "check-booking-replies": {
+            "task": "app.tasks.meeting_booking.check_booking_replies",
+            "schedule": 900.0,  # every 15 minutes
+        },
+        # Meeting Booking Agent: send the ~1h pre-meeting reminder for confirmed
+        # meetings and close out elapsed ones. Every 30 minutes with a 90-minute
+        # look-ahead → exactly one reminder per meeting, ~1h out.
+        "send-meeting-reminders": {
+            "task": "app.tasks.meeting_booking.send_meeting_reminders",
+            "schedule": 1800.0,  # every 30 minutes
+        },
     },
 )
 
@@ -366,3 +382,4 @@ import app.tasks.phone_enrichment  # noqa: F401
 import app.tasks.deal_agent  # noqa: F401
 import app.tasks.referral_agent  # noqa: F401
 import app.tasks.social_listening  # noqa: F401
+import app.tasks.meeting_booking  # noqa: F401

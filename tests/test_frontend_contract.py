@@ -87,6 +87,13 @@ FRONTEND_ROUTES = [
     ("PUT", "/api/v1/org/members/{member_id}/role"),
     ("DELETE", "/api/v1/org/members/{member_id}"),
     ("GET", "/api/v1/org/usage"),
+    # BookingAgent.jsx — the Meeting Booking Agent dashboard.
+    ("GET", "/api/v1/meeting-agent/config"),
+    ("PUT", "/api/v1/meeting-agent/config"),
+    ("GET", "/api/v1/meeting-agent/meetings"),
+    ("GET", "/api/v1/meeting-agent/meetings/{meeting_id}"),
+    ("POST", "/api/v1/meeting-agent/meetings/{meeting_id}/cancel"),
+    ("GET", "/api/v1/meeting-agent/stats"),
 ]
 
 

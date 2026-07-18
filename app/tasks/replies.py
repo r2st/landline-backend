@@ -35,6 +35,7 @@ from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.outreach import OutreachEnrollment
 from app.services import bounce_handler
+from app.services import meeting_booking_agent
 from app.services.ai_service import get_ai_service
 from app.services.notifications import get_notification_service
 from app.tasks.celery_app import celery_app
@@ -159,6 +160,16 @@ async def route_auto_action(
             await notif.notify_reply(contact_name, company_name, reply.from_email or "")
         except Exception as exc:  # pragma: no cover - notification is best-effort
             logger.info("interested notify failed for reply %s: %s", reply.id, exc)
+        # Hand off to the Meeting Booking Agent: if the org has an active agent
+        # and the reply reads as wanting to meet, it proposes calendar slots in
+        # this same thread. Best-effort and fully self-contained — a booking
+        # failure must never disrupt reply routing, so it's guarded here.
+        try:
+            await meeting_booking_agent.on_interested_reply(
+                db, reply=reply, contact=contact, company=company
+            )
+        except Exception as exc:  # noqa: BLE001 — booking is best-effort
+            logger.info("meeting-booking handoff failed for reply %s: %s", reply.id, exc)
         return "none"
 
     if effective_category == "unsubscribe":
