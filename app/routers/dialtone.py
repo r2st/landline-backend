@@ -22,7 +22,7 @@ from collections import Counter
 from datetime import date as date_cls, datetime, time, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,7 +40,14 @@ from app.models.prospecting import ProspectCandidate
 from app.models.sender_health import SenderHealth
 from app.models.sender_warmup import SenderWarmupPlan
 from app.models.smtp_account import SmtpAccount
+from app.models.suppression import SuppressionEntry
 from app.schemas.booking import BookingConfig, BookingConfigUpdate
+from app.schemas.suppression import (
+    SuppressionEntryCreate,
+    SuppressionEntryRead,
+    SuppressionImportResult,
+    SuppressionListResponse,
+)
 from app.schemas.warmup import WarmupPlanCreate, WarmupPlanRead
 from app.schemas.dialtone import (
     DIALTONE_EVENT_TYPES,
@@ -54,7 +61,7 @@ from app.schemas.dialtone import (
     PhoneEnrichmentRecent,
     PhoneEnrichmentSummary,
 )
-from app.services import system_settings, warmup
+from app.services import suppression, system_settings, warmup
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
@@ -938,3 +945,89 @@ async def create_warmup_plan(
     await db.commit()
     await db.refresh(plan)
     return _warmup_read(plan, account)
+
+
+# ─── Suppression list (Feature 2) ────────────────────────────────────────────
+
+# Cap an uploaded file at 5 MB so a runaway upload can't exhaust memory. A CSV
+# of email addresses is tiny; 5 MB is ~150k addresses.
+_MAX_SUPPRESSION_UPLOAD = 5 * 1024 * 1024
+
+
+@router.get("/suppression", response_model=SuppressionListResponse)
+async def list_suppression(
+    q: Optional[str] = Query(None, description="Filter by email substring"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Paginated do-not-contact list, newest first, optionally search-filtered."""
+    total = await suppression.count_entries(db, q)
+
+    query = select(SuppressionEntry).order_by(SuppressionEntry.created_at.desc())
+    if q:
+        query = query.where(SuppressionEntry.email.ilike(f"%{q.strip().lower()}%"))
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    rows = (await db.execute(query)).scalars().all()
+
+    return SuppressionListResponse(
+        items=[SuppressionEntryRead.model_validate(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post("/suppression", response_model=SuppressionEntryRead, status_code=201)
+async def add_suppression(
+    payload: SuppressionEntryCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Add a single address to the suppression list by hand."""
+    entry, status = await suppression.add_entry(
+        db, payload.email, reason=payload.reason, source="manual"
+    )
+    if status == "invalid":
+        raise HTTPException(status_code=400, detail="Not a valid email address.")
+    if status == "duplicate":
+        raise HTTPException(status_code=409, detail="Address is already suppressed.")
+    await db.commit()
+    await db.refresh(entry)
+    return SuppressionEntryRead.model_validate(entry)
+
+
+@router.post("/suppression/import", response_model=SuppressionImportResult)
+async def import_suppression(
+    file: UploadFile = File(..., description="CSV or newline-separated address list"),
+    reason: str = Query("unsubscribe", description="Default reason for rows without one"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-import a CSV (or plain text) of addresses into the suppression list.
+
+    Accepts a header row naming ``email``/``reason`` columns, a headerless CSV
+    (email first), or one address per line. Returns per-outcome counts.
+    """
+    raw = await file.read()
+    if len(raw) > _MAX_SUPPRESSION_UPLOAD:
+        raise HTTPException(status_code=413, detail="File too large (max 5 MB).")
+    try:
+        content = raw.decode("utf-8-sig")  # tolerate a UTF-8 BOM from Excel
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 text/CSV.")
+
+    result = await suppression.import_csv(db, content, default_reason=reason)
+    return SuppressionImportResult(**result)
+
+
+@router.delete("/suppression/{entry_id}", status_code=204)
+async def delete_suppression(entry_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Remove an address from the suppression list (re-allows contacting it)."""
+    entry = (
+        await db.execute(
+            select(SuppressionEntry).where(SuppressionEntry.id == entry_id)
+        )
+    ).scalar_one_or_none()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Suppression entry not found")
+    await db.delete(entry)
+    await db.commit()

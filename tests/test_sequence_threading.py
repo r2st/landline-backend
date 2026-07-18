@@ -123,7 +123,12 @@ async def test_send_outreach_email_passes_threading_params():
         mock_make_sender.return_value = mock_sender
 
         mock_db = AsyncMock()
-        mock_db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
+        # No rows for any lookup: scalar_one_or_none (warm-up plan / signature)
+        # AND first() (suppression check) must both read as "not found".
+        mock_db.execute = AsyncMock(return_value=MagicMock(
+            scalar_one_or_none=MagicMock(return_value=None),
+            first=MagicMock(return_value=None),
+        ))
 
         result = await send_outreach_email(
             mock_db,
@@ -458,6 +463,9 @@ async def test_rotation_skips_sending_disabled_accounts():
     smtp_result.scalars.return_value.all.return_value = []
     empty_result = MagicMock()
     empty_result.scalars.return_value.all.return_value = []
+    # The per-account warm-up plan lookup (plan_daily_limit → get_plan) must read
+    # as "no plan" so the health/warm-up filter doesn't try to min() a mock.
+    empty_result.scalar_one_or_none.return_value = None
 
     results = iter([gmail_result, smtp_result])
 

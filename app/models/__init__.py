@@ -43,6 +43,7 @@ from app.models.discovery_search import DiscoverySearch
 from app.models.discovered_business import DiscoveredBusiness
 from app.models.sender_health import SenderHealth
 from app.models.sender_warmup import SenderWarmupPlan
+from app.models.suppression import SuppressionEntry
 from app.models.danger_signal import DangerSignalEvent
 from app.models.domain_health import DomainHealth
 from app.models.bounce_record import BounceRecord
@@ -124,6 +125,7 @@ __all__ = [
     "DiscoveredBusiness",
     "SenderHealth",
     "SenderWarmupPlan",
+    "SuppressionEntry",
     "DangerSignalEvent",
     "DomainHealth",
     "BounceRecord",

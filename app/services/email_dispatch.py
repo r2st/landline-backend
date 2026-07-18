@@ -400,6 +400,23 @@ async def send_outreach_email(
                 "sender": None,
             }
 
+    # --- Suppression list (Feature 2) -----------------------------------------
+    # The do-not-contact list is a compliance gate: an address on it must never
+    # receive ANY outbound mail. Checked here, the single choke point every
+    # outreach path funnels through, so it covers sequence steps, the queue and
+    # manual sends alike — and enforced even for kill-switch-bypass callers,
+    # because suppression is stricter than the operational pause.
+    from app.services import suppression
+
+    if await suppression.is_suppressed(db, to_email):
+        logger.info("Send to %s blocked: address is on the suppression list", to_email)
+        return {
+            "status": "suppressed",
+            "reason": "Recipient is on the do-not-contact suppression list.",
+            "transport": "none",
+            "sender": None,
+        }
+
     account = None
     if sender_account_id is not None:
         account = await get_account(db, sender_account_id)

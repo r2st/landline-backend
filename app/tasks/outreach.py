@@ -204,7 +204,16 @@ def send_sequence_step(self, enrollment_id: str):
                     return {"status": "paused", "reason": "no_contact_email"}
 
                 # Hard suppression (Feature 1): never send to a suppressed contact.
-                if getattr(contact, "suppressed", False):
+                # Two sources: the per-contact ``suppressed`` flag, and the org
+                # do-not-contact suppression LIST keyed by email (Feature 2 — a
+                # bulk compliance import that may name an address which isn't even
+                # a contact). Either one stops the enrollment as unsubscribed
+                # (NOT bounced — a compliance stop must not dent sender metrics).
+                from app.services import suppression as _suppression
+
+                if getattr(contact, "suppressed", False) or await _suppression.is_suppressed(
+                    db, contact.email
+                ):
                     enrollment.status = "unsubscribed"
                     enrollment.completed_at = datetime.now(timezone.utc)
                     await db.commit()
@@ -603,6 +612,24 @@ def send_sequence_step(self, enrollment_id: str):
                     references=references,
                 )
 
+                # Soft-skip statuses: the dispatcher declined to send but this is
+                # NOT a bounce (warm-up cap hit, suppression, kill switch). Record
+                # nothing and DON'T advance — the step hasn't been sent, so the
+                # queue will retry it once the block clears. Recording a bounce
+                # here would falsely dent sender metrics and end the enrollment.
+                if send_result.get("status") in ("skipped", "suppressed", "halted"):
+                    await db.rollback()
+                    logger.info(
+                        "Step %d for enrollment %s not sent (%s): %s",
+                        step.step_number, enrollment_id,
+                        send_result.get("status"), send_result.get("reason"),
+                    )
+                    return {
+                        "status": send_result.get("status"),
+                        "reason": send_result.get("reason"),
+                        "step": step.step_number,
+                    }
+
                 # Record event. ``tracked`` records whether this send carried an
                 # open pixel — ``evaluate_step_condition`` reads it to decide
                 # whether a missing open means "not opened" or "we never looked".
@@ -808,9 +835,16 @@ def process_outreach_queue():
                 )
                 contact = contact_result.scalar_one_or_none()
 
-                # Hard suppression (Feature 1): a contact suppressed via an
-                # unsubscribe reply is never emailed again. Skip before any send.
-                if contact and getattr(contact, "suppressed", False):
+                # Hard suppression: a contact suppressed via an unsubscribe reply
+                # (Feature 1), or an address on the org do-not-contact list
+                # (Feature 2), is never emailed again. Skip before any send —
+                # send_sequence_step re-checks and stops the enrollment properly.
+                from app.services import suppression as _suppression
+
+                if contact and (
+                    getattr(contact, "suppressed", False)
+                    or await _suppression.is_suppressed(db, contact.email)
+                ):
                     logger.info("Skipping enrollment %s: contact suppressed", enrollment.id)
                     continue
 
