@@ -246,9 +246,9 @@ class AIService:
 
         ``openrouter_api_key`` lets a caller run this instance on a *specific*
         OpenRouter credential rather than the process-wide one — used by the
-        Social Listening and Deal Progression agents, which carry their own
-        per-org key. Passing a non-empty key pins the backend to OpenRouter with
-        that key + model, regardless of ``AI_PROVIDER``.
+        Social Listening, Deal Progression, and Client Success agents, which
+        carry their own per-org key. Passing a non-empty key pins the backend to
+        OpenRouter with that key + model, regardless of ``AI_PROVIDER``.
 
         ``force_openrouter`` pins OpenRouter even when no key is supplied here
         (the global env key is then used as the fallback) — the Deal Progression

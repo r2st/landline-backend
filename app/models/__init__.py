@@ -54,6 +54,7 @@ from app.models.relationship import StakeholderMap, OrgRelationship
 from app.models.meeting import MeetingBrief
 from app.models.meeting_booking import BookedMeeting, MeetingBookingAgent
 from app.models.agent_daily_summary import AgentDailySummary
+from app.models.client_success_agent import ClientSuccessAgent, ClientSuccessAction
 from app.models.system_setting import SystemSetting
 from app.models.referral import ReferralAgent, Referral, ReferralAction
 from app.models.social_listening_agent import (
@@ -141,4 +142,6 @@ __all__ = [
     "SocialListeningAgent",
     "SignalEvent",
     "MonitoredCompany",
+    "ClientSuccessAgent",
+    "ClientSuccessAction",
 ]

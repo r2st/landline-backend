@@ -43,6 +43,7 @@ celery_app.conf.update(
         "app.tasks.smart_suggestions_task.*": {"queue": "enrichment"},
         "app.tasks.prospecting.*": {"queue": "enrichment"},
         "app.tasks.client_health.*": {"queue": "enrichment"},
+        "app.tasks.client_success.*": {"queue": "enrichment"},
         "app.tasks.deliverability.*": {"queue": "enrichment"},
         "app.tasks.bounces.*": {"queue": "enrichment"},
         "app.tasks.danger_signals.*": {"queue": "enrichment"},
@@ -178,6 +179,17 @@ celery_app.conf.update(
         "predict-client-health": {
             "task": "app.tasks.client_health.predict_client_health",
             "schedule": crontab(hour=6, minute=30, day_of_week=1),  # Mondays 6:30 AM UTC
+        },
+        # Client Success Agent: daily scan of client health → enqueue check-in /
+        # escalation / celebration / review-call actions (per active-agent org).
+        "client-success-scan": {
+            "task": "app.tasks.client_success.scan_client_health_task",
+            "schedule": crontab(hour=7, minute=45),  # daily 7:45 AM UTC
+        },
+        # Client Success Agent: hourly send of approved auto check-ins.
+        "client-success-execute": {
+            "task": "app.tasks.client_success.execute_success_actions",
+            "schedule": 3600.0,  # hourly
         },
         # 3.3: hourly sender deliverability health assessment.
         "assess-sender-health": {
@@ -383,3 +395,4 @@ import app.tasks.deal_agent  # noqa: F401
 import app.tasks.referral_agent  # noqa: F401
 import app.tasks.social_listening  # noqa: F401
 import app.tasks.meeting_booking  # noqa: F401
+import app.tasks.client_success  # noqa: F401

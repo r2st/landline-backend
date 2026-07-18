@@ -94,6 +94,14 @@ FRONTEND_ROUTES = [
     ("GET", "/api/v1/meeting-agent/meetings/{meeting_id}"),
     ("POST", "/api/v1/meeting-agent/meetings/{meeting_id}/cancel"),
     ("GET", "/api/v1/meeting-agent/stats"),
+    # ClientSuccessAgent.jsx — the autonomous client-success agent surface.
+    ("GET", "/api/v1/client-success-agent/config"),
+    ("PUT", "/api/v1/client-success-agent/config"),
+    ("GET", "/api/v1/client-success-agent/actions"),
+    ("POST", "/api/v1/client-success-agent/actions/{action_id}/approve"),
+    ("POST", "/api/v1/client-success-agent/actions/{action_id}/dismiss"),
+    ("GET", "/api/v1/client-success-agent/stats"),
+    ("GET", "/api/v1/client-success-agent/health-overview"),
 ]
 
 
