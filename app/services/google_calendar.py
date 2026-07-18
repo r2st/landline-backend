@@ -89,3 +89,43 @@ def create_event(
     except Exception as e:  # noqa: BLE001 — best-effort; caller falls back to a link
         logger.warning("Calendar event creation failed for %s: %s", account.email, e)
         return {"error": str(e)}
+
+
+def get_busy_intervals(
+    account: GmailAccount,
+    *,
+    start: datetime,
+    end: datetime,
+) -> dict:
+    """Query the account's primary-calendar busy intervals between ``start`` and ``end``.
+
+    Returns ``{"busy": [(start, end), ...]}`` (aware datetimes) on success or
+    ``{"error": ...}`` on failure — never raises. The meeting-booking agent uses
+    this to carve free slots out of the working-hours window; on error the caller
+    treats the calendar as fully free rather than blocking scheduling entirely.
+
+    Runs the blocking Google client synchronously — call it from a thread/executor
+    when on the event loop.
+    """
+    try:
+        creds = _build_credentials(account)
+        service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        body = {
+            "timeMin": start.isoformat(),
+            "timeMax": end.isoformat(),
+            "items": [{"id": "primary"}],
+        }
+        resp = service.freebusy().query(body=body).execute()
+        raw = resp.get("calendars", {}).get("primary", {}).get("busy", [])
+        busy: list[tuple[datetime, datetime]] = []
+        for slot in raw:
+            try:
+                bs = datetime.fromisoformat(slot["start"].replace("Z", "+00:00"))
+                be = datetime.fromisoformat(slot["end"].replace("Z", "+00:00"))
+                busy.append((bs, be))
+            except (KeyError, ValueError):
+                continue
+        return {"busy": busy}
+    except Exception as e:  # noqa: BLE001 — best-effort; caller assumes free on error
+        logger.warning("Calendar free/busy query failed for %s: %s", account.email, e)
+        return {"error": str(e)}
