@@ -295,6 +295,23 @@ celery_app.conf.update(
             "task": "app.tasks.deal_agent.execute_pending_actions",
             "schedule": 3600.0,  # hourly
         },
+        # --- Referral & Warm-Intro agent ---
+        # Weekly scan for happy, long-tenured clients to ask for referrals.
+        # Mondays 7 AM UTC, clear of the other Monday-morning report tasks.
+        "scan-referral-candidates": {
+            "task": "app.tasks.referral_agent.scan_referral_candidates",
+            "schedule": crontab(hour=7, minute=0, day_of_week=1),
+        },
+        # Daily nudge on referral asks that have gone unanswered past threshold.
+        "followup-pending-referrals": {
+            "task": "app.tasks.referral_agent.followup_pending_referrals",
+            "schedule": crontab(hour=9, minute=30),  # daily 9:30 AM UTC
+        },
+        # Daily check for referred contacts who have since closed a won deal.
+        "check-referral-conversions": {
+            "task": "app.tasks.referral_agent.check_referral_conversions",
+            "schedule": crontab(hour=10, minute=0),  # daily 10 AM UTC
+        },
     },
 )
 
@@ -332,3 +349,4 @@ import app.tasks.verification  # noqa: F401
 import app.tasks.places_discovery  # noqa: F401
 import app.tasks.phone_enrichment  # noqa: F401
 import app.tasks.deal_agent  # noqa: F401
+import app.tasks.referral_agent  # noqa: F401

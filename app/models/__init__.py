@@ -54,6 +54,7 @@ from app.models.relationship import StakeholderMap, OrgRelationship
 from app.models.meeting import MeetingBrief
 from app.models.agent_daily_summary import AgentDailySummary
 from app.models.system_setting import SystemSetting
+from app.models.referral import ReferralAgent, Referral, ReferralAction
 
 __all__ = [
     "SystemSetting",
@@ -128,4 +129,7 @@ __all__ = [
     "OrgRelationship",
     "MeetingBrief",
     "AgentDailySummary",
+    "ReferralAgent",
+    "Referral",
+    "ReferralAction",
 ]
