@@ -1,6 +1,6 @@
 """Automated sender warm-up plans.
 
-Chains off ``080_system_settings_per_org_unique``, the current head.
+Chains off ``086_client_success_agent``, the current head.
 
 One row per sending account tracks its position on the graduated warm-up ramp
 (5/day → 10 → 20 → 35 → 50 → graduated) so a brand-new mailbox never dumps full
@@ -16,8 +16,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "081_sender_warmup_plans"
-down_revision = "080_system_settings_per_org_unique"
+revision = "087_sender_warmup_plans"
+down_revision = "086_client_success_agent"
 branch_labels = None
 depends_on = None
 

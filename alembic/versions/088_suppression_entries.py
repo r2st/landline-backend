@@ -1,6 +1,6 @@
 """Global do-not-contact suppression list.
 
-Chains off ``081_sender_warmup_plans``, the current head.
+Chains off ``087_sender_warmup_plans``, the current head.
 
 One row per suppressed email per org, consulted by every outreach path before a
 send (Feature 2). Emails are stored lower-cased; a unique ``(org_id, email)``
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "082_suppression_entries"
-down_revision = "081_sender_warmup_plans"
+revision = "088_suppression_entries"
+down_revision = "087_sender_warmup_plans"
 branch_labels = None
 depends_on = None
 
