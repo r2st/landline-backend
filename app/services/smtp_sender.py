@@ -15,6 +15,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from typing import Optional
 
+from app.config import get_settings
 from app.services import crypto
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,27 @@ logger = logging.getLogger(__name__)
 # Connections to third-party SMTP hosts can be slow; cap so a wedged host can't
 # hang a request/worker indefinitely.
 _SMTP_TIMEOUT = 20
+
+
+def _apply_unsubscribe_headers(
+    message, list_unsubscribe_url: Optional[str], sender_email: Optional[str] = None
+) -> None:
+    """Add RFC 2369 List-Unsubscribe + RFC 8058 one-click headers.
+
+    Mirrors ``gmail_sender._apply_unsubscribe_headers`` so SMTP-sent mail carries
+    the same one-click unsubscribe affordance Gmail/Yahoo require of bulk senders
+    (June 2024). Without these headers on the SMTP transport, sequences sent from
+    Outlook/custom hosts were shipping with no List-Unsubscribe at all.
+    """
+    if not list_unsubscribe_url:
+        return
+    methods = []
+    mailto = get_settings().unsubscribe_mailto or sender_email
+    if mailto:
+        methods.append(f"<mailto:{mailto}?subject=unsubscribe>")
+    methods.append(f"<{list_unsubscribe_url}>")
+    message["List-Unsubscribe"] = ", ".join(methods)
+    message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 
 
 class SmtpSender:
@@ -77,6 +99,9 @@ class SmtpSender:
         body_html: str,
         body_text: Optional[str],
         reply_to: Optional[str],
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> MIMEMultipart:
         message = MIMEMultipart("alternative")
         message["To"] = to_email
@@ -84,6 +109,12 @@ class SmtpSender:
         message["Subject"] = subject
         if reply_to:
             message["Reply-To"] = reply_to
+        # Threading headers so replies thread correctly in the recipient's client.
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+        if references:
+            message["References"] = references
+        _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
         if body_text:
             message.attach(MIMEText(body_text, "plain", "utf-8"))
         message.attach(MIMEText(body_html, "html", "utf-8"))
@@ -96,10 +127,23 @@ class SmtpSender:
         body_html: str,
         body_text: Optional[str] = None,
         reply_to: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> dict:
-        """Send a single email. Mirrors GmailSender.send_email's return shape."""
+        """Send a single email. Mirrors GmailSender.send_email's return shape.
+
+        ``thread_id`` is accepted for interface parity with ``GmailSender`` (Gmail
+        threads by its own thread id) but is not used over SMTP — RFC threading is
+        carried entirely by the ``In-Reply-To``/``References`` headers.
+        """
         try:
-            message = self._build_message(to_email, subject, body_html, body_text, reply_to)
+            message = self._build_message(
+                to_email, subject, body_html, body_text, reply_to,
+                in_reply_to=in_reply_to, references=references,
+                list_unsubscribe_url=list_unsubscribe_url,
+            )
             server = self._connect()
             try:
                 server.sendmail(self.sender_email, [to_email], message.as_string())

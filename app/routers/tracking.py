@@ -310,39 +310,69 @@ async def track_click(token: str, db: AsyncSession = Depends(get_db)):
         return RedirectResponse(url="https://apprendtechnologies.com", status_code=302)
 
 
+async def _process_unsubscribe(token: str, db: AsyncSession) -> bool:
+    """Verify an unsubscribe token and mark the contact unsubscribed.
+
+    Returns True when the token was valid (whether or not a matching contact
+    row existed), False when the token failed to verify. Shared by the GET
+    (user clicks a link) and POST (RFC 8058 one-click) handlers so both do
+    exactly the same thing.
+    """
+    serializer = _get_unsubscribe_serializer()
+    email = serializer.loads(token, salt="unsubscribe", max_age=86400 * 365)  # 1 year
+    if email:
+        result = await db.execute(select(Contact).where(Contact.email == email))
+        contact = result.scalar_one_or_none()
+        if contact:
+            contact.unsubscribed = True
+            await db.commit()
+            logger.info("Contact %s unsubscribed", email)
+    return True
+
+
+_UNSUB_OK_HTML = (
+    "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
+    "text-align: center; padding: 60px 20px; color: #333;'>"
+    "<h2 style='font-weight: 500; margin-bottom: 12px;'>You're unsubscribed</h2>"
+    "<p style='color: #666;'>We've removed you from our list. You won't hear from us again.</p>"
+    "</body></html>"
+)
+_UNSUB_ERR_HTML = (
+    "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
+    "text-align: center; padding: 60px 20px; color: #333;'>"
+    "<h2 style='font-weight: 500; margin-bottom: 12px;'>That link didn't work</h2>"
+    "<p style='color: #666;'>It may have expired. Just reply to any of our emails "
+    "with the word UNSUBSCRIBE and we'll take care of it.</p>"
+    "</body></html>"
+)
+
+
 @router.get("/unsubscribe")
 async def unsubscribe(token: str, db: AsyncSession = Depends(get_db)):
-    """Handle email unsubscribe requests."""
+    """Handle a user-clicked unsubscribe link (renders a confirmation page)."""
     try:
-        serializer = _get_unsubscribe_serializer()
-        email = serializer.loads(token, salt="unsubscribe", max_age=86400 * 365)  # 1 year
-
-        if email:
-            # Mark contact as unsubscribed
-            result = await db.execute(
-                select(Contact).where(Contact.email == email)
-            )
-            contact = result.scalar_one_or_none()
-            if contact:
-                contact.unsubscribed = True
-                await db.commit()
-                logger.info("Contact %s unsubscribed", email)
-
-        return HTMLResponse(
-            "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
-            "text-align: center; padding: 60px 20px; color: #333;'>"
-            "<h2 style='font-weight: 500; margin-bottom: 12px;'>You're unsubscribed</h2>"
-            "<p style='color: #666;'>We've removed you from our list. You won't hear from us again.</p>"
-            "</body></html>"
-        )
+        await _process_unsubscribe(token, db)
+        return HTMLResponse(_UNSUB_OK_HTML)
     except Exception as e:
         logger.warning("Unsubscribe failed: %s", str(e))
-        return HTMLResponse(
-            "<html><body style='font-family: -apple-system, BlinkMacSystemFont, sans-serif; "
-            "text-align: center; padding: 60px 20px; color: #333;'>"
-            "<h2 style='font-weight: 500; margin-bottom: 12px;'>That link didn't work</h2>"
-            "<p style='color: #666;'>It may have expired. Just reply to any of our emails "
-            "with the word UNSUBSCRIBE and we'll take care of it.</p>"
-            "</body></html>",
-            status_code=400,
-        )
+        return HTMLResponse(_UNSUB_ERR_HTML, status_code=400)
+
+
+@router.post("/unsubscribe")
+async def unsubscribe_one_click(token: str, db: AsyncSession = Depends(get_db)):
+    """Handle RFC 8058 one-click unsubscribe.
+
+    Gmail/Yahoo bulk-sender guidelines (June 2024) require a ``List-Unsubscribe:
+    <https…>`` URL paired with ``List-Unsubscribe-Post: List-Unsubscribe=One-Click``.
+    The mailbox provider then POSTs to that URL (no human ever loads the page), so
+    this must accept POST or the provider gets a 405 and the one-click affordance
+    is treated as broken. Processes the unsubscribe exactly like the GET path and
+    returns a small 200 body (the provider ignores the content).
+    """
+    try:
+        await _process_unsubscribe(token, db)
+        return Response(status_code=200)
+    except Exception as e:
+        logger.warning("One-click unsubscribe failed: %s", str(e))
+        # A 400 tells the provider the token was bad; the address stays subscribed.
+        return Response(status_code=400)
