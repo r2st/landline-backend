@@ -5,6 +5,9 @@ import os
 # A signing secret must exist before importing app modules — the app now
 # refuses to run without one, and tests mint JWTs. Set it first.
 os.environ.setdefault("SECRET_KEY", "test-secret-key-not-for-production")
+# Disable the short-TTL response cache in tests — a hit from a prior test's data
+# would leak across the per-test in-memory DBs. The cache is verified separately.
+os.environ.setdefault("RESPONSE_CACHE_ENABLED", "false")
 
 import asyncio
 import json

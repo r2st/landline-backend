@@ -8,6 +8,7 @@ from sqlalchemy import func, select, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services import cache
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.deal import Deal
@@ -37,7 +38,13 @@ SENT_STATUSES = ("sent", "skipped")
 
 @router.get("/overview", response_model=DashboardOverview)
 async def get_overview(db: AsyncSession = Depends(get_db)):
-    """Get full dashboard overview with pipeline, outreach, and scoring stats."""
+    """Get full dashboard overview with pipeline, outreach, and scoring stats.
+
+    Short-TTL cached — this runs a dozen aggregate queries and is polled often."""
+    return await cache.cached("dashboard:overview", lambda: _build_overview(db))
+
+
+async def _build_overview(db: AsyncSession) -> DashboardOverview:
     # Total companies
     result = await db.execute(select(func.count(Company.id)))
     total_companies = result.scalar() or 0
@@ -214,7 +221,11 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
 
 @router.get("/kpis", response_model=DashboardKPIs)
 async def get_kpis(db: AsyncSession = Depends(get_db)):
-    """Get quick KPI stats for the dashboard."""
+    """Get quick KPI stats for the dashboard (short-TTL cached)."""
+    return await cache.cached("dashboard:kpis", lambda: _build_kpis(db))
+
+
+async def _build_kpis(db: AsyncSession) -> DashboardKPIs:
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
@@ -292,19 +303,22 @@ async def get_kpis(db: AsyncSession = Depends(get_db)):
 
 @router.get("/pipeline")
 async def get_pipeline_stats(db: AsyncSession = Depends(get_db)):
-    """Get pipeline stage breakdown."""
-    result = await db.execute(
-        select(Company.stage, func.count(Company.id))
-        .group_by(Company.stage)
-        .order_by(func.count(Company.id).desc())
-    )
-    return [{"stage": row[0], "count": row[1]} for row in result.all()]
+    """Get pipeline stage breakdown (short-TTL cached)."""
+    async def _build():
+        result = await db.execute(
+            select(Company.stage, func.count(Company.id))
+            .group_by(Company.stage)
+            .order_by(func.count(Company.id).desc())
+        )
+        return [{"stage": row[0], "count": row[1]} for row in result.all()]
+
+    return await cache.cached("dashboard:pipeline", _build)
 
 
 @router.get("/outreach-metrics", response_model=OutreachMetrics)
 async def get_outreach_stats(db: AsyncSession = Depends(get_db)):
-    """Get outreach email performance metrics."""
-    return await _get_outreach_metrics(db)
+    """Get outreach email performance metrics (short-TTL cached)."""
+    return await cache.cached("dashboard:outreach-metrics", lambda: _get_outreach_metrics(db))
 
 
 @router.get("/industry", response_model=list[IndustryStat])
@@ -312,8 +326,10 @@ async def get_industry_breakdown(
     limit: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the company count by industry segment (top N)."""
-    return await _get_industry_breakdown(db, limit=limit)
+    """Get the company count by industry segment (top N, short-TTL cached)."""
+    return await cache.cached(
+        f"dashboard:industry:{limit}", lambda: _get_industry_breakdown(db, limit=limit)
+    )
 
 
 @router.get("/top-leads", response_model=list[TopLead])

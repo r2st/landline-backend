@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
 
+    # Short-TTL response cache for hot dashboard/analytics aggregates. Disabled in
+    # the test suite (see conftest) so cached rows can't leak across tests.
+    response_cache_enabled: bool = True
+    response_cache_ttl: int = 30  # seconds
+
     # AWS SES (fallback email transport when no Gmail account is connected).
     # SES sends from its own DNS-verified domain, so this stays on the
     # SES-verified apprendtechnologies.com identity even though the *primary*
