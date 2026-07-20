@@ -121,6 +121,10 @@ async def add_account(
         password_encrypted=crypto.encrypt(payload.password),
         use_tls=payload.use_tls,
         use_ssl=payload.use_ssl,
+        imap_host=payload.imap_host,
+        imap_port=payload.imap_port,
+        imap_use_ssl=payload.imap_use_ssl,
+        imap_enabled=payload.imap_enabled,
         sending_enabled=True,
     )
 
@@ -180,7 +184,10 @@ async def update_account(
     data = payload.model_dump(exclude_unset=True)
     if "email" in data and data["email"] is not None:
         account.email = str(data["email"])
-    for field in ("display_name", "host", "port", "username", "use_tls", "use_ssl"):
+    for field in (
+        "display_name", "host", "port", "username", "use_tls", "use_ssl",
+        "imap_host", "imap_port", "imap_use_ssl", "imap_enabled",
+    ):
         if field in data and data[field] is not None:
             setattr(account, field, data[field])
     if data.get("password"):

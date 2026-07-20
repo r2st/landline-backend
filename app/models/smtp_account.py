@@ -49,6 +49,19 @@ class SmtpAccount(Base, OrgScopedMixin):
     use_tls: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     use_ssl: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # IMAP connection details — used by the reply/bounce sweeps to poll this
+    # mailbox for inbound mail (SMTP itself is send-only). ``imap_host`` is
+    # nullable: when unset the reader derives it from ``host`` (smtp.→imap.).
+    imap_host: Mapped[str | None] = mapped_column(String(255))
+    imap_port: Mapped[int] = mapped_column(Integer, nullable=False, default=993, server_default="993")
+    imap_use_ssl: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    # Whether the reply/bounce sweep polls this mailbox. Off for send-only relays.
+    imap_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
     # Primary sender flag — at most one across Gmail + SMTP at a time.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Whether this account is in the sending rotation pool.

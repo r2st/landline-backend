@@ -25,6 +25,13 @@ class SmtpAccountBase(BaseModel):
     username: str = Field(..., min_length=1, max_length=320)
     use_tls: bool = True
     use_ssl: bool = False
+    # IMAP settings for the reply/bounce sweep. When ``imap_host`` is omitted it
+    # is derived from ``host`` (smtp.→imap.). ``imap_enabled`` turns polling off
+    # for send-only relays.
+    imap_host: Optional[str] = Field(None, max_length=255)
+    imap_port: int = Field(993, ge=1, le=65535)
+    imap_use_ssl: bool = True
+    imap_enabled: bool = True
 
     @field_validator("host")
     @classmethod
@@ -49,6 +56,10 @@ class SmtpAccountUpdate(BaseModel):
     password: Optional[str] = Field(None, min_length=1)
     use_tls: Optional[bool] = None
     use_ssl: Optional[bool] = None
+    imap_host: Optional[str] = Field(None, max_length=255)
+    imap_port: Optional[int] = Field(None, ge=1, le=65535)
+    imap_use_ssl: Optional[bool] = None
+    imap_enabled: Optional[bool] = None
 
 
 class SmtpAccountRead(BaseModel):
@@ -62,6 +73,10 @@ class SmtpAccountRead(BaseModel):
     username: str
     use_tls: bool
     use_ssl: bool
+    imap_host: Optional[str] = None
+    imap_port: int = 993
+    imap_use_ssl: bool = True
+    imap_enabled: bool = True
     is_active: bool
     sending_enabled: bool
     status: str

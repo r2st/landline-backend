@@ -9,6 +9,7 @@ addresses we have previously emailed.  When a reply is found the service:
     4. Auto-advances the parent Company stage to ``engaged`` when appropriate.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -25,7 +26,9 @@ from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.interaction import Interaction
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.models.smtp_account import SmtpAccount
 from app.services import crypto, google_oauth
+from app.services.smtp_reader import SmtpMailboxReader
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +58,59 @@ class ReplyTracker:
                     "Failed to check replies for %s: %s", account.email, str(e)
                 )
 
+        # Also poll SMTP mailboxes over IMAP — otherwise a contact on an
+        # SMTP-sent sequence keeps getting follow-ups after they've replied.
+        smtp_accounts = (
+            await db.execute(
+                select(SmtpAccount).where(
+                    SmtpAccount.status == "connected",
+                    SmtpAccount.imap_enabled == True,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        for account in smtp_accounts:
+            try:
+                replies = await self._check_smtp_account_replies(db, account)
+                all_replies.extend(replies)
+            except Exception as e:
+                logger.error(
+                    "Failed to check SMTP replies for %s: %s", account.email, str(e)
+                )
+
         return all_replies
+
+    async def _check_smtp_account_replies(
+        self, db: AsyncSession, account: SmtpAccount
+    ) -> list[dict]:
+        """Check a single SMTP mailbox (over IMAP) for replies to outreach.
+
+        Reuses ``_match_reply_to_send`` so an SMTP reply advances the send,
+        pauses the enrollment, and advances the company stage exactly like a
+        Gmail reply does.
+        """
+        reader = SmtpMailboxReader(account)
+        messages = await asyncio.to_thread(reader.fetch_recent, 1)
+
+        own_address = (account.email or "").strip().lower()
+        replies_found: list[dict] = []
+        for msg in messages:
+            from_email = (msg.get("from_email") or "").strip().lower()
+            if not from_email or from_email == own_address:
+                continue  # skip our own sent copies / empty senders
+            subject = msg.get("subject", "")
+            try:
+                reply_info = await self._match_reply_to_send(db, from_email, subject)
+            except Exception as e:
+                logger.debug("SMTP reply match failed for %s: %s", from_email, e)
+                continue
+            if reply_info:
+                replies_found.append({
+                    "from_email": from_email,
+                    "subject": subject,
+                    "receiving_account": account.email,
+                    **reply_info,
+                })
+        return replies_found
 
     # ------------------------------------------------------------------
     # Internal helpers

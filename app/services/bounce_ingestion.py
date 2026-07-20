@@ -30,6 +30,8 @@ inflate that counter and eventually suppress a perfectly live contact for no
 reason other than how often we poll.
 """
 
+import asyncio
+import hashlib
 import logging
 import re
 from typing import Optional
@@ -42,7 +44,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.bounce_record import BounceRecord
 from app.models.gmail_account import GmailAccount
+from app.models.smtp_account import SmtpAccount
 from app.services.bounce_handler import classify_bounce, record_bounce
+from app.services.smtp_reader import SmtpMailboxReader
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,29 @@ _LOOSE_ENHANCED_RE = re.compile(r"\b([245]\.\d{1,3}\.\d{1,3})\b")
 # Addresses that are never a real bounced recipient — matching one of these
 # would suppress our own sender or the postmaster rather than the dead lead.
 _IGNORED_LOCALPARTS = ("mailer-daemon", "postmaster", "noreply", "no-reply")
+
+# IMAP has no server-side equivalent of Gmail's rich search, so the SMTP sweep
+# fetches recent mail and classifies "is this a bounce?" client-side against the
+# same senders/subjects the Gmail BOUNCE_QUERY targets.
+_BOUNCE_SENDER_MARKERS = ("mailer-daemon", "postmaster")
+_BOUNCE_SUBJECT_MARKERS = (
+    "delivery status notification",
+    "undelivered mail returned to sender",
+    "delivery incomplete",
+    "address not found",
+    "undeliverable",
+    "failure notice",
+    "returned mail",
+)
+
+
+def _looks_like_bounce(from_email: str, subject: str) -> bool:
+    """Cheap client-side filter mirroring the Gmail ``BOUNCE_QUERY``."""
+    sender = (from_email or "").lower()
+    subj = (subject or "").lower()
+    if any(marker in sender for marker in _BOUNCE_SENDER_MARKERS):
+        return True
+    return any(marker in subj for marker in _BOUNCE_SUBJECT_MARKERS)
 
 
 def _is_plausible_recipient(email: str) -> bool:
@@ -290,8 +317,78 @@ class BounceIngestionService:
 
         return processed
 
+    async def ingest_smtp_account(
+        self, db: AsyncSession, account: SmtpAccount, lookback_days: int = 3
+    ) -> list[dict]:
+        """Scan one SMTP mailbox (over IMAP) for bounce notifications.
+
+        Mirrors ``ingest_account`` but reads via IMAP and dedups on a synthetic
+        key (``smtp:<account>:<message-id>``) since there is no Gmail message id.
+        ``BounceRecord.gmail_account_id`` is left NULL — the FK targets
+        ``gmail_accounts`` and this bounce came from an SMTP mailbox.
+        """
+        processed: list[dict] = []
+        reader = SmtpMailboxReader(account)
+        try:
+            messages = await asyncio.to_thread(reader.fetch_recent, lookback_days)
+        except Exception as exc:
+            logger.error("SMTP bounce scan failed for %s: %s", account.email, exc)
+            return processed
+
+        for msg in messages:
+            if not _looks_like_bounce(msg.get("from_email", ""), msg.get("subject", "")):
+                continue
+            text = msg.get("text") or ""
+            # Stable dedup key: prefer the RFC Message-ID, else a hash of the body.
+            raw_id = msg.get("message_id") or hashlib.sha1(
+                (msg.get("from_email", "") + msg.get("subject", "") + text[:500]).encode(
+                    "utf-8", "replace"
+                )
+            ).hexdigest()
+            dedup_key = f"smtp:{account.id}:{raw_id}"[:255]
+            try:
+                if await self._already_processed(db, dedup_key):
+                    continue
+                parsed = parse_bounce(text)
+                if not parsed:
+                    logger.debug("SMTP message %s matched bounce filter but parsed no recipient", dedup_key)
+                    continue
+
+                record = BounceRecord(
+                    gmail_message_id=dedup_key,
+                    gmail_account_id=None,  # sourced from an SMTP mailbox
+                    recipient_email=parsed["email"],
+                    bounce_kind=parsed["kind"],
+                    status_code=parsed["status_code"],
+                    diagnostic=parsed["diagnostic"],
+                    result={},
+                )
+                db.add(record)
+                await db.flush()
+
+                result = await record_bounce(
+                    db,
+                    parsed["email"],
+                    status_code=parsed["status_code"],
+                    diagnostic=parsed["diagnostic"],
+                    kind=parsed["kind"],
+                )
+                record.result = result
+                await db.commit()
+
+                processed.append({"gmail_message_id": dedup_key, **parsed, "result": result})
+                logger.info(
+                    "Ingested %s SMTP bounce for %s (suppressed=%s)",
+                    parsed["kind"], parsed["email"], result.get("suppressed"),
+                )
+            except Exception as exc:
+                await db.rollback()
+                logger.warning("Failed to ingest SMTP bounce %s: %s", dedup_key, exc)
+
+        return processed
+
     async def ingest_all_accounts(self, db: AsyncSession, lookback_days: int = 3) -> dict:
-        """Scan every active connected mailbox."""
+        """Scan every active connected mailbox (Gmail API + SMTP over IMAP)."""
         accounts = (
             await db.execute(select(GmailAccount).where(GmailAccount.is_active == True))  # noqa: E712
         ).scalars().all()
@@ -300,9 +397,21 @@ class BounceIngestionService:
         for account in accounts:
             total.extend(await self.ingest_account(db, account, lookback_days))
 
+        # SMTP mailboxes — same bounce-closing loop, read over IMAP.
+        smtp_accounts = (
+            await db.execute(
+                select(SmtpAccount).where(
+                    SmtpAccount.status == "connected",
+                    SmtpAccount.imap_enabled == True,  # noqa: E712
+                )
+            )
+        ).scalars().all()
+        for account in smtp_accounts:
+            total.extend(await self.ingest_smtp_account(db, account, lookback_days))
+
         hard = sum(1 for b in total if b.get("kind") == "hard")
         return {
-            "accounts_scanned": len(accounts),
+            "accounts_scanned": len(accounts) + len(smtp_accounts),
             "bounces_ingested": len(total),
             "hard": hard,
             "soft": len(total) - hard,
