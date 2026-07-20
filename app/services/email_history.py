@@ -640,6 +640,17 @@ class EmailHistoryService:
 
         messages = []
 
+        # Bound how many rows each side pulls before thread-grouping — an inbox is
+        # a recency view, so the most-recent N sends/replies are what matter, and
+        # an unbounded scan of the whole history was the risk the audit flagged.
+        # Pull a generous multiple of the page window so grouping still has enough
+        # rows to assemble full threads for the requested page.
+        scan_cap = max(per_page * 20, 500)
+        if sends_query is not None:
+            sends_query = sends_query.order_by(EmailSend.sent_at.desc()).limit(scan_cap)
+        if replies_query is not None:
+            replies_query = replies_query.order_by(EmailReply.received_at.desc()).limit(scan_cap)
+
         if sends_query is not None:
             sends = (await db.execute(sends_query)).scalars().all()
             for s in sends:

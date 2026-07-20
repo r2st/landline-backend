@@ -38,25 +38,34 @@ async def get_stakeholder_map(
     company_id: uuid.UUID,
     rebuild: bool = Query(False, description="Recompute the map and org edges from scratch."),
     use_ai: bool = Query(True, description="Use the LLM to refine role classification."),
+    limit: int = Query(200, ge=1, le=1000, description="Max stakeholders/edges returned"),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
     """Return the stakeholder map + inferred org chart for a company.
 
     When ``rebuild`` is true (or no map exists yet) the map and reporting edges
     are (re)computed and persisted; otherwise the stored rows are returned.
+    ``limit``/``offset`` bound how many stakeholders and org edges are returned.
     """
     await _require_company(db, company_id)
     ri = get_relationship_intelligence()
 
     existing = (
         await db.execute(
-            select(StakeholderMap).where(StakeholderMap.company_id == company_id)
+            select(StakeholderMap)
+            .where(StakeholderMap.company_id == company_id)
+            .offset(offset)
+            .limit(limit)
         )
     ).scalars().all()
 
     if rebuild or not existing:
         stakeholders = await ri.build_stakeholder_map(db, company_id, persist=True, use_ai=use_ai)
         org_edges = await ri.infer_org_relationships(db, company_id, persist=True)
+        # Bound the freshly-computed lists the same way as the stored path.
+        stakeholders = stakeholders[offset:offset + limit]
+        org_edges = org_edges[offset:offset + limit]
     else:
         stakeholders = [
             {
@@ -72,7 +81,10 @@ async def get_stakeholder_map(
         ]
         edges = (
             await db.execute(
-                select(OrgRelationship).where(OrgRelationship.company_id == company_id)
+                select(OrgRelationship)
+                .where(OrgRelationship.company_id == company_id)
+                .offset(offset)
+                .limit(limit)
             )
         ).scalars().all()
         org_edges = [

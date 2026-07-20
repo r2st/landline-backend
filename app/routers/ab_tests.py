@@ -17,7 +17,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -152,15 +152,22 @@ async def _build_detail(db: AsyncSession, test: AbTest) -> AbTestDetail:
 @router.get("", response_model=AbTestList)
 async def list_ab_tests(
     status: Optional[str] = Query(None, description="Filter by status (running/insufficient_data/completed)"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
     """List A/B tests, newest-first, optionally filtered by status."""
+    count_q = select(func.count()).select_from(AbTest)
     q = select(AbTest).order_by(AbTest.created_at.desc())
     if status is not None:
         q = q.where(AbTest.status == status)
+        count_q = count_q.where(AbTest.status == status)
+
+    total = (await db.execute(count_q)).scalar() or 0
+    q = q.offset((page - 1) * page_size).limit(page_size)
     tests = list((await db.execute(q)).scalars().all())
     items = [await _build_summary(db, t) for t in tests]
-    return AbTestList(items=items, total=len(items))
+    return AbTestList(items=items, total=total)
 
 
 @router.get("/{test_id}", response_model=AbTestDetail)

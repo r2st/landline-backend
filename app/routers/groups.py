@@ -3,7 +3,7 @@
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -68,10 +68,18 @@ class GroupMembersUpdate(BaseModel):
 
 
 @router.get("")
-async def list_groups(db: AsyncSession = Depends(get_db)):
-    """List all company groups with member counts."""
+async def list_groups(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """List company groups with member counts, paginated (newest names first)."""
     result = await db.execute(
-        select(CompanyGroup).options(selectinload(CompanyGroup.companies)).order_by(CompanyGroup.name)
+        select(CompanyGroup)
+        .options(selectinload(CompanyGroup.companies))
+        .order_by(CompanyGroup.name)
+        .offset(offset)
+        .limit(limit)
     )
     groups = result.scalars().all()
     return [

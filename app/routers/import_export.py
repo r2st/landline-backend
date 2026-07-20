@@ -5,8 +5,9 @@ import io
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -211,12 +212,16 @@ async def import_csv(
 
 @router.get("/export/companies/csv")
 async def export_companies_csv(
+    limit: Optional[int] = Query(None, ge=1, le=100000, description="Max rows (omit = all)"),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    """Export all companies as a CSV file."""
-    result = await db.execute(
-        select(Company).order_by(Company.created_at.desc())
-    )
+    """Export companies as a CSV file. Unbounded by default; ``limit``/``offset``
+    let a caller page a very large table instead of streaming it all at once."""
+    query = select(Company).order_by(Company.created_at.desc()).offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    result = await db.execute(query)
     companies = list(result.scalars().all())
 
     output = io.StringIO()
@@ -248,14 +253,21 @@ async def export_companies_csv(
 
 @router.get("/export/contacts/csv")
 async def export_contacts_csv(
+    limit: Optional[int] = Query(None, ge=1, le=100000, description="Max rows (omit = all)"),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    """Export all contacts as a CSV file."""
-    result = await db.execute(
+    """Export contacts as a CSV file. Unbounded by default; ``limit``/``offset``
+    let a caller page a very large table instead of streaming it all at once."""
+    query = (
         select(Contact, Company.name)
         .outerjoin(Company, Contact.company_id == Company.id)
         .order_by(Contact.created_at.desc())
+        .offset(offset)
     )
+    if limit is not None:
+        query = query.limit(limit)
+    result = await db.execute(query)
     rows = result.all()
 
     output = io.StringIO()

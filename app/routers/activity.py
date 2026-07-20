@@ -41,9 +41,14 @@ def _aware(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 async def _collect_activities(
-    db: AsyncSession, company_id: uuid.UUID
+    db: AsyncSession, company_id: uuid.UUID, cap: int = 2000
 ) -> list[ActivityItem]:
-    """Gather all activity items for a company across every source table."""
+    """Gather all activity items for a company across every source table.
+
+    ``cap`` bounds how many rows are pulled per source so a company with a very
+    long history can't blow up the response (the endpoint then paginates the
+    merged, time-sorted list).
+    """
     items: list[ActivityItem] = []
 
     # --- Emails (and their engagement) sent to this company's contacts ---
@@ -51,6 +56,8 @@ async def _collect_activities(
         select(EmailSend, Contact)
         .join(Contact, EmailSend.contact_id == Contact.id)
         .where(Contact.company_id == company_id)
+        .order_by(EmailSend.sent_at.desc())
+        .limit(cap)
     )
     for send, contact in email_rows.all():
         who = contact.full_name
@@ -105,6 +112,8 @@ async def _collect_activities(
         .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
         .join(Contact, OutreachEnrollment.contact_id == Contact.id)
         .where(Contact.company_id == company_id)
+        .order_by(OutreachEvent.occurred_at.desc())
+        .limit(cap)
     )
     for event, contact in event_rows.all():
         items.append(ActivityItem(
@@ -126,6 +135,8 @@ async def _collect_activities(
     # --- Lead score changes ---
     score_rows = await db.execute(
         select(LeadScore).where(LeadScore.company_id == company_id)
+        .order_by(LeadScore.scored_at.desc())
+        .limit(cap)
     )
     for score in score_rows.scalars().all():
         items.append(ActivityItem(
@@ -148,6 +159,8 @@ async def _collect_activities(
     # --- News ---
     news_rows = await db.execute(
         select(CompanyNews).where(CompanyNews.company_id == company_id)
+        .order_by(CompanyNews.discovered_at.desc())
+        .limit(cap)
     )
     for news in news_rows.scalars().all():
         items.append(ActivityItem(
@@ -169,6 +182,8 @@ async def _collect_activities(
     # --- Logged interactions / notes ---
     interaction_rows = await db.execute(
         select(Interaction).where(Interaction.company_id == company_id)
+        .order_by(Interaction.occurred_at.desc())
+        .limit(cap)
     )
     for inter in interaction_rows.scalars().all():
         items.append(ActivityItem(
@@ -187,6 +202,8 @@ async def _collect_activities(
     # --- Contacts added ---
     contact_rows = await db.execute(
         select(Contact).where(Contact.company_id == company_id)
+        .order_by(Contact.created_at.desc())
+        .limit(cap)
     )
     for contact in contact_rows.scalars().all():
         items.append(ActivityItem(
