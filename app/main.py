@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent
 
 settings = get_settings()
 
@@ -170,6 +170,8 @@ app.include_router(email_test.router, prefix=settings.api_prefix, dependencies=_
 app.include_router(dialtone.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(danger_signals.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(replies.router, prefix=settings.api_prefix, dependencies=_auth)
+# Smart-reply: manual sweep trigger + operator approve-and-send for inbox drafts.
+app.include_router(smart_reply.router, prefix=settings.api_prefix, dependencies=_auth)
 # Feature 5 — Domain Health Dashboard (SPF/DKIM/DMARC + DNSBL, scored & persisted).
 app.include_router(domain_health.router, prefix=settings.api_prefix, dependencies=_auth)
 # Feature 3 — A/B Testing (variant persistence, assignment, results dashboard).

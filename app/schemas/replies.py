@@ -99,3 +99,26 @@ class ReclassifyRequest(BaseModel):
 
     category: str
     priority_flag: Optional[bool] = None
+
+
+class ApproveSendRequest(BaseModel):
+    """Operator-approved reply to dispatch from the Dialtone inbox.
+
+    ``body`` is the (possibly operator-edited) suggested draft. ``subject``
+    defaults to ``Re: <original subject>`` when omitted. ``body_html`` may carry a
+    pre-rendered HTML body; otherwise ``body`` is treated as plain text and
+    wrapped by the dispatcher.
+    """
+
+    subject: Optional[str] = None
+    body: str
+    body_html: Optional[str] = None
+
+
+class ApproveSendResult(BaseModel):
+    status: str  # "sent" | "skipped" | "halted" | "suppressed" | "error"
+    detail: Optional[str] = None
+    to_email: Optional[str] = None
+    transport: Optional[str] = None
+    sender: Optional[str] = None
+    reply_id: Optional[str] = None
