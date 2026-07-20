@@ -113,6 +113,10 @@ class Contact(Base, OrgScopedMixin):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+    # GDPR right-to-erasure: set when the contact's PII has been scrubbed. A
+    # non-null value means "anonymized" — the row is retained for referential
+    # integrity but carries no personal data (see app/services/gdpr.py).
+    anonymized_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
     # Relationships
     company: Mapped["Company"] = relationship("Company", back_populates="contacts")
