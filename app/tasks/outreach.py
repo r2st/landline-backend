@@ -473,6 +473,29 @@ def send_sequence_step(self, enrollment_id: str):
                     template_context,
                 )
 
+                # --- Spintax (manual copy variation) ---
+                # Resolve {a|b|c} groups down to one variant for THIS send, and
+                # record which alternatives were chosen so per-variant response
+                # can be attributed later. Runs after the Jinja merge so merge
+                # fields inside a spintax option are already substituted, and
+                # before AI composition (which, when it fires, supersedes the
+                # static copy entirely).
+                from app.services import spintax
+
+                _subj_spin = spintax.resolve_tracked(subject)
+                _body_spin = spintax.resolve_tracked(body)
+                subject = _subj_spin.text
+                body = _body_spin.text
+                spintax_meta = None
+                if _subj_spin.has_choices or _body_spin.has_choices:
+                    spintax_meta = {
+                        "subject_signature": _subj_spin.signature,
+                        "body_signature": _body_spin.signature,
+                        "subject_choices": _subj_spin.choices,
+                        "body_choices": _body_spin.choices,
+                        "variant_key": f"s:{_subj_spin.signature}|b:{_body_spin.signature}",
+                    }
+
                 # --- AI composition (first touch) ---
                 # Replace the static mail-merge with copy grounded in the
                 # company's research brief. Fail-safe: any problem returns the
@@ -675,6 +698,9 @@ def send_sequence_step(self, enrollment_id: str):
                         "to_email": contact.email,
                         "subject": subject,
                         "body_html": human_body,
+                        # Which spintax variant shipped (when the copy used any),
+                        # so downstream engagement can be attributed per variant.
+                        **({"spintax": spintax_meta} if spintax_meta else {}),
                     },
                 )
                 db.add(event)
