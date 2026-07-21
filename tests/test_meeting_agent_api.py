@@ -226,6 +226,10 @@ async def test_check_booking_replies_confirms_on_selection(db_session, sample_co
     meeting = await _mk_meeting(
         db_session, sample_contact.id, status="proposed",
         gmail_thread_id="thread-9", gmail_message_id="orig-9", sender_account_id=account.id,
+        # Pin created_at to test time. Otherwise the server_default (func.now())
+        # stamps the real wall-clock, which is later than the fixed-NOW reply, and
+        # the reply-freshness guard (received > created_at) discards the reply.
+        created_at=NOW,
     )
     # A reply picking option 1, arriving after the proposal.
     reply = EmailReply(
@@ -239,6 +243,15 @@ async def test_check_booking_replies_confirms_on_selection(db_session, sample_co
     # No calendar/email network: stub the event creator and gmail send.
     monkeypatch.setattr(mba.google_calendar, "create_event", lambda *a, **k: {"event_id": "evt-9"})
     monkeypatch.setattr(mba, "_default_gmail_send", lambda account, **k: {"gmail_message_id": "m", "gmail_thread_id": "t"})
+
+    # Force the deterministic keyword slot-parse path (no live LLM call). The test
+    # env may carry an anthropic_api_key from .env, which flips the cached AI
+    # service to "configured" and would send this reply to a real API. We are
+    # asserting the "Option 1" keyword selection is honoured.
+    class _NoAI:
+        is_configured = False
+
+    monkeypatch.setattr(mba, "get_ai_service", lambda: _NoAI())
 
     report = await tasks.check_booking_replies_async(db_session, now=NOW + timedelta(hours=2))
     assert report["confirmed"] == 1

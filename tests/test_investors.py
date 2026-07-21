@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 from httpx import AsyncClient
 
+from app.config import get_settings
 from app.models.investor import Investor
 from app.services import ai_investor_outreach
 
@@ -405,7 +406,11 @@ async def test_update_and_delete_document(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_outreach_falls_back_to_template(client: AsyncClient):
+async def test_outreach_falls_back_to_template(client: AsyncClient, monkeypatch):
+    # Force the no-AI path deterministically: the test env may carry an
+    # anthropic_api_key from .env, which would otherwise flip ai_available True
+    # (and make a live API call). We're asserting the template-fallback shape.
+    monkeypatch.setattr(get_settings(), "anthropic_api_key", "")
     iid = (
         await _make_investor(client, name="Priya Angel",
                              investment_focus=["manufacturing"],
@@ -458,7 +463,10 @@ def test_format_check_size_ranges():
 
 
 @pytest.mark.asyncio
-async def test_generate_outreach_template_shape():
+async def test_generate_outreach_template_shape(monkeypatch):
+    # Clear any env-provided key so we deterministically exercise the no-AI
+    # (template) branch without a live API call. See _available().
+    monkeypatch.setattr(get_settings(), "anthropic_api_key", "")
     inv = Investor(
         id=_uuid.uuid4(), name="Deepa Rao", firm="North Ventures",
         investment_focus=["ai", "manufacturing"], investment_stage="seed",

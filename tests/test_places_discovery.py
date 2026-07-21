@@ -1314,7 +1314,9 @@ async def test_enrich_sweep_keeps_scraping_after_hunter_budget_runs_out(
         async with factory() as s:
             yield s
 
-    monkeypatch.setattr(task_mod, "celery_session", _session)
+    # _enrich_discovered_emails fans out via for_each_org, which calls
+    # celery_session in the org_runner module's namespace — patch it there.
+    monkeypatch.setattr("app.tasks.org_runner.celery_session", _session)
 
     result = await task_mod._enrich_discovered_emails()
     assert result["checked"] == 3
@@ -1355,7 +1357,9 @@ async def test_enrich_sweep_skips_dispositioned_and_websiteless_rows(
         async with factory() as s:
             yield s
 
-    monkeypatch.setattr(task_mod, "celery_session", _session)
+    # _enrich_discovered_emails fans out via for_each_org, which calls
+    # celery_session in the org_runner module's namespace — patch it there.
+    monkeypatch.setattr("app.tasks.org_runner.celery_session", _session)
 
     result = await task_mod._enrich_discovered_emails()
     assert result["checked"] == 1
