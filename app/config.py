@@ -178,6 +178,16 @@ class Settings(BaseSettings):
     google_places_page_size: int = 20
     google_places_max_results: int = 60
 
+    # --- Multi-channel step execution (P2 audit) ---
+    # LinkedIn and phone/SMS channels execute through provider stubs until a
+    # real integration lands. An empty credential = "not configured": the
+    # handler simulates the touch (status="simulated") instead of hitting an
+    # API, so a cadence authored across channels still runs end-to-end.
+    linkedin_api_token: str = ""
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""
+
     # Census Bureau
     census_api_key: str = ""
 

@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels
 
 settings = get_settings()
 
@@ -207,6 +207,8 @@ app.include_router(referral_agent.router, prefix=settings.api_prefix, dependenci
 # Meeting Booking Agent — autonomous scheduling on a positive reply. Auth
 # required; per-route OrgScope enforces org_admin for config writes.
 app.include_router(meeting_agent.router, prefix=settings.api_prefix, dependencies=_auth)
+# P2 audit — multi-channel step execution (email real; LinkedIn/phone stubs).
+app.include_router(channels.router, prefix=settings.api_prefix, dependencies=_auth)
 
 
 @app.get("/health")

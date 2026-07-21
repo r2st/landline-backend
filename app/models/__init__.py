@@ -52,6 +52,7 @@ from app.models.ab_test import AbTest, AbTestVariant, AbTestAssignment
 from app.models.content_embedding import ContentEmbedding
 from app.models.call_recording import CallRecording
 from app.models.orchestration import OrchestrationPolicy
+from app.models.channel_execution import ChannelStepExecution
 from app.models.relationship import StakeholderMap, OrgRelationship
 from app.models.meeting import MeetingBrief
 from app.models.meeting_booking import BookedMeeting, MeetingBookingAgent
@@ -136,6 +137,7 @@ __all__ = [
     "ContentEmbedding",
     "CallRecording",
     "OrchestrationPolicy",
+    "ChannelStepExecution",
     "StakeholderMap",
     "OrgRelationship",
     "MeetingBrief",
