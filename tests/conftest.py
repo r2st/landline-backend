@@ -117,13 +117,27 @@ def _patch_pg_types_for_sqlite():
                 if "gen_random_uuid" in sd_text or "uuid" in sd_text.lower():
                     col.server_default = None
 
+    # Freeze the mappers *now*, while the patched (SQLite-compatible) column
+    # types are in place. SQLAlchemy snapshots each column's type into the
+    # InstrumentedAttribute comparator the first time the mapper is configured;
+    # that comparator is what generates bind parameters for ``Model.col == x``.
+    # If a mapper is configured *before* this patch runs (e.g. a pure-unit test
+    # module that imports a model triggers global ``configure_mappers()`` before
+    # any ``db_engine`` fixture is instantiated), the comparator would freeze the
+    # original PostgreSQL ``UUID`` type and serialize UUID binds with the wrong
+    # dialect processor — every ``WHERE uuid_col == :param`` then silently
+    # matches nothing under the SQLite shim, poisoning later DB tests with empty
+    # reads and spurious 401s. Configuring here, at conftest import time (before
+    # any test runs), makes the ordering deterministic.
+    from sqlalchemy.orm import configure_mappers
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create a single event loop for the entire test session."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+    configure_mappers()
+
+
+# Patch PG-only types at import time — conftest is imported before any test is
+# collected or run, so this executes before any model usage can configure the
+# mappers with the un-patched native types. See _patch_pg_types_for_sqlite.
+_patch_pg_types_for_sqlite()
 
 
 @pytest_asyncio.fixture(autouse=True)
