@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # Must EXACTLY match an Authorized redirect URI configured in Google Cloud.
     # e.g. https://landline-api.apprendtechnologies.com/api/v1/gmail/oauth/callback
     google_oauth_redirect_uri: str = "http://localhost:8000/api/v1/gmail/oauth/callback"
+    # Postmaster Tools OAuth callback (P2 audit). Empty = derive from the Gmail
+    # redirect by swapping the path (see postmaster_oauth._redirect_uri).
+    postmaster_oauth_redirect_uri: str = ""
     # Where to send the user's browser back to after a connect attempt (the frontend).
     # The OAuth callback closes the popup and notifies this origin via postMessage.
     frontend_url: str = "http://localhost:5173"

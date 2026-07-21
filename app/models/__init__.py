@@ -53,6 +53,7 @@ from app.models.content_embedding import ContentEmbedding
 from app.models.call_recording import CallRecording
 from app.models.orchestration import OrchestrationPolicy
 from app.models.channel_execution import ChannelStepExecution
+from app.models.postmaster import PostmasterAccount, PostmasterMetric
 from app.models.relationship import StakeholderMap, OrgRelationship
 from app.models.meeting import MeetingBrief
 from app.models.meeting_booking import BookedMeeting, MeetingBookingAgent
@@ -138,6 +139,8 @@ __all__ = [
     "CallRecording",
     "OrchestrationPolicy",
     "ChannelStepExecution",
+    "PostmasterAccount",
+    "PostmasterMetric",
     "StakeholderMap",
     "OrgRelationship",
     "MeetingBrief",

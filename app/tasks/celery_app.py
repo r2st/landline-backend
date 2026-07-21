@@ -48,6 +48,7 @@ celery_app.conf.update(
         "app.tasks.bounces.*": {"queue": "enrichment"},
         "app.tasks.danger_signals.*": {"queue": "enrichment"},
         "app.tasks.domain_health.*": {"queue": "enrichment"},
+        "app.tasks.postmaster.*": {"queue": "enrichment"},
         "app.tasks.rag.*": {"queue": "enrichment"},
         "app.tasks.voice.*": {"queue": "enrichment"},
         "app.tasks.replies.*": {"queue": "enrichment"},
@@ -247,6 +248,15 @@ celery_app.conf.update(
             "task": "app.tasks.domain_health.check_domain_health",
             "schedule": crontab(hour=5, minute=30),
         },
+        # P2 audit: daily Google Postmaster Tools pull (reputation, spam rate,
+        # SPF/DKIM/DMARC pass rates, delivery errors) per verified domain. Gmail
+        # has no FBL, so this is the only complaint signal for the primary
+        # transport. Daily is plenty — Postmaster reports trailing daily windows.
+        # 5 AM UTC, alongside the other daily deliverability sweeps.
+        "pull-postmaster-metrics": {
+            "task": "app.tasks.postmaster.pull_postmaster_metrics",
+            "schedule": crontab(hour=5, minute=45),
+        },
         # Feature 3: auto-evaluate running A/B tests and declare/promote winners
         # once they reach significance (or the hard cap). Daily is plenty — copy
         # tests accrue sample slowly. 4:30 AM UTC.
@@ -390,6 +400,7 @@ import app.tasks.deliverability  # noqa: F401
 import app.tasks.bounces  # noqa: F401
 import app.tasks.danger_signals  # noqa: F401
 import app.tasks.domain_health  # noqa: F401
+import app.tasks.postmaster  # noqa: F401
 import app.tasks.rag  # noqa: F401
 import app.tasks.voice  # noqa: F401
 import app.tasks.replies  # noqa: F401
