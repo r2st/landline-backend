@@ -251,3 +251,86 @@ async def test_sender_history_rejects_bad_window(client):
     # days is bounded 1..365; a nonsense window is a 422, not a silent clamp.
     r = await client.get("/api/v1/deliverability/senders/history?days=0")
     assert r.status_code == 422
+
+
+# ─── Sender-health degradation alerting (P0-2) ───────────────────────────────
+
+class _SpyNotifier:
+    """Captures notify_sender_health_change calls instead of sending mail."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def notify_sender_health_change(self, account_email, prior_status, new_status, metrics=None, db=None):
+        self.calls.append({
+            "email": account_email, "prior": prior_status,
+            "new": new_status, "metrics": metrics,
+        })
+
+
+async def test_degrading_transition_alerts_operator(db_session, monkeypatch):
+    """healthy → throttled/critical fires exactly one alert."""
+    import app.services.notifications as notifications_module
+
+    spy = _SpyNotifier()
+    monkeypatch.setattr(notifications_module, "get_notification_service", lambda: spy)
+
+    acct = await _gmail_account(db_session, email="degrading@apprend.co")
+    # Seed a prior 'healthy' assessment so there is a state to transition FROM.
+    db_session.add(SenderHealth(
+        account_type="gmail", account_id=acct.id, account_email=acct.email,
+        status="healthy", reputation_score=95,
+    ))
+    await db_session.flush()
+
+    # Now make it bounce hard so the next assessment drops to throttled/critical.
+    for _ in range(16):
+        await _email(db_session, acct, status="sent")
+    for _ in range(4):
+        await _email(db_session, acct, status="bounced")
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.status in ("throttled", "critical")
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["email"] == "degrading@apprend.co"
+    assert spy.calls[0]["prior"] == "healthy"
+    assert spy.calls[0]["new"] in ("throttled", "critical")
+
+
+async def test_first_assessment_does_not_alert(db_session, monkeypatch):
+    """No prior row → the first-ever assessment is silent, even if bad."""
+    import app.services.notifications as notifications_module
+
+    spy = _SpyNotifier()
+    monkeypatch.setattr(notifications_module, "get_notification_service", lambda: spy)
+
+    acct = await _gmail_account(db_session, email="fresh-bad@apprend.co")
+    for _ in range(20):
+        await _email(db_session, acct, status="bounced")
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.status in ("throttled", "critical")
+    assert spy.calls == []  # first observation is not alerted (avoids rollout burst)
+
+
+async def test_stable_degraded_does_not_realert(db_session, monkeypatch):
+    """An already-throttled account does not re-alert on the next assessment."""
+    import app.services.notifications as notifications_module
+
+    spy = _SpyNotifier()
+    monkeypatch.setattr(notifications_module, "get_notification_service", lambda: spy)
+
+    acct = await _gmail_account(db_session, email="stuck@apprend.co")
+    db_session.add(SenderHealth(
+        account_type="gmail", account_id=acct.id, account_email=acct.email,
+        status="critical", reputation_score=20,
+    ))
+    await db_session.flush()
+    for _ in range(20):
+        await _email(db_session, acct, status="bounced")
+    await db_session.flush()
+
+    await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert spy.calls == []  # critical → critical is not a new degradation

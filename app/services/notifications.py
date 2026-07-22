@@ -1,6 +1,10 @@
 """Notification service — sends alerts on important lead engagement events."""
 
+import asyncio
 import logging
+from typing import Optional
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 
@@ -64,6 +68,36 @@ They're warm — a personal call now could move this forward. Open the company i
 """
         await self._send_notification(subject, body)
 
+    async def notify_sender_health_change(
+        self,
+        account_email: str,
+        prior_status: Optional[str],
+        new_status: str,
+        metrics: Optional[dict] = None,
+        db: Optional[AsyncSession] = None,
+    ):
+        """Notify when a sending account's reputation degrades (feature 3.3).
+
+        Fired only on a *degrading transition* into ``throttled`` / ``critical``
+        from a healthier state — the caller guards this so an account that is
+        already throttled (or that recovers) does not re-alert on every hourly
+        assessment.
+        """
+        m = metrics or {}
+        subject = f"⚠️ Sender reputation: {account_email} is now {new_status}"
+        body = (
+            f"Dialtone throttled sending account {account_email}: reputation "
+            f"transitioned {prior_status or 'unknown'} → {new_status}.\n\n"
+            f"Last 7 days — sent: {m.get('sent_7d', '?')}, "
+            f"bounce rate: {m.get('bounce_rate_7d', '?')}, "
+            f"complaint rate: {m.get('complaint_rate_7d', '?')}, "
+            f"open rate: {m.get('open_rate_7d', '?')}.\n\n"
+            f"Volume has been shifted to healthier senders automatically. Open the "
+            f"Sender Health dashboard in Landline to investigate before this domain's "
+            f"reputation drags down the rest.\n"
+        )
+        await self._send_notification(subject, body, db=db)
+
     async def notify_domain_health_change(
         self, domain: str, summary: str, details: str = ""
     ):
@@ -82,17 +116,71 @@ They're warm — a personal call now could move this forward. Open the company i
         body += "\nOpen the Domain Health dashboard in Landline for the full breakdown and DNS fixes.\n"
         await self._send_notification(subject, body)
 
-    async def _send_notification(self, subject: str, body: str):
-        """Send notification email to the configured recipient."""
+    async def _send_notification(
+        self, subject: str, body: str, db: Optional[AsyncSession] = None
+    ) -> dict:
+        """Deliver a notification email to ``settings.notification_email``.
+
+        Sends through the org's active connected sending account (Gmail preferred,
+        SMTP fallback) — the same transactional path as the welcome email, so no
+        marketing footer or open tracking is attached. Best-effort by contract:
+        a missing recipient/account or a transport error is logged and returned as
+        a status dict, never raised, because every caller treats notification as a
+        side effect that must not break the work that triggered it.
+
+        ``db`` is used when the caller already holds a session; otherwise a
+        short-lived Celery session is opened (notifications fire overwhelmingly
+        from Celery tasks). The session inherits the caller's org context, so the
+        sending account chosen belongs to the right tenant.
+        """
         notify_email = self.settings.notification_email
         if not notify_email:
             logger.debug("No notification_email configured, skipping notification")
-            return
+            return {"status": "skipped", "reason": "no_notification_email"}
 
-        logger.warning(
-            "NOTIFICATION (not yet delivered): [%s] to %s — configure email dispatch to enable delivery",
-            subject, notify_email,
+        try:
+            if db is not None:
+                return await self._deliver(db, notify_email, subject, body)
+            from app.database_celery import celery_session
+
+            async with celery_session() as own_db:
+                return await self._deliver(own_db, notify_email, subject, body)
+        except Exception:  # noqa: BLE001 — notification must never break its caller
+            logger.exception("Notification delivery failed: [%s]", subject)
+            return {"status": "error", "subject": subject}
+
+    async def _deliver(
+        self, db: AsyncSession, to_email: str, subject: str, body: str
+    ) -> dict:
+        """Pick the active sending account and hand the message to its transport."""
+        from app.services.email_dispatch import get_active_account, _make_sender
+
+        account = await get_active_account(db)
+        if account is None:
+            logger.warning(
+                "No connected sending account — notification not delivered: [%s]",
+                subject,
+            )
+            return {"status": "no_account", "subject": subject}
+
+        # Plain-text bodies are the source of truth; wrap for a minimal HTML part
+        # so it renders as paragraphs rather than one run-on line.
+        html_body = "<p>" + body.strip().replace("\n\n", "</p><p>").replace(
+            "\n", "<br>"
+        ) + "</p>"
+
+        result = await asyncio.to_thread(
+            _make_sender(account).send_email,
+            to_email=to_email,
+            subject=subject,
+            body_html=html_body,
+            body_text=body,
         )
+        logger.info(
+            "Notification [%s] → %s via %s (%s)",
+            subject, to_email, account.email, result.get("status"),
+        )
+        return result
 
 
 def get_notification_service() -> NotificationService:

@@ -168,6 +168,10 @@ class DeliverabilityOptimizer:
             )
         ).scalar_one_or_none()
         now = datetime.now(timezone.utc)
+        # Capture the prior status before we overwrite it, so we can alert only on
+        # a *degrading transition* (not on every hourly re-assessment of an
+        # already-throttled account). None on the very first assessment.
+        prior_status = row.status if row is not None else None
         if row is None:
             row = SenderHealth(account_type=account_type, account_id=account.id)
             db.add(row)
@@ -206,6 +210,21 @@ class DeliverabilityOptimizer:
             await db.flush()
         except Exception:
             logger.exception("Sender-health snapshot failed for %s", account.email)
+
+        # Alert on a degrading transition into throttled/critical (change-only, so
+        # an already-degraded account doesn't re-alert every hour; recovery and the
+        # first-ever assessment are intentionally silent). Best-effort — an alert
+        # failure must never sink the assessment that throttling depends on.
+        _DEGRADED = ("throttled", "critical")
+        if status in _DEGRADED and prior_status is not None and prior_status not in _DEGRADED:
+            try:
+                from app.services.notifications import get_notification_service
+
+                await get_notification_service().notify_sender_health_change(
+                    account.email, prior_status, status, metrics, db=db
+                )
+            except Exception:  # pragma: no cover - notification must never break the run
+                logger.exception("Sender-health alert failed for %s", account.email)
 
         return row
 

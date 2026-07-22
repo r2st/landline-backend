@@ -143,6 +143,36 @@ async def test_funnel_window_filter_excludes_old_events(db_session):
     assert windowed["totals"]["positive"] == 1
 
 
+async def test_funnel_counts_bounces_and_derives_delivered(db_session):
+    """Bounced events feed bounce_rate; delivered is derived as sent − bounced."""
+    seq = await _seq(db_session, "Bouncy")
+    e1 = await _enrollment(db_session, await _contact(db_session), seq)
+    e2 = await _enrollment(db_session, await _contact(db_session), seq)
+    e3 = await _enrollment(db_session, await _contact(db_session), seq)
+    e4 = await _enrollment(db_session, await _contact(db_session), seq)
+    db_session.add_all([
+        _ev(e1, 1, "sent"),
+        _ev(e2, 1, "sent"),
+        _ev(e3, 1, "sent"),
+        _ev(e4, 1, "sent"),
+        # one of the four sends bounced
+        _ev(e4, 1, "bounced"),
+        _ev(e1, 1, "opened"),
+    ])
+    await db_session.commit()
+
+    funnel = await compute_funnel(db_session)
+    t = funnel["totals"]
+    assert t["sent"] == 4
+    assert t["bounced"] == 1
+    assert t["bounce_rate"] == 25.0
+    assert t["delivered"] == 3          # 4 sent − 1 bounced
+    assert t["delivered_rate"] == 75.0
+    # Per-step carries the same figures.
+    step = funnel["sequences"][0]["steps"][0]
+    assert step["bounced"] == 1 and step["delivered"] == 3 and step["bounce_rate"] == 25.0
+
+
 async def test_funnel_empty_is_well_formed(db_session):
     funnel = await compute_funnel(db_session)
     assert funnel["sequences"] == []

@@ -36,9 +36,13 @@ from app.models.sequence import OutreachSequence
 
 logger = logging.getLogger(__name__)
 
-# Funnel stages, in order. Kept explicit so the response shape is stable even for
-# a sequence that has zero events of some type.
-_STAGES = ("sent", "delivered", "opened", "replied")
+# Funnel progression stages counted straight off OutreachEvent rows. NOTE:
+# "delivered" is intentionally NOT here — Gmail emits no delivered signal, so no
+# "delivered" event is ever written; a real delivered figure is derived as
+# sent − bounced in ``_with_rates`` instead of always reading 0. "bounced" is a
+# real event the send path writes, tracked separately (it's a negative outcome,
+# not a forward stage) so the funnel can show per-sequence deliverability.
+_STAGES = ("sent", "opened", "replied")
 
 
 def _rate(numerator: int, denominator: int) -> float:
@@ -49,16 +53,25 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 def _blank_counts() -> dict:
-    return {stage: 0 for stage in _STAGES} | {"positive": 0}
+    return {stage: 0 for stage in _STAGES} | {"bounced": 0, "positive": 0}
 
 
 def _with_rates(counts: dict) -> dict:
-    """Attach funnel rates to a counts dict (counts left intact)."""
+    """Attach funnel rates to a counts dict (counts left intact).
+
+    ``delivered`` is derived as ``sent − bounced`` (clamped at 0) rather than read
+    from a non-existent "delivered" event, giving a real delivered figure and rate.
+    ``bounced`` / ``bounce_rate`` expose per-sequence deliverability in the funnel.
+    """
     sent = counts.get("sent", 0)
     replied = counts.get("replied", 0)
+    bounced = counts.get("bounced", 0)
+    delivered = max(0, sent - bounced)
     return {
         **counts,
-        "delivered_rate": _rate(counts.get("delivered", 0), sent),
+        "delivered": delivered,
+        "delivered_rate": _rate(delivered, sent),
+        "bounce_rate": _rate(bounced, sent),
         "open_rate": _rate(counts.get("opened", 0), sent),
         "reply_rate": _rate(replied, sent),
         "positive_rate": _rate(counts.get("positive", 0), sent),
@@ -114,6 +127,8 @@ async def compute_funnel(
         bucket = per_step.setdefault(key, _blank_counts())
         if event_type in _STAGES:
             bucket[event_type] += int(n)
+        elif event_type == "bounced":
+            bucket["bounced"] += int(n)
 
     # Positive replies: replied events whose metadata flags interest. Portable
     # across Postgres/SQLite by reading the JSON in Python (the volume here is
