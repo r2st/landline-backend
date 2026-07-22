@@ -76,10 +76,11 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     # NOTE: a ":free" model id is only valid while OpenRouter actually serves that
     # variant, and they retire them without notice — the previous default here
-    # (meta-llama/llama-3.1-8b-instruct:free) had already stopped existing, which
-    # 404s every call and looks exactly like an outage: silent template fallback.
+    # (meta-llama/llama-3.3-70b-instruct:free, and before it llama-3.1-8b) had
+    # stopped existing, which 404s every call and looks exactly like an outage:
+    # silent template fallback + a hard 404 on conversation.analyze_thread.
     # Check a candidate against https://openrouter.ai/api/v1/models before setting.
-    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    openrouter_model: str = "openai/gpt-oss-20b:free"
     # Cold-email copy is the quality-sensitive call, so it gets its own knob. It
     # currently resolves to the same model as everything else: on the free tier the
     # daily quota is per-account and shared across models, so a smaller model buys
@@ -87,8 +88,8 @@ class Settings(BaseSettings):
     # constraints (no buzzwords, no fabricated proof, hold a tone) that small
     # models comply with poorly — an 8B will happily invent the customer story the
     # guardrail bans. Kept separate so email can move to a paid model without
-    # dragging scoring/classification along.
-    openrouter_email_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    # dragging scoring/classification along (e.g. openai/gpt-4o-mini).
+    openrouter_email_model: str = "openai/gpt-oss-20b:free"
 
     # Apollo.io
     apollo_api_key: str = ""

@@ -257,3 +257,48 @@ async def test_score_lead_degrades_on_anthropic_credit_exhaustion(monkeypatch):
     assert result["grade"] == "C"
     assert result["priority"] == "medium"
     assert result["degraded"] is True
+
+
+# ---------------------------------------------------------------------------
+# Config-default model guard (regression: OpenRouter 404 on analyze_thread)
+# ---------------------------------------------------------------------------
+# The production symptom was conversation.analyze_thread 404ing on every call:
+# get_ai_service() built an AIService on the OpenRouter backend using the config
+# default openrouter_model, and that default id had been retired by OpenRouter.
+# A retired id 404s at request time, which the mocked suite above cannot see, so
+# these offline guards pin the defaults away from every id known to have been
+# retired and caused this exact outage. When OpenRouter retires the current id,
+# add it here and bump the default in app/config.py (verify against
+# https://openrouter.ai/api/v1/models first).
+_RETIRED_OPENROUTER_MODELS = frozenset(
+    {
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "openai/gpt-oss-120b:free",
+    }
+)
+
+
+def test_default_openrouter_models_are_not_retired():
+    """Neither config default may be an id OpenRouter has retired (→ 404)."""
+    defaults = Settings(secret_key="test-secret-key-not-for-production")
+    assert defaults.openrouter_model not in _RETIRED_OPENROUTER_MODELS, (
+        f"default openrouter_model {defaults.openrouter_model!r} is a retired "
+        "OpenRouter id — it 404s every scoring / analyze_thread call"
+    )
+    assert defaults.openrouter_email_model not in _RETIRED_OPENROUTER_MODELS, (
+        f"default openrouter_email_model {defaults.openrouter_email_model!r} is a "
+        "retired OpenRouter id — cold-email compose silently falls back to a template"
+    )
+
+
+def test_ai_service_uses_config_default_model_on_openrouter(monkeypatch):
+    """get_ai_service()'s backend (used by conversation.analyze_thread) sends the
+    config default openrouter_model to OpenRouter — the fixed, served id, never a
+    retired one."""
+    defaults = Settings(secret_key="test-secret-key-not-for-production")
+    svc = _openrouter_service(monkeypatch, openrouter_model=defaults.openrouter_model)
+    assert svc.provider == "openrouter"
+    assert svc.model == defaults.openrouter_model
+    assert svc.model not in _RETIRED_OPENROUTER_MODELS
