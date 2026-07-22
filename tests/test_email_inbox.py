@@ -904,6 +904,80 @@ class TestPagination:
 
 
 # ---------------------------------------------------------------------------
+# N+1 batching: contact/company lookups are grouped, not per-row
+# ---------------------------------------------------------------------------
+
+class TestInboxBatching:
+    """Inbox assembly must resolve contacts + companies in grouped queries.
+
+    Previously ``get_inbox`` issued up to two lookups per send and per reply
+    (contact, then company) — an N+1 that, with the ~500-row scan cap, meant
+    thousands of round-trips to render one page. The lookups are now batched into
+    a single grouped query per table; this test proves the query count no longer
+    scales with the number of rows, while the resolved lead/company is unchanged.
+    """
+
+    async def test_contact_company_lookups_are_batched(self, db_session, monkeypatch):
+        acct = await _make_gmail_account(db_session, "us@company.com", active=True)
+
+        n = 6
+        expected_lead = {}
+        for i in range(n):
+            company = Company(
+                id=uuid.uuid4(), name=f"Batch Co {i}", country="US", source="test"
+            )
+            db_session.add(company)
+            await db_session.flush()
+            contact = Contact(
+                id=uuid.uuid4(), company_id=company.id, first_name="Lead",
+                last_name=str(i), email=f"lead{i}@x.com", source="test",
+            )
+            db_session.add(contact)
+            await db_session.flush()
+            await _make_email_send(
+                db_session, from_email="us@company.com", to_email=f"lead{i}@x.com",
+                subject=f"Batch {i}", gmail_thread_id=f"batch-thr-{i}",
+                gmail_message_id=f"batch-send-{i}", sender_account_id=acct.id,
+                contact_id=contact.id,
+            )
+            await _make_email_reply(
+                db_session, from_email=f"lead{i}@x.com", to_email="us@company.com",
+                gmail_thread_id=f"batch-thr-{i}", contact_id=contact.id,
+                company_id=company.id,
+            )
+            expected_lead[f"batch-thr-{i}"] = f"Batch Co {i}"
+        await db_session.commit()
+
+        # Count SELECTs that touch the contacts / companies tables during assembly.
+        real_execute = db_session.execute
+        counts = {"contacts": 0, "companies": 0}
+
+        async def counting_execute(statement, *args, **kwargs):
+            sql = str(statement).lower()
+            if "from contacts" in sql:
+                counts["contacts"] += 1
+            if "from companies" in sql:
+                counts["companies"] += 1
+            return await real_execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db_session, "execute", counting_execute)
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(db_session, filter_type="all", per_page=50)
+
+        # Batched: one grouped query per table regardless of row count. The old
+        # N+1 would have issued ~12 contact + ~12 company selects for n=6.
+        assert counts["contacts"] <= 1, counts
+        assert counts["companies"] <= 1, counts
+
+        # Correctness preserved: every thread resolved its company as the lead.
+        threads = result["threads"]
+        assert len(threads) == n
+        for t in threads:
+            assert t["lead_name"] == expected_lead[t["gmail_thread_id"]]
+
+
+# ---------------------------------------------------------------------------
 # Reply-sync self-healing on revoked OAuth tokens
 # ---------------------------------------------------------------------------
 

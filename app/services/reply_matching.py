@@ -76,36 +76,43 @@ def _message_id_tokens(*header_values: Optional[str]) -> list[str]:
 
 
 async def find_stoppable_enrollment(
-    db: AsyncSession, contact_id: UUID
+    db: AsyncSession, contact_id: UUID, org_id: Optional[UUID] = None
 ) -> Optional[OutreachEnrollment]:
     """The enrollment a reply from this contact should stop, or None.
 
     Broadened beyond ``active``: prefers a still-running enrollment (active, then
     pending_review) and otherwise takes the most recent worked one, so a reply is
     never dropped just because the sequence had moved on.
+
+    ``org_id`` scopes the match to a single tenant. Pass the owning account's
+    org so the matcher can never reach across organizations even when it runs
+    without a bound request context (e.g. the manual smart-reply endpoint), in
+    addition to the global org read filter.
     """
     priority = case(
         (OutreachEnrollment.status == "active", 0),
         (OutreachEnrollment.status == "pending_review", 1),
         else_=2,
     )
-    return (
-        await db.execute(
-            select(OutreachEnrollment)
-            .where(
-                OutreachEnrollment.contact_id == contact_id,
-                OutreachEnrollment.status.in_(REPLY_STOPPABLE_STATUSES),
-            )
-            .order_by(priority, OutreachEnrollment.enrolled_at.desc())
-            .limit(1)
+    query = (
+        select(OutreachEnrollment)
+        .where(
+            OutreachEnrollment.contact_id == contact_id,
+            OutreachEnrollment.status.in_(REPLY_STOPPABLE_STATUSES),
         )
-    ).scalar_one_or_none()
+        .order_by(priority, OutreachEnrollment.enrolled_at.desc())
+        .limit(1)
+    )
+    if org_id is not None:
+        query = query.where(OutreachEnrollment.org_id == org_id)
+    return (await db.execute(query)).scalar_one_or_none()
 
 
 async def match_enrollment_by_headers(
     db: AsyncSession,
     in_reply_to: Optional[str],
     references: Optional[str],
+    org_id: Optional[UUID] = None,
 ) -> Optional[OutreachEnrollment]:
     """Fallback: match a reply to an enrollment by its threading headers.
 
@@ -113,25 +120,32 @@ async def match_enrollment_by_headers(
     Gmail ``gmail_message_id`` and ``gmail_thread_id`` the send path recorded on
     the enrollment. Returns the matched enrollment (only if it is still
     reply-stoppable) or None. Used when address-based matching finds nothing.
+
+    ``org_id`` scopes the match to a single tenant. Threading-header ids are not
+    guaranteed unique across organizations, so passing the owning account's org
+    prevents a reply on one tenant from ever matching (and stopping) another
+    tenant's enrollment — a cross-tenant leak the global read filter would only
+    catch when a request context is bound.
     """
     tokens = _message_id_tokens(in_reply_to, references)
     if not tokens:
         return None
 
-    enrollment = (
-        await db.execute(
-            select(OutreachEnrollment)
-            .where(
-                OutreachEnrollment.status.in_(REPLY_STOPPABLE_STATUSES),
-                (
-                    OutreachEnrollment.gmail_message_id.in_(tokens)
-                    | OutreachEnrollment.gmail_thread_id.in_(tokens)
-                ),
-            )
-            .order_by(OutreachEnrollment.enrolled_at.desc())
-            .limit(1)
+    query = (
+        select(OutreachEnrollment)
+        .where(
+            OutreachEnrollment.status.in_(REPLY_STOPPABLE_STATUSES),
+            (
+                OutreachEnrollment.gmail_message_id.in_(tokens)
+                | OutreachEnrollment.gmail_thread_id.in_(tokens)
+            ),
         )
-    ).scalar_one_or_none()
+        .order_by(OutreachEnrollment.enrolled_at.desc())
+        .limit(1)
+    )
+    if org_id is not None:
+        query = query.where(OutreachEnrollment.org_id == org_id)
+    enrollment = (await db.execute(query)).scalar_one_or_none()
     if enrollment is not None:
         logger.info(
             "Reply matched enrollment %s by threading headers (%d token(s))",

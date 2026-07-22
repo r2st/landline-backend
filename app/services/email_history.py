@@ -719,37 +719,80 @@ class EmailHistoryService:
         if replies_query is not None:
             replies_query = replies_query.order_by(EmailReply.received_at.desc()).limit(scan_cap)
 
-        if sends_query is not None:
-            sends = (await db.execute(sends_query)).scalars().all()
-            for s in sends:
-                contact = await self._load_contact(db, s.contact_id)
-                company_name, cid = await self._load_company_for_contact(db, contact)
-                messages.append(
-                    self._send_to_message(s, contact, company_name, cid, account_email_map)
-                )
+        sends = (
+            (await db.execute(sends_query)).scalars().all()
+            if sends_query is not None
+            else []
+        )
+        replies = (
+            (await db.execute(replies_query)).scalars().all()
+            if replies_query is not None
+            else []
+        )
 
-        if replies_query is not None:
-            replies = (await db.execute(replies_query)).scalars().all()
-            for r in replies:
-                contact = await self._load_contact(db, r.contact_id)
-                company_name = None
-                cid = r.company_id
-                if cid:
-                    company = (
-                        await db.execute(select(Company.name).where(Company.id == cid))
-                    ).scalar_one_or_none()
-                    company_name = company
-                elif contact and contact.company_id:
-                    cid = contact.company_id
-                    company = (
-                        await db.execute(select(Company.name).where(Company.id == cid))
-                    ).scalar_one_or_none()
-                    company_name = company
-                messages.append(
-                    self._reply_to_message(
-                        r, contact, company_name, cid, connected_emails, account_email_map
-                    )
+        # Batch-load the contacts and companies referenced by this page of rows.
+        # Inbox assembly used to be an N+1 — up to two queries per send and per
+        # reply (contact, then company) — which with the scan cap of ~500 rows a
+        # side meant ~2000 round-trips to render one inbox page. Collect the ids
+        # up front and resolve them in two grouped queries, then build the
+        # message dicts from the in-memory maps.
+        contact_ids = {
+            row.contact_id
+            for row in (*sends, *replies)
+            if getattr(row, "contact_id", None)
+        }
+        contacts_by_id: dict[uuid.UUID, Contact] = {}
+        if contact_ids:
+            contact_rows = (
+                await db.execute(select(Contact).where(Contact.id.in_(contact_ids)))
+            ).scalars().all()
+            contacts_by_id = {c.id: c for c in contact_rows}
+
+        # Company ids come from two places: a reply may carry its own company_id,
+        # and any contact (from a send or a reply) may point at a company.
+        company_ids: set[uuid.UUID] = set()
+        for r in replies:
+            if r.company_id:
+                company_ids.add(r.company_id)
+        for c in contacts_by_id.values():
+            if c.company_id:
+                company_ids.add(c.company_id)
+        company_name_by_id: dict[uuid.UUID, Optional[str]] = {}
+        if company_ids:
+            company_rows = (
+                await db.execute(
+                    select(Company.id, Company.name).where(Company.id.in_(company_ids))
                 )
+            ).all()
+            company_name_by_id = {row[0]: row[1] for row in company_rows}
+
+        for s in sends:
+            contact = contacts_by_id.get(s.contact_id) if s.contact_id else None
+            # Mirror _load_company_for_contact: name+id only when the contact
+            # points at a company row that actually exists.
+            company_name, cid = None, None
+            if contact and contact.company_id in company_name_by_id:
+                cid = contact.company_id
+                company_name = company_name_by_id[cid]
+            messages.append(
+                self._send_to_message(s, contact, company_name, cid, account_email_map)
+            )
+
+        for r in replies:
+            contact = contacts_by_id.get(r.contact_id) if r.contact_id else None
+            # Reply's own company_id wins; else fall back to the contact's.
+            company_name = None
+            cid = r.company_id
+            if cid:
+                company_name = company_name_by_id.get(cid)
+            elif contact and contact.company_id:
+                cid = contact.company_id
+                company_name = company_name_by_id.get(cid)
+            messages.append(
+                self._reply_to_message(
+                    r, contact, company_name, cid, connected_emails, account_email_map
+                )
+            )
 
         # Group into threads
         threads = self._group_into_threads(messages)

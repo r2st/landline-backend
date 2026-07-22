@@ -158,3 +158,60 @@ async def test_process_endpoint_returns_summary(client, monkeypatch):
 async def test_process_endpoint_requires_auth(unauth_client):
     resp = await unauth_client.post("/api/v1/dialtone/smart-reply/process")
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_approve_and_send_requires_auth(unauth_client, db_session):
+    """Approve-send is a state-changing dispatch — it must reject anon callers."""
+    reply = await _seed_reply(db_session)
+    resp = await unauth_client.post(
+        f"/api/v1/dialtone/inbox/{reply.id}/approve-send",
+        json={"body": "hi"},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_approve_and_send_cross_tenant_is_404(client, db_session, monkeypatch):
+    """A reply owned by another org must be invisible: 404, never a dispatch.
+
+    The default client is the Apprend (org A) admin. We seed a reply under a
+    second org (org B) and confirm approve-send can neither read nor send it —
+    the IDOR the audit flagged (fetch-by-raw-id with no org filter).
+    """
+    from app.models.tenant import Organization
+
+    org_b = Organization(
+        id=uuid.uuid4(), name="Beta Co", slug="beta-co-approve",
+        is_active=True, billing_plan="free",
+    )
+    db_session.add(org_b)
+    await db_session.flush()
+
+    foreign_reply = EmailReply(
+        id=uuid.uuid4(),
+        org_id=org_b.id,
+        from_email="stranger@other.co",
+        subject="Re: something",
+        body_text="not your reply",
+        received_at=datetime.now(timezone.utc),
+    )
+    db_session.add(foreign_reply)
+    await db_session.commit()
+
+    # If isolation failed this would dispatch; assert it never gets called.
+    def _boom(*a, **k):  # pragma: no cover - must not run
+        raise AssertionError("send_outreach_email called for a cross-tenant reply")
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", _boom)
+
+    resp = await client.post(
+        f"/api/v1/dialtone/inbox/{foreign_reply.id}/approve-send",
+        json={"body": "should never send"},
+    )
+    assert resp.status_code == 404, resp.text
+
+    # And the foreign reply is untouched.
+    await db_session.refresh(foreign_reply)
+    assert foreign_reply.handled_action is None
+    assert foreign_reply.is_read is False

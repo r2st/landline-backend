@@ -20,8 +20,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
+from app.models.user import User
 from app.schemas.replies import ApproveSendRequest, ApproveSendResult
 from app.services import email_dispatch
 from app.services.smart_reply import get_smart_reply_service
@@ -32,11 +34,19 @@ router = APIRouter(prefix="/dialtone", tags=["dialtone-smart-reply"])
 
 
 @router.post("/smart-reply/process")
-async def process_smart_replies(db: AsyncSession = Depends(get_db)):
+async def process_smart_replies(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Run the smart-reply sweep now: read replies across connected accounts,
     classify with AI, draft responses, and auto-send where enabled.
 
     Returns a per-reply summary so the operator can see what was processed.
+
+    Requires authentication: ``get_current_user`` binds the caller's org as the
+    request context, so the sweep (connected-account lookup, enrollment/contact
+    matching) is filtered to the caller's own organization by the global
+    read filter — never every tenant's mailboxes at once.
     """
     service = get_smart_reply_service()
     results = await service.process_replies(db)
@@ -53,6 +63,7 @@ async def approve_and_send(
     reply_id: uuid.UUID,
     payload: ApproveSendRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Send an operator-approved reply to the person who replied, in-thread.
 
@@ -62,10 +73,19 @@ async def approve_and_send(
     under the original conversation when we have its Gmail thread/message ids.
     On a successful send an ``EmailSend`` row is recorded and the reply is marked
     read + handled.
+
+    Tenant isolation: the reply must belong to the caller's organization.
+    ``get_current_user`` binds the org context (so the global read filter also
+    applies), and we additionally filter ``EmailReply.org_id`` explicitly — a
+    reply id from another tenant returns 404, never someone else's inbox.
     """
-    reply = (
-        await db.execute(select(EmailReply).where(EmailReply.id == reply_id))
-    ).scalar_one_or_none()
+    reply_query = select(EmailReply).where(EmailReply.id == reply_id)
+    # Belt-and-suspenders alongside the global org filter: an explicit predicate
+    # so a cross-tenant reply id is a 404 even for a platform admin (org_id=None,
+    # which the global filter deliberately does not scope).
+    if current_user.org_id is not None:
+        reply_query = reply_query.where(EmailReply.org_id == current_user.org_id)
+    reply = (await db.execute(reply_query)).scalar_one_or_none()
     if reply is None:
         raise HTTPException(status_code=404, detail="Reply not found")
 

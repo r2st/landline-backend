@@ -433,11 +433,21 @@ class SmartReplyService:
         )
 
         enrollment = None
+        # Scope enrollment matching to the account's own org: threading ids and
+        # contact rows are not globally unique, so an explicit org filter keeps a
+        # reply from ever matching another tenant's enrollment even when this
+        # runs without a bound request context.
+        account_org_id = gmail_account.org_id
         if contact is not None:
-            enrollment = await find_stoppable_enrollment(db, contact.id)
+            enrollment = await find_stoppable_enrollment(
+                db, contact.id, org_id=account_org_id
+            )
         if enrollment is None:
             enrollment = await match_enrollment_by_headers(
-                db, headers.get("in-reply-to"), headers.get("references")
+                db,
+                headers.get("in-reply-to"),
+                headers.get("references"),
+                org_id=account_org_id,
             )
         # A header match can identify the contact when the address didn't.
         if enrollment is not None and contact is None and enrollment.contact_id:

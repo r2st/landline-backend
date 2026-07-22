@@ -429,3 +429,7 @@ import app.tasks.referral_agent  # noqa: F401
 import app.tasks.social_listening  # noqa: F401
 import app.tasks.meeting_booking  # noqa: F401
 import app.tasks.client_success  # noqa: F401
+# Registers generate_daily_summary — referenced by the "daily-summary" beat
+# schedule above. Without this force-import the task is never registered and the
+# beat-dispatched summary silently fails with an unregistered-task error.
+import app.tasks.reporting  # noqa: F401
