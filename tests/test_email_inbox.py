@@ -15,6 +15,7 @@ from app.models.contact import Contact
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
+from app.models.smtp_account import SmtpAccount
 from app.services import crypto, google_oauth
 from app.services.email_history import EmailHistoryService
 
@@ -49,6 +50,28 @@ async def _make_gmail_account(
         refresh_token_encrypted=crypto.encrypt("refresh-xyz"),
         access_token_encrypted=crypto.encrypt("access-xyz"),
         scopes=" ".join(google_oauth.SCOPES),
+        is_active=active,
+        status=status,
+    )
+    db.add(account)
+    await db.flush()
+    return account
+
+
+async def _make_smtp_account(
+    db: AsyncSession,
+    email: str,
+    active: bool = False,
+    status: str = "connected",
+) -> SmtpAccount:
+    account = SmtpAccount(
+        id=uuid.uuid4(),
+        email=email,
+        display_name=email.split("@")[0].title(),
+        host="smtp.example.com",
+        port=587,
+        username=email,
+        password_encrypted=crypto.encrypt("smtp-secret"),
         is_active=active,
         status=status,
     )
@@ -687,6 +710,164 @@ class TestInboxAccountFilterEndpoint:
         await db_session.commit()
 
         resp = await client.get(f"/api/v1/emails/inbox?gmail_account_id={uuid.uuid4()}")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Filter by email address (Gmail *and* SMTP)
+# ---------------------------------------------------------------------------
+
+class TestInboxAccountEmailFilter:
+    """``account_email`` scopes the inbox to one address and, unlike
+    ``gmail_account_id``, works for SMTP accounts (which have no FK on the
+    message rows)."""
+
+    async def test_filter_by_email_scopes_sends_and_replies(self, db_session):
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        sales = await _make_gmail_account(db_session, "sales@company.com")
+
+        await _make_email_send(
+            db_session,
+            from_email="support@company.com",
+            to_email="a@x.com",
+            gmail_thread_id="e-support-sent",
+            gmail_message_id="em-1",
+            sender_account_id=support.id,
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="a@x.com",
+            to_email="support@company.com",
+            gmail_thread_id="e-support-recv",
+            gmail_account_id=support.id,
+        )
+        await _make_email_send(
+            db_session,
+            from_email="sales@company.com",
+            to_email="b@y.com",
+            gmail_thread_id="e-sales-sent",
+            gmail_message_id="em-2",
+            sender_account_id=sales.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="all", account_email="support@company.com"
+        )
+        thread_ids = {t["gmail_thread_id"] for t in result["threads"]}
+        assert thread_ids == {"e-support-sent", "e-support-recv"}
+
+    async def test_filter_by_email_is_case_insensitive(self, db_session):
+        await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_email_reply(
+            db_session,
+            from_email="a@x.com",
+            to_email="support@company.com",
+            gmail_thread_id="e-case",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="all", account_email="SUPPORT@Company.com"
+        )
+        assert result["total"] == 1
+        assert result["threads"][0]["gmail_thread_id"] == "e-case"
+
+    async def test_filter_by_smtp_account_email(self, db_session):
+        """SMTP sends/replies carry no account-id FK — the address is the only
+        link, and ``account_email`` must still scope to them."""
+        await _make_smtp_account(db_session, "relay@company.com", active=True)
+        # SMTP send: sender_account_id is null (FK points at gmail_accounts).
+        await _make_email_send(
+            db_session,
+            from_email="relay@company.com",
+            to_email="lead@x.com",
+            gmail_thread_id="smtp-sent",
+            gmail_message_id="smtp-em-1",
+            sender_account_id=None,
+        )
+        # SMTP reply landed over IMAP: gmail_account_id is null too.
+        await _make_email_reply(
+            db_session,
+            from_email="lead@x.com",
+            to_email="relay@company.com",
+            gmail_thread_id="smtp-recv",
+            gmail_account_id=None,
+        )
+        # Unrelated mail on another address must be excluded.
+        await _make_email_reply(
+            db_session,
+            from_email="lead@x.com",
+            to_email="other@company.com",
+            gmail_thread_id="smtp-other",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="all", account_email="relay@company.com"
+        )
+        thread_ids = {t["gmail_thread_id"] for t in result["threads"]}
+        assert thread_ids == {"smtp-sent", "smtp-recv"}
+
+    async def test_filter_by_email_combines_with_sent_filter(self, db_session):
+        await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_email_send(
+            db_session,
+            from_email="support@company.com",
+            to_email="a@x.com",
+            gmail_thread_id="e-combo-sent",
+            gmail_message_id="ec-1",
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="a@x.com",
+            to_email="support@company.com",
+            gmail_thread_id="e-combo-recv",
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="sent", account_email="support@company.com"
+        )
+        assert result["total"] == 1
+        assert result["threads"][0]["gmail_thread_id"] == "e-combo-sent"
+
+    async def test_endpoint_filters_by_email(self, client, db_session):
+        await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_smtp_account(db_session, "relay@company.com")
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="support@company.com",
+            gmail_thread_id="ep-em-support",
+        )
+        await _make_email_reply(
+            db_session,
+            from_email="client@external.com",
+            to_email="relay@company.com",
+            gmail_thread_id="ep-em-relay",
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            "/api/v1/emails/inbox?account_email=relay@company.com"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["threads"][0]["gmail_thread_id"] == "ep-em-relay"
+
+    async def test_endpoint_unknown_email_returns_404(self, client, db_session):
+        await _make_gmail_account(db_session, "support@company.com", active=True)
+        await db_session.commit()
+
+        resp = await client.get(
+            "/api/v1/emails/inbox?account_email=nobody@nowhere.com"
+        )
         assert resp.status_code == 404
 
 

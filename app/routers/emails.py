@@ -5,7 +5,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -63,7 +63,15 @@ async def get_inbox(
     filter: str = Query("all", alias="filter"),
     search: Optional[str] = Query(None),
     gmail_account_id: Optional[uuid.UUID] = Query(
-        None, description="Filter to a single connected email account by its id"
+        None, description="Filter to a single connected Gmail account by its id"
+    ),
+    account_email: Optional[str] = Query(
+        None,
+        description=(
+            "Filter to a single connected email account by its address. Unlike "
+            "gmail_account_id this also covers SMTP accounts, which carry no "
+            "foreign-key link on the message rows and so are matched by address."
+        ),
     ),
     db: AsyncSession = Depends(get_db),
     scope: UserScope = Depends(get_scope),
@@ -77,10 +85,11 @@ async def get_inbox(
     ``view_as_user_id=all`` to see everyone's mail. An authenticated user with
     no connected accounts sees an empty inbox (fail closed).
 
-    Pass ``gmail_account_id`` to filter to a single connected email account
-    (e.g. only mail sent from / received on support@company.com). Each returned
-    message includes ``gmail_account_id`` and ``gmail_account_email`` so the
-    frontend can label and group mail by the email address it belongs to.
+    Pass ``gmail_account_id`` (Gmail only) or ``account_email`` (Gmail *or*
+    SMTP) to filter to a single connected email account — e.g. only mail sent
+    from / received on support@company.com. Each returned message includes
+    ``gmail_account_id`` and ``gmail_account_email`` so the frontend can label
+    and group mail by the email address it belongs to.
     """
     valid_filters = ("all", "sent", "received", "opened", "needs_reply")
     if filter not in valid_filters:
@@ -107,10 +116,40 @@ async def get_inbox(
         if account_exists is None:
             raise HTTPException(status_code=404, detail="Email account not found")
 
+    # Same guard for the by-address filter, which spans Gmail *and* SMTP. When
+    # scoped, the user's own sender-address set (already Gmail+SMTP) is the
+    # allowlist; unscoped admins just need the address to exist somewhere.
+    normalized_account_email = None
+    if account_email is not None:
+        normalized_account_email = account_email.strip().lower() or None
+    if normalized_account_email is not None:
+        if user_gmail_emails is not None:
+            if normalized_account_email not in user_gmail_emails:
+                raise HTTPException(status_code=404, detail="Email account not found")
+        else:
+            exists = (
+                await db.execute(
+                    select(GmailAccount.id)
+                    .where(func.lower(GmailAccount.email) == normalized_account_email)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if exists is None:
+                exists = (
+                    await db.execute(
+                        select(SmtpAccount.id)
+                        .where(func.lower(SmtpAccount.email) == normalized_account_email)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Email account not found")
+
     service = _get_service()
     result = await service.get_inbox(
         db, page=page, per_page=per_page, filter_type=filter, search=search,
         user_gmail_emails=user_gmail_emails, gmail_account_id=gmail_account_id,
+        account_email=normalized_account_email,
     )
     return result
 

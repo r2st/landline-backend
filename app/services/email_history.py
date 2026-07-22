@@ -558,13 +558,17 @@ class EmailHistoryService:
         search: Optional[str] = None,
         user_gmail_emails: Optional[set[str]] = None,
         gmail_account_id: Optional[uuid.UUID] = None,
+        account_email: Optional[str] = None,
     ) -> dict:
         """Unified inbox query with filters.
 
         filter_type: all | sent | received | opened | needs_reply
         user_gmail_emails: when provided, scope to only these email addresses
-        gmail_account_id: when provided, scope to a single connected account
-            (sends from it and replies received on it)
+        gmail_account_id: when provided, scope to a single connected Gmail
+            account (sends from it and replies received on it)
+        account_email: when provided, scope to a single connected account by its
+            address — sends *from* it and replies *to* it. Covers SMTP accounts
+            too, which have no account-id FK on the message rows.
         search: optional text search on subject/from_email
         """
         # Load connected account emails for direction detection
@@ -600,6 +604,20 @@ class EmailHistoryService:
             )
             replies_query = replies_query.where(
                 EmailReply.gmail_account_id == gmail_account_id
+            )
+
+        # Scope to a single email account by address. This is the SMTP-friendly
+        # filter: SMTP sends/replies carry no account-id FK, so we resolve the
+        # owning account from the address instead — a sent message belongs to
+        # the address it was sent FROM, a received message to the address it was
+        # sent TO. Mirrors the id-or-address matching in ``danger_monitor``.
+        if account_email:
+            addr = account_email.lower()
+            sends_query = sends_query.where(
+                func.lower(EmailSend.from_email) == addr
+            )
+            replies_query = replies_query.where(
+                func.lower(EmailReply.to_email) == addr
             )
 
         if filter_type == "sent":
