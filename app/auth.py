@@ -50,6 +50,11 @@ PUBLIC_PREFIXES = (
     "/api/v1/gmail/oauth/callback",
     "/api/v1/outreach/events",
     "/api/v1/track/",         # tracking pixels and click redirects must be public
+    # The public REST API is a mounted sub-app that enforces its own X-API-Key
+    # auth per route (see app.routers.public_api / app.services.api_key_auth), so
+    # this JWT/static-key middleware must let its whole prefix through — including
+    # its self-hosted OpenAPI docs at /api/v1/public/docs.
+    "/api/v1/public",
 )
 
 

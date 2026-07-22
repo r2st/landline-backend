@@ -68,6 +68,7 @@ from app.models.social_listening_agent import (
     MonitoredCompany,
 )
 from app.models.inbox_thread_state import InboxThreadState
+from app.models.api_key import ApiKey
 
 __all__ = [
     "SystemSetting",
@@ -157,4 +158,5 @@ __all__ = [
     "ClientSuccessAgent",
     "ClientSuccessAction",
     "InboxThreadState",
+    "ApiKey",
 ]

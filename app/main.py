@@ -16,7 +16,8 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys
+from app.routers.public_api import public_app
 
 settings = get_settings()
 
@@ -216,6 +217,18 @@ app.include_router(channels.router, prefix=settings.api_prefix, dependencies=_au
 # router; the rest carries org-scoped data and requires auth.
 app.include_router(postmaster.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(postmaster.public_router, prefix=settings.api_prefix)
+# Public-API key management (mint/list/revoke). Auth required; each route
+# enforces org_admin via OrgScope. The keys minted here authenticate the public
+# API mounted below.
+app.include_router(api_keys.router, prefix=settings.api_prefix, dependencies=_auth)
+
+# Public REST API v1 — a mounted sub-application with its own OpenAPI docs at
+# /api/v1/public/docs and X-API-Key authentication enforced per route. It shares
+# the parent's dependency_overrides so test/DB overrides propagate into it, and
+# its prefix is whitelisted in the auth middleware (which would otherwise demand
+# a JWT) because the sub-app authenticates callers itself.
+public_app.dependency_overrides = app.dependency_overrides
+app.mount(f"{settings.api_prefix}/public", public_app)
 
 
 @app.get("/health")
