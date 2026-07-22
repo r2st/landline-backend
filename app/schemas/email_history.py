@@ -34,6 +34,9 @@ class EmailMessageRead(BaseModel):
     # The connected Gmail account this message was sent from / received on.
     gmail_account_id: Optional[uuid.UUID] = None
     gmail_account_email: Optional[str] = None
+    # Intent classification + hot-lead marker (incoming replies only).
+    reply_classification: Optional[str] = None
+    priority_flag: bool = False
 
 
 class EmailThreadRead(BaseModel):
@@ -46,6 +49,10 @@ class EmailThreadRead(BaseModel):
     has_unread: bool = False
     lead_name: Optional[str] = None
     lead_id: Optional[uuid.UUID] = None
+    # Thread-level triage surface (see EmailHistoryService._group_into_threads).
+    priority: bool = False
+    classification: Optional[str] = None
+    is_archived: bool = False
 
 
 class EmailInboxResponse(BaseModel):
@@ -85,3 +92,28 @@ class SyncStatusResponse(BaseModel):
     synced: int = 0
     errors: int = 0
     last_sync: Optional[datetime] = None
+
+
+# --- Thread read-state / archive ---
+
+from pydantic import Field  # noqa: E402
+
+
+class ThreadIdsRequest(BaseModel):
+    """A batch of thread ids for a bulk read/archive action."""
+
+    thread_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ThreadReadResponse(BaseModel):
+    """Result of a mark-read / mark-unread action."""
+
+    updated: int = 0  # number of reply rows whose is_read was set
+    is_read: bool = True
+
+
+class ThreadArchiveResponse(BaseModel):
+    """Result of an archive / unarchive action."""
+
+    updated: int = 0  # number of threads whose archive flag was set
+    is_archived: bool = True

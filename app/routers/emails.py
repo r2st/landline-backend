@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,6 +20,9 @@ from app.schemas.email_history import (
     EmailReplyResponse,
     EmailThreadRead,
     SyncStatusResponse,
+    ThreadArchiveResponse,
+    ThreadIdsRequest,
+    ThreadReadResponse,
 )
 from app.services.email_history import EmailHistoryService
 
@@ -62,6 +66,12 @@ async def get_inbox(
     per_page: int = Query(20, ge=1, le=100),
     filter: str = Query("all", alias="filter"),
     search: Optional[str] = Query(None),
+    date_from: Optional[datetime] = Query(
+        None, description="Only threads with activity on/after this timestamp"
+    ),
+    date_to: Optional[datetime] = Query(
+        None, description="Only threads with activity on/before this timestamp"
+    ),
     gmail_account_id: Optional[uuid.UUID] = Query(
         None, description="Filter to a single connected Gmail account by its id"
     ),
@@ -91,7 +101,9 @@ async def get_inbox(
     ``gmail_account_id`` and ``gmail_account_email`` so the frontend can label
     and group mail by the email address it belongs to.
     """
-    valid_filters = ("all", "sent", "received", "opened", "needs_reply")
+    valid_filters = (
+        "all", "sent", "received", "opened", "needs_reply", "priority", "archived"
+    )
     if filter not in valid_filters:
         raise HTTPException(
             status_code=400,
@@ -150,6 +162,10 @@ async def get_inbox(
         db, page=page, per_page=per_page, filter_type=filter, search=search,
         user_gmail_emails=user_gmail_emails, gmail_account_id=gmail_account_id,
         account_email=normalized_account_email,
+        date_from=date_from, date_to=date_to,
+        # Archive state is per-user; owner_id is the acting human (None for the
+        # legacy/unscoped admin path, which then sees every thread unarchived).
+        state_user_id=scope.owner_id,
     )
     return result
 
@@ -215,6 +231,123 @@ async def get_thread_intelligence(
             detail="Thread not found or could not be analyzed",
         )
     return {"status": "ok", **_serialize_conversation_analysis(analysis)}
+
+
+async def _scoped_sender_emails(
+    db: AsyncSession, scope: UserScope
+) -> Optional[set[str]]:
+    """The caller's own sender addresses, or ``None`` for the unscoped admin.
+
+    Mirrors the scoping used by ``get_inbox``: a scoped user may only touch mail
+    on their own mailboxes; the legacy/unscoped admin path (``see_all``) applies
+    no address filter.
+    """
+    if scope.see_all:
+        return None
+    return await _sender_emails_for_user(db, scope.target_user_id)
+
+
+def _require_state_user(scope: UserScope) -> uuid.UUID:
+    """The user id that per-thread archive state is keyed on.
+
+    Archive/snooze/read-override are inherently per-user, so an unscoped
+    (legacy API-key) caller with no resolvable user cannot own thread state.
+    """
+    user_id = scope.owner_id
+    if user_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Archiving requires an authenticated user.",
+        )
+    return user_id
+
+
+async def _set_read(
+    db: AsyncSession, scope: UserScope, thread_ids: list[str], is_read: bool
+) -> ThreadReadResponse:
+    user_emails = await _scoped_sender_emails(db, scope)
+    service = _get_service()
+    updated = await service.set_threads_read(
+        db, thread_ids, is_read=is_read, user_gmail_emails=user_emails
+    )
+    return ThreadReadResponse(updated=updated, is_read=is_read)
+
+
+@router.post("/thread/{gmail_thread_id}/read", response_model=ThreadReadResponse)
+async def mark_thread_read(
+    gmail_thread_id: str,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Mark every reply in a thread read (org/mailbox-scoped to the caller)."""
+    return await _set_read(db, scope, [gmail_thread_id], True)
+
+
+@router.post("/thread/{gmail_thread_id}/unread", response_model=ThreadReadResponse)
+async def mark_thread_unread(
+    gmail_thread_id: str,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Mark every reply in a thread unread — the 'mark unread' affordance."""
+    return await _set_read(db, scope, [gmail_thread_id], False)
+
+
+@router.post("/threads/read", response_model=ThreadReadResponse)
+async def bulk_mark_read(
+    payload: ThreadIdsRequest,
+    is_read: bool = Query(True, description="Set read (true) or unread (false)"),
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Bulk mark-read (or unread) across a selection of threads."""
+    return await _set_read(db, scope, payload.thread_ids, is_read)
+
+
+@router.post("/thread/{gmail_thread_id}/archive", response_model=ThreadArchiveResponse)
+async def archive_thread(
+    gmail_thread_id: str,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Archive a thread for the caller — drops it from the default inbox view."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    updated = await service.set_threads_archived(
+        db, [gmail_thread_id], is_archived=True, user_id=user_id
+    )
+    return ThreadArchiveResponse(updated=updated, is_archived=True)
+
+
+@router.post("/thread/{gmail_thread_id}/unarchive", response_model=ThreadArchiveResponse)
+async def unarchive_thread(
+    gmail_thread_id: str,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Unarchive a thread for the caller — returns it to the default view."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    updated = await service.set_threads_archived(
+        db, [gmail_thread_id], is_archived=False, user_id=user_id
+    )
+    return ThreadArchiveResponse(updated=updated, is_archived=False)
+
+
+@router.post("/threads/archive", response_model=ThreadArchiveResponse)
+async def bulk_archive(
+    payload: ThreadIdsRequest,
+    is_archived: bool = Query(True, description="Archive (true) or unarchive (false)"),
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Bulk archive (or unarchive) a selection of threads for the caller."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    updated = await service.set_threads_archived(
+        db, payload.thread_ids, is_archived=is_archived, user_id=user_id
+    )
+    return ThreadArchiveResponse(updated=updated, is_archived=is_archived)
 
 
 @router.post("/reply/{email_id}", response_model=EmailReplyResponse)

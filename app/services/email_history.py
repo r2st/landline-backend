@@ -25,6 +25,7 @@ from app.models.contact import Contact
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
+from app.models.inbox_thread_state import InboxThreadState
 from app.models.outreach import OutreachEnrollment
 from app.services import crypto, google_oauth
 from app.services.bounce_ingestion import is_bounce_message
@@ -570,17 +571,27 @@ class EmailHistoryService:
         user_gmail_emails: Optional[set[str]] = None,
         gmail_account_id: Optional[uuid.UUID] = None,
         account_email: Optional[str] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        state_user_id: Optional[uuid.UUID] = None,
     ) -> dict:
         """Unified inbox query with filters.
 
-        filter_type: all | sent | received | opened | needs_reply
+        filter_type: all | sent | received | opened | needs_reply | priority |
+            archived
         user_gmail_emails: when provided, scope to only these email addresses
         gmail_account_id: when provided, scope to a single connected Gmail
             account (sends from it and replies received on it)
         account_email: when provided, scope to a single connected account by its
             address — sends *from* it and replies *to* it. Covers SMTP accounts
             too, which have no account-id FK on the message rows.
-        search: optional text search on subject/from_email
+        search: optional full-text search on subject / from / to / body
+        date_from / date_to: optional inclusive bounds on message timestamp
+            (sent_at for sends, received_at for replies)
+        state_user_id: the user whose per-thread archive state applies. Archived
+            threads are excluded from every view except ``archived``, which shows
+            only them. When None (legacy/unscoped admin), no archive state is
+            applied.
         """
         # Load connected account emails for direction detection
         if user_gmail_emails is not None:
@@ -647,25 +658,53 @@ class EmailHistoryService:
         elif filter_type == "needs_reply":
             # Threads where the last message is a received email (needs reply)
             pass  # We'll filter after grouping
+        elif filter_type == "priority":
+            # Hot-lead view: threads carrying a priority-flagged reply. The flag
+            # lives on incoming replies, so a thread is priority iff one of its
+            # replies is flagged. We still load the thread's sends below so the
+            # full conversation renders; the priority narrowing is applied after
+            # grouping.
+            if replies_query is not None:
+                replies_query = replies_query.where(EmailReply.priority_flag.is_(True))
+        # "archived" and "all" scan normally; archive membership is applied after
+        # grouping via the per-user thread-state set.
 
         if search:
             search_term = f"%{search}%"
             if sends_query is not None:
+                # Sent copy lives in body_html (no separate plaintext column).
                 sends_query = sends_query.where(
                     or_(
                         EmailSend.subject.ilike(search_term),
                         EmailSend.to_email.ilike(search_term),
                         EmailSend.from_email.ilike(search_term),
+                        EmailSend.body_html.ilike(search_term),
                     )
                 )
             if replies_query is not None:
+                # Full-text: also match the reply body (plain + html), so a rep
+                # searching for a phrase inside an email finds the thread.
                 replies_query = replies_query.where(
                     or_(
                         EmailReply.subject.ilike(search_term),
                         EmailReply.from_email.ilike(search_term),
                         EmailReply.to_email.ilike(search_term),
+                        EmailReply.body_text.ilike(search_term),
+                        EmailReply.body_html.ilike(search_term),
                     )
                 )
+
+        # Inclusive date-range bounds on the message timestamp.
+        if date_from is not None:
+            if sends_query is not None:
+                sends_query = sends_query.where(EmailSend.sent_at >= date_from)
+            if replies_query is not None:
+                replies_query = replies_query.where(EmailReply.received_at >= date_from)
+        if date_to is not None:
+            if sends_query is not None:
+                sends_query = sends_query.where(EmailSend.sent_at <= date_to)
+            if replies_query is not None:
+                replies_query = replies_query.where(EmailReply.received_at <= date_to)
 
         messages = []
 
@@ -715,12 +754,33 @@ class EmailHistoryService:
         # Group into threads
         threads = self._group_into_threads(messages)
 
-        # Filter needs_reply after grouping
+        # Per-user archive state: which of these threads has this user archived?
+        archived_ids: set[str] = set()
+        if state_user_id is not None:
+            candidate_ids = [t["gmail_thread_id"] for t in threads]
+            if candidate_ids:
+                archived_ids = await self._archived_thread_ids(
+                    db, state_user_id, candidate_ids
+                )
+        for t in threads:
+            t["is_archived"] = t["gmail_thread_id"] in archived_ids
+
+        # Apply post-grouping filters BEFORE counting/paginating so ``total``
+        # always equals the number of threads actually in the view (P0-4).
+        if filter_type == "archived":
+            # The Archived tab shows only archived threads.
+            threads = [t for t in threads if t["is_archived"]]
+        else:
+            # Every other view hides archived threads.
+            threads = [t for t in threads if not t["is_archived"]]
+
         if filter_type == "needs_reply":
             threads = [
                 t for t in threads
                 if t["messages"] and t["messages"][-1]["direction"] == "received"
             ]
+        elif filter_type == "priority":
+            threads = [t for t in threads if t["priority"]]
 
         # Sort by last activity
         threads.sort(key=lambda t: t["last_activity"], reverse=True)
@@ -731,6 +791,96 @@ class EmailHistoryService:
         paginated = threads[start:end]
 
         return {"threads": paginated, "total": total, "page": page, "per_page": per_page}
+
+    # ------------------------------------------------------------------
+    # Read state + archive (per-user thread state)
+    # ------------------------------------------------------------------
+
+    async def _archived_thread_ids(
+        self, db: AsyncSession, user_id: uuid.UUID, thread_ids: list[str]
+    ) -> set[str]:
+        """The subset of ``thread_ids`` this user has archived."""
+        if not thread_ids:
+            return set()
+        rows = await db.execute(
+            select(InboxThreadState.gmail_thread_id).where(
+                InboxThreadState.user_id == user_id,
+                InboxThreadState.is_archived.is_(True),
+                InboxThreadState.gmail_thread_id.in_(thread_ids),
+            )
+        )
+        return set(rows.scalars().all())
+
+    async def set_threads_read(
+        self,
+        db: AsyncSession,
+        thread_ids: list[str],
+        is_read: bool,
+        user_gmail_emails: Optional[set[str]] = None,
+    ) -> int:
+        """Flip ``is_read`` on every reply in the given threads.
+
+        Scoped to the caller's own mailbox when ``user_gmail_emails`` is provided
+        — only replies *received on* one of the user's addresses are touched, so
+        a user can never mark another user's thread read/unread. Returns the
+        number of reply rows updated. Idempotent (setting read→read is a no-op
+        that still reports the row count in the thread).
+        """
+        if not thread_ids:
+            return 0
+        query = select(EmailReply).where(
+            EmailReply.gmail_thread_id.in_(thread_ids)
+        )
+        if user_gmail_emails is not None:
+            if not user_gmail_emails:
+                return 0
+            query = query.where(
+                func.lower(EmailReply.to_email).in_(user_gmail_emails)
+            )
+        replies = (await db.execute(query)).scalars().all()
+        for reply in replies:
+            reply.is_read = is_read
+        await db.commit()
+        return len(replies)
+
+    async def set_threads_archived(
+        self,
+        db: AsyncSession,
+        thread_ids: list[str],
+        is_archived: bool,
+        user_id: uuid.UUID,
+    ) -> int:
+        """Upsert the per-user archive flag for each thread.
+
+        Creates an ``inbox_thread_state`` row on first archive of a thread, and
+        updates it thereafter. Returns the number of threads affected.
+        """
+        if not thread_ids:
+            return 0
+        existing = {
+            s.gmail_thread_id: s
+            for s in (
+                await db.execute(
+                    select(InboxThreadState).where(
+                        InboxThreadState.user_id == user_id,
+                        InboxThreadState.gmail_thread_id.in_(thread_ids),
+                    )
+                )
+            ).scalars().all()
+        }
+        for thread_id in thread_ids:
+            state = existing.get(thread_id)
+            if state is None:
+                state = InboxThreadState(
+                    gmail_thread_id=thread_id,
+                    user_id=user_id,
+                    is_archived=is_archived,
+                )
+                db.add(state)
+            else:
+                state.is_archived = is_archived
+        await db.commit()
+        return len(thread_ids)
 
     # ------------------------------------------------------------------
     # Thread detail
@@ -1095,6 +1245,9 @@ class EmailHistoryService:
             "company_name": company_name,
             "gmail_account_id": account_id,
             "gmail_account_email": account_email,
+            # Classification/priority live only on incoming replies.
+            "reply_classification": None,
+            "priority_flag": False,
         }
 
     def _reply_to_message(
@@ -1146,6 +1299,10 @@ class EmailHistoryService:
             "company_name": company_name,
             "gmail_account_id": account_id,
             "gmail_account_email": account_email,
+            # Intent classification + hot-lead marker (surfaced as chips / the
+            # Priority tab). Only meaningful on the "received" direction.
+            "reply_classification": reply.reply_classification if direction == "received" else None,
+            "priority_flag": bool(reply.priority_flag) if direction == "received" else False,
         }
 
     def _group_into_threads(
@@ -1188,6 +1345,16 @@ class EmailHistoryService:
             last_activity = thread_messages[-1]["timestamp"]
             has_unread = any(not m["is_read"] for m in thread_messages)
 
+            # Thread-level intent surface: hot if any message is flagged; the
+            # thread's classification is the latest received message's category
+            # (that's the reply a rep is triaging against).
+            priority = any(m.get("priority_flag") for m in thread_messages)
+            classification = None
+            for m in reversed(thread_messages):
+                if m.get("direction") == "received" and m.get("reply_classification"):
+                    classification = m["reply_classification"]
+                    break
+
             # Determine lead from messages
             lead_name = default_lead_name
             lead_id = default_lead_id
@@ -1206,6 +1373,11 @@ class EmailHistoryService:
                 "has_unread": has_unread,
                 "lead_name": lead_name,
                 "lead_id": lead_id,
+                "priority": priority,
+                "classification": classification,
+                # Overwritten with the caller's per-user state in get_inbox; the
+                # default (no state row) is not-archived.
+                "is_archived": False,
             })
 
         return threads

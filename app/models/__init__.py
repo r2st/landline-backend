@@ -66,6 +66,7 @@ from app.models.social_listening_agent import (
     SignalEvent,
     MonitoredCompany,
 )
+from app.models.inbox_thread_state import InboxThreadState
 
 __all__ = [
     "SystemSetting",
@@ -153,4 +154,5 @@ __all__ = [
     "MonitoredCompany",
     "ClientSuccessAgent",
     "ClientSuccessAction",
+    "InboxThreadState",
 ]
