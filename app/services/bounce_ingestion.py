@@ -4,9 +4,9 @@
 nothing ever called it: its only caller was a manual API endpoint on the
 deliverability router. Meanwhile Gmail is the primary transport, so real bounces
 arrive as *messages in the mailbox* — Delivery Status Notifications from
-mailer-daemon — and the reply sweep drops them on the floor, because
-``reply_tracker._match_reply_to_send`` matches on the sender and a DSN's sender
-is a postmaster nobody has a Contact row for.
+mailer-daemon — that the reply sweep skips, because a DSN's sender is a
+postmaster nobody has a Contact row for (see ``EmailHistoryService`` /
+``smart_reply``, which match on outreach threads and known contacts).
 
 Net effect before this module: a dead address kept receiving the whole sequence,
 ``Contact.last_bounce_type`` was never set by anything automatic, and the bounce

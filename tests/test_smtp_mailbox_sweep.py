@@ -1,25 +1,20 @@
-"""SMTP mailboxes get reply/bounce visibility over IMAP (P1 audit fix).
+"""SMTP mailbox bounce visibility over IMAP (P1 audit fix).
 
-Before this, reply_tracker and bounce_ingestion only spoke to the Gmail API, so
-a contact on an SMTP-sent sequence kept getting follow-ups after they replied or
-bounced. These cover the IMAP host derivation and that both sweeps now pick up
-SMTP accounts.
+Before this, bounce_ingestion only spoke to the Gmail API, so a contact on an
+SMTP-sent sequence kept getting follow-ups after they bounced. These cover the
+IMAP host derivation, bounce classification, and that the bounce sweep now picks
+up SMTP accounts.
 """
 
 import uuid
-from datetime import datetime, timezone
 
 import pytest
 
 from app.models.company import Company
 from app.models.contact import Contact
-from app.models.email_template import EmailSend
-from app.models.outreach import OutreachEnrollment
-from app.models.sequence import OutreachSequence
 from app.models.smtp_account import SmtpAccount
 from app.services import crypto
 from app.services.bounce_ingestion import BounceIngestionService, _looks_like_bounce
-from app.services.reply_tracker import ReplyTracker
 from app.services.smtp_reader import SmtpMailboxReader, derive_imap_host
 
 
@@ -91,71 +86,6 @@ def test_looks_like_bounce_by_subject():
 
 def test_normal_mail_is_not_a_bounce():
     assert not _looks_like_bounce("pat@prospect.co", "Re: your proposal")
-
-
-# --- reply_tracker over IMAP -----------------------------------------------
-
-@pytest.mark.asyncio
-async def test_smtp_reply_pauses_enrollment(db_session, crypto_key, monkeypatch):
-    """An SMTP reply flips the send to 'replied' and stops the sequence."""
-    company = Company(id=uuid.uuid4(), name="Prospect Co", country="US", source="test")
-    db_session.add(company)
-    await db_session.flush()
-    contact = Contact(
-        id=uuid.uuid4(), company_id=company.id, first_name="Pat", last_name="Prospect",
-        email="pat@prospect.co", source="test",
-    )
-    db_session.add(contact)
-    seq = OutreachSequence(id=uuid.uuid4(), name="Seq", status="active")
-    db_session.add(seq)
-    await db_session.flush()
-    enrollment = OutreachEnrollment(
-        id=uuid.uuid4(), contact_id=contact.id, sequence_id=seq.id, status="active",
-    )
-    db_session.add(enrollment)
-    send = EmailSend(
-        id=uuid.uuid4(), from_email="rep@outlook.com", to_email="pat@prospect.co",
-        subject="Intro", status="sent", sent_at=datetime.now(timezone.utc),
-        contact_id=contact.id,
-    )
-    db_session.add(send)
-    acct = await _smtp_account(db_session, crypto_key, imap_enabled=True)
-    await db_session.commit()
-
-    # Stub the IMAP fetch: a reply from the contact plus our own sent copy.
-    def fake_fetch(self, days=2, mailbox="INBOX"):
-        return [
-            {"from_email": "rep@outlook.com", "subject": "Intro", "text": "sent copy"},
-            {"from_email": "pat@prospect.co", "subject": "Re: Intro", "text": "Sounds good!"},
-        ]
-
-    monkeypatch.setattr(SmtpMailboxReader, "fetch_recent", fake_fetch)
-
-    replies = await ReplyTracker().check_for_replies(db_session)
-
-    assert any(r["from_email"] == "pat@prospect.co" for r in replies)
-    await db_session.refresh(send)
-    await db_session.refresh(enrollment)
-    assert send.status == "replied"
-    assert enrollment.status == "replied"
-
-
-@pytest.mark.asyncio
-async def test_send_only_smtp_account_is_skipped(db_session, crypto_key, monkeypatch):
-    """imap_enabled=False (send-only relay) must not be polled."""
-    await _smtp_account(db_session, crypto_key, email="relay@sendonly.com",
-                        username="relay@sendonly.com", imap_enabled=False)
-    await db_session.commit()
-
-    called = {"n": 0}
-
-    def fake_fetch(self, days=2, mailbox="INBOX"):
-        called["n"] += 1
-        return []
-
-    monkeypatch.setattr(SmtpMailboxReader, "fetch_recent", fake_fetch)
-    await ReplyTracker().check_for_replies(db_session)
-    assert called["n"] == 0
 
 
 # --- bounce_ingestion over IMAP --------------------------------------------

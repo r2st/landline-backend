@@ -385,7 +385,12 @@ class SmartReplyService:
         if not body_text:
             return None
 
-        # Match to a sent email
+        # Match to a prior send by recipient address. A *sequence* send is
+        # recorded as an OutreachEvent and has NO EmailSend row, so a missing
+        # EmailSend is not a reason to drop the reply — we fall through to
+        # enrollment matching (by contact, then by threading headers) below.
+        # EmailSend, when present, is the legacy-engagement send we also mark
+        # 'replied'.
         result = await db.execute(
             select(EmailSend)
             .where(EmailSend.to_email == from_email)
@@ -395,75 +400,96 @@ class SmartReplyService:
         )
         email_send = result.scalar_one_or_none()
 
-        if not email_send:
+        # Dedup for the EmailSend path: this send is already answered.
+        if email_send is not None and email_send.status == "replied" and email_send.replied_at:
             return None
 
-        if email_send.status == "replied" and email_send.replied_at:
-            return None
-
-        # Get contact and company info
+        # Resolve the contact: prefer the EmailSend's contact, else match the
+        # sender address to a known contact.
         contact = None
         company = None
         contact_name = sender_name
         company_name = ""
 
-        if email_send.contact_id:
-            result = await db.execute(
-                select(Contact).where(Contact.id == email_send.contact_id)
-            )
-            contact = result.scalar_one_or_none()
-            if contact:
-                first = contact.first_name or ""
-                last = contact.last_name or ""
-                contact_name = f"{first} {last}".strip() or sender_name
-                if contact.company_id:
-                    result = await db.execute(
-                        select(Company).where(Company.id == contact.company_id)
-                    )
-                    company = result.scalar_one_or_none()
-                    if company:
-                        company_name = company.name
+        if email_send is not None and email_send.contact_id:
+            contact = (
+                await db.execute(select(Contact).where(Contact.id == email_send.contact_id))
+            ).scalar_one_or_none()
+        if contact is None:
+            contact = (
+                await db.execute(select(Contact).where(Contact.email == from_email))
+            ).scalars().first()
 
-        # Update email send status
-        await db.execute(
-            update(EmailSend)
-            .where(EmailSend.id == email_send.id)
-            .values(status="replied", replied_at=datetime.now(timezone.utc))
-        )
-
-        # Stop outreach sequences. Broadened beyond 'active': a reply that lands
-        # while a step is parked for review, after the sequence completed, or
-        # while paused must still stop the enrollment and record the reply — see
-        # reply_matching.REPLY_STOPPABLE_STATUSES. Falls back to matching the
-        # reply's threading headers when no enrollment is found by contact.
+        # Match the enrollment this reply stops. Broadened beyond 'active': a
+        # reply that lands while a step is parked for review, after the sequence
+        # completed, or while paused must still stop the enrollment and record the
+        # reply (see reply_matching.REPLY_STOPPABLE_STATUSES). By contact first,
+        # then by the reply's threading headers against the ids the send path
+        # stored on the enrollment — this is what lets a reply to a *sequence*
+        # send (no EmailSend row) still be recognised, stopped, and answered.
         from app.services.reply_matching import (
             find_stoppable_enrollment,
             match_enrollment_by_headers,
         )
 
-        if contact:
+        enrollment = None
+        if contact is not None:
             enrollment = await find_stoppable_enrollment(db, contact.id)
-            if enrollment is None:
-                enrollment = await match_enrollment_by_headers(
-                    db, headers.get("in-reply-to"), headers.get("references")
-                )
-            if enrollment:
-                enrollment.status = "replied"
-                enrollment.completed_at = datetime.now(timezone.utc)
-                # Attributed to the step actually sent, not current_step — the
-                # send path advances the counter before the reply arrives.
-                from app.services.outreach_events import build_reply_event
+        if enrollment is None:
+            enrollment = await match_enrollment_by_headers(
+                db, headers.get("in-reply-to"), headers.get("references")
+            )
+        # A header match can identify the contact when the address didn't.
+        if enrollment is not None and contact is None and enrollment.contact_id:
+            contact = (
+                await db.execute(select(Contact).where(Contact.id == enrollment.contact_id))
+            ).scalar_one_or_none()
 
-                reply_event = await build_reply_event(
-                    db,
-                    enrollment,
-                    metadata={
-                        "from_email": from_email,
-                        "subject": subject,
-                        "receiving_account": gmail_account.email,
-                    },
-                )
-                db.add(reply_event)
+        # Nothing ties this inbound message to our outreach — no prior send and no
+        # live enrollment to stop. A reply we already processed also lands here
+        # ('replied' is excluded from both matchers), so this doubles as dedup for
+        # the sequence path. Treat as inbox noise and skip.
+        if email_send is None and enrollment is None:
+            return None
+
+        # Fill contact/company display fields now that the contact is resolved.
+        if contact is not None:
+            first = contact.first_name or ""
+            last = contact.last_name or ""
+            contact_name = f"{first} {last}".strip() or sender_name
+            if contact.company_id:
+                company = (
+                    await db.execute(select(Company).where(Company.id == contact.company_id))
+                ).scalar_one_or_none()
+                if company:
+                    company_name = company.name
+
+        # Mark the legacy-engagement send replied (only when there was one).
+        if email_send is not None:
+            await db.execute(
+                update(EmailSend)
+                .where(EmailSend.id == email_send.id)
+                .values(status="replied", replied_at=datetime.now(timezone.utc))
+            )
+
+        # Stop the matched enrollment and record the reply on the timeline.
+        if enrollment is not None:
+            enrollment.status = "replied"
+            enrollment.completed_at = datetime.now(timezone.utc)
+            # Attributed to the step actually sent, not current_step — the send
+            # path advances the counter before the reply arrives.
+            from app.services.outreach_events import build_reply_event
+
+            reply_event = await build_reply_event(
+                db,
+                enrollment,
+                metadata={
+                    "from_email": from_email,
+                    "subject": subject,
+                    "receiving_account": gmail_account.email,
+                },
+            )
+            db.add(reply_event)
 
         # Auto-advance company stage
         if company and company.stage in ("new", "researched", "scored", "contacted"):
@@ -473,7 +499,7 @@ class SmartReplyService:
         ai = get_ai_service()
         analysis = await ai.analyze_reply(
             reply_body=body_text,
-            original_subject=email_send.subject or "",
+            original_subject=(email_send.subject if email_send is not None else subject) or "",
             original_body="",
             contact_name=contact_name,
             company_name=company_name,

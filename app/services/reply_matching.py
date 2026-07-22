@@ -1,8 +1,9 @@
 """Shared enrollment-matching for inbound replies (reply-detection breadth).
 
-Both reply paths (:mod:`app.services.reply_tracker` and
-:mod:`app.services.smart_reply`) need to answer the same question when a prospect
-writes back: *which enrollment does this stop?* Two failure modes lost replies:
+The reply path (:mod:`app.services.smart_reply`, and the ingest gate in
+:mod:`app.services.email_history`) needs to answer the same question when a
+prospect writes back: *which enrollment does this stop?* Two failure modes lost
+replies:
 
 1. **Status too narrow.** They only stopped ``status == "active"`` enrollments.
    A reply that lands while a step is parked for review (``pending_review``),
