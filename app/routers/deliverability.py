@@ -40,7 +40,7 @@ class SenderHealthRead(BaseModel):
     bounce_rate_7d: float
     complaint_rate_7d: float
     open_rate_7d: float
-    reputation_score: int
+    reputation_score: Optional[int] = None
     throttle_factor: float
     status: str
     last_assessed: datetime
@@ -72,7 +72,7 @@ async def list_sender_health(db: AsyncSession = Depends(get_db)):
 
 class SenderHistoryPoint(BaseModel):
     captured_at: datetime
-    reputation_score: int
+    reputation_score: Optional[int] = None
     bounce_rate_7d: float
     complaint_rate_7d: float
     throttle_factor: float

@@ -12,6 +12,8 @@ A few convenience aliases are also exposed: {{last_name}}, {{full_name}},
 {{company_name}}, {{title}}, {{industry}}.
 """
 
+import re
+
 from jinja2.sandbox import SandboxedEnvironment
 
 from app.services.ai_email_generator import resolve_demo_link, DEFAULT_DEMO_LINK
@@ -37,10 +39,12 @@ DEMO_LINK = DEFAULT_DEMO_LINK
 
 def build_merge_context(contact, company) -> dict:
     """Build the Jinja render context from a Contact (+ its Company)."""
-    first_name = (getattr(contact, "first_name", None) or "") if contact else ""
+    raw_first = (getattr(contact, "first_name", None) or "").strip() if contact else ""
     last_name = (getattr(contact, "last_name", None) or "") if contact else ""
     title = (getattr(contact, "title", None) or "") if contact else ""
-    full_name = " ".join(p for p in (first_name, last_name) if p)
+    # ``full_name`` uses the *real* names only — never the "there" fallback — so a
+    # nameless contact renders as their last name (or empty), not "there Avery".
+    full_name = " ".join(p for p in (raw_first, last_name) if p)
 
     company_name = (getattr(company, "name", None) or "") if company else ""
     industry = (getattr(company, "industry_segment", None) or "") if company else ""
@@ -49,8 +53,11 @@ def build_merge_context(contact, company) -> dict:
     # Dynamically resolve demo link based on industry/company
     demo_link = resolve_demo_link(industry, company_name)
 
+    # A missing/blank first name must render "Hi there," not "Hi ,". The greeting
+    # field defaults to a friendly generic; every other field keeps its real (or
+    # empty) value.
     return {
-        "first_name": first_name,
+        "first_name": raw_first or "there",
         "last_name": last_name,
         "full_name": full_name,
         "company": company_name,
@@ -73,3 +80,28 @@ def render(template_str: str, context: dict) -> str:
     env = SandboxedEnvironment()
     template = env.from_string(template_str or "")
     return template.render(**context)
+
+
+# Leading punctuation an empty merge field leaves behind at the start of a
+# subject, e.g. "{{first_name}}, who eats it?" with no first name → ", who eats
+# it?". A comma/semicolon/colon/dash plus any surrounding whitespace.
+_LEADING_MERGE_ARTIFACT_RE = re.compile(r"^[\s,;:–—-]+")
+_COLLAPSE_WS_RE = re.compile(r"[ \t]{2,}")
+
+
+def clean_subject(subject: str) -> str:
+    """Tidy a rendered subject line after merge fields have been substituted.
+
+    A subject template that opens with a merge field (``{{first_name}}, who eats
+    it?``) renders as ``, who eats it?`` when that field is empty. Strip the
+    dangling leading punctuation/whitespace so the subject never starts with a
+    comma, and collapse the double space an emptied mid-line field can leave.
+
+    Defensive and idempotent: a subject with no artifact is returned unchanged
+    (aside from trimming), so it is safe to call on every rendered subject.
+    """
+    if not subject:
+        return subject or ""
+    cleaned = _LEADING_MERGE_ARTIFACT_RE.sub("", subject)
+    cleaned = _COLLAPSE_WS_RE.sub(" ", cleaned)
+    return cleaned.strip()

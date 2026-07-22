@@ -293,7 +293,11 @@ async def compose_step(
         logger.debug("Research brief unavailable for %s: %s", company.name, exc)
 
     lead_data = {
-        "first_name": contact.first_name or "",
+        # "there", not "", so ``ai_email_generator``'s greeting default actually
+        # fires: it reads first_name off this dict, and an empty string is a
+        # present-but-blank key that ``.get(..., "there")`` would never override,
+        # producing "Hi ,".
+        "first_name": contact.first_name or "there",
         "last_name": contact.last_name or "",
         "title": contact.title or "",
         "company_name": company.name or "",

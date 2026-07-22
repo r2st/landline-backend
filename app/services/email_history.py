@@ -27,6 +27,7 @@ from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment
 from app.services import crypto, google_oauth
+from app.services.bounce_ingestion import is_bounce_message
 from app.services.gmail_sender import GmailSender
 
 logger = logging.getLogger(__name__)
@@ -258,6 +259,16 @@ class EmailHistoryService:
 
                     # Skip emails from other connected accounts (already tracked as sent)
                     if from_email in connected_emails:
+                        continue
+
+                    # Skip delivery-failure / delay notices (DSNs). A mailer-daemon
+                    # bounce often lands in the same thread as the send it failed,
+                    # so ``_is_outreach_reply``'s thread/header match would wave it
+                    # through and file it as a prospect reply. It is a bounce — the
+                    # bounce-ingestion sweep owns it (bounce_records), and it must
+                    # never masquerade as a reply in the inbox.
+                    if is_bounce_message(from_email, subject):
+                        skipped += 1
                         continue
 
                     gmail_thread_id = msg.get("threadId")

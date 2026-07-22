@@ -361,8 +361,10 @@ async def generate_email(
     company_name = lead_data.get("company_name", "") or lead_data.get("company", "") or ""
     demo_link = resolve_demo_link(industry, company_name)
 
-    # Build the user prompt
-    first_name = lead_data.get("first_name", "there")
+    # Build the user prompt. ``or "there"`` (not ``.get(..., "there")``) so a
+    # present-but-blank first_name ("") still resolves to the generic greeting
+    # rather than prompting the model to write "Hi ,".
+    first_name = lead_data.get("first_name") or "there"
     title = lead_data.get("title", "") or lead_data.get("contact_title", "")
     city = lead_data.get("city", "")
 
@@ -435,7 +437,7 @@ def _fallback_response(lead_data: dict, template_type: str) -> dict:
     field a lie exactly where a caller is most likely to be debugging why the
     voice looks wrong.
     """
-    first_name = lead_data.get("first_name", "there")
+    first_name = lead_data.get("first_name") or "there"
     company_name = lead_data.get("company_name", "") or lead_data.get("company", "")
     industry = lead_data.get("industry", "") or lead_data.get("industry_segment", "")
     demo_link = resolve_demo_link(industry, company_name)

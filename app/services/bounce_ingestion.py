@@ -55,11 +55,18 @@ logger = logging.getLogger(__name__)
 # only a parse that finds no recipient and is discarded.
 BOUNCE_QUERY = (
     "newer_than:{days}d ("
-    "from:mailer-daemon OR from:postmaster OR "
+    "from:mailer-daemon OR from:postmaster OR from:mail-daemon OR "
     'subject:"Delivery Status Notification" OR '
     'subject:"Undelivered Mail Returned to Sender" OR '
     'subject:"Delivery incomplete" OR '
-    'subject:"Address not found"'
+    'subject:"Address not found" OR '
+    'subject:"Delivery delayed" OR '
+    'subject:"Delivery has been delayed" OR '
+    'subject:"Warning: could not send message" OR '
+    'subject:"Undeliverable" OR '
+    'subject:"Mail delivery failed" OR '
+    'subject:"Failure notice" OR '
+    'subject:"Returned mail"'
     ")"
 )
 
@@ -86,8 +93,11 @@ _IGNORED_LOCALPARTS = ("mailer-daemon", "postmaster", "noreply", "no-reply")
 
 # IMAP has no server-side equivalent of Gmail's rich search, so the SMTP sweep
 # fetches recent mail and classifies "is this a bounce?" client-side against the
-# same senders/subjects the Gmail BOUNCE_QUERY targets.
-_BOUNCE_SENDER_MARKERS = ("mailer-daemon", "postmaster")
+# same senders/subjects the Gmail BOUNCE_QUERY targets. This is also the shared
+# guard ``email_history`` uses to keep DSNs *out* of the replies inbox — a
+# mailer-daemon failure/delay notice is a bounce, not a prospect reply, so both
+# sweeps must agree on what a bounce looks like.
+_BOUNCE_SENDER_MARKERS = ("mailer-daemon", "mail-daemon", "postmaster")
 _BOUNCE_SUBJECT_MARKERS = (
     "delivery status notification",
     "undelivered mail returned to sender",
@@ -96,16 +106,32 @@ _BOUNCE_SUBJECT_MARKERS = (
     "undeliverable",
     "failure notice",
     "returned mail",
+    "mail delivery failed",
+    "delivery delayed",
+    "delivery has been delayed",
+    "message delayed",
+    "could not send message",
+    "returned to sender",
+    "delivery failure",
 )
 
 
-def _looks_like_bounce(from_email: str, subject: str) -> bool:
-    """Cheap client-side filter mirroring the Gmail ``BOUNCE_QUERY``."""
+def is_bounce_message(from_email: str, subject: str) -> bool:
+    """Whether an inbound message is a delivery-failure/delay notice (a DSN).
+
+    Cheap client-side filter mirroring the Gmail ``BOUNCE_QUERY``. Public so the
+    replies inbox can reuse the exact same definition and skip DSNs rather than
+    misfiling them as prospect replies.
+    """
     sender = (from_email or "").lower()
     subj = (subject or "").lower()
     if any(marker in sender for marker in _BOUNCE_SENDER_MARKERS):
         return True
     return any(marker in subj for marker in _BOUNCE_SUBJECT_MARKERS)
+
+
+# Backwards-compatible private alias (the SMTP sweep calls this name).
+_looks_like_bounce = is_bounce_message
 
 
 def _is_plausible_recipient(email: str) -> bool:

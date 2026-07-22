@@ -16,7 +16,7 @@ from typing import Optional
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -28,11 +28,71 @@ from app.models.interaction import Interaction
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.smtp_account import SmtpAccount
 from app.services import crypto, google_oauth
+from app.services.bounce_ingestion import is_bounce_message
 from app.services.smtp_reader import SmtpMailboxReader
 
 logger = logging.getLogger(__name__)
 
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+# Local-parts that are never a human prospect replying to us. A real reply comes
+# from a person's mailbox, not from a newsletter engine or a system daemon. These
+# are matched as substrings against the sender's local-part so "newsletter",
+# "news", "noreply", "no-reply", "notifications", "mailer-daemon" etc. are all
+# filtered. This is what keeps Squarespace/Kaggle/Google-Cloud/Claude.com bulk
+# mail out of the reply tracker — and it also guards the same-domain fallback
+# below from matching automated senders on a domain we happen to have emailed.
+# Kept deliberately tight: only patterns that are *never* a human replying.
+# Shared-but-human mailboxes (info@, hello@, support@, sales@, a shop's team@)
+# are intentionally NOT here — a small prospect often replies from one, and
+# dropping a genuine reply is worse than letting one newsletter slip through.
+_AUTOMATED_LOCALPART_MARKERS = (
+    "no-reply", "noreply", "no_reply", "do-not-reply", "do_not_reply", "donotreply",
+    "mailer-daemon", "mail-daemon", "postmaster", "newsletter", "news@",
+    "notifications", "notification", "notify@", "updates@", "update@",
+    "digest", "bounce", "bounces", "unsubscribe", "mailer@", "auto-confirm",
+    "automated", "alerts", "alert@", "marketing@", "campaigns", "email@",
+)
+
+# Free / consumer webmail providers. Same-domain reply matching must NOT trigger
+# for these — everyone shares "gmail.com", so "we emailed a@gmail.com" tells us
+# nothing about "b@gmail.com". Same-domain matching is only meaningful for a
+# company's own mail domain.
+_FREE_EMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com",
+    "hotmail.com", "hotmail.co.uk", "outlook.com", "live.com", "msn.com",
+    "aol.com", "icloud.com", "me.com", "mac.com", "protonmail.com", "proton.me",
+    "gmx.com", "gmx.net", "mail.com", "zoho.com", "yandex.com", "fastmail.com",
+    "pm.me", "hey.com", "tutanota.com", "qq.com", "163.com", "126.com",
+})
+
+
+def _domain_of(email: str) -> str:
+    """Lowercased domain part of an address, or '' if it has none."""
+    email = (email or "").strip().lower()
+    return email.split("@", 1)[1] if "@" in email else ""
+
+
+def _is_automated_sender(from_email: str) -> bool:
+    """Whether ``from_email`` is an automated/bulk sender, not a human prospect.
+
+    A genuine reply comes from a person's mailbox. Newsletters, notification
+    engines, and system daemons never are, so they must never advance a send,
+    pause an enrollment, or advance a company stage.
+    """
+    local = (from_email or "").strip().lower().split("@", 1)[0]
+    if not local:
+        return True
+    full = (from_email or "").strip().lower()
+    for marker in _AUTOMATED_LOCALPART_MARKERS:
+        # Markers ending in "@" pin the whole local-part (e.g. "news@" must not
+        # match "andrews@"); the rest are substring hits on the local-part.
+        if marker.endswith("@"):
+            if full.startswith(marker):
+                return True
+        elif marker in local:
+            return True
+    return False
 
 
 class ReplyTracker:
@@ -98,6 +158,10 @@ class ReplyTracker:
             if not from_email or from_email == own_address:
                 continue  # skip our own sent copies / empty senders
             subject = msg.get("subject", "")
+            # Skip bulk/automated mail and delivery notices — a prospect reply
+            # never comes from a newsletter engine or mailer-daemon.
+            if _is_automated_sender(from_email) or is_bounce_message(from_email, subject):
+                continue
             try:
                 reply_info = await self._match_reply_to_send(db, from_email, subject)
             except Exception as e:
@@ -188,6 +252,15 @@ class ReplyTracker:
                         from_email = from_email.split("<")[1].split(">")[0].strip()
                     from_email = from_email.strip().lower()
 
+                    # Skip bulk/automated mail and delivery notices. The founder's
+                    # mailbox also receives Squarespace/Kaggle/Google-Cloud/Claude
+                    # newsletters; none are prospect replies, so they must not
+                    # touch a send, enrollment, or company stage.
+                    if _is_automated_sender(from_email) or is_bounce_message(
+                        from_email, subject
+                    ):
+                        continue
+
                     # Try to match this message to an outreach we sent
                     reply_info = await self._match_reply_to_send(
                         db, from_email, subject
@@ -228,12 +301,35 @@ class ReplyTracker:
         # already been marked as replied.
         result = await db.execute(
             select(EmailSend)
-            .where(EmailSend.to_email == from_email)
+            .where(func.lower(EmailSend.to_email) == from_email)
             .where(EmailSend.status.in_(["sent", "opened", "clicked"]))
             .order_by(EmailSend.sent_at.desc())
             .limit(1)
         )
         email_send = result.scalar_one_or_none()
+
+        # Same-domain fallback: we emailed info@shop.com and john@shop.com
+        # replies. Exact-address matching misses that, so fall back to the most
+        # recent send to *anyone* at the same company domain. Guarded so it never
+        # over-matches: free webmail domains are excluded (gmail.com is not a
+        # company), and the automated-sender filter upstream keeps noreply@ off
+        # this path.
+        if email_send is None:
+            domain = _domain_of(from_email)
+            if domain and domain not in _FREE_EMAIL_DOMAINS:
+                result = await db.execute(
+                    select(EmailSend)
+                    .where(func.lower(EmailSend.to_email).like(f"%@{domain}"))
+                    .where(EmailSend.status.in_(["sent", "opened", "clicked"]))
+                    .order_by(EmailSend.sent_at.desc())
+                    .limit(1)
+                )
+                email_send = result.scalar_one_or_none()
+                if email_send is not None:
+                    logger.info(
+                        "Reply from %s matched send to %s by shared domain %s",
+                        from_email, email_send.to_email, domain,
+                    )
 
         if not email_send:
             return None

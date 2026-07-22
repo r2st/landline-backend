@@ -26,6 +26,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.models.bounce_record import BounceRecord
 from app.models.email_template import EmailSend
 from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.services.email_dispatch import get_sending_accounts, _transport_for
@@ -58,13 +59,32 @@ class DeliverabilityOptimizer:
         base = select(func.count(EmailSend.id)).where(EmailSend.sent_at >= cutoff, match)
 
         sent = (await db.execute(base.where(EmailSend.status != "skipped"))).scalar() or 0
-        bounces = (await db.execute(base.where(EmailSend.status == "bounced"))).scalar() or 0
+        send_bounces = (await db.execute(base.where(EmailSend.status == "bounced"))).scalar() or 0
         complaints = (
             await db.execute(base.where(EmailSend.status.in_(("complained", "complaint", "spam"))))
         ).scalar() or 0
         opens = (
             await db.execute(base.where(EmailSend.opened_at.isnot(None)))
         ).scalar() or 0
+
+        # Real bounces mostly arrive as mailer-daemon DSNs and are ledgered in
+        # ``bounce_records`` by the ingestion sweep — which does NOT flip
+        # ``EmailSend.status`` to "bounced". Counting only the send status would
+        # therefore report ~0 bounces for an account that is actually bouncing,
+        # so fold in the ingested bounce ledger. Gmail DSNs land in the sending
+        # mailbox, so they attribute cleanly by ``gmail_account_id``; SMTP DSNs
+        # carry no account link, so those accounts fall back to send status only.
+        ingested_bounces = 0
+        if _transport_for(account) == "gmail":
+            ingested_bounces = (
+                await db.execute(
+                    select(func.count(BounceRecord.id)).where(
+                        BounceRecord.gmail_account_id == account.id,
+                        BounceRecord.processed_at >= cutoff,
+                    )
+                )
+            ).scalar() or 0
+        bounces = send_bounces + ingested_bounces
 
         bounce_rate = round(bounces / sent, 4) if sent else 0.0
         complaint_rate = round(complaints / sent, 4) if sent else 0.0
@@ -79,12 +99,39 @@ class DeliverabilityOptimizer:
             "open_rate_7d": open_rate,
         }
 
-    def _score(self, m: dict) -> tuple[int, float, str]:
-        """Return (reputation 0-100, throttle_factor 0..1, status)."""
+    def _score(self, m: dict) -> tuple[Optional[int], float, str]:
+        """Return (reputation 0-100 or None, throttle_factor 0..1, status).
+
+        A ``None`` reputation with status ``"pending"`` means "not enough data to
+        rate this account yet" — reported honestly instead of the old fabricated
+        ``100 / healthy``, which made an account that had never sent a single
+        email look like a proven-clean sender.
+        """
         s = self.settings
-        # Not enough data → treat as healthy (new accounts warm up elsewhere).
-        if m["sent_7d"] < 10:
-            return 100, 1.0, "healthy"
+        sent = m["sent_7d"]
+        bounces = m["bounces_7d"]
+        complaints = m["complaints_7d"]
+
+        # No activity in the window at all → nothing measured yet. Don't claim a
+        # perfect reputation; report 'pending' and don't throttle (there is
+        # nothing to throttle).
+        if sent == 0 and bounces == 0 and complaints == 0:
+            return None, 1.0, "pending"
+
+        # Some signal, but too little send volume for stable *rates* (one bounce
+        # in three sends is not a 33% bounce rate). Score on absolute bad-event
+        # counts so a clean low-volume account isn't thrown to 'critical', while
+        # real damage (a hard bounce, a complaint) still shows.
+        if sent < 10:
+            rep = 100.0
+            rep -= min(70.0, bounces * 20.0)
+            rep -= min(60.0, complaints * 35.0)
+            rep = int(max(0, min(100, round(rep))))
+            if rep < s.sender_min_reputation:
+                return rep, 0.4, "throttled"
+            if rep < 80:
+                return rep, 0.75, "watch"
+            return rep, 1.0, "healthy"
 
         rep = 100.0
         rep -= min(60.0, m["bounce_rate_7d"] * 400)      # 5% bounce → -20, 15% → -60

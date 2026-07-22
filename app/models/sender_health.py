@@ -47,10 +47,14 @@ class SenderHealth(Base, OrgScopedMixin):
     complaint_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     open_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
-    # 0-100 reputation. throttle_factor (0..1) scales the account's daily cap.
-    reputation_score: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    # 0-100 reputation, or NULL when there isn't enough send activity to rate the
+    # account yet (status "pending") — reported honestly instead of a fabricated
+    # perfect score. No column default: a default would turn the explicit NULL a
+    # 'pending' assessment writes back into 100 on insert. throttle_factor (0..1)
+    # scales the account's daily cap.
+    reputation_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     throttle_factor: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="healthy")  # healthy|watch|throttled|critical
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="healthy")  # healthy|watch|throttled|critical|pending
     details: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     last_assessed: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
@@ -92,7 +96,7 @@ class SenderHealthSnapshot(Base, OrgScopedMixin):
     bounce_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     complaint_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     open_rate_7d: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    reputation_score: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    reputation_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     throttle_factor: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="healthy")
     captured_at: Mapped[datetime] = mapped_column(

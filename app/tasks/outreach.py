@@ -16,7 +16,7 @@ from app.models.follow_up import FollowUp
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.services.consent import check_consent
-from app.services.email_compose import render, build_merge_context
+from app.services.email_compose import render, build_merge_context, clean_subject
 from app.services.email_dispatch import send_outreach_email
 from app.services.sequence_optimizer import get_sequence_optimizer, record_decision
 from app.tasks.celery_app import celery_app
@@ -464,9 +464,11 @@ def send_sequence_step(self, enrollment_id: str):
                 # to SES when no account is connected). Render the chosen variant
                 # copy, with the booking placeholder applied to it; the dispatcher
                 # appends the CAN-SPAM footer.
-                subject = render(
-                    apply_booking_placeholder(resolution.subject_template, booking_url),
-                    template_context,
+                subject = clean_subject(
+                    render(
+                        apply_booking_placeholder(resolution.subject_template, booking_url),
+                        template_context,
+                    )
                 )
                 body = render(
                     apply_booking_placeholder(resolution.body_template, booking_url),

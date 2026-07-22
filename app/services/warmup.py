@@ -231,11 +231,78 @@ def recompute(plan: SenderWarmupPlan, today: Optional[date] = None) -> bool:
     return changed
 
 
+async def backfill_warmup_plans(db: AsyncSession) -> dict:
+    """Create a warm-up plan for every connected sender that lacks one.
+
+    ``ensure_warmup_plan`` is wired into the Gmail/SMTP connect paths, so *new*
+    accounts get a plan. But accounts connected before that wiring existed have
+    none — which is why ``sender_warmup_plans`` sat empty — so a mailbox that
+    should be ramping instead sends at full volume. This closes that gap
+    idempotently: it is safe to run on every warm-up beat and only ever adds the
+    plans that are missing.
+
+    Existing accounts start their ramp *today* (day 1), not back-dated to when
+    they were connected: back-dating an already-active sender to a graduated day
+    would hand it full volume immediately, defeating the point of a ramp.
+    """
+    from app.models.gmail_account import GmailAccount
+    from app.models.smtp_account import SmtpAccount
+
+    created = 0
+
+    gmail_accounts = (
+        await db.execute(
+            select(GmailAccount).where(GmailAccount.status == "connected")
+        )
+    ).scalars().all()
+    for account in gmail_accounts:
+        if await get_plan(db, account.id, "gmail") is None:
+            await ensure_warmup_plan(
+                db,
+                account_id=account.id,
+                account_type="gmail",
+                account_email=account.email,
+                org_id=getattr(account, "org_id", None),
+            )
+            created += 1
+
+    smtp_accounts = (
+        await db.execute(
+            select(SmtpAccount).where(SmtpAccount.status == "connected")
+        )
+    ).scalars().all()
+    for account in smtp_accounts:
+        if await get_plan(db, account.id, "smtp") is None:
+            await ensure_warmup_plan(
+                db,
+                account_id=account.id,
+                account_type="smtp",
+                account_email=account.email,
+                org_id=getattr(account, "org_id", None),
+            )
+            created += 1
+
+    if created:
+        await db.commit()
+    return {
+        "gmail_accounts": len(gmail_accounts),
+        "smtp_accounts": len(smtp_accounts),
+        "plans_created": created,
+    }
+
+
 async def advance_all(db: AsyncSession) -> dict:
     """Daily task body: step every plan in the current org forward one day.
 
-    Returns a small summary ({plans, advanced, graduated}) for the task log.
+    Backfills any missing plans first, so a sender connected before the
+    ensure-plan wiring existed still gets a ramp (and the plans table stops being
+    empty) rather than silently sending at full volume.
+
+    Returns a small summary ({plans, advanced, graduated, backfilled}) for the
+    task log.
     """
+    backfill = await backfill_warmup_plans(db)
+
     plans = (await db.execute(select(SenderWarmupPlan))).scalars().all()
     advanced = 0
     graduated = 0
@@ -245,4 +312,9 @@ async def advance_all(db: AsyncSession) -> dict:
         if plan.status == "graduated":
             graduated += 1
     await db.commit()
-    return {"plans": len(plans), "advanced": advanced, "graduated": graduated}
+    return {
+        "plans": len(plans),
+        "advanced": advanced,
+        "graduated": graduated,
+        "backfilled": backfill["plans_created"],
+    }

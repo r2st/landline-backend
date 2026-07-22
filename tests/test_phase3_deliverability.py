@@ -70,6 +70,73 @@ async def test_assess_account_healthy(db_session):
     assert row.throttle_factor == 1.0
 
 
+async def test_assess_account_no_sends_is_pending_not_fake_healthy(db_session):
+    # Audit #6: an account that has never sent must NOT report "reputation 100 /
+    # healthy" — that fabricated a proven-clean reputation for a sender we had no
+    # data on. It is reported as 'pending' with a NULL reputation instead.
+    acct = await _gmail_account(db_session)
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.sent_7d == 0
+    assert row.status == "pending"
+    assert row.reputation_score is None
+    assert row.throttle_factor == 1.0  # nothing to throttle
+
+
+async def test_assess_counts_ingested_bounce_records(db_session):
+    # Real bounces arrive as DSNs recorded in bounce_records — the ingestion
+    # sweep does NOT flip EmailSend.status to "bounced", so health scoring must
+    # fold the bounce ledger in or it reports ~0 bounces for a bouncing account.
+    from datetime import datetime, timezone
+    from app.models.bounce_record import BounceRecord
+
+    acct = await _gmail_account(db_session)
+    for _ in range(16):
+        await _email(db_session, acct, status="sent")
+    # 4 DSN-ingested hard bounces attributed to this sending mailbox.
+    for i in range(4):
+        db_session.add(BounceRecord(
+            id=uuid.uuid4(), gmail_message_id=f"dsn-{i}", gmail_account_id=acct.id,
+            recipient_email=f"dead{i}@x.com", bounce_kind="hard", status_code="5.1.1",
+            diagnostic="user unknown", processed_at=datetime.now(timezone.utc),
+        ))
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.sent_7d == 16
+    assert row.bounces_7d == 4           # counted from bounce_records, not send status
+    assert row.bounce_rate_7d == 0.25
+    assert row.throttle_factor < 1.0
+    assert row.status in ("throttled", "critical")
+
+
+async def test_low_volume_clean_account_is_not_critical(db_session):
+    # A handful of clean sends must not be thrown to 'critical' by noisy rates —
+    # but it is also no longer a fabricated perfect score; it's a real 'healthy'.
+    acct = await _gmail_account(db_session)
+    for _ in range(3):
+        await _email(db_session, acct, status="sent", opened=True)
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.sent_7d == 3
+    assert row.status == "healthy"
+    assert row.reputation_score == 100
+
+
+async def test_low_volume_with_bounce_is_penalized(db_session):
+    acct = await _gmail_account(db_session)
+    for _ in range(2):
+        await _email(db_session, acct, status="sent")
+    await _email(db_session, acct, status="bounced")
+    await db_session.flush()
+
+    row = await get_deliverability_optimizer().assess_account(db_session, acct)
+    assert row.sent_7d == 3
+    assert row.reputation_score is not None and row.reputation_score < 100
+
+
 async def test_assess_account_high_bounce_throttled(db_session):
     acct = await _gmail_account(db_session)
     for _ in range(16):
