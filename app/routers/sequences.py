@@ -176,6 +176,25 @@ async def _enroll_into_sequence(
         except Exception as exc:  # pragma: no cover - broker-dependent
             logger.warning("Could not dispatch first sequence step(s): %s", exc)
 
+        # Warm up a research brief for each enrolled prospect's company so the
+        # first AI-composed touch is grounded in real signals (see ai_compose /
+        # research_agent). research_company is idempotent — force=False returns
+        # an existing non-stale brief untouched — so dispatching per distinct
+        # company is cheap and safe. Best-effort: a missing broker or an already
+        # -briefed company just means the static/optimizer path runs as before.
+        company_ids = {
+            contacts[cid].company_id
+            for cid in enrolled
+            if contacts.get(cid) is not None and contacts[cid].company_id is not None
+        }
+        if company_ids:
+            try:
+                from app.tasks.research import research_company
+                for company_id in company_ids:
+                    research_company.delay(str(company_id))
+            except Exception as exc:  # pragma: no cover - broker-dependent
+                logger.warning("Could not dispatch research brief(s) on enroll: %s", exc)
+
     logger.info(
         "Batch-enrolled %d/%d contacts into sequence %s",
         len(enrolled), len(requested), sequence_id,

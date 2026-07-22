@@ -263,7 +263,9 @@ class ReplyTracker:
 
                     # Try to match this message to an outreach we sent
                     reply_info = await self._match_reply_to_send(
-                        db, from_email, subject
+                        db, from_email, subject,
+                        in_reply_to=headers.get("in-reply-to"),
+                        references=headers.get("references"),
                     )
                     if reply_info:
                         replies_found.append(
@@ -289,13 +291,21 @@ class ReplyTracker:
             return []
 
     async def _match_reply_to_send(
-        self, db: AsyncSession, from_email: str, subject: str
+        self,
+        db: AsyncSession,
+        from_email: str,
+        subject: str,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
     ) -> Optional[dict]:
         """Match an incoming email to a previously sent outreach email.
 
         If matched, updates the EmailSend status to ``replied``, pauses the
         enrollment, records an event, and (when applicable) advances the
-        company stage.
+        company stage. When no EmailSend matches by address/domain, falls back to
+        matching the reply's threading headers against an enrollment's Gmail
+        thread/message ids (a threaded reply from an alias the address match
+        misses) and stops that enrollment directly.
         """
         # Find the most recent email we sent to this address that has not
         # already been marked as replied.
@@ -332,7 +342,13 @@ class ReplyTracker:
                     )
 
         if not email_send:
-            return None
+            # Header fallback: a threaded reply whose From: we can't match to any
+            # send (alias, forwarded, different mailbox on the thread). Match the
+            # In-Reply-To / References ids to an enrollment's Gmail thread and
+            # stop it directly — there's no EmailSend row to update here.
+            return await self._match_reply_by_headers(
+                db, from_email, subject, in_reply_to, references
+            )
 
         # -- Mark the send as replied --
         await db.execute(
@@ -350,14 +366,14 @@ class ReplyTracker:
             contact = result.scalar_one_or_none()
 
         # -- Update enrollment: stop follow-ups --
+        # Broadened beyond 'active' (see reply_matching.REPLY_STOPPABLE_STATUSES):
+        # a reply during review / after completion / while paused still stops the
+        # enrollment and records the reply.
+        from app.services.reply_matching import find_stoppable_enrollment
+
         enrollment_updated = False
         if contact:
-            result = await db.execute(
-                select(OutreachEnrollment)
-                .where(OutreachEnrollment.contact_id == contact.id)
-                .where(OutreachEnrollment.status == "active")
-            )
-            enrollment = result.scalar_one_or_none()
+            enrollment = await find_stoppable_enrollment(db, contact.id)
 
             if enrollment:
                 enrollment.status = "replied"
@@ -420,6 +436,86 @@ class ReplyTracker:
             ),
             "enrollment_paused": enrollment_updated,
             "original_subject": email_send.subject,
+        }
+
+    async def _match_reply_by_headers(
+        self,
+        db: AsyncSession,
+        from_email: str,
+        subject: str,
+        in_reply_to: Optional[str],
+        references: Optional[str],
+    ) -> Optional[dict]:
+        """Stop an enrollment matched only by the reply's threading headers.
+
+        The address/domain match already failed, so there is no EmailSend to
+        touch; we match the reply's In-Reply-To / References ids to the Gmail
+        thread the send path recorded on an enrollment, then stop it, record the
+        reply event, and advance the company stage — the same side effects the
+        address path performs, minus the EmailSend update.
+        """
+        from app.services.reply_matching import match_enrollment_by_headers
+
+        enrollment = await match_enrollment_by_headers(db, in_reply_to, references)
+        if enrollment is None:
+            return None
+
+        enrollment.status = "replied"
+        enrollment.completed_at = datetime.now(timezone.utc)
+
+        from app.services.outreach_events import build_reply_event
+
+        db.add(
+            await build_reply_event(
+                db, enrollment,
+                metadata={
+                    "from_email": from_email,
+                    "subject": subject,
+                    "matched_by": "threading_headers",
+                },
+            )
+        )
+
+        contact = (
+            await db.execute(
+                select(Contact).where(Contact.id == enrollment.contact_id)
+            )
+        ).scalar_one_or_none()
+
+        if contact is not None:
+            db.add(
+                Interaction(
+                    contact_id=contact.id,
+                    company_id=contact.company_id,
+                    interaction_type="email_reply_received",
+                    subject=subject,
+                    notes=f"Reply received from {from_email} (matched by thread)",
+                    occurred_at=datetime.now(timezone.utc),
+                )
+            )
+            if contact.company_id:
+                company = (
+                    await db.execute(
+                        select(Company).where(Company.id == contact.company_id)
+                    )
+                ).scalar_one_or_none()
+                if company and company.stage in (
+                    "new", "researched", "scored", "contacted",
+                ):
+                    company.stage = "engaged"
+
+        await db.commit()
+        return {
+            "send_id": None,
+            "contact_id": str(contact.id) if contact else None,
+            "contact_name": (
+                f"{contact.first_name or ''} {contact.last_name or ''}".strip()
+                if contact
+                else None
+            ),
+            "enrollment_paused": True,
+            "original_subject": subject,
+            "matched_by": "threading_headers",
         }
 
 

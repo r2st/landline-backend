@@ -640,14 +640,23 @@ def send_sequence_step(self, enrollment_id: str):
                 # is no EmailSend row here. Applied last so nothing downstream
                 # rewrites the pixel or the wrapped links.
                 from app.config import get_settings as _get_settings
-                from app.services.email_tracking import apply_tracking
+                from app.services.email_tracking import apply_tracking, should_track_step
 
                 # The human copy, before the open-pixel / link-wrapping is baked
                 # in. Stored on the event so the operator can read back exactly
                 # what Dialtone said, without the tracking artifacts.
                 human_body = body
 
-                tracking_applied = _get_settings().sequence_tracking_enabled
+                # Drop tracking on the first touch. An open pixel and rewrapped
+                # links are a bulk-mail tell, and they hurt most on the cold
+                # first email to an address with no prior relationship — exactly
+                # where deliverability decides whether the sequence ever gets a
+                # reply. Steps 2+ stay tracked, so the engagement signal (and the
+                # send_condition / optimizer / A/B stats that read it) is only
+                # deferred one step, not lost. ``track_first_step`` overrides.
+                tracking_applied = should_track_step(
+                    enrollment.current_step, _get_settings()
+                )
                 body = apply_tracking(
                     body, str(enrollment.id), enrollment.current_step,
                     enabled=tracking_applied,
@@ -967,6 +976,120 @@ def process_outreach_queue():
         return _run_async(_run())
     except Exception as exc:
         logger.error("process_outreach_queue failed: %s", str(exc))
+        return {"status": "error", "error": str(exc)}
+
+
+async def expire_stale_review_drafts(
+    db: AsyncSession,
+    *,
+    older_than_hours: int = 24,
+    now: datetime | None = None,
+    dispatch: bool = True,
+) -> dict:
+    """Release ``pending`` AI drafts older than the cutoff and un-park them.
+
+    A ``pending_review`` draft freezes its enrollment: the outreach queue only
+    dispatches ``active`` enrollments, so an unreviewed draft stalls the prospect
+    forever. This sweep is the backstop for the human reviewer never showing up.
+
+    Crucially it does **not** send the unreviewed AI copy — that is the exact
+    thing the review gate exists to prevent. It mirrors a *rejection*: the draft
+    is marked ``rejected`` (which makes :func:`ai_compose.compose_step` fall back
+    to the static template the human already wrote for the step) and the
+    enrollment is un-parked back to ``active`` so the next send goes out on the
+    safe copy. A missed review therefore costs a plainer email, never a frozen
+    enrollment or an unreviewed cold send.
+
+    Returns ``{"expired": n, "resumed": m}``. Callable directly (tested against a
+    plain session); the Celery task wraps it per-org.
+    """
+    from app.models.ai_email_draft import AiEmailDraft
+
+    now = now or datetime.now(timezone.utc)
+    if older_than_hours <= 0:
+        return {"expired": 0, "resumed": 0}
+    cutoff = now - timedelta(hours=older_than_hours)
+
+    stale = list(
+        (
+            await db.execute(
+                select(AiEmailDraft).where(
+                    AiEmailDraft.status == "pending",
+                    AiEmailDraft.created_at < cutoff,
+                )
+            )
+        ).scalars().all()
+    )
+    if not stale:
+        return {"expired": 0, "resumed": 0}
+
+    resumed = 0
+    to_dispatch: list[str] = []
+    for draft in stale:
+        draft.status = "rejected"
+        draft.reviewed_at = now
+        # Distinguish the auto-release from a human rejection in the audit trail
+        # while staying within the draft-status enum (compose_step reads the
+        # 'rejected' status, not the note).
+        note = f"auto-expired after {older_than_hours}h with no review — released to static template"
+        draft.review_notes = (
+            f"{draft.review_notes}\n{note}" if draft.review_notes else note
+        )
+
+        enrollment = (
+            await db.execute(
+                select(OutreachEnrollment).where(
+                    OutreachEnrollment.id == draft.enrollment_id
+                )
+            )
+        ).scalar_one_or_none()
+        if enrollment is not None and enrollment.status == "pending_review":
+            enrollment.status = "active"
+            enrollment.next_send_at = now
+            resumed += 1
+            to_dispatch.append(str(enrollment.id))
+
+    await db.commit()
+
+    if dispatch and to_dispatch:
+        try:
+            for eid in to_dispatch:
+                send_sequence_step.delay(eid)
+        except Exception as exc:  # pragma: no cover - broker-dependent
+            logger.warning("Could not dispatch resumed enrollment(s): %s", exc)
+
+    logger.info(
+        "Auto-expired %d stale review draft(s), resumed %d enrollment(s)",
+        len(stale), resumed,
+    )
+    return {"expired": len(stale), "resumed": resumed}
+
+
+@celery_app.task(name="app.tasks.outreach.auto_expire_review_drafts")
+def auto_expire_review_drafts():
+    """Periodic task: release ``pending_review`` drafts left too long unreviewed.
+
+    See :func:`expire_stale_review_drafts` for the semantics — a stalled draft is
+    dropped back to the static template and its enrollment un-parked, so a missed
+    review never freezes a prospect. Runs per-org so releases stay tenant-scoped.
+    """
+    from app.config import get_settings as _get_settings
+
+    hours = _get_settings().ai_compose_review_expiry_hours
+    if hours <= 0:
+        logger.info("Review auto-expiry disabled (ai_compose_review_expiry_hours=0)")
+        return {"status": "disabled"}
+
+    async def _run():
+        async def _body(db):
+            return await expire_stale_review_drafts(db, older_than_hours=hours)
+
+        return await for_each_org(_body, label="auto_expire_review_drafts")
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("auto_expire_review_drafts failed: %s", str(exc))
         return {"status": "error", "error": str(exc)}
 
 

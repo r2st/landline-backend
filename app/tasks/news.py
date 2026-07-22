@@ -39,3 +39,38 @@ def check_company_news_batch():
         return await for_each_org(_body, label="check_company_news_batch")
 
     return _run_async(_run())
+
+
+@celery_app.task(name="app.tasks.news.enroll_on_company_signals")
+def enroll_on_company_signals():
+    """React to fresh company signals by surfacing un-enrolled prospects.
+
+    Runs shortly after the news sweep. On a fresh funding/hire/expansion signal
+    it finds the company's un-enrolled emailable contacts and flags them for
+    priority outreach (or auto-enrolls them when the org opted in). See
+    :func:`app.services.signal_enrollment.surface_prospects_on_signals`.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.signal_enrollment_enabled:
+        logger.info("Signal enrollment disabled (signal_enrollment_enabled=False)")
+        return {"status": "disabled"}
+
+    logger.info("Scanning fresh company signals for priority outreach")
+
+    async def _run():
+        from app.services.signal_enrollment import surface_prospects_on_signals
+
+        # Per-org: news, contacts, enrollments and follow-ups are all org-scoped.
+        async def _body(db):
+            return await surface_prospects_on_signals(
+                db,
+                fresh_hours=settings.signal_enrollment_fresh_hours,
+                min_relevance=settings.signal_enrollment_min_relevance,
+                auto_enroll=settings.signal_enrollment_auto_enroll,
+            )
+
+        return await for_each_org(_body, label="enroll_on_company_signals")
+
+    return _run_async(_run())

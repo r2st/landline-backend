@@ -18,7 +18,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -52,6 +52,61 @@ class AiDraftRead(BaseModel):
 
 class ReviewDecision(BaseModel):
     notes: Optional[str] = None
+
+
+class AiDraftStats(BaseModel):
+    """Review-queue health for the Dialtone dashboard.
+
+    ``pending`` is the number of enrollments currently frozen on a human review
+    (the metric the dashboard surfaces so a growing backlog is visible), plus a
+    per-status breakdown and the age of the oldest pending draft — a large
+    ``oldest_pending_age_hours`` is the signal that the auto-expiry sweep is
+    about to release drafts to the static template.
+    """
+
+    pending: int
+    approved: int
+    rejected: int
+    sent: int
+    failed: int
+    total: int
+    oldest_pending_age_hours: Optional[float] = None
+
+
+@router.get("/stats", response_model=AiDraftStats)
+async def draft_stats(db: AsyncSession = Depends(get_db)):
+    """Counts of AI drafts by status, plus the pending-review backlog age."""
+    rows = (
+        await db.execute(
+            select(AiEmailDraft.status, func.count()).group_by(AiEmailDraft.status)
+        )
+    ).all()
+    counts = {status: count for status, count in rows}
+
+    oldest_age_hours: Optional[float] = None
+    oldest = (
+        await db.execute(
+            select(func.min(AiEmailDraft.created_at)).where(
+                AiEmailDraft.status == "pending"
+            )
+        )
+    ).scalar_one_or_none()
+    if oldest is not None:
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        oldest_age_hours = round(
+            (datetime.now(timezone.utc) - oldest).total_seconds() / 3600.0, 2
+        )
+
+    return AiDraftStats(
+        pending=counts.get("pending", 0),
+        approved=counts.get("approved", 0),
+        rejected=counts.get("rejected", 0),
+        sent=counts.get("sent", 0),
+        failed=counts.get("failed", 0),
+        total=sum(counts.values()),
+        oldest_pending_age_hours=oldest_age_hours,
+    )
 
 
 @router.get("", response_model=list[AiDraftRead])

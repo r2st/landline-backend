@@ -102,6 +102,27 @@ def inject_open_pixel(body_html: str, enrollment_id: str, step_number: int) -> s
         return body_html
 
 
+def should_track_step(step_number: int, settings=None) -> bool:
+    """Whether a sequence step's send should carry an open pixel + wrapped links.
+
+    Two gates: the global ``sequence_tracking_enabled`` switch, and a first-touch
+    carve-out. The cold first email (``step_number <= 1``) is where a tracking
+    pixel and rewrapped links hurt deliverability most — a bulk-mail tell on an
+    address with no prior relationship — so it is left untracked unless
+    ``track_first_step`` is set. Steps 2+ stay tracked, so the engagement signal
+    is deferred one step, not lost.
+    """
+    if settings is None:
+        from app.config import get_settings
+
+        settings = get_settings()
+    if not settings.sequence_tracking_enabled:
+        return False
+    if step_number <= 1 and not settings.track_first_step:
+        return False
+    return True
+
+
 def apply_tracking(
     body_html: str,
     enrollment_id: str,

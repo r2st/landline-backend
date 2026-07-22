@@ -203,16 +203,18 @@ async def test_later_steps_are_left_to_the_optimizer_when_all_steps_is_off(
 # Every step writes as itself
 # ---------------------------------------------------------------------------
 
-def test_all_steps_composition_is_on_by_default():
-    """The whole sequence speaks in the sequence's voice, not just step 1.
+def test_only_first_step_is_gated_by_default():
+    """Follow-ups (steps 2+) send freely; only step 1 goes through the AI gate.
 
-    Pinned as a default rather than left to the env: with this off, ``tone`` is
-    a column that shapes one email in four and silently does nothing to the
-    other three.
+    Reversed from the earlier default (all-steps-on): gating every step parks
+    follow-ups behind a human review too, which froze mid-sequence enrollments
+    and depressed reply rates. With this off, ``compose_step`` short-circuits to
+    the static template for steps 2+ (the optimizer still rewrites them off
+    engagement), so a follow-up never waits on a reviewer.
     """
     from app.config import Settings
 
-    assert Settings.model_fields["ai_compose_all_steps"].default is True
+    assert Settings.model_fields["ai_compose_all_steps"].default is False
 
 
 def test_every_step_template_type_is_a_real_prompt_hint():

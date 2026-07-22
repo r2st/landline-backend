@@ -36,7 +36,10 @@ Research-backed design principles (2025-2026 benchmarks):
   warmup over 4-8 weeks.
 
 Merge fields available (rendered by app.services.email_compose.render):
-    {{first_name}} {{company_name}} {{title}} {{demo_link}}
+    {{first_name}} {{last_name}} {{full_name}} {{company_name}} {{title}}
+    {{industry}} {{city}} {{demo_link}}
+Prefer wrapping {{industry}} / {{city}} in a Jinja ``{% if %}`` so a prospect
+with no city/industry on file never renders an awkward blank in the copy.
 """
 
 from __future__ import annotations
@@ -82,9 +85,10 @@ STEP_DELAYS = [0, 3, 7, 14]
 STEP_1_SUBJECT = "{{first_name}}, who takes the blame when cavity 4 goes bad?"
 STEP_1_BODY = (
     "<p>Hi {{first_name}},</p>"
-    "<p>Every molder I talk to has one mold they nurse along — the one where a "
-    "bad run means a frantic weekend, an angry customer call, and an air-freight "
-    "bill that eats the whole job's margin.</p>"
+    "<p>Every molder I talk to{% if city %} around {{city}}{% endif %} has one "
+    "mold they nurse along — the one where a bad run means a frantic weekend, an "
+    "angry customer call, and an air-freight bill that eats the whole job's "
+    "margin.</p>"
     "<p>Here's the part nobody likes to sit with: when a press drifts at 2 AM and "
     "the night shift misses it, when 8,000 parts ship and 400 have sink marks "
     "that slipped past visual — whose name ends up on the corrective-action "
@@ -108,8 +112,9 @@ STEP_2_BODY = (
     "before the air freight on a blown delivery or the margin you give back on "
     "the next quote because the customer remembers the last quality issue. Run "
     "your own numbers; I'd bet they're bigger than the line item you track.</p>"
-    "<p>The pattern we see across the industry is simple: shops that catch drift "
-    "in real time turn most of that scrap back into shipped parts. "
+    "<p>The pattern we see across {% if industry %}{{industry}}{% else %}the "
+    "industry{% endif %} is simple: shops that catch drift in real time turn "
+    "most of that scrap back into shipped parts. "
     '<a href="{{demo_link}}">This is what watching it live looks like.</a></p>'
     "<p>Want me to walk your numbers with you for 15 minutes? No slides.</p>"
 )

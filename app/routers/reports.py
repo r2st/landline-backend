@@ -6,6 +6,7 @@ Rows are windowed and aggregated in Python so naive (SQLite) and aware
 """
 
 import logging
+import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
@@ -21,9 +22,12 @@ from app.models.client_health import ClientHealthSnapshot
 from app.models.company import Company
 from app.models.deal import Deal
 from app.models.email_template import EmailSend
+from app.models.ab_test import AbTestAssignment, AbTestVariant
 from app.models.interaction import Interaction
 from app.models.lead_score import LeadScore
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectingRun
+from app.models.sequence import OutreachSequence, SequenceStep
 from app.models.task import Task
 from app.services.daily_summary import generate_and_store_summary
 from app.services.scoring import grade_for_fit
@@ -31,9 +35,14 @@ from app.schemas.company import VALID_STAGES
 from app.schemas.reports import (
     ActivitySummaryReport,
     ClientRetentionReport,
+    FunnelCounts,
+    OutreachFunnelReport,
     RevenuePipelineReport,
     ReportPeriod,
+    SequenceFunnel,
     StatusValue,
+    StepFunnel,
+    SubjectFunnel,
 )
 
 logger = logging.getLogger(__name__)
@@ -690,3 +699,172 @@ async def daily_summary_by_date(
     if row is None:
         raise HTTPException(status_code=404, detail="No summary for that date")
     return _serialize_summary(row)
+
+
+# ─── Outreach funnel analytics ───────────────────────────────────────────────
+# Cold-outreach sends are recorded in ``outreach_events`` (enrollment_id + step
+# number + event_type), NOT ``email_sends``, so the existing activity-summary
+# report — which counts EmailSend rows — is blind to the sequence path. This
+# endpoint reads the real log and reports the sent→opened→replied→bounced funnel
+# broken down by step, sequence, and subject/variant.
+
+_FUNNEL_EVENTS = ("sent", "opened", "replied", "bounced")
+
+
+def _funnel_counts(buckets: dict) -> FunnelCounts:
+    """Turn a ``{event_type: count}`` bucket into a FunnelCounts (rates vs sent)."""
+    sent = buckets.get("sent", 0)
+    opened = buckets.get("opened", 0)
+    replied = buckets.get("replied", 0)
+    bounced = buckets.get("bounced", 0)
+    denom = sent or 0
+    return FunnelCounts(
+        sent=sent,
+        opened=opened,
+        replied=replied,
+        bounced=bounced,
+        open_rate=round(opened / denom, 4) if denom else 0.0,
+        reply_rate=round(replied / denom, 4) if denom else 0.0,
+        bounce_rate=round(bounced / denom, 4) if denom else 0.0,
+    )
+
+
+@router.get("/outreach-funnel", response_model=OutreachFunnelReport)
+async def outreach_funnel(
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    sequence_id: Optional[str] = Query(None, description="Restrict to one sequence"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cold-outreach funnel (sent → opened → replied → bounced) from OutreachEvent.
+
+    Grouped three ways — by step number, by sequence, and by subject line (with
+    the A/B variant label when the send went through a subject-line test). A
+    contact is counted once per outcome per step (an open pixel that fires five
+    times is one open), matching the A/B engine's distinct-enrollment semantics.
+    """
+    start, end = _aware(start_date), _aware(end_date)
+    seq_filter = None
+    if sequence_id:
+        try:
+            seq_filter = uuid.UUID(sequence_id)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid sequence_id")
+
+    # enrollment_id → sequence_id (and sequence_id → name) so events can be
+    # attributed to their sequence, which the event row itself doesn't carry.
+    enr_rows = (
+        await db.execute(
+            select(OutreachEnrollment.id, OutreachEnrollment.sequence_id)
+        )
+    ).all()
+    seq_by_enrollment = {eid: sid for eid, sid in enr_rows}
+
+    seq_names = dict(
+        (
+            await db.execute(select(OutreachSequence.id, OutreachSequence.name))
+        ).all()
+    )
+
+    # (enrollment_id, step_number) → subject, resolved from the sent/bounced
+    # event metadata (the only events that carry the copy). Later events
+    # (opened/replied) inherit it so every outcome attributes to a subject.
+    # A/B variant labels come from the assignment tables, keyed the same way.
+    step_by_stepid = dict(
+        (
+            await db.execute(select(SequenceStep.id, SequenceStep.step_number))
+        ).all()
+    )
+    variant_label_by_id = dict(
+        (
+            await db.execute(select(AbTestVariant.id, AbTestVariant.label))
+        ).all()
+    )
+    variant_by_enr_step: dict[tuple, str] = {}
+    for enr_id, step_id, variant_id in (
+        await db.execute(
+            select(
+                AbTestAssignment.enrollment_id,
+                AbTestAssignment.sequence_step_id,
+                AbTestAssignment.variant_id,
+            )
+        )
+    ).all():
+        step_no = step_by_stepid.get(step_id)
+        label = variant_label_by_id.get(variant_id)
+        if step_no is not None and label is not None:
+            variant_by_enr_step[(enr_id, step_no)] = label
+
+    events = list((await db.execute(select(OutreachEvent))).scalars().all())
+
+    # First pass: harvest the subject per (enrollment, step) from sent/bounced.
+    subject_by_enr_step: dict[tuple, str] = {}
+    for ev in events:
+        if ev.event_type in ("sent", "bounced"):
+            subj = (ev.event_metadata or {}).get("subject")
+            if subj:
+                subject_by_enr_step.setdefault((ev.enrollment_id, ev.step_number), subj)
+
+    overall: dict = defaultdict(int)
+    by_step: dict[int, dict] = defaultdict(lambda: defaultdict(int))
+    by_sequence: dict = defaultdict(lambda: defaultdict(int))
+    by_subject: dict[tuple, dict] = defaultdict(lambda: defaultdict(int))
+    seen: set = set()  # dedupe (enrollment, step, event_type): count a contact once
+
+    for ev in events:
+        if ev.event_type not in _FUNNEL_EVENTS:
+            continue
+        if not _in_window(ev.occurred_at, start, end):
+            continue
+        seq_id = seq_by_enrollment.get(ev.enrollment_id)
+        if seq_filter is not None and seq_id != seq_filter:
+            continue
+
+        key = (ev.enrollment_id, ev.step_number, ev.event_type)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        et = ev.event_type
+        overall[et] += 1
+        by_step[ev.step_number][et] += 1
+        by_sequence[seq_id][et] += 1
+
+        subject = subject_by_enr_step.get(
+            (ev.enrollment_id, ev.step_number), "(unknown subject)"
+        )
+        label = variant_by_enr_step.get((ev.enrollment_id, ev.step_number))
+        by_subject[(subject, label)][et] += 1
+
+    return OutreachFunnelReport(
+        period=ReportPeriod(start_date=start_date, end_date=end_date),
+        overall=_funnel_counts(overall),
+        by_step=[
+            StepFunnel(step_number=step, counts=_funnel_counts(by_step[step]))
+            for step in sorted(by_step)
+        ],
+        by_sequence=[
+            SequenceFunnel(
+                sequence_id=str(sid) if sid else None,
+                sequence_name=seq_names.get(sid),
+                counts=_funnel_counts(buckets),
+            )
+            for sid, buckets in sorted(
+                by_sequence.items(),
+                key=lambda kv: kv[1].get("sent", 0),
+                reverse=True,
+            )
+        ],
+        by_subject=[
+            SubjectFunnel(
+                subject=subject,
+                variant_label=label,
+                counts=_funnel_counts(buckets),
+            )
+            for (subject, label), buckets in sorted(
+                by_subject.items(),
+                key=lambda kv: kv[1].get("sent", 0),
+                reverse=True,
+            )
+        ],
+    )

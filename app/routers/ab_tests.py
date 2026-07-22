@@ -278,6 +278,32 @@ async def create_ab_test(payload: AbTestCreate, db: AsyncSession = Depends(get_d
     return await _build_detail(db, test)
 
 
+@router.post("/seed-subjects/{sequence_id}")
+async def seed_subject_tests(
+    sequence_id: uuid.UUID,
+    strategy: str = Query("even"),
+    metric: str = Query("replied"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Seed subject-line A/B tests for a sequence from the static variant bank.
+
+    Turns the hand-written ``SUBJECT_AB_VARIANTS`` alternatives into live tests
+    (control A inheriting the step subject + challengers) so cold sends start
+    rotating subjects. Idempotent: steps already under test are skipped.
+    """
+    if strategy not in AB_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"strategy must be one of {list(AB_STRATEGIES)}")
+    if metric not in AB_METRICS:
+        raise HTTPException(status_code=400, detail=f"metric must be one of {list(AB_METRICS)}")
+
+    from app.services.ab_test_seed import seed_subject_ab_tests
+
+    result = await seed_subject_ab_tests(
+        db, sequence_id, strategy=strategy, metric=metric
+    )
+    return {"sequence_id": str(sequence_id), **result}
+
+
 @router.put("/{test_id}/variants", response_model=AbTestDetail)
 async def update_variants(
     test_id: uuid.UUID, payload: VariantsUpdate, db: AsyncSession = Depends(get_db)

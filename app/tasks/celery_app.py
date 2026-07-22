@@ -70,9 +70,24 @@ celery_app.conf.update(
             "task": "app.tasks.outreach.check_email_replies",
             "schedule": 600.0,  # every 10 minutes
         },
+        # Release AI-compose drafts that have sat in pending_review too long so a
+        # missed review can't freeze an enrollment. Hourly is fine — the expiry
+        # window is measured in hours (default 24h).
+        "auto-expire-review-drafts": {
+            "task": "app.tasks.outreach.auto_expire_review_drafts",
+            "schedule": 3600.0,  # hourly
+        },
         "check-company-news": {
             "task": "app.tasks.news.check_company_news_batch",
             "schedule": 21600.0,  # every 6 hours
+        },
+        # Feature 6 (signal-based timing): react to fresh funding/hire/expansion
+        # signals by surfacing a company's un-enrolled prospects for priority
+        # outreach. Runs every 2 hours so a signal is acted on well inside its
+        # freshness window (default 48h), staggered off the 6-hourly news sweep.
+        "enroll-on-company-signals": {
+            "task": "app.tasks.news.enroll_on_company_signals",
+            "schedule": 7200.0,  # every 2 hours
         },
         "auto-enrich-companies": {
             "task": "app.tasks.enrichment.auto_enrich_companies",

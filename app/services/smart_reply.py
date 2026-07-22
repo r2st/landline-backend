@@ -431,14 +431,22 @@ class SmartReplyService:
             .values(status="replied", replied_at=datetime.now(timezone.utc))
         )
 
-        # Stop active outreach sequences
+        # Stop outreach sequences. Broadened beyond 'active': a reply that lands
+        # while a step is parked for review, after the sequence completed, or
+        # while paused must still stop the enrollment and record the reply — see
+        # reply_matching.REPLY_STOPPABLE_STATUSES. Falls back to matching the
+        # reply's threading headers when no enrollment is found by contact.
+        from app.services.reply_matching import (
+            find_stoppable_enrollment,
+            match_enrollment_by_headers,
+        )
+
         if contact:
-            result = await db.execute(
-                select(OutreachEnrollment)
-                .where(OutreachEnrollment.contact_id == contact.id)
-                .where(OutreachEnrollment.status == "active")
-            )
-            enrollment = result.scalar_one_or_none()
+            enrollment = await find_stoppable_enrollment(db, contact.id)
+            if enrollment is None:
+                enrollment = await match_enrollment_by_headers(
+                    db, headers.get("in-reply-to"), headers.get("references")
+                )
             if enrollment:
                 enrollment.status = "replied"
                 enrollment.completed_at = datetime.now(timezone.utc)

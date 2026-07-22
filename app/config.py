@@ -221,6 +221,14 @@ class Settings(BaseSettings):
     # counts that are structurally zero. Kept behind a flag because a pixel is a
     # (small) deliverability cost: turning it off restores the prior behaviour.
     sequence_tracking_enabled: bool = True
+    # Instrument the FIRST touch of a sequence with an open pixel + wrapped
+    # links. Off by default: the cold first email is the one most likely to be
+    # flagged by a spam filter, and an open pixel + link-rewrapping is a strong
+    # bulk-mail signal on an address with no prior relationship. Dropping tracking
+    # on step 1 keeps it as plain as a personal note (which lands), and the
+    # engagement signal it would have carried is recovered on steps 2+, which
+    # stay tracked. Set True to restore uniform tracking across every step.
+    track_first_step: bool = False
 
     # --- CAN-SPAM sender identity ---
     # Legal sender name + a FULL physical postal address are required on every
@@ -335,13 +343,20 @@ class Settings(BaseSettings):
     # ``ai_compose.STEP_TEMPLATE_TYPES``) so the arc survives — a follow-up is
     # still written as a follow-up, not as a second first touch. The optimizer
     # still rewrites off engagement history afterwards.
-    ai_compose_all_steps: bool = True
+    ai_compose_all_steps: bool = False
     # How many AI-composed emails per sequence *step* go to a human before that
     # step is trusted to send them unattended. Cold outreach is irreversible and
     # charged against the sending domain, so the first batch gets read. Counted
     # per step, not per sequence: a quota the first touch can exhaust on its own
     # would let every follow-up the model has ever written send unread.
-    ai_compose_review_batch_size: int = 10
+    ai_compose_review_batch_size: int = 3
+    # A ``pending_review`` draft parks its enrollment (the outreach queue only
+    # dispatches ``active``). If no human clears it, the whole enrollment stalls
+    # indefinitely. After this many hours the auto-expire sweep releases the
+    # draft — it does NOT send the unreviewed AI copy; it falls back to the
+    # static template a human already wrote and un-parks the enrollment, so a
+    # missed review costs a plainer email, never a frozen prospect. 0 disables.
+    ai_compose_review_expiry_hours: int = 24
     # 1.4 AI Company Research Agent: auto-trigger a research brief when a company
     # is created / before first outreach.
     auto_research_enabled: bool = True
@@ -350,6 +365,23 @@ class Settings(BaseSettings):
     # Threads with activity in the last N days are considered "active" for the
     # analyze_active_threads beat task.
     conversation_active_days: int = 14
+
+    # Signal-based outreach timing: when fresh company news (funding, a new hire,
+    # expansion) lands, prospects at that company are at their most receptive.
+    # The signal-enrollment sweep reacts to those signals by surfacing the
+    # company's un-enrolled, emailable contacts for priority outreach. Fresh =
+    # discovered within this many hours (the relevance window closes fast — a
+    # funding round is old news in a week). ``signal_enrollment_auto_enroll``
+    # controls whether a matched prospect is enrolled automatically (into the
+    # company's resolved vertical sequence) or only flagged as a priority
+    # follow-up for a human to send — flagging is the safe default so a news
+    # blip can never fire an unreviewed cold send.
+    signal_enrollment_enabled: bool = True
+    signal_enrollment_fresh_hours: int = 48
+    signal_enrollment_auto_enroll: bool = False
+    # Only news scored at least this relevant (1-10) counts as an outreach
+    # trigger, so routine PR noise doesn't surface prospects.
+    signal_enrollment_min_relevance: int = 5
 
     # --- Phase 3 AI features ---
     # 3.1 Autonomous Prospecting Agent.
