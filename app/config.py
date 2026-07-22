@@ -279,6 +279,17 @@ class Settings(BaseSettings):
 
     # Smart auto-reply
     auto_reply_enabled: bool = True                        # Auto-send AI-drafted replies for clear positive intents
+    # Safety floor for auto-send (P1 fix). An AI-drafted reply is only auto-sent
+    # when the reply analysis is at least this confident about the intent; below
+    # it we draft-only and leave the send to a human. Guards against replying to
+    # a misread "please stop" or a borderline classification.
+    auto_reply_min_confidence: float = 0.75
+
+    # Complaint / feedback-loop (FBL) ingestion (P1 fix). Rolling lookback window
+    # the mailbox sweep scans for abuse/complaint reports, mirroring the bounce
+    # sweep. A complained-about recipient is suppressed immediately, like a hard
+    # bounce.
+    complaint_lookback_days: int = 3
 
     # Autonomous follow-up + re-scoring (Celery beat)
     stale_lead_followup_days: int = 7                      # Active-pipeline lead with no touch in N days → auto follow-up reminder

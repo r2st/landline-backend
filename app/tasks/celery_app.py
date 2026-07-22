@@ -46,6 +46,7 @@ celery_app.conf.update(
         "app.tasks.client_success.*": {"queue": "enrichment"},
         "app.tasks.deliverability.*": {"queue": "enrichment"},
         "app.tasks.bounces.*": {"queue": "enrichment"},
+        "app.tasks.complaints.*": {"queue": "enrichment"},
         "app.tasks.danger_signals.*": {"queue": "enrichment"},
         "app.tasks.domain_health.*": {"queue": "enrichment"},
         "app.tasks.postmaster.*": {"queue": "enrichment"},
@@ -225,6 +226,15 @@ celery_app.conf.update(
         # address early in a run, cheap because it dedups on message id.
         "ingest-bounces": {
             "task": "app.tasks.bounces.ingest_bounces",
+            "schedule": 900.0,  # every 15 minutes
+        },
+        # Ingest complaint / feedback-loop (FBL) reports from the mailbox. Gmail
+        # exposes no FBL, so a provider abuse report (Yahoo/Outlook/AOL) that is
+        # forwarded to a monitored mailbox is the only per-recipient complaint
+        # signal — this sweep suppresses the complainer, same path as a hard
+        # bounce. Every 15 minutes, deduped on message id like the bounce sweep.
+        "ingest-complaints": {
+            "task": "app.tasks.complaints.ingest_complaints",
             "schedule": 900.0,  # every 15 minutes
         },
         # Feature 2: auto-pause on danger signals — 24h bounce/complaint monitor.
@@ -413,6 +423,7 @@ import app.tasks.prospecting  # noqa: F401
 import app.tasks.client_health  # noqa: F401
 import app.tasks.deliverability  # noqa: F401
 import app.tasks.bounces  # noqa: F401
+import app.tasks.complaints  # noqa: F401
 import app.tasks.danger_signals  # noqa: F401
 import app.tasks.domain_health  # noqa: F401
 import app.tasks.postmaster  # noqa: F401

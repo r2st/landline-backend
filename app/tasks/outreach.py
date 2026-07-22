@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import select, and_
@@ -1095,35 +1096,32 @@ def auto_expire_review_drafts():
 
 @celery_app.task(name="app.tasks.outreach.check_email_replies")
 def check_email_replies():
-    """Periodic task: check Gmail for replies and auto-respond with AI.
+    """Periodic dispatcher: fan out one reply-processing task per mailbox.
 
-    Uses the SmartReplyService to detect replies, classify intent with Claude,
-    draft human-like responses, and optionally auto-send for clear positive
-    intents.  Falls back to logging-only when AI analysis is unavailable.
+    Reading a mailbox is synchronous Gmail I/O; doing every connected account
+    serially inside one beat tick blocked the event loop for the whole sweep and
+    let one slow/oversized mailbox starve the rest. Instead this task only
+    *enumerates* connected accounts (per org, so the scoping is correct) and
+    dispatches ``process_account_replies`` for each, so mailboxes are read
+    concurrently across workers and a failure in one is isolated to its own task.
     """
-    logger.info("Checking Gmail for outreach replies (smart reply)")
+    logger.info("Dispatching per-account smart-reply tasks")
 
     async def _run():
         from app.services.smart_reply import get_smart_reply_service
 
         service = get_smart_reply_service()
 
-        # Per-org: replies / contacts / accounts are org-scoped.
+        # Per-org: Gmail accounts are org-scoped, so enumerate within each org's
+        # context and hand the id (plus its org) to the per-account task.
         async def _body(db):
-            results = await service.process_replies(db)
-            if results:
-                logger.info("Processed %d replies", len(results))
-                for r in results:
-                    logger.info(
-                        "Reply from %s (%s) -- intent: %s, auto-sent: %s",
-                        r.get("contact_name"),
-                        r.get("from_email"),
-                        r.get("analysis", {}).get("intent", "unknown"),
-                        r.get("auto_sent", False),
-                    )
-            else:
-                logger.info("No new replies found")
-            return results
+            from app.org_context import get_current_org_id
+
+            org_id = get_current_org_id()
+            account_ids = await service.connected_account_ids(db)
+            for account_id in account_ids:
+                process_account_replies.delay(str(account_id), str(org_id) if org_id else None)
+            return {"dispatched": len(account_ids), "org_id": str(org_id) if org_id else None}
 
         return await for_each_org(_body, label="check_email_replies")
 
@@ -1132,6 +1130,56 @@ def check_email_replies():
     except Exception as exc:
         logger.error("check_email_replies failed: %s", str(exc))
         return {"status": "error", "error": str(exc)}
+
+
+@celery_app.task(
+    name="app.tasks.outreach.process_account_replies", bind=True, max_retries=2
+)
+def process_account_replies(self, gmail_account_id: str, org_id: Optional[str] = None):
+    """Process incoming replies for ONE connected Gmail account.
+
+    Dispatched per-account by :func:`check_email_replies`. The org context is
+    lost over the Celery wire, so it is rebound here — from the passed ``org_id``
+    when present, else resolved from the account row (unfiltered) — before any
+    org-scoped read/write. All Gmail I/O inside the service is offloaded off the
+    event loop, so this task never blocks the loop while reading the mailbox.
+    """
+    logger.info("Processing replies for Gmail account %s", gmail_account_id)
+
+    async def _run():
+        from app.models.gmail_account import GmailAccount
+        from app.services.smart_reply import get_smart_reply_service
+
+        resolved_org = org_id
+        if resolved_org is None:
+            async with celery_session() as db0:
+                resolved_org = (
+                    await db0.execute(
+                        select(GmailAccount.org_id)
+                        .where(GmailAccount.id == UUID(gmail_account_id))
+                        .execution_options(skip_org_filter=True)
+                    )
+                ).scalar_one_or_none()
+
+        async with org_scope(UUID(str(resolved_org)) if resolved_org else None):
+            async with celery_session() as db:
+                service = get_smart_reply_service()
+                results = await service.process_account_by_id(db, UUID(gmail_account_id))
+                for r in results:
+                    logger.info(
+                        "Reply from %s (%s) -- intent: %s, auto-sent: %s",
+                        r.get("contact_name"),
+                        r.get("from_email"),
+                        r.get("analysis", {}).get("intent", "unknown"),
+                        r.get("auto_sent", False),
+                    )
+                return {"account_id": gmail_account_id, "processed": len(results)}
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("process_account_replies(%s) failed: %s", gmail_account_id, str(exc))
+        return {"status": "error", "error": str(exc), "account_id": gmail_account_id}
 
 
 @celery_app.task(name="app.tasks.outreach.sync_email_replies")

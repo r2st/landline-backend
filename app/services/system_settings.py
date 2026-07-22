@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 SENDING_ENABLED_KEY = "sending_enabled"
 WARMUP_START_KEY = "warmup_start_date"
+# Per-org opt-in for autonomous auto-replies (P1 safety floor). Distinct from the
+# global ``auto_reply_enabled`` config: sending is a per-tenant decision, so an
+# org must opt in for the SmartReplyService to auto-send on its behalf. When the
+# row is unset the global config default applies, preserving current behaviour.
+AUTO_REPLY_ENABLED_KEY = "auto_reply_enabled"
 
 
 async def _get_row(db: AsyncSession, key: str) -> Optional[SystemSetting]:
@@ -198,6 +203,33 @@ async def _notify_admin_killswitch(
         )
     except Exception as exc:  # pragma: no cover - notification is best-effort
         logger.info("Kill-switch admin notification skipped: %s", exc)
+
+
+# --- Per-org auto-reply opt-in --------------------------------------------------
+
+
+async def is_auto_reply_enabled(db: AsyncSession) -> bool:
+    """Whether THIS org has opted in to autonomous auto-replies.
+
+    Falls back to the global ``auto_reply_enabled`` config when the org has never
+    set a preference (fail-safe: the global default decides). Never raises — a
+    lookup failure degrades to the config default rather than silently changing
+    send behaviour.
+    """
+    default = bool(get_settings().auto_reply_enabled)
+    value = await get_value(db, AUTO_REPLY_ENABLED_KEY, default=None)
+    if not value:
+        return default
+    return bool(value.get("enabled", default))
+
+
+async def set_auto_reply_enabled(
+    db: AsyncSession, enabled: bool, updated_by: Optional[str] = None
+) -> dict:
+    """Set the per-org auto-reply opt-in. Returns the new state."""
+    await set_value(db, AUTO_REPLY_ENABLED_KEY, {"enabled": enabled}, updated_by=updated_by)
+    await db.flush()
+    return {"enabled": enabled}
 
 
 # --- Warm-up start date ---------------------------------------------------------

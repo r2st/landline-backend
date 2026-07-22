@@ -12,6 +12,7 @@ common objections automatically (see :func:`classify_objection`):
 - **"talk to <name>"** → creates a referral-outreach task for the named person.
 """
 
+import asyncio
 import base64
 import logging
 import re
@@ -40,6 +41,12 @@ _TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 # Number of days to defer a "not now" lead before nudging again.
 NOT_NOW_FOLLOW_UP_DAYS = 30
+
+# Reply intents that count as a "positive" outcome in the funnel analytics — the
+# prospect showed real interest (wants to talk, asked a qualifying question, or
+# asked to meet). Everything else (not_now / not_interested / referral /
+# auto_reply) is a reply but not a positive one.
+POSITIVE_REPLY_INTENTS = frozenset({"interested", "question", "meeting_request"})
 
 # Intents / actions that signal the prospect is open to a meeting (feature 2.5).
 _MEETING_INTENT_MARKERS = ("interested", "meeting_request", "question")
@@ -265,12 +272,83 @@ async def handle_objection(
     return {"action": "none"}
 
 
+# Auto-send safety floor (P1 fix) --------------------------------------------
+# Header signals that an inbound message is machine-generated (out-of-office
+# autoresponder, mailing list, bulk blast). Auto-replying to any of these is
+# either useless (a bot) or actively harmful (a loop / a list). We must never
+# auto-send to them — detection mirrors RFC 3834 (Auto-Submitted) plus the
+# de-facto Precedence / List-* conventions.
+def is_automated_message(headers: dict) -> Optional[str]:
+    """Return the header reason a message looks machine-generated, else ``None``.
+
+    ``headers`` is the lower-cased name→value map already built by the caller.
+    Checked signals:
+
+    - ``Auto-Submitted`` present and not ``no`` (RFC 3834 autoresponders/DSNs).
+    - ``Precedence`` of ``bulk``/``list``/``junk`` (bulk mail convention).
+    - Any ``List-*`` header (``List-Id``/``List-Unsubscribe``/…) — mailing list.
+    - ``X-Autoreply`` / ``X-Autorespond`` (vendor out-of-office markers).
+    """
+    auto_submitted = (headers.get("auto-submitted") or "").strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return f"auto-submitted:{auto_submitted}"
+
+    precedence = (headers.get("precedence") or "").strip().lower()
+    if precedence in ("bulk", "list", "junk"):
+        return f"precedence:{precedence}"
+
+    for name in headers:
+        if name.startswith("list-"):
+            return f"header:{name}"
+
+    if headers.get("x-autoreply") or headers.get("x-autorespond"):
+        return "x-autoreply"
+
+    return None
+
+
 class SmartReplyService:
     """Reads incoming replies from ALL connected accounts, classifies intent,
     drafts responses, and optionally auto-sends."""
 
+    @staticmethod
+    async def _gexec(request):
+        """Run a blocking googleapiclient request off the event loop.
+
+        The Gmail client is synchronous; calling ``.execute()`` inline blocks the
+        whole asyncio loop for the duration of the network round-trip. Offloading
+        to a thread (P1 fix) keeps the loop free while a mailbox is being read.
+        """
+        return await asyncio.to_thread(request.execute)
+
+    async def connected_account_ids(self, db: AsyncSession) -> list:
+        """IDs of every connected Gmail account in the current org context.
+
+        Used by the fan-out dispatcher so each mailbox is processed by its own
+        Celery task instead of a serial in-process loop.
+        """
+        result = await db.execute(
+            select(GmailAccount.id).where(GmailAccount.status == "connected")
+        )
+        return list(result.scalars().all())
+
+    async def process_account_by_id(self, db: AsyncSession, account_id) -> list[dict]:
+        """Process one mailbox by id (the per-account fan-out entry point)."""
+        account = (
+            await db.execute(select(GmailAccount).where(GmailAccount.id == account_id))
+        ).scalar_one_or_none()
+        if account is None or account.status != "connected":
+            return []
+        return await self._process_account(db, account, get_settings())
+
     async def process_replies(self, db: AsyncSession) -> list[dict]:
-        """Main entry: check ALL connected Gmail accounts for replies."""
+        """Serial fallback: check ALL connected Gmail accounts for replies.
+
+        The scheduled path fans out one Celery task per account (see
+        ``process_account_replies``); this in-process loop is retained for direct
+        callers and tests. Gmail I/O is offloaded off the event loop so even the
+        serial path never blocks the loop for a whole mailbox.
+        """
         settings = get_settings()
 
         # Query ALL connected accounts, not just the active one
@@ -317,14 +395,13 @@ class SmartReplyService:
         """Process replies for a single Gmail account."""
         try:
             creds = self._build_credentials(gmail_account)
-            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            service = await asyncio.to_thread(
+                build, "gmail", "v1", credentials=creds, cache_discovery=False
+            )
 
             query = "in:inbox is:unread newer_than:2h -from:me"
-            results_list = (
-                service.users()
-                .messages()
-                .list(userId="me", q=query, maxResults=20)
-                .execute()
+            results_list = await self._gexec(
+                service.users().messages().list(userId="me", q=query, maxResults=20)
             )
 
             messages = results_list.get("messages", [])
@@ -359,11 +436,8 @@ class SmartReplyService:
     ) -> Optional[dict]:
         """Process a single incoming message -- match, analyze, draft, optionally send."""
 
-        msg = (
-            gmail_service.users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute()
+        msg = await self._gexec(
+            gmail_service.users().messages().get(userId="me", id=message_id, format="full")
         )
 
         headers = {
@@ -483,6 +557,7 @@ class SmartReplyService:
             )
 
         # Stop the matched enrollment and record the reply on the timeline.
+        reply_event = None
         if enrollment is not None:
             enrollment.status = "replied"
             enrollment.completed_at = datetime.now(timezone.utc)
@@ -518,6 +593,18 @@ class SmartReplyService:
         # On meeting interest, guarantee the draft offers a scheduling link (2.5).
         meeting_interest = apply_scheduling_link(analysis)
 
+        # Stamp the reply's intent onto the timeline event so the funnel
+        # analytics can count "positive" replies straight off OutreachEvent
+        # (its primary source) without re-classifying. positive == the intent
+        # signalled real interest.
+        if reply_event is not None:
+            intent = (analysis or {}).get("intent") or ""
+            reply_event.event_metadata = {
+                **(reply_event.event_metadata or {}),
+                "intent": intent,
+                "positive": intent in POSITIVE_REPLY_INTENTS,
+            }
+
         # Handle common objections automatically (price / timing / referral).
         objection_action = None
         objection = classify_objection(body_text, analysis)
@@ -544,23 +631,58 @@ class SmartReplyService:
 
         await db.commit()
 
-        # Auto-send response if conditions are met
+        # Auto-send response only when every safety floor is cleared (P1 fix).
+        # An auto-reply is an autonomous outbound send, so before firing we
+        # require ALL of:
+        #   - the global sending kill switch is on;
+        #   - THIS org has opted in to auto-replies (per-org, not just the global
+        #     config default);
+        #   - the AI itself said should_auto_send AND produced a draft;
+        #   - the classification confidence clears the min threshold;
+        #   - the inbound message is NOT machine-generated (auto-submitted /
+        #     bulk / mailing-list) — never reply to an OOO bot or a list, and
+        #     never risk an auto-reply loop.
+        # Every skip is logged with its reason so a suppressed auto-send is
+        # auditable rather than silent.
         auto_sent = False
+        auto_send_decision: dict = {"sent": False, "reason": None}
         settings = get_settings()
-        # Respect the global sending kill switch — an auto-reply is still an
-        # outbound send, so a paused system must not fire it.
         from app.services import system_settings
 
         sending_on = await system_settings.is_sending_enabled(db)
-        if (
-            sending_on
-            and analysis.get("should_auto_send")
-            and analysis.get("draft_reply")
-            and getattr(settings, "auto_reply_enabled", False)
-        ):
+        org_opted_in = await system_settings.is_auto_reply_enabled(db)
+        min_conf = float(getattr(settings, "auto_reply_min_confidence", 0.75) or 0.0)
+        try:
+            confidence = float(analysis.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        automated_reason = is_automated_message(headers)
+
+        if not sending_on:
+            auto_send_decision["reason"] = "kill_switch_engaged"
+        elif not org_opted_in:
+            auto_send_decision["reason"] = "org_opt_out"
+        elif not (analysis.get("should_auto_send") and analysis.get("draft_reply")):
+            auto_send_decision["reason"] = "ai_declined"
+        elif automated_reason is not None:
+            auto_send_decision["reason"] = f"automated_message({automated_reason})"
+        elif confidence < min_conf:
+            auto_send_decision["reason"] = f"low_confidence({confidence:.2f}<{min_conf:.2f})"
+
+        should_auto_send = auto_send_decision["reason"] is None
+        if not should_auto_send and analysis.get("should_auto_send"):
+            # The AI wanted to send but a safety floor blocked it — log so the
+            # decision is visible in the ops trail.
+            logger.info(
+                "Auto-send suppressed for %s (%s): %s (intent=%s, conf=%.2f)",
+                contact_name, from_email, auto_send_decision["reason"],
+                analysis.get("intent"), confidence,
+            )
+
+        if should_auto_send:
             try:
                 draft = analysis["draft_reply"]
-                self._send_reply(
+                await self._send_reply(
                     gmail_service,
                     to_email=from_email,
                     subject=draft.get("subject", "Re: " + subject),
@@ -569,6 +691,7 @@ class SmartReplyService:
                     in_reply_to=headers.get("message-id", ""),
                 )
                 auto_sent = True
+                auto_send_decision = {"sent": True, "reason": None}
 
                 auto_send = EmailSend(
                     to_email=from_email,
@@ -591,14 +714,17 @@ class SmartReplyService:
             except Exception as e:
                 logger.error("Auto-reply send failed via %s: %s", gmail_account.email, str(e))
                 auto_sent = False
+                auto_send_decision = {"sent": False, "reason": "send_failed"}
 
         # Mark Gmail message as read
         try:
-            gmail_service.users().messages().modify(
-                userId="me",
-                id=message_id,
-                body={"removeLabelIds": ["UNREAD"]},
-            ).execute()
+            await self._gexec(
+                gmail_service.users().messages().modify(
+                    userId="me",
+                    id=message_id,
+                    body={"removeLabelIds": ["UNREAD"]},
+                )
+            )
         except Exception:
             pass
 
@@ -611,6 +737,7 @@ class SmartReplyService:
             "receiving_account": gmail_account.email,
             "analysis": analysis,
             "auto_sent": auto_sent,
+            "auto_send_decision": auto_send_decision,
             "objection_action": objection_action,
             "meeting_interest": meeting_interest,
         }
@@ -652,16 +779,16 @@ class SmartReplyService:
 
         return ""
 
-    def _send_reply(
+    async def _send_reply(
         self,
         gmail_service,
         to_email: str,
         subject: str,
         body: str,
-        thread_id: str = None,
+        thread_id: Optional[str] = None,
         in_reply_to: str = "",
     ):
-        """Send a reply via Gmail API, in the same thread."""
+        """Send a reply via Gmail API, in the same thread (non-blocking)."""
         msg = MIMEText(body)
         msg["to"] = to_email
         msg["subject"] = subject
@@ -675,7 +802,9 @@ class SmartReplyService:
         if thread_id:
             send_body["threadId"] = thread_id
 
-        gmail_service.users().messages().send(userId="me", body=send_body).execute()
+        await self._gexec(
+            gmail_service.users().messages().send(userId="me", body=send_body)
+        )
 
 
 def get_smart_reply_service() -> SmartReplyService:

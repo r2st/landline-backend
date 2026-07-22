@@ -47,6 +47,7 @@ from app.models.suppression import SuppressionEntry
 from app.models.danger_signal import DangerSignalEvent
 from app.models.domain_health import DomainHealth
 from app.models.bounce_record import BounceRecord
+from app.models.complaint_record import ComplaintRecord
 from app.models.ai_email_draft import AiEmailDraft
 from app.models.ab_test import AbTest, AbTestVariant, AbTestAssignment
 from app.models.content_embedding import ContentEmbedding
@@ -132,6 +133,7 @@ __all__ = [
     "DangerSignalEvent",
     "DomainHealth",
     "BounceRecord",
+    "ComplaintRecord",
     "AiEmailDraft",
     "AbTest",
     "AbTestVariant",
