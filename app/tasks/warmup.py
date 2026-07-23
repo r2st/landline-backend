@@ -34,9 +34,11 @@ def advance_warmup_progress():
         async def _body(db):
             result = await warmup.advance_all(db)
             logger.info(
-                "Warm-up advanced: %d plans, %d changed, %d graduated, %d backfilled",
+                "Warm-up advanced: %d plans, %d changed, %d graduated, "
+                "%d backfilled, %d re-credited",
                 result.get("plans", 0), result.get("advanced", 0),
                 result.get("graduated", 0), result.get("backfilled", 0),
+                result.get("repaired", 0),
             )
             return result
 
