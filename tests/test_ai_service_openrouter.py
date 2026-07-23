@@ -9,6 +9,7 @@ these run fully offline.
 
 import json
 
+import httpx
 import pytest
 
 from app.config import Settings
@@ -302,3 +303,147 @@ def test_ai_service_uses_config_default_model_on_openrouter(monkeypatch):
     assert svc.provider == "openrouter"
     assert svc.model == defaults.openrouter_model
     assert svc.model not in _RETIRED_OPENROUTER_MODELS
+
+
+# ---------------------------------------------------------------------------
+# Free-tier 429 fallback
+# ---------------------------------------------------------------------------
+# A ":free" model answers 429 once the account's shared daily quota is spent.
+# With no fallback that silently dropped every AI call back to its degradation
+# path — which is how the outreach engine shipped un-personalised mail-merge copy
+# for weeks while every dashboard read "healthy".
+class _StatusResponse:
+    def __init__(self, status_code, data=None):
+        self.status_code = status_code
+        self._data = data or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"{self.status_code}", request=httpx.Request("POST", "https://x"),
+                response=httpx.Response(self.status_code),
+            )
+
+    def json(self):
+        return self._data
+
+
+class _SequencedClient:
+    """Answers per-model: ``responses`` maps model id → status code."""
+
+    responses: dict = {}
+    models_tried: list = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        model = json["model"]
+        _SequencedClient.models_tried.append(model)
+        status = _SequencedClient.responses.get(model, 200)
+        if status != 200:
+            return _StatusResponse(status)
+        return _StatusResponse(
+            200, {"choices": [{"message": {"content": "composed copy"}}]}
+        )
+
+
+@pytest.fixture
+def _sequenced():
+    """Reset the per-model transport. Install it *after* ``_openrouter_service``,
+    which patches ``AsyncClient`` itself and would otherwise clobber this."""
+    _SequencedClient.responses = {}
+    _SequencedClient.models_tried = []
+    return _SequencedClient
+
+
+def _install_sequenced(monkeypatch):
+    monkeypatch.setattr(ai_module.httpx, "AsyncClient", _SequencedClient)
+
+
+def test_model_chain_is_primary_then_fallbacks(monkeypatch):
+    svc = _openrouter_service(
+        monkeypatch, openrouter_fallback_models="openai/gpt-4o-mini, anthropic/claude-haiku-4.5"
+    )
+    assert svc._model_chain() == [
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "openai/gpt-4o-mini",
+        "anthropic/claude-haiku-4.5",
+    ]
+
+
+def test_model_chain_dedupes_and_ignores_blanks(monkeypatch):
+    svc = _openrouter_service(
+        monkeypatch,
+        openrouter_fallback_models="meta-llama/llama-3.1-8b-instruct:free, ,openai/gpt-4o-mini",
+    )
+    # The primary listed again must not be retried after it already 429'd.
+    assert svc._model_chain() == [
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "openai/gpt-4o-mini",
+    ]
+
+
+def test_model_chain_is_just_the_primary_when_unconfigured(monkeypatch):
+    svc = _openrouter_service(monkeypatch)
+    assert svc._model_chain() == ["meta-llama/llama-3.1-8b-instruct:free"]
+
+
+@pytest.mark.asyncio
+async def test_429_on_free_model_falls_through_to_the_paid_one(monkeypatch, _sequenced):
+    svc = _openrouter_service(monkeypatch, openrouter_fallback_models="openai/gpt-4o-mini")
+    _install_sequenced(monkeypatch)
+    _sequenced.responses = {"meta-llama/llama-3.1-8b-instruct:free": 429}
+
+    out = await svc._chat_completion([{"role": "user", "content": "write a subject"}])
+
+    assert out == "composed copy"
+    assert _sequenced.models_tried == [
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "openai/gpt-4o-mini",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_5xx_also_falls_through(monkeypatch, _sequenced):
+    svc = _openrouter_service(monkeypatch, openrouter_fallback_models="openai/gpt-4o-mini")
+    _install_sequenced(monkeypatch)
+    _sequenced.responses = {"meta-llama/llama-3.1-8b-instruct:free": 503}
+
+    assert await svc._chat_completion([{"role": "user", "content": "x"}]) == "composed copy"
+
+
+@pytest.mark.asyncio
+async def test_4xx_that_is_not_429_raises_without_burning_the_fallback(
+    monkeypatch, _sequenced
+):
+    """A bad request is our bug — retrying a paid model would just cost money."""
+    svc = _openrouter_service(monkeypatch, openrouter_fallback_models="openai/gpt-4o-mini")
+    _install_sequenced(monkeypatch)
+    _sequenced.responses = {"meta-llama/llama-3.1-8b-instruct:free": 400}
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await svc._chat_completion([{"role": "user", "content": "x"}])
+    assert _sequenced.models_tried == ["meta-llama/llama-3.1-8b-instruct:free"]
+
+
+@pytest.mark.asyncio
+async def test_every_model_rate_limited_raises_for_the_callers_degradation_path(
+    monkeypatch, _sequenced
+):
+    svc = _openrouter_service(monkeypatch, openrouter_fallback_models="openai/gpt-4o-mini")
+    _install_sequenced(monkeypatch)
+    _sequenced.responses = {
+        "meta-llama/llama-3.1-8b-instruct:free": 429,
+        "openai/gpt-4o-mini": 429,
+    }
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await svc._chat_completion([{"role": "user", "content": "x"}])
+    assert len(_sequenced.models_tried) == 2

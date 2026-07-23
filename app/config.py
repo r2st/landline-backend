@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     # guardrail bans. Kept separate so email can move to a paid model without
     # dragging scoring/classification along (e.g. openai/gpt-4o-mini).
     openrouter_email_model: str = "openai/gpt-oss-20b:free"
+    # Comma-separated model ids tried, in order, when the primary model answers
+    # 429 (free-tier quota exhausted) or 5xx. Without this a single 429 silently
+    # drops every AI call back to the static mail-merge — which is how the whole
+    # sequence engine ended up sending un-personalised template copy while
+    # looking healthy. Leave empty to disable fallback. Paid ids belong here: the
+    # free tier shares one quota across models, so a second ":free" id buys
+    # nothing when the 429 is the account-level daily cap.
+    openrouter_fallback_models: str = ""
 
     # Apollo.io
     apollo_api_key: str = ""

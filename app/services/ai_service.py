@@ -324,13 +324,6 @@ class AIService:
             openai_messages = [self._to_openai_message(m) for m in messages]
             if system:
                 openai_messages.insert(0, {"role": "system", "content": system})
-            payload = {
-                "model": self.model,
-                "max_tokens": max_tokens,
-                "messages": openai_messages,
-            }
-            if temperature is not None:
-                payload["temperature"] = temperature
             headers = {
                 "Authorization": f"Bearer {self._openrouter_key}",
                 "Content-Type": "application/json",
@@ -338,15 +331,46 @@ class AIService:
                 "HTTP-Referer": "https://apprend.tech",
                 "X-Title": "Landline",
             }
+            last_exc: Exception | None = None
             async with httpx.AsyncClient(timeout=60.0) as http:
-                resp = await http.post(
-                    f"{self._openrouter_base}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            return data["choices"][0]["message"]["content"] or ""
+                # Try the configured model, then each fallback in turn. A 429 on
+                # the free tier is a *quota* answer, not a transport blip, so
+                # retrying the same model is pointless — only a different model
+                # (realistically a paid one) can succeed.
+                for attempt, model in enumerate(self._model_chain()):
+                    payload = {
+                        "model": model,
+                        "max_tokens": max_tokens,
+                        "messages": openai_messages,
+                    }
+                    if temperature is not None:
+                        payload["temperature"] = temperature
+                    try:
+                        resp = await http.post(
+                            f"{self._openrouter_base}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        )
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        status = exc.response.status_code
+                        if status != 429 and status < 500:
+                            raise
+                        last_exc = exc
+                        logger.warning(
+                            "OpenRouter model %s returned %s — %s",
+                            model, status,
+                            "trying fallback" if attempt == 0 else "fallback also failed",
+                        )
+                        continue
+                    if attempt:
+                        logger.info("OpenRouter fell back to model %s", model)
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"] or ""
+            # Every model in the chain was rate-limited / erroring. Raise so the
+            # caller's existing degradation path (static copy, neutral score)
+            # runs, exactly as before this fallback existed.
+            raise last_exc if last_exc else RuntimeError("no OpenRouter model configured")
 
         # Anthropic backend.
         kwargs = {"model": self.model, "max_tokens": max_tokens, "messages": messages}
@@ -356,6 +380,18 @@ class AIService:
             kwargs["system"] = system
         message = await self.client.messages.create(**kwargs)
         return message.content[0].text
+
+    def _model_chain(self) -> list[str]:
+        """The OpenRouter models to try, in order: primary then configured fallbacks.
+
+        De-duplicated (preserving order) so listing the primary among the
+        fallbacks doesn't retry a model that already answered 429.
+        """
+        chain = [self.model]
+        raw = getattr(get_settings(), "openrouter_fallback_models", "") or ""
+        chain.extend(m.strip() for m in raw.split(",") if m.strip())
+        seen: set[str] = set()
+        return [m for m in chain if m and not (m in seen or seen.add(m))]
 
     @staticmethod
     def _to_openai_message(message: dict) -> dict:

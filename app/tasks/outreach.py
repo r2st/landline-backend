@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database_celery import celery_session
@@ -26,6 +26,39 @@ from app.services.send_limiter import get_send_limiter
 from app.services.send_time_optimizer import get_send_time_optimizer
 
 logger = logging.getLogger(__name__)
+
+# How far to push ``next_send_at`` when a send is soft-skipped (warm-up cap hit,
+# suppression, kill switch). These conditions clear on a timescale of hours, but
+# ``process_outreach_queue`` re-dispatches anything whose ``next_send_at`` is due
+# every 5 minutes — and each re-dispatch pays for contact research and an AI
+# composition *before* reaching the gate that declines the send. Without a
+# back-off a single capped mailbox turns into a hot loop that burns the LLM
+# quota (and, once the provider starts answering 429, produces nothing else).
+SOFT_SKIP_BACKOFF = timedelta(hours=1)
+
+
+async def _defer_enrollment(
+    db: AsyncSession, enrollment_id: str, delay: timedelta
+) -> None:
+    """Push an enrollment's ``next_send_at`` out by ``delay``.
+
+    Issued as a Core UPDATE keyed by id rather than through the ORM object: the
+    callers run right after a ``rollback()``, which expires every instance in the
+    session, so touching the loaded enrollment would trigger a lazy refresh.
+    Best-effort — a failure here only costs an earlier retry, so it must never
+    turn a benign soft-skip into a task failure.
+    """
+    try:
+        await db.execute(
+            update(OutreachEnrollment)
+            .where(OutreachEnrollment.id == UUID(enrollment_id))
+            .values(next_send_at=datetime.now(timezone.utc) + delay)
+            .execution_options(skip_org_filter=True)
+        )
+        await db.commit()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not defer enrollment %s: %s", enrollment_id, exc)
+        await db.rollback()
 
 
 def _run_async(coro):
@@ -233,6 +266,37 @@ def send_sequence_step(self, enrollment_id: str):
                 # Recipient validation — a domain with no MX can't receive mail,
                 # so sending guarantees a hard bounce. Validate once (lazily) and
                 # pause the enrollment on a definitively invalid domain.
+                #
+                # Sending capacity is checked HERE, before the recipient
+                # validation / Hunter verification / research / AI-composition
+                # work below, because all of that is wasted when the mailbox that
+                # would carry the send has already hit its warm-up cap. A
+                # follow-up step is pinned to the mailbox that started the thread
+                # (``enrollment.sender_account_id``) and cannot rotate away from
+                # it, so a capped sender means this enrollment is going nowhere
+                # until tomorrow — paying an LLM call every 5 minutes to
+                # rediscover that is what exhausted the provider quota.
+                if enrollment.sender_account_id is not None:
+                    from app.services import warmup as _warmup
+                    from app.services.email_dispatch import get_account as _get_account
+
+                    _pinned = await _get_account(db, enrollment.sender_account_id)
+                    if _pinned is not None:
+                        _ok, _cap_reason = await _warmup.check_send_allowed(db, _pinned)
+                        if not _ok:
+                            await _defer_enrollment(
+                                db, enrollment_id, SOFT_SKIP_BACKOFF
+                            )
+                            logger.info(
+                                "Enrollment %s held: pinned sender %s has no capacity (%s)",
+                                enrollment_id, getattr(_pinned, "email", "?"), _cap_reason,
+                            )
+                            return {
+                                "status": "skipped",
+                                "reason": _cap_reason,
+                                "sender_capped": True,
+                            }
+
                 from app.services.email_validation import validate_contact
 
                 if contact.email_status is None:
@@ -526,7 +590,14 @@ def send_sequence_step(self, enrollment_id: str):
                         "draft_id": str(composed.draft_id) if composed.draft_id else None,
                         "reason": composed.reason,
                     }
-                subject, body = composed.subject, composed.body
+                # ``clean_subject`` again: the static render was cleaned before
+                # composition, but an AI subject is a *different* string that
+                # never passed through it. The model is prompted with the static
+                # copy as an exemplar, so it can echo a leading "{{first_name},"
+                # shape and emit ", who eats it when a part runs out of tol?" for
+                # a contact with no first name. Idempotent on an already-clean
+                # subject, so this only ever removes the artifact.
+                subject, body = clean_subject(composed.subject), composed.body
                 if composed.ai_generated:
                     logger.info(
                         "AI-composed step %d for enrollment %s (research=%s)",
@@ -680,16 +751,33 @@ def send_sequence_step(self, enrollment_id: str):
                 # queue will retry it once the block clears. Recording a bounce
                 # here would falsely dent sender metrics and end the enrollment.
                 if send_result.get("status") in ("skipped", "suppressed", "halted"):
+                    # Read every ORM attribute we still need BEFORE rolling back.
+                    # ``rollback()`` expires all instances in the session, and an
+                    # expired attribute read on an AsyncSession attempts sync IO
+                    # to refresh itself, which raises MissingGreenlet. That turned
+                    # this benign soft-skip into a task crash → Celery retry →
+                    # re-dispatch, so a single warm-up cap wedged the whole queue.
+                    skip_step = step.step_number
+                    skip_status = send_result.get("status")
+                    skip_reason = send_result.get("reason")
                     await db.rollback()
+
+                    # Back the enrollment off so the 5-minute queue sweep stops
+                    # re-dispatching a send that is going to be declined again.
+                    await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+
                     logger.info(
-                        "Step %d for enrollment %s not sent (%s): %s",
-                        step.step_number, enrollment_id,
-                        send_result.get("status"), send_result.get("reason"),
+                        "Step %d for enrollment %s not sent (%s): %s — retrying after %s",
+                        skip_step, enrollment_id, skip_status, skip_reason,
+                        SOFT_SKIP_BACKOFF,
                     )
                     return {
-                        "status": send_result.get("status"),
-                        "reason": send_result.get("reason"),
-                        "step": step.step_number,
+                        "status": skip_status,
+                        "reason": skip_reason,
+                        "step": skip_step,
+                        "deferred_until": (
+                            datetime.now(timezone.utc) + SOFT_SKIP_BACKOFF
+                        ).isoformat(),
                     }
 
                 # Record event. ``tracked`` records whether this send carried an

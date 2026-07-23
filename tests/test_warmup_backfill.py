@@ -6,6 +6,7 @@ creates a plan for every connected sender that lacks one, idempotently.
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import func, select
@@ -85,3 +86,91 @@ async def test_advance_all_backfills_then_advances(db_session: AsyncSession):
     result = await warmup.advance_all(db_session)
     assert result["backfilled"] == 1
     assert result["plans"] == 1
+
+
+# --- Crediting existing send history -----------------------------------------
+#
+# The first backfill started every sender at day 1. That is right for a new
+# mailbox and wrong for one that had been sending for weeks: it re-throttled an
+# already-warm sender from its real volume down to 5/day, and outreach
+# throughput collapsed overnight. ``credited_start_date`` back-dates the ramp for
+# a mailbox with real history, capped so nobody graduates on a date field alone.
+
+
+async def test_never_used_account_still_starts_at_day_one(db_session: AsyncSession):
+    """No sends means genuinely new — the ramp must start from scratch."""
+    acct = await _gmail(db_session, "brandnew@apprend.tech")
+    acct.connected_at = datetime.now(timezone.utc) - timedelta(days=90)
+    acct.last_used_at = None
+    await db_session.commit()
+
+    await warmup.backfill_warmup_plans(db_session)
+    plan = await warmup.get_plan(db_session, acct.id, "gmail")
+    assert plan.current_day == 1
+    assert plan.daily_limit == 5
+
+
+async def test_account_with_history_is_credited_not_reset_to_five_a_day(
+    db_session: AsyncSession,
+):
+    """The regression: a mailbox sending for a month must not drop to 5/day."""
+    acct = await _gmail(db_session, "veteran@apprend.tech")
+    acct.connected_at = datetime.now(timezone.utc) - timedelta(days=28)
+    acct.last_used_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    await db_session.commit()
+
+    await warmup.backfill_warmup_plans(db_session)
+    plan = await warmup.get_plan(db_session, acct.id, "gmail")
+
+    assert plan.current_day == warmup.BACKFILL_MAX_CREDIT_DAY
+    assert plan.daily_limit == 20  # top of the day 8–14 band, not 5
+    assert plan.status == "warming"
+
+
+async def test_credit_is_capped_so_an_old_account_cannot_graduate_instantly(
+    db_session: AsyncSession,
+):
+    """A two-year-old mailbox still climbs the last bands under observation."""
+    acct = await _gmail(db_session, "ancient@apprend.tech")
+    acct.connected_at = datetime.now(timezone.utc) - timedelta(days=700)
+    acct.last_used_at = datetime.now(timezone.utc)
+    await db_session.commit()
+
+    await warmup.backfill_warmup_plans(db_session)
+    plan = await warmup.get_plan(db_session, acct.id, "gmail")
+
+    assert plan.current_day == warmup.BACKFILL_MAX_CREDIT_DAY
+    assert plan.status != "graduated"
+
+
+async def test_partial_history_is_credited_proportionally(db_session: AsyncSession):
+    """Under the cap, credit tracks actual age rather than snapping to it."""
+    acct = await _gmail(db_session, "week-old@apprend.tech")
+    acct.connected_at = datetime.now(timezone.utc) - timedelta(days=5)
+    acct.last_used_at = datetime.now(timezone.utc)
+    await db_session.commit()
+
+    await warmup.backfill_warmup_plans(db_session)
+    plan = await warmup.get_plan(db_session, acct.id, "gmail")
+
+    assert plan.current_day == 6      # day 1 == connected_at, so 5 days later is day 6
+    assert plan.daily_limit == 10     # day 4–7 band
+
+
+async def test_credited_plan_keeps_advancing_from_its_credited_day(
+    db_session: AsyncSession,
+):
+    """The back-dated start_date must stay consistent with the daily advance."""
+    acct = await _gmail(db_session, "advancing@apprend.tech")
+    acct.connected_at = datetime.now(timezone.utc) - timedelta(days=20)
+    acct.last_used_at = datetime.now(timezone.utc)
+    await db_session.commit()
+
+    await warmup.backfill_warmup_plans(db_session)
+    plan = await warmup.get_plan(db_session, acct.id, "gmail")
+    assert plan.current_day == warmup.BACKFILL_MAX_CREDIT_DAY
+
+    # Roll the clock forward a day: the plan steps to 15, not back to 2.
+    warmup.recompute(plan, today=datetime.now(timezone.utc).date() + timedelta(days=1))
+    assert plan.current_day == warmup.BACKFILL_MAX_CREDIT_DAY + 1
+    assert plan.daily_limit == 35  # day 15–21 band

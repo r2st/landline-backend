@@ -23,7 +23,7 @@ exists it is authoritative for that account.
 """
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -47,6 +47,13 @@ _RAMP: tuple[tuple[int, int], ...] = (
 
 # Day at which an account is considered fully warmed.
 GRADUATION_DAY = 31
+
+# Ceiling on the ramp day a *pre-existing* sender may be credited with when its
+# plan is backfilled (see :func:`credited_start_date`). Day 14 is the top of the
+# 20/day band: enough that a mailbox with real history isn't throttled to a
+# brand-new 5/day, low enough that it still climbs the last two bands under
+# observation rather than jumping straight to full volume.
+BACKFILL_MAX_CREDIT_DAY = 14
 
 
 def org_normal_limit() -> int:
@@ -231,6 +238,37 @@ def recompute(plan: SenderWarmupPlan, today: Optional[date] = None) -> bool:
     return changed
 
 
+def credited_start_date(account, today: Optional[date] = None) -> date:
+    """The ramp start date to give a sender whose plan is being backfilled.
+
+    A mailbox that has never sent (``last_used_at`` unset) is genuinely new and
+    starts at day 1 — today.
+
+    A mailbox that *has* sent is not new, and starting it at day 1 throttles an
+    already-warm sender to 5/day. That is what happened when plans were first
+    backfilled onto senders that had been running for weeks: throughput
+    collapsed overnight. So credit its existing history by back-dating the ramp
+    to ``connected_at`` — but clamp the credit to
+    :data:`BACKFILL_MAX_CREDIT_DAY` so an old account resumes partway up the
+    ramp under observation instead of graduating instantly on a date field.
+    """
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+
+    last_used = getattr(account, "last_used_at", None)
+    if last_used is None:
+        return today
+
+    connected = getattr(account, "connected_at", None)
+    if connected is None:
+        return today
+    if isinstance(connected, datetime):
+        connected = connected.date()
+
+    credited_day = min(day_for(connected, today), BACKFILL_MAX_CREDIT_DAY)
+    return today - timedelta(days=credited_day - 1)
+
+
 async def backfill_warmup_plans(db: AsyncSession) -> dict:
     """Create a warm-up plan for every connected sender that lacks one.
 
@@ -241,9 +279,11 @@ async def backfill_warmup_plans(db: AsyncSession) -> dict:
     idempotently: it is safe to run on every warm-up beat and only ever adds the
     plans that are missing.
 
-    Existing accounts start their ramp *today* (day 1), not back-dated to when
-    they were connected: back-dating an already-active sender to a graduated day
-    would hand it full volume immediately, defeating the point of a ramp.
+    An account that has never sent starts its ramp *today* (day 1). One that has
+    already been sending is credited for that history via
+    :func:`credited_start_date` — capped partway up the ramp, so it is neither
+    throttled back to a brand-new 5/day nor handed full volume on the strength of
+    a date field alone.
     """
     from app.models.gmail_account import GmailAccount
     from app.models.smtp_account import SmtpAccount
@@ -262,6 +302,7 @@ async def backfill_warmup_plans(db: AsyncSession) -> dict:
                 account_id=account.id,
                 account_type="gmail",
                 account_email=account.email,
+                start=credited_start_date(account),
                 org_id=getattr(account, "org_id", None),
             )
             created += 1
@@ -278,6 +319,7 @@ async def backfill_warmup_plans(db: AsyncSession) -> dict:
                 account_id=account.id,
                 account_type="smtp",
                 account_email=account.email,
+                start=credited_start_date(account),
                 org_id=getattr(account, "org_id", None),
             )
             created += 1
