@@ -333,17 +333,93 @@ async def backfill_warmup_plans(db: AsyncSession) -> dict:
     }
 
 
+async def repair_uncredited_plans(db: AsyncSession) -> dict:
+    """Re-credit plans that were backfilled *before* history-crediting existed.
+
+    :func:`backfill_warmup_plans` only ever creates plans that are **missing**,
+    so it cannot repair a plan that already exists with a wrong start date. That
+    left a real hole: plans backfilled by the earlier code started every sender
+    at day 1 (5/day) regardless of history, and because the row then existed the
+    later :func:`credited_start_date` fix never touched it. Six mailboxes that
+    had been sending for weeks were pinned to 5/day each, collapsing daily
+    capacity to 30 — the throughput floor behind "we send almost nothing".
+
+    This closes that hole by re-deriving the credited start date for every
+    connected sender that has real sending history and moving its plan's
+    ``start_date`` back to match.
+
+    Deliberately conservative — it only ever moves a plan **forward on the
+    ramp** (``start_date`` earlier). It never pushes a sender backwards, never
+    touches a ``paused`` plan, and never credits a mailbox that has never sent.
+    So it is safe to run on every warm-up beat and is idempotent: once a plan
+    holds its credited date, later runs are no-ops.
+    """
+    from app.models.gmail_account import GmailAccount
+    from app.models.smtp_account import SmtpAccount
+
+    repaired = 0
+
+    async def _repair(accounts, account_type: str) -> None:
+        nonlocal repaired
+        for account in accounts:
+            # Never credit a mailbox with no send history — it really is new.
+            if getattr(account, "last_used_at", None) is None:
+                continue
+            plan = await get_plan(db, account.id, account_type)
+            if plan is None or plan.status == "paused":
+                continue
+
+            credited = credited_start_date(account)
+            start = plan.start_date
+            if isinstance(start, datetime):
+                start = start.date()
+            # Only ever move the ramp *earlier* (i.e. further along).
+            if start is None or credited >= start:
+                continue
+
+            plan.start_date = credited
+            recompute(plan)
+            repaired += 1
+            logger.info(
+                "Re-credited warm-up plan for %s:%s — start %s → %s "
+                "(now day %d, limit %d)",
+                account_type, plan.account_email or account.id,
+                start, credited, plan.current_day, plan.daily_limit,
+            )
+
+    gmail_accounts = (
+        await db.execute(
+            select(GmailAccount).where(GmailAccount.status == "connected")
+        )
+    ).scalars().all()
+    await _repair(gmail_accounts, "gmail")
+
+    smtp_accounts = (
+        await db.execute(
+            select(SmtpAccount).where(SmtpAccount.status == "connected")
+        )
+    ).scalars().all()
+    await _repair(smtp_accounts, "smtp")
+
+    if repaired:
+        await db.commit()
+    return {"plans_repaired": repaired}
+
+
 async def advance_all(db: AsyncSession) -> dict:
     """Daily task body: step every plan in the current org forward one day.
 
     Backfills any missing plans first, so a sender connected before the
     ensure-plan wiring existed still gets a ramp (and the plans table stops being
-    empty) rather than silently sending at full volume.
+    empty) rather than silently sending at full volume. Then re-credits any plan
+    that an earlier backfill started at day 1 despite the mailbox having real
+    sending history (see :func:`repair_uncredited_plans`).
 
-    Returns a small summary ({plans, advanced, graduated, backfilled}) for the
-    task log.
+    Returns a small summary ({plans, advanced, graduated, backfilled, repaired})
+    for the task log.
     """
     backfill = await backfill_warmup_plans(db)
+    repair = await repair_uncredited_plans(db)
 
     plans = (await db.execute(select(SenderWarmupPlan))).scalars().all()
     advanced = 0
@@ -359,4 +435,5 @@ async def advance_all(db: AsyncSession) -> dict:
         "advanced": advanced,
         "graduated": graduated,
         "backfilled": backfill["plans_created"],
+        "repaired": repair["plans_repaired"],
     }

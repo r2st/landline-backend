@@ -96,9 +96,92 @@ def check_mx(domain: str) -> str:
     return status
 
 
+# Addresses that are syntactically fine and whose domain publishes MX — so both
+# gates above wave them through — but that are never a human prospect. These are
+# scraper residue: a website crawl picks up the Sentry error-reporting address
+# embedded in a Wix site's JavaScript, or an asset filename that happens to look
+# like an address. We really did enrol and email
+# ``460ff4620fa44cba8df530afde949785@sentry.wixpress.com``.
+#
+# Domains whose mail is machine-only. Matched on the domain or any parent, so
+# ``sentry.wixpress.com`` is caught by ``wixpress.com``.
+_NON_PROSPECT_DOMAINS = frozenset({
+    "sentry.io",
+    "wixpress.com",
+    "sentry.wixpress.com",
+})
+
+# Web-asset extensions. A "domain" ending in one of these came from a filename
+# (``logo@2x.png`` — a retina asset), not a mail host.
+_ASSET_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
+    ".css", ".js", ".woff", ".woff2", ".ttf", ".pdf",
+)
+
+# A local part that is a bare 32-char hex blob is a machine identifier (a Sentry
+# public key, a tracking id), never a person's mailbox.
+_HEX_BLOB_LOCALPART_RE = re.compile(r"^[0-9a-f]{32,}$", re.IGNORECASE)
+
+# Mailboxes that exist only to originate mail; sending to them is guaranteed
+# waste and often lands in an abuse-monitored trap.
+_NO_REPLY_LOCALPART_RE = re.compile(
+    r"^(no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|bounce[sd]?|"
+    r"mailer[-_.]?daemon|postmaster|abuse)$",
+    re.IGNORECASE,
+)
+
+
+def is_non_prospect_address(email: Optional[str]) -> tuple[bool, str]:
+    """Whether ``email`` is structurally incapable of being a real prospect.
+
+    This is a *shape* check, not a deliverability check: every address it
+    rejects would sail through both the syntax and MX gates, because the domain
+    is genuinely real and genuinely accepts mail — it is just never read by a
+    person who could reply. Sending to these spends sender reputation for a
+    guaranteed zero and risks tripping an abuse mailbox.
+
+    Returns ``(is_junk, reason)``; ``reason`` is "" when the address is fine.
+    Conservative by design — it only rejects patterns that cannot be a human
+    mailbox, so a role address like ``info@`` (a weak prospect, but a real
+    inbox a person may read) is deliberately **not** rejected here.
+    """
+    if not email:
+        return True, "empty address"
+    addr = email.strip().lower()
+    if "@" not in addr:
+        return True, "not an address"
+
+    local, _, domain = addr.rpartition("@")
+
+    if domain.endswith(_ASSET_SUFFIXES):
+        return True, f"asset filename, not a mail domain ({domain})"
+
+    # Match the domain or any parent domain.
+    labels = domain.split(".")
+    for i in range(len(labels) - 1):
+        if ".".join(labels[i:]) in _NON_PROSPECT_DOMAINS:
+            return True, f"machine-only domain ({domain})"
+
+    if _HEX_BLOB_LOCALPART_RE.match(local):
+        return True, "machine-generated local part"
+
+    if _NO_REPLY_LOCALPART_RE.match(local):
+        return True, f"unattended mailbox ({local}@)"
+
+    return False, ""
+
+
 def validate_email(email: Optional[str]) -> str:
-    """Full recipient validation: syntax then MX. Returns the status string."""
+    """Full recipient validation: syntax, junk shape, then MX.
+
+    The junk-shape gate runs before the (network) MX lookup: it is free, and an
+    address it rejects is undeliverable-in-practice regardless of what DNS says.
+    """
     if not is_valid_syntax(email):
+        return "invalid"
+    is_junk, reason = is_non_prospect_address(email)
+    if is_junk:
+        logger.info("Rejecting non-prospect address %s: %s", email, reason)
         return "invalid"
     return check_mx(domain_of(email))
 

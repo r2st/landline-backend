@@ -20,6 +20,9 @@ from app.services.ai_email_generator import resolve_demo_link, DEFAULT_DEMO_LINK
 
 # Placeholder values used when previewing a template with no real contact.
 SAMPLE_CONTEXT = {
+    # Mirrors build_merge_context so ``subject_context`` treats the sample as a
+    # named contact and previews keep showing the name.
+    "_first_name_raw": "Jordan",
     "first_name": "Jordan",
     "last_name": "Avery",
     "full_name": "Jordan Avery",
@@ -57,6 +60,10 @@ def build_merge_context(contact, company) -> dict:
     # field defaults to a friendly generic; every other field keeps its real (or
     # empty) value.
     return {
+        # The raw value, kept for callers that need to know whether the greeting
+        # fallback was applied (see ``subject_context``). Underscore-prefixed so
+        # it can never collide with a real merge field.
+        "_first_name_raw": raw_first,
         "first_name": raw_first or "there",
         "last_name": last_name,
         "full_name": full_name,
@@ -69,6 +76,24 @@ def build_merge_context(contact, company) -> dict:
         "title": title,
         "demo_link": demo_link,
     }
+
+
+def subject_context(context: dict) -> dict:
+    """A merge context suited to rendering a **subject line**.
+
+    The ``"there"`` greeting fallback is right for a body — ``"Hi there,"`` reads
+    like a human wrote it. It is wrong for a subject: templates lead with the
+    name (``"{{first_name}}, who eats it when a part runs out of tol?"``), and
+    the fallback turns that into ``"there, who eats it when a part runs out of
+    tol?"``, which reads like nobody proof-read it.
+
+    So for subjects the field renders **empty** and :func:`clean_subject` strips
+    the punctuation it leaves behind, giving the clean ``"who eats it when a
+    part runs out of tol?"``. A contact with a real first name is unaffected.
+    """
+    if not context.get("_first_name_raw"):
+        return {**context, "first_name": ""}
+    return context
 
 
 def render(template_str: str, context: dict) -> str:
@@ -105,3 +130,50 @@ def clean_subject(subject: str) -> str:
     cleaned = _LEADING_MERGE_ARTIFACT_RE.sub("", subject)
     cleaned = _COLLAPSE_WS_RE.sub(" ", cleaned)
     return cleaned.strip()
+
+
+# A greeting left dangling by an empty {{first_name}}: "Hi ,", "Hello  ,",
+# "Hey ,"  — optionally wrapped in the tags the HTML body uses ("<p>Hi ,</p>").
+#
+# Anchored to the start of the body, a line, or an HTML tag boundary, because a
+# greeting only *is* a greeting in that position. Matching the bare word
+# anywhere would rewrite ordinary prose — "We said hi, then left." must survive
+# untouched. The greeting word is captured so its casing and choice are kept.
+_EMPTY_GREETING_RE = re.compile(
+    r"(^|>|\n|\r)([ \t]*)(Hi|Hello|Hey|Dear)[ \t]*,",
+    re.IGNORECASE,
+)
+
+# " ," / " ;" left mid-sentence by an emptied merge field.
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"[ \t]+([,;:])")
+
+
+def clean_body(body: str, fallback_name: str = "there") -> str:
+    """Repair merge artifacts left in a rendered email **body**.
+
+    :func:`clean_subject` only ever fixed subject lines, so a body whose
+    ``{{first_name}}`` rendered empty still went out opening with a literal
+    ``"Hi ,"`` — which is the single most obvious "this is broken automated
+    mail" tell a cold email can carry, and it led every first-touch send to a
+    contact with no first name on record.
+
+    ``build_merge_context`` now defaults the greeting field to ``"there"``, so
+    this is the belt-and-braces layer: it repairs bodies rendered from a context
+    built elsewhere (an older cached draft, a caller that assembles its own
+    context, a template with a differently-named field) rather than trusting
+    every producer to have got the fallback right.
+
+    Two safe, targeted repairs — nothing that could mangle legitimate copy:
+
+    * ``"Hi ,"`` → ``"Hi there,"`` (greeting word and casing preserved)
+    * a space stranded before a comma/semicolon is closed up
+
+    Idempotent: a body with no artifact comes back unchanged.
+    """
+    if not body:
+        return body or ""
+    cleaned = _EMPTY_GREETING_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)} {fallback_name},", body
+    )
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    return cleaned

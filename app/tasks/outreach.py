@@ -17,7 +17,13 @@ from app.models.follow_up import FollowUp
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.services.consent import check_consent
-from app.services.email_compose import render, build_merge_context, clean_subject
+from app.services.email_compose import (
+    render,
+    build_merge_context,
+    clean_body,
+    clean_subject,
+    subject_context,
+)
 from app.services.email_dispatch import send_outreach_email
 from app.services.sequence_optimizer import get_sequence_optimizer, record_decision
 from app.tasks.celery_app import celery_app
@@ -532,12 +538,14 @@ def send_sequence_step(self, enrollment_id: str):
                 subject = clean_subject(
                     render(
                         apply_booking_placeholder(resolution.subject_template, booking_url),
-                        template_context,
+                        subject_context(template_context),
                     )
                 )
-                body = render(
-                    apply_booking_placeholder(resolution.body_template, booking_url),
-                    template_context,
+                body = clean_body(
+                    render(
+                        apply_booking_placeholder(resolution.body_template, booking_url),
+                        template_context,
+                    )
                 )
 
                 # --- Spintax (manual copy variation) ---
@@ -597,7 +605,10 @@ def send_sequence_step(self, enrollment_id: str):
                 # shape and emit ", who eats it when a part runs out of tol?" for
                 # a contact with no first name. Idempotent on an already-clean
                 # subject, so this only ever removes the artifact.
-                subject, body = clean_subject(composed.subject), composed.body
+                # ``clean_body`` for the same reason: an AI body is a different
+                # string too, and echoing the exemplar's "Hi {{first_name}},"
+                # shape for a nameless contact yields a literal "Hi ,".
+                subject, body = clean_subject(composed.subject), clean_body(composed.body)
                 if composed.ai_generated:
                     logger.info(
                         "AI-composed step %d for enrollment %s (research=%s)",
