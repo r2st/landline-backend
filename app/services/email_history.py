@@ -604,18 +604,47 @@ class EmailHistoryService:
 
         # Map account id -> email so each message carries its owning address.
         account_email_map = await self._load_account_email_map(db)
+        # Reverse index: email -> the connected Gmail account ids using it. Lets
+        # us scope by the authoritative account-id FK, not just the message's
+        # header address. This matters because a received reply's ``to_email``
+        # is the "To" header, which for a connected mailbox is frequently *not*
+        # the account's own address — shared aliases / distribution lists (a
+        # prospect replies to ``team@`` that lands in the connected ``support@``
+        # box), multiple recipients, or plus-addressing all diverge. Those
+        # replies still carry the correct ``gmail_account_id``, so matching on
+        # the FK keeps them in the inbox where address-only matching dropped them.
+        ids_by_email: dict[str, list] = {}
+        for acc_id, acc_email in account_email_map.items():
+            if acc_email:
+                ids_by_email.setdefault(acc_email.lower(), []).append(acc_id)
+
+        def _account_ids_for(addrs) -> list:
+            ids: list = []
+            for a in addrs:
+                ids.extend(ids_by_email.get(a, ()))
+            return ids
 
         # Build sent messages query
         sends_query = select(EmailSend).where(EmailSend.status != "skipped")
         replies_query = select(EmailReply)
 
-        # Scope to user's accounts when authenticated
+        # Scope to user's accounts when authenticated. A message belongs to the
+        # user if it carries one of their account-id FKs OR its header address is
+        # one of theirs (the FK covers alias/multi-recipient Gmail replies; the
+        # address covers SMTP mail, which carries no FK).
         if user_gmail_emails is not None and user_gmail_emails:
+            user_account_ids = _account_ids_for(user_gmail_emails)
             sends_query = sends_query.where(
-                func.lower(EmailSend.from_email).in_(user_gmail_emails)
+                or_(
+                    EmailSend.sender_account_id.in_(user_account_ids),
+                    func.lower(EmailSend.from_email).in_(user_gmail_emails),
+                )
             )
             replies_query = replies_query.where(
-                func.lower(EmailReply.to_email).in_(user_gmail_emails)
+                or_(
+                    EmailReply.gmail_account_id.in_(user_account_ids),
+                    func.lower(EmailReply.to_email).in_(user_gmail_emails),
+                )
             )
 
         # Scope to a single email account when requested. Sends are matched by
@@ -628,18 +657,27 @@ class EmailHistoryService:
                 EmailReply.gmail_account_id == gmail_account_id
             )
 
-        # Scope to a single email account by address. This is the SMTP-friendly
-        # filter: SMTP sends/replies carry no account-id FK, so we resolve the
-        # owning account from the address instead — a sent message belongs to
-        # the address it was sent FROM, a received message to the address it was
-        # sent TO. Mirrors the id-or-address matching in ``danger_monitor``.
+        # Scope to a single email account by address. Matches on the connected
+        # account's id FK *or* the header address, for the same reason as the
+        # user scope above: Gmail replies to a shared alias / with extra
+        # recipients keep the right ``gmail_account_id`` but a divergent
+        # ``to_email``, so an address-only filter silently hid them the moment a
+        # user selected that account. SMTP sends/replies carry no id FK, so the
+        # address arm still covers them. Mirrors ``danger_monitor``.
         if account_email:
             addr = account_email.lower()
+            addr_account_ids = _account_ids_for([addr])
             sends_query = sends_query.where(
-                func.lower(EmailSend.from_email) == addr
+                or_(
+                    EmailSend.sender_account_id.in_(addr_account_ids),
+                    func.lower(EmailSend.from_email) == addr,
+                )
             )
             replies_query = replies_query.where(
-                func.lower(EmailReply.to_email) == addr
+                or_(
+                    EmailReply.gmail_account_id.in_(addr_account_ids),
+                    func.lower(EmailReply.to_email) == addr,
+                )
             )
 
         if filter_type == "sent":

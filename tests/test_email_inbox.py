@@ -16,6 +16,9 @@ from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
+from app.models.user import User, UserRole
+from app.org_context import APPREND_ORG_ID
+from app.security import create_access_token, hash_password
 from app.services import crypto, google_oauth
 from app.services.email_history import EmailHistoryService
 
@@ -867,6 +870,164 @@ class TestInboxAccountEmailFilter:
 
         resp = await client.get(
             "/api/v1/emails/inbox?account_email=nobody@nowhere.com"
+        )
+        assert resp.status_code == 404
+
+    async def test_filter_by_email_matches_alias_reply_via_account_fk(self, db_session):
+        """Regression: a Gmail reply that landed in the connected account but
+        whose ``to_email`` is a *different* address (a shared alias / list, or
+        one of several recipients) must still surface when filtering by that
+        account's own address. The reply carries the right ``gmail_account_id``;
+        an address-only ``to_email`` match silently dropped it, which is the
+        "select an account and the inbox breaks" bug users hit."""
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        # Reply delivered to the support mailbox but addressed to a shared alias.
+        await _make_email_reply(
+            db_session,
+            from_email="prospect@lead.com",
+            to_email="team@company.com",  # alias, NOT the account's own address
+            gmail_thread_id="alias-recv",
+            gmail_account_id=support.id,
+        )
+        # A plain reply addressed straight to the account, for contrast.
+        await _make_email_reply(
+            db_session,
+            from_email="prospect2@lead.com",
+            to_email="support@company.com",
+            gmail_thread_id="direct-recv",
+            gmail_account_id=support.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="all", account_email="support@company.com"
+        )
+        thread_ids = {t["gmail_thread_id"] for t in result["threads"]}
+        # Both belong to the support account — the alias one must not vanish.
+        assert thread_ids == {"alias-recv", "direct-recv"}
+
+    async def test_filter_by_email_matches_alias_send_via_account_fk(self, db_session):
+        """Symmetric case for sends: a send tied to the account by
+        ``sender_account_id`` but with a divergent ``from_email`` still counts."""
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        await _make_email_send(
+            db_session,
+            from_email="noreply@company.com",  # envelope/alias, not the account addr
+            to_email="lead@x.com",
+            gmail_thread_id="alias-sent",
+            gmail_message_id="as-1",
+            sender_account_id=support.id,
+        )
+        await db_session.commit()
+
+        service = EmailHistoryService()
+        result = await service.get_inbox(
+            db_session, filter_type="all", account_email="support@company.com"
+        )
+        assert {t["gmail_thread_id"] for t in result["threads"]} == {"alias-sent"}
+
+
+# ---------------------------------------------------------------------------
+# Scoped authenticated-user account filter (the real production path — every
+# other endpoint test above runs as the unscoped see-all admin)
+# ---------------------------------------------------------------------------
+
+class TestInboxAccountFilterScopedUser:
+    """End-to-end coverage for a real authenticated, non-admin user filtering
+    their own inbox by connected account. This is the path users actually hit;
+    it exercises ``_sender_emails_for_user`` scoping + the per-account filter
+    together, which the see-all admin tests never touch."""
+
+    async def _seed_user_with_two_accounts(self, db_session):
+        user = User(
+            id=uuid.uuid4(),
+            email="rep@company.com",
+            name="Rep",
+            role=UserRole.AGENT.value,
+            password_hash=hash_password("pw12345678"),
+            is_active=True,
+            org_id=APPREND_ORG_ID,
+        )
+        db_session.add(user)
+        await db_session.flush()
+
+        support = await _make_gmail_account(db_session, "support@company.com", active=True)
+        sales = await _make_gmail_account(db_session, "sales@company.com")
+        support.user_id = user.id
+        sales.user_id = user.id
+        return user, support, sales
+
+    def _headers(self, user):
+        return {"Authorization": f"Bearer {create_access_token(user.id, user.role)}"}
+
+    async def test_scoped_user_filters_inbox_to_one_account(self, client, db_session):
+        user, support, sales = await self._seed_user_with_two_accounts(db_session)
+        await _make_email_send(
+            db_session, from_email="support@company.com", to_email="a@x.com",
+            gmail_thread_id="sup-sent", gmail_message_id="s1", sender_account_id=support.id,
+        )
+        await _make_email_reply(
+            db_session, from_email="a@x.com", to_email="support@company.com",
+            gmail_thread_id="sup-recv", gmail_account_id=support.id,
+        )
+        await _make_email_send(
+            db_session, from_email="sales@company.com", to_email="b@y.com",
+            gmail_thread_id="sales-sent", gmail_message_id="s2", sender_account_id=sales.id,
+        )
+        await db_session.commit()
+        headers = self._headers(user)
+
+        # Unfiltered: all three threads across both connected accounts.
+        resp = await client.get("/api/v1/emails/inbox", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert {t["gmail_thread_id"] for t in resp.json()["threads"]} == {
+            "sup-sent", "sup-recv", "sales-sent"
+        }
+
+        # Filtered to support: only its two threads.
+        resp = await client.get(
+            "/api/v1/emails/inbox?account_email=support@company.com", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        assert {t["gmail_thread_id"] for t in resp.json()["threads"]} == {
+            "sup-sent", "sup-recv"
+        }
+
+    async def test_scoped_user_alias_reply_survives_account_filter(self, client, db_session):
+        """The production bug, end-to-end: a scoped user selects an account and a
+        reply that landed in it via a shared alias must still show — both in the
+        unfiltered inbox and under the account filter."""
+        user, support, sales = await self._seed_user_with_two_accounts(db_session)
+        await _make_email_reply(
+            db_session, from_email="prospect@lead.com", to_email="team@company.com",
+            gmail_thread_id="alias-recv", gmail_account_id=support.id,
+        )
+        await db_session.commit()
+        headers = self._headers(user)
+
+        # Present in the unfiltered scoped inbox (scoping is now FK-aware too).
+        resp = await client.get("/api/v1/emails/inbox", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert "alias-recv" in {t["gmail_thread_id"] for t in resp.json()["threads"]}
+
+        # And still present once the user narrows to that account.
+        resp = await client.get(
+            "/api/v1/emails/inbox?account_email=support@company.com", headers=headers
+        )
+        assert resp.status_code == 200, resp.text
+        assert {t["gmail_thread_id"] for t in resp.json()["threads"]} == {"alias-recv"}
+
+    async def test_scoped_user_cannot_filter_by_another_users_account(self, client, db_session):
+        """A user asking for an address they don't own gets 404, not a peek."""
+        user, _support, _sales = await self._seed_user_with_two_accounts(db_session)
+        other = await _make_gmail_account(db_session, "stranger@rival.com", active=True)
+        other.user_id = uuid.uuid4()  # belongs to someone else
+        await db_session.commit()
+
+        resp = await client.get(
+            "/api/v1/emails/inbox?account_email=stranger@rival.com",
+            headers=self._headers(user),
         )
         assert resp.status_code == 404
 
