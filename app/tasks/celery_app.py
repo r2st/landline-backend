@@ -61,6 +61,7 @@ celery_app.conf.update(
         "app.tasks.deal_agent.*": {"queue": "enrichment"},
         "app.tasks.social_listening.*": {"queue": "enrichment"},
         "app.tasks.meeting_booking.*": {"queue": "enrichment"},
+        "app.tasks.inbox.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -396,6 +397,13 @@ celery_app.conf.update(
             "task": "app.tasks.meeting_booking.send_meeting_reminders",
             "schedule": 1800.0,  # every 30 minutes
         },
+        # Inbox hygiene: null out elapsed thread snoozes so the column stays
+        # clean. Resurfacing is already automatic (the query treats an elapsed
+        # snooze as not-snoozed); this just tidies. Every 5 minutes.
+        "clear-expired-snoozes": {
+            "task": "app.tasks.inbox.clear_expired_snoozes",
+            "schedule": 300.0,  # every 5 minutes
+        },
     },
 )
 
@@ -444,3 +452,4 @@ import app.tasks.client_success  # noqa: F401
 # schedule above. Without this force-import the task is never registered and the
 # beat-dispatched summary silently fails with an unregistered-task error.
 import app.tasks.reporting  # noqa: F401
+import app.tasks.inbox  # noqa: F401

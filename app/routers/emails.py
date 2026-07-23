@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,15 +14,23 @@ from app.dependencies import UserScope, get_scope
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.schemas.email_history import (
+    BulkThreadSnoozeRequest,
     EmailInboxResponse,
     EmailLeadResponse,
     EmailReplyRequest,
     EmailReplyResponse,
     EmailThreadRead,
+    InboxAnalyticsResponse,
+    LabelCreateRequest,
+    LabelRead,
+    LabelUpdateRequest,
     SyncStatusResponse,
     ThreadArchiveResponse,
     ThreadIdsRequest,
+    ThreadLabelToggleResponse,
     ThreadReadResponse,
+    ThreadSnoozeRequest,
+    ThreadSnoozeResponse,
 )
 from app.services.email_history import EmailHistoryService
 
@@ -83,6 +91,9 @@ async def get_inbox(
             "foreign-key link on the message rows and so are matched by address."
         ),
     ),
+    label_id: Optional[uuid.UUID] = Query(
+        None, description="Filter to threads the caller has tagged with this label"
+    ),
     db: AsyncSession = Depends(get_db),
     scope: UserScope = Depends(get_scope),
 ):
@@ -102,7 +113,8 @@ async def get_inbox(
     and group mail by the email address it belongs to.
     """
     valid_filters = (
-        "all", "sent", "received", "opened", "needs_reply", "priority", "archived"
+        "all", "sent", "received", "opened", "needs_reply", "priority",
+        "archived", "snoozed",
     )
     if filter not in valid_filters:
         raise HTTPException(
@@ -163,11 +175,32 @@ async def get_inbox(
         user_gmail_emails=user_gmail_emails, gmail_account_id=gmail_account_id,
         account_email=normalized_account_email,
         date_from=date_from, date_to=date_to,
-        # Archive state is per-user; owner_id is the acting human (None for the
-        # legacy/unscoped admin path, which then sees every thread unarchived).
+        # Archive/snooze/label state is per-user; owner_id is the acting human
+        # (None for the legacy/unscoped admin path, which then sees every thread
+        # unarchived, un-snoozed, and unlabeled).
         state_user_id=scope.owner_id,
+        label_id=label_id,
     )
     return result
+
+
+@router.get("/analytics", response_model=InboxAnalyticsResponse)
+async def get_inbox_analytics(
+    days: int = Query(30, ge=1, le=365, description="Trailing window in days"),
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Mailbox analytics: volume, response time, unread / needs-reply counts,
+    and reply-intent breakdown — scoped to the caller's own mailboxes."""
+    user_gmail_emails = None
+    if not scope.see_all:
+        user_gmail_emails = await _sender_emails_for_user(db, scope.target_user_id)
+        if not user_gmail_emails:
+            return EmailHistoryService._empty_analytics(days)
+    service = _get_service()
+    return await service.get_inbox_analytics(
+        db, user_gmail_emails=user_gmail_emails, days=days
+    )
 
 
 @router.get("/thread/{gmail_thread_id}", response_model=EmailThreadRead)
@@ -348,6 +381,179 @@ async def bulk_archive(
         db, payload.thread_ids, is_archived=is_archived, user_id=user_id
     )
     return ThreadArchiveResponse(updated=updated, is_archived=is_archived)
+
+
+# ---------------------------------------------------------------------------
+# Snooze (per-user; reuses inbox_thread_state.snoozed_until)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_snooze_until(dt: Optional[datetime]) -> Optional[datetime]:
+    """Coerce a snooze timestamp to aware UTC (naive is assumed UTC)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@router.post("/thread/{gmail_thread_id}/snooze", response_model=ThreadSnoozeResponse)
+async def snooze_thread(
+    gmail_thread_id: str,
+    payload: ThreadSnoozeRequest,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Snooze a thread until ``snoozed_until`` — it drops out of the default
+    inbox and reappears automatically once that time passes."""
+    user_id = _require_state_user(scope)
+    until = _normalize_snooze_until(payload.snoozed_until)
+    service = _get_service()
+    updated = await service.set_threads_snoozed(
+        db, [gmail_thread_id], until, user_id=user_id
+    )
+    return ThreadSnoozeResponse(updated=updated, snoozed_until=until)
+
+
+@router.post("/thread/{gmail_thread_id}/unsnooze", response_model=ThreadSnoozeResponse)
+async def unsnooze_thread(
+    gmail_thread_id: str,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Un-snooze a thread — returns it to the default view immediately."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    updated = await service.set_threads_snoozed(
+        db, [gmail_thread_id], None, user_id=user_id
+    )
+    return ThreadSnoozeResponse(updated=updated, snoozed_until=None)
+
+
+@router.post("/threads/snooze", response_model=ThreadSnoozeResponse)
+async def bulk_snooze(
+    payload: BulkThreadSnoozeRequest,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Snooze (or un-snooze, when ``snoozed_until`` is null) a selection."""
+    user_id = _require_state_user(scope)
+    until = _normalize_snooze_until(payload.snoozed_until)
+    service = _get_service()
+    updated = await service.set_threads_snoozed(
+        db, payload.thread_ids, until, user_id=user_id
+    )
+    return ThreadSnoozeResponse(updated=updated, snoozed_until=until)
+
+
+# ---------------------------------------------------------------------------
+# Labels (per-user thread tags)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/labels", response_model=list[LabelRead])
+async def list_labels(
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """List the caller's inbox labels with per-label thread counts."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    return await service.list_labels(db, user_id)
+
+
+@router.post("/labels", response_model=LabelRead, status_code=201)
+async def create_label(
+    payload: LabelCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Create a label for the caller. 409 on a duplicate name."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    label = await service.create_label(db, user_id, payload.name, payload.color)
+    if label is None:
+        raise HTTPException(status_code=409, detail="A label with that name already exists")
+    return label
+
+
+@router.patch("/labels/{label_id}", response_model=LabelRead)
+async def update_label(
+    label_id: uuid.UUID,
+    payload: LabelUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Rename / recolor one of the caller's labels."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    label = await service.update_label(
+        db, user_id, label_id, name=payload.name, color=payload.color
+    )
+    if label is None:
+        raise HTTPException(status_code=404, detail="Label not found")
+    return label
+
+
+@router.delete("/labels/{label_id}", status_code=204)
+async def delete_label(
+    label_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Delete one of the caller's labels (its thread attachments cascade)."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    ok = await service.delete_label(db, user_id, label_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Label not found")
+    return None
+
+
+@router.post(
+    "/thread/{gmail_thread_id}/labels/{label_id}",
+    response_model=ThreadLabelToggleResponse,
+)
+async def add_thread_label(
+    gmail_thread_id: str,
+    label_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Attach one of the caller's labels to a thread (idempotent)."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    result = await service.set_thread_label(
+        db, user_id, gmail_thread_id, label_id, attached=True
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Label not found")
+    return ThreadLabelToggleResponse(
+        gmail_thread_id=gmail_thread_id, label_id=label_id, attached=True
+    )
+
+
+@router.delete(
+    "/thread/{gmail_thread_id}/labels/{label_id}",
+    response_model=ThreadLabelToggleResponse,
+)
+async def remove_thread_label(
+    gmail_thread_id: str,
+    label_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    scope: UserScope = Depends(get_scope),
+):
+    """Detach one of the caller's labels from a thread (idempotent)."""
+    user_id = _require_state_user(scope)
+    service = _get_service()
+    result = await service.set_thread_label(
+        db, user_id, gmail_thread_id, label_id, attached=False
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Label not found")
+    return ThreadLabelToggleResponse(
+        gmail_thread_id=gmail_thread_id, label_id=label_id, attached=False
+    )
 
 
 @router.post("/reply/{email_id}", response_model=EmailReplyResponse)

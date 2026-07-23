@@ -16,7 +16,7 @@ from typing import Optional
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from sqlalchemy import func, or_, select, union_all
+from sqlalchemy import and_, func, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -25,6 +25,7 @@ from app.models.contact import Contact
 from app.models.email_reply import EmailReply
 from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
+from app.models.inbox_label import InboxLabel, InboxThreadLabel
 from app.models.inbox_thread_state import InboxThreadState
 from app.models.outreach import OutreachEnrollment
 from app.services import crypto, google_oauth
@@ -574,11 +575,13 @@ class EmailHistoryService:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         state_user_id: Optional[uuid.UUID] = None,
+        label_id: Optional[uuid.UUID] = None,
+        now: Optional[datetime] = None,
     ) -> dict:
         """Unified inbox query with filters.
 
         filter_type: all | sent | received | opened | needs_reply | priority |
-            archived
+            archived | snoozed
         user_gmail_emails: when provided, scope to only these email addresses
         gmail_account_id: when provided, scope to a single connected Gmail
             account (sends from it and replies received on it)
@@ -590,9 +593,17 @@ class EmailHistoryService:
             (sent_at for sends, received_at for replies)
         state_user_id: the user whose per-thread archive state applies. Archived
             threads are excluded from every view except ``archived``, which shows
-            only them. When None (legacy/unscoped admin), no archive state is
-            applied.
+            only them. Snoozed threads (``snoozed_until`` still in the future)
+            are hidden from every view except ``snoozed``, which shows only them
+            — snoozing is auto-reversing, so a thread reappears the moment its
+            snooze passes. When None (legacy/unscoped admin), no archive/snooze/
+            label state is applied.
+        label_id: when provided (with ``state_user_id``), scope to threads the
+            user has tagged with this label.
+        now: injectable "current time" for snooze comparison (tests). Defaults
+            to ``datetime.now(timezone.utc)``.
         """
+        now = now or datetime.now(timezone.utc)
         # Load connected account emails for direction detection
         if user_gmail_emails is not None:
             connected_emails = user_gmail_emails
@@ -835,25 +846,52 @@ class EmailHistoryService:
         # Group into threads
         threads = self._group_into_threads(messages)
 
-        # Per-user archive state: which of these threads has this user archived?
+        # Per-user thread state: archive, snooze, and labels for these threads.
         archived_ids: set[str] = set()
+        snoozed_until_by_id: dict[str, datetime] = {}
+        labels_by_id: dict[str, list[dict]] = {}
         if state_user_id is not None:
             candidate_ids = [t["gmail_thread_id"] for t in threads]
             if candidate_ids:
-                archived_ids = await self._archived_thread_ids(
+                archived_ids, snoozed_until_by_id = await self._thread_state(
+                    db, state_user_id, candidate_ids, now=now
+                )
+                labels_by_id = await self._labels_by_thread(
                     db, state_user_id, candidate_ids
                 )
         for t in threads:
-            t["is_archived"] = t["gmail_thread_id"] in archived_ids
+            tid = t["gmail_thread_id"]
+            t["is_archived"] = tid in archived_ids
+            snoozed_until = snoozed_until_by_id.get(tid)
+            t["snoozed_until"] = snoozed_until
+            t["labels"] = labels_by_id.get(tid, [])
 
         # Apply post-grouping filters BEFORE counting/paginating so ``total``
         # always equals the number of threads actually in the view (P0-4).
         if filter_type == "archived":
             # The Archived tab shows only archived threads.
             threads = [t for t in threads if t["is_archived"]]
+        elif filter_type == "snoozed":
+            # The Snoozed tab shows only threads still under an active snooze
+            # (and not archived — archive wins).
+            threads = [
+                t for t in threads
+                if t.get("snoozed_until") is not None and not t["is_archived"]
+            ]
         else:
-            # Every other view hides archived threads.
-            threads = [t for t in threads if not t["is_archived"]]
+            # Every other view hides archived and currently-snoozed threads.
+            threads = [
+                t for t in threads
+                if not t["is_archived"] and t.get("snoozed_until") is None
+            ]
+
+        # Label scope: keep only threads carrying the requested label.
+        if label_id is not None:
+            label_key = str(label_id)
+            threads = [
+                t for t in threads
+                if any(str(l["id"]) == label_key for l in t.get("labels", []))
+            ]
 
         if filter_type == "needs_reply":
             threads = [
@@ -891,6 +929,284 @@ class EmailHistoryService:
             )
         )
         return set(rows.scalars().all())
+
+    async def _thread_state(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        thread_ids: list[str],
+        now: Optional[datetime] = None,
+    ) -> tuple[set[str], dict[str, datetime]]:
+        """One-shot per-user archive + active-snooze state for ``thread_ids``.
+
+        Returns ``(archived_ids, snoozed_until_by_id)`` where the snooze map only
+        includes threads whose ``snoozed_until`` is still in the future — an
+        elapsed snooze is treated as not-snoozed, which is what makes snoozing
+        auto-reverse without a sweep.
+        """
+        if not thread_ids:
+            return set(), {}
+        now = now or datetime.now(timezone.utc)
+        rows = (
+            await db.execute(
+                select(
+                    InboxThreadState.gmail_thread_id,
+                    InboxThreadState.is_archived,
+                    InboxThreadState.snoozed_until,
+                ).where(
+                    InboxThreadState.user_id == user_id,
+                    InboxThreadState.gmail_thread_id.in_(thread_ids),
+                )
+            )
+        ).all()
+        archived: set[str] = set()
+        snoozed: dict[str, datetime] = {}
+        for thread_id, is_archived, snoozed_until in rows:
+            if is_archived:
+                archived.add(thread_id)
+            if snoozed_until is not None:
+                # Normalize to aware UTC before comparing — SQLite hands back
+                # naive datetimes even for a timezone=True column.
+                su = snoozed_until
+                if su.tzinfo is None:
+                    su = su.replace(tzinfo=timezone.utc)
+                if su > now:
+                    snoozed[thread_id] = su
+        return archived, snoozed
+
+    async def _labels_by_thread(
+        self, db: AsyncSession, user_id: uuid.UUID, thread_ids: list[str]
+    ) -> dict[str, list[dict]]:
+        """Map each thread id to the user's labels attached to it.
+
+        A single grouped query joins the join-table to the label rows so the
+        inbox can render label chips without an N+1.
+        """
+        if not thread_ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(
+                    InboxThreadLabel.gmail_thread_id,
+                    InboxLabel.id,
+                    InboxLabel.name,
+                    InboxLabel.color,
+                )
+                .join(InboxLabel, InboxLabel.id == InboxThreadLabel.label_id)
+                .where(
+                    InboxThreadLabel.user_id == user_id,
+                    InboxThreadLabel.gmail_thread_id.in_(thread_ids),
+                )
+                .order_by(InboxLabel.name)
+            )
+        ).all()
+        by_thread: dict[str, list[dict]] = {}
+        for thread_id, label_id, name, color in rows:
+            by_thread.setdefault(thread_id, []).append(
+                {"id": label_id, "name": name, "color": color}
+            )
+        return by_thread
+
+    async def set_threads_snoozed(
+        self,
+        db: AsyncSession,
+        thread_ids: list[str],
+        snoozed_until: Optional[datetime],
+        user_id: uuid.UUID,
+    ) -> int:
+        """Upsert the per-user snooze timestamp for each thread.
+
+        ``snoozed_until=None`` un-snoozes (the thread returns to the default
+        view immediately). Reuses the same ``inbox_thread_state`` row as archive
+        so a thread carries one state row per user. Returns the count affected.
+        """
+        if not thread_ids:
+            return 0
+        existing = {
+            s.gmail_thread_id: s
+            for s in (
+                await db.execute(
+                    select(InboxThreadState).where(
+                        InboxThreadState.user_id == user_id,
+                        InboxThreadState.gmail_thread_id.in_(thread_ids),
+                    )
+                )
+            ).scalars().all()
+        }
+        for thread_id in thread_ids:
+            state = existing.get(thread_id)
+            if state is None:
+                state = InboxThreadState(
+                    gmail_thread_id=thread_id,
+                    user_id=user_id,
+                    snoozed_until=snoozed_until,
+                )
+                db.add(state)
+            else:
+                state.snoozed_until = snoozed_until
+        await db.commit()
+        return len(thread_ids)
+
+    # ------------------------------------------------------------------
+    # Labels (per-user thread tags)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _label_dict(label: InboxLabel) -> dict:
+        return {
+            "id": label.id,
+            "name": label.name,
+            "color": label.color,
+            "created_at": label.created_at,
+        }
+
+    async def list_labels(self, db: AsyncSession, user_id: uuid.UUID) -> list[dict]:
+        """All of a user's labels, alphabetical, each with its thread count."""
+        labels = (
+            await db.execute(
+                select(InboxLabel)
+                .where(InboxLabel.user_id == user_id)
+                .order_by(InboxLabel.name)
+            )
+        ).scalars().all()
+        counts = dict(
+            (
+                await db.execute(
+                    select(
+                        InboxThreadLabel.label_id, func.count()
+                    )
+                    .where(InboxThreadLabel.user_id == user_id)
+                    .group_by(InboxThreadLabel.label_id)
+                )
+            ).all()
+        )
+        out = []
+        for label in labels:
+            d = self._label_dict(label)
+            d["thread_count"] = int(counts.get(label.id, 0))
+            out.append(d)
+        return out
+
+    async def create_label(
+        self, db: AsyncSession, user_id: uuid.UUID, name: str, color: str = "gray"
+    ) -> Optional[dict]:
+        """Create a label for the user. Returns None on a duplicate name."""
+        name = (name or "").strip()
+        if not name:
+            return None
+        existing = (
+            await db.execute(
+                select(InboxLabel).where(
+                    InboxLabel.user_id == user_id,
+                    func.lower(InboxLabel.name) == name.lower(),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return None
+        label = InboxLabel(user_id=user_id, name=name, color=color or "gray")
+        db.add(label)
+        await db.commit()
+        await db.refresh(label)
+        d = self._label_dict(label)
+        d["thread_count"] = 0
+        return d
+
+    async def update_label(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        label_id: uuid.UUID,
+        name: Optional[str] = None,
+        color: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Rename / recolor a label the user owns. None if not found."""
+        label = (
+            await db.execute(
+                select(InboxLabel).where(
+                    InboxLabel.id == label_id, InboxLabel.user_id == user_id
+                )
+            )
+        ).scalar_one_or_none()
+        if label is None:
+            return None
+        if name is not None and name.strip():
+            label.name = name.strip()
+        if color is not None and color.strip():
+            label.color = color.strip()
+        await db.commit()
+        await db.refresh(label)
+        return self._label_dict(label)
+
+    async def delete_label(
+        self, db: AsyncSession, user_id: uuid.UUID, label_id: uuid.UUID
+    ) -> bool:
+        """Delete a user's label (its thread attachments cascade). False if
+        the label doesn't belong to the user / doesn't exist."""
+        label = (
+            await db.execute(
+                select(InboxLabel).where(
+                    InboxLabel.id == label_id, InboxLabel.user_id == user_id
+                )
+            )
+        ).scalar_one_or_none()
+        if label is None:
+            return False
+        # Explicitly clear attachments rather than leaning on the DB-level
+        # ON DELETE CASCADE — that FK only fires under Postgres with FK
+        # enforcement on, so doing it here keeps behaviour identical everywhere.
+        from sqlalchemy import delete as sa_delete
+
+        await db.execute(
+            sa_delete(InboxThreadLabel).where(InboxThreadLabel.label_id == label_id)
+        )
+        await db.delete(label)
+        await db.commit()
+        return True
+
+    async def set_thread_label(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        gmail_thread_id: str,
+        label_id: uuid.UUID,
+        attached: bool,
+    ) -> Optional[bool]:
+        """Attach (or detach) a label to a thread for the user.
+
+        Returns the resulting attached-state, or ``None`` if the label doesn't
+        belong to the user (so the caller can 404). Idempotent both ways.
+        """
+        label = (
+            await db.execute(
+                select(InboxLabel.id).where(
+                    InboxLabel.id == label_id, InboxLabel.user_id == user_id
+                )
+            )
+        ).scalar_one_or_none()
+        if label is None:
+            return None
+        existing = (
+            await db.execute(
+                select(InboxThreadLabel).where(
+                    InboxThreadLabel.user_id == user_id,
+                    InboxThreadLabel.gmail_thread_id == gmail_thread_id,
+                    InboxThreadLabel.label_id == label_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if attached and existing is None:
+            db.add(
+                InboxThreadLabel(
+                    gmail_thread_id=gmail_thread_id,
+                    label_id=label_id,
+                    user_id=user_id,
+                )
+            )
+        elif not attached and existing is not None:
+            await db.delete(existing)
+        await db.commit()
+        return attached
 
     async def set_threads_read(
         self,
@@ -962,6 +1278,170 @@ class EmailHistoryService:
                 state.is_archived = is_archived
         await db.commit()
         return len(thread_ids)
+
+    # ------------------------------------------------------------------
+    # Analytics
+    # ------------------------------------------------------------------
+
+    async def get_inbox_analytics(
+        self,
+        db: AsyncSession,
+        user_gmail_emails: Optional[set[str]] = None,
+        days: int = 30,
+        now: Optional[datetime] = None,
+    ) -> dict:
+        """Mailbox analytics over a trailing window.
+
+        Scoped like ``get_inbox`` (the caller's own mailboxes, or everything for
+        the unscoped admin). Returns:
+
+        * ``sent_count`` / ``received_count`` — message volume in the window.
+        * ``unread_count`` — unread received replies right now (window-bounded).
+        * ``needs_reply_count`` — threads whose latest message is inbound.
+        * ``avg_response_seconds`` / ``median_response_seconds`` / ``responded_count``
+          — how fast we replied to inbound messages that got a reply.
+        * ``classification_breakdown`` — reply-intent category counts.
+        * ``daily_volume`` — per-day sent/received counts for a sparkline.
+        """
+        now = now or datetime.now(timezone.utc)
+        since = now - timedelta(days=max(1, days))
+
+        # Resolve the account-id set for the user scope (mirrors get_inbox).
+        account_email_map = await self._load_account_email_map(db)
+        ids_by_email: dict[str, list] = {}
+        for acc_id, acc_email in account_email_map.items():
+            if acc_email:
+                ids_by_email.setdefault(acc_email.lower(), []).append(acc_id)
+
+        sends_query = select(EmailSend).where(
+            EmailSend.status != "skipped", EmailSend.sent_at >= since
+        )
+        replies_query = select(EmailReply).where(EmailReply.received_at >= since)
+
+        if user_gmail_emails is not None:
+            if not user_gmail_emails:
+                return self._empty_analytics(days)
+            user_account_ids: list = []
+            for a in user_gmail_emails:
+                user_account_ids.extend(ids_by_email.get(a, ()))
+            sends_query = sends_query.where(
+                or_(
+                    EmailSend.sender_account_id.in_(user_account_ids),
+                    func.lower(EmailSend.from_email).in_(user_gmail_emails),
+                )
+            )
+            replies_query = replies_query.where(
+                or_(
+                    EmailReply.gmail_account_id.in_(user_account_ids),
+                    func.lower(EmailReply.to_email).in_(user_gmail_emails),
+                )
+            )
+
+        sends = (await db.execute(sends_query)).scalars().all()
+        replies = (await db.execute(replies_query)).scalars().all()
+
+        connected_emails = user_gmail_emails or {
+            e.lower() for e in account_email_map.values() if e
+        }
+
+        # Build unified messages + group into threads (reuse existing helpers).
+        messages = []
+        for s in sends:
+            messages.append(
+                self._send_to_message(s, None, None, None, account_email_map)
+            )
+        for r in replies:
+            messages.append(
+                self._reply_to_message(
+                    r, None, None, None, connected_emails, account_email_map
+                )
+            )
+        threads = self._group_into_threads(messages)
+
+        sent_count = sum(1 for m in messages if m["direction"] == "sent")
+        received_count = sum(1 for m in messages if m["direction"] == "received")
+        unread_count = sum(
+            1 for m in messages
+            if m["direction"] == "received" and not m["is_read"]
+        )
+
+        needs_reply_count = sum(
+            1 for t in threads
+            if t["messages"] and t["messages"][-1]["direction"] == "received"
+        )
+
+        # Response times: for each inbound message that is followed later in its
+        # thread by an outbound, the gap to that first outbound is a response.
+        response_deltas: list[float] = []
+        for t in threads:
+            msgs = t["messages"]
+            for i, m in enumerate(msgs):
+                if m["direction"] != "received":
+                    continue
+                for later in msgs[i + 1:]:
+                    if later["direction"] == "sent":
+                        d = (later["timestamp"] - m["timestamp"]).total_seconds()
+                        if d >= 0:
+                            response_deltas.append(d)
+                        break
+        responded_count = len(response_deltas)
+        avg_response_seconds = (
+            sum(response_deltas) / responded_count if responded_count else None
+        )
+        median_response_seconds = None
+        if responded_count:
+            ordered = sorted(response_deltas)
+            mid = responded_count // 2
+            median_response_seconds = (
+                ordered[mid]
+                if responded_count % 2
+                else (ordered[mid - 1] + ordered[mid]) / 2
+            )
+
+        classification_breakdown: dict[str, int] = {}
+        for r in replies:
+            cat = r.reply_classification
+            if cat:
+                classification_breakdown[cat] = classification_breakdown.get(cat, 0) + 1
+
+        # Per-day sent/received for the sparkline (UTC calendar days).
+        daily: dict[str, dict[str, int]] = {}
+        for m in messages:
+            day = m["timestamp"].astimezone(timezone.utc).date().isoformat()
+            bucket = daily.setdefault(day, {"sent": 0, "received": 0})
+            bucket[m["direction"]] = bucket.get(m["direction"], 0) + 1
+        daily_volume = [
+            {"date": day, "sent": v["sent"], "received": v["received"]}
+            for day, v in sorted(daily.items())
+        ]
+
+        return {
+            "window_days": days,
+            "sent_count": sent_count,
+            "received_count": received_count,
+            "unread_count": unread_count,
+            "needs_reply_count": needs_reply_count,
+            "responded_count": responded_count,
+            "avg_response_seconds": avg_response_seconds,
+            "median_response_seconds": median_response_seconds,
+            "classification_breakdown": classification_breakdown,
+            "daily_volume": daily_volume,
+        }
+
+    @staticmethod
+    def _empty_analytics(days: int) -> dict:
+        return {
+            "window_days": days,
+            "sent_count": 0,
+            "received_count": 0,
+            "unread_count": 0,
+            "needs_reply_count": 0,
+            "responded_count": 0,
+            "avg_response_seconds": None,
+            "median_response_seconds": None,
+            "classification_breakdown": {},
+            "daily_volume": [],
+        }
 
     # ------------------------------------------------------------------
     # Thread detail
@@ -1457,8 +1937,10 @@ class EmailHistoryService:
                 "priority": priority,
                 "classification": classification,
                 # Overwritten with the caller's per-user state in get_inbox; the
-                # default (no state row) is not-archived.
+                # default (no state row) is not-archived, not-snoozed, unlabeled.
                 "is_archived": False,
+                "snoozed_until": None,
+                "labels": [],
             })
 
         return threads

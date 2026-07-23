@@ -39,6 +39,14 @@ class EmailMessageRead(BaseModel):
     priority_flag: bool = False
 
 
+class ThreadLabelRead(BaseModel):
+    """A label chip attached to a thread."""
+
+    id: uuid.UUID
+    name: str
+    color: str
+
+
 class EmailThreadRead(BaseModel):
     """A conversation thread grouping sent and received messages."""
 
@@ -53,6 +61,10 @@ class EmailThreadRead(BaseModel):
     priority: bool = False
     classification: Optional[str] = None
     is_archived: bool = False
+    # Per-user view state: an active snooze (null = not snoozed) and the user's
+    # labels attached to this thread.
+    snoozed_until: Optional[datetime] = None
+    labels: list[ThreadLabelRead] = []
 
 
 class EmailInboxResponse(BaseModel):
@@ -117,3 +129,82 @@ class ThreadArchiveResponse(BaseModel):
 
     updated: int = 0  # number of threads whose archive flag was set
     is_archived: bool = True
+
+
+# --- Snooze ---
+
+
+class ThreadSnoozeRequest(BaseModel):
+    """Request body for snoozing a thread until a given time.
+
+    ``snoozed_until=None`` un-snoozes (the thread returns immediately). A
+    timestamp in the past is treated as un-snooze by the query layer.
+    """
+
+    snoozed_until: Optional[datetime] = None
+
+
+class BulkThreadSnoozeRequest(ThreadSnoozeRequest):
+    """Snooze/un-snooze a batch of threads."""
+
+    thread_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+class ThreadSnoozeResponse(BaseModel):
+    """Result of a snooze / un-snooze action."""
+
+    updated: int = 0
+    snoozed_until: Optional[datetime] = None
+
+
+# --- Labels ---
+
+
+class LabelCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60)
+    color: str = Field("gray", max_length=24)
+
+
+class LabelUpdateRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=60)
+    color: Optional[str] = Field(None, max_length=24)
+
+
+class LabelRead(BaseModel):
+    id: uuid.UUID
+    name: str
+    color: str
+    created_at: Optional[datetime] = None
+    thread_count: int = 0
+
+
+class ThreadLabelToggleResponse(BaseModel):
+    """Result of attaching / detaching a label to a thread."""
+
+    gmail_thread_id: str
+    label_id: uuid.UUID
+    attached: bool
+
+
+# --- Analytics ---
+
+
+class DailyVolumePoint(BaseModel):
+    date: str
+    sent: int = 0
+    received: int = 0
+
+
+class InboxAnalyticsResponse(BaseModel):
+    """Mailbox analytics over a trailing window (see get_inbox_analytics)."""
+
+    window_days: int = 30
+    sent_count: int = 0
+    received_count: int = 0
+    unread_count: int = 0
+    needs_reply_count: int = 0
+    responded_count: int = 0
+    avg_response_seconds: Optional[float] = None
+    median_response_seconds: Optional[float] = None
+    classification_breakdown: dict[str, int] = {}
+    daily_volume: list[DailyVolumePoint] = []
