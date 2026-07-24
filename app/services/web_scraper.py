@@ -1,11 +1,12 @@
 """Website scraper — extracts company info from their website."""
 
 import asyncio
+import html as html_mod
 import ipaddress
 import logging
 import re
 import socket
-from typing import Optional
+from typing import Iterable, Optional
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -16,6 +17,85 @@ logger = logging.getLogger(__name__)
 # Maximum redirects we follow manually (validating each hop) so a redirect to
 # an internal address can't bypass the SSRF check.
 _MAX_REDIRECTS = 5
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+# Local-parts of addresses no human reads — automated/technical inboxes. These
+# are dropped outright: sending to them is a wasted touch at best and a
+# spam-complaint magnet at worst.
+_UNSENDABLE_EMAIL_PREFIXES = (
+    "noreply", "no-reply", "donotreply", "do-not-reply", "postmaster",
+    "webmaster", "hostmaster", "abuse", "mailer-daemon", "mailerdaemon",
+    "bounce", "bounces", "notifications", "notification", "newsletter",
+    "unsubscribe", "privacy", "legal", "dmarc", "spf",
+)
+
+# Generic-but-monitored inboxes. Not a named person, but for a small
+# manufacturer these are frequently the ONLY address on the site and a real
+# human reads them — so they are RANKED behind any personal-looking address
+# rather than discarded. Discarding them (the old behaviour) stranded every
+# shop that lists only info@ / sales@ / contact@, which is most of them, and is
+# why Places-sourced businesses kept importing with no emailable contact.
+_GENERIC_EMAIL_PREFIXES = (
+    "sales", "contact", "info", "hello", "hi", "enquiries", "enquiry",
+    "inquiries", "inquiry", "office", "admin", "support", "mail", "team",
+    "reception", "general", "customerservice", "service",
+)
+
+# Image/asset false positives the email regex sometimes catches (e.g. a
+# "logo@2x.png" sprite reference).
+_ASSET_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico")
+
+
+def _deobfuscate(text: str) -> str:
+    """Undo the common human-readable email obfuscations before regex.
+
+    Only bracketed forms — ``name [at] domain [dot] com`` — are rewritten, so
+    ordinary prose ("meet us at the shop") is never touched. HTML entities are
+    also unescaped first so ``&#64;``-encoded @ signs become real ones.
+    """
+    text = html_mod.unescape(text)
+    text = re.sub(r"\s*[\[(]\s*at\s*[\])]\s*", "@", text, flags=re.I)
+    text = re.sub(r"\s*[\[(]\s*dot\s*[\])]\s*", ".", text, flags=re.I)
+    return text
+
+
+def extract_emails(html_text: str) -> set[str]:
+    """Pull every email-shaped string out of a chunk of HTML/text."""
+    return set(_EMAIL_RE.findall(_deobfuscate(html_text or "")))
+
+
+def _email_rank(email: str) -> int:
+    """Sort key — 0 = personal-looking, 1 = generic inbox. Lower is preferred."""
+    local = email.split("@", 1)[0].lower()
+    if any(local == p or local.startswith(p) for p in _GENERIC_EMAIL_PREFIXES):
+        return 1
+    return 0
+
+
+def usable_emails(raw: Iterable[str], limit: int = 10) -> list[str]:
+    """Filter, de-dupe and rank scraped emails for cold outreach.
+
+    Technical/automated inboxes are dropped; everything else is kept with
+    personal-looking addresses ranked ahead of generic ones. A generic inbox is
+    a real fallback, not junk — for an SMB the ``info@`` box is often the only
+    door there is, and one monitored generic address beats no contact at all.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for e in raw:
+        el = (e or "").strip().lower().strip(".")
+        if not el or "@" not in el or el in seen:
+            continue
+        if el.endswith(_ASSET_SUFFIXES):
+            continue
+        local = el.split("@", 1)[0]
+        if any(local == p or local.startswith(p) for p in _UNSENDABLE_EMAIL_PREFIXES):
+            continue
+        seen.add(el)
+        out.append(el)
+    out.sort(key=_email_rank)
+    return out[:limit]
 
 
 class UnsafeURLError(ValueError):
@@ -154,15 +234,13 @@ class WebScraper:
                 if meta_desc:
                     result["description"] = meta_desc.get("content", "").strip()
 
-                # Extract emails from page text
-                emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', resp.text))
-                # Filter out common non-person emails
-                skip_prefixes = ("noreply", "no-reply", "info@", "support@", "admin@", "webmaster@")
-                result["emails"] = [e for e in emails if not any(e.lower().startswith(p) for p in skip_prefixes)][:10]
+                # Accumulate emails across every page we touch, then filter and
+                # rank once at the end (see ``usable_emails``). Generic inboxes
+                # are kept as a ranked fallback, not thrown away.
+                all_emails: set[str] = extract_emails(resp.text)
 
-                # Extract phone numbers
+                # Extract phone numbers (finalized after sub-pages are scanned).
                 phones = set(re.findall(r'[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}', resp.text))
-                result["phones"] = list(phones)[:5]
 
                 # Extract social media links
                 for link in soup.find_all("a", href=True):
@@ -174,54 +252,53 @@ class WebScraper:
                     elif "facebook.com" in href:
                         result["social_links"]["facebook"] = link["href"]
 
-                # Try to find About page
-                about_links = []
-                for link in soup.find_all("a", href=True):
-                    href = link["href"].lower()
-                    text = link.get_text(strip=True).lower()
-                    if "about" in href or "about" in text:
-                        about_url = urljoin(url, link["href"])
-                        about_links.append(about_url)
+                # Sub-pages worth a look for emails/people. Contact and team
+                # pages are where a small manufacturer actually lists an address
+                # or a name; about is mostly for the summary text. We fetch the
+                # first matching link in each category (deduped) so one scrape
+                # can't fan out into an unbounded crawl.
+                phone_re = re.compile(
+                    r'[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}'
+                )
 
-                if about_links:
+                def _first_link(keywords: tuple[str, ...]) -> Optional[str]:
+                    for link in soup.find_all("a", href=True):
+                        href = link["href"].lower()
+                        text = link.get_text(strip=True).lower()
+                        if any(k in href or k in text for k in keywords):
+                            return urljoin(url, link["href"])
+                    return None
+
+                sub_pages: list[str] = []
+                for keywords in (
+                    ("about",),
+                    ("contact", "get-in-touch", "reach-us"),
+                    ("team", "staff", "leadership", "people", "our-team", "management"),
+                ):
+                    link = _first_link(keywords)
+                    if link and link not in sub_pages and link not in result["pages_checked"]:
+                        sub_pages.append(link)
+
+                for i, page_url in enumerate(sub_pages):
                     try:
-                        about_resp = await self._safe_get(client, about_links[0])
-                        if about_resp.status_code == 200:
-                            about_soup = BeautifulSoup(about_resp.text, "html.parser")
-                            # Get main content text
-                            for tag in about_soup(["script", "style", "nav", "header", "footer"]):
-                                tag.decompose()
-                            about_text = about_soup.get_text(" ", strip=True)
-                            # Take first 500 chars as about summary
-                            result["about"] = about_text[:500] if about_text else None
-                            result["pages_checked"].append(about_links[0])
-
-                            # Also grab emails from about page
-                            more_emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', about_resp.text))
-                            result["emails"] = list(set(result["emails"]) | more_emails)[:10]
+                        sub_resp = await self._safe_get(client, page_url)
                     except Exception:
-                        pass
+                        continue
+                    if sub_resp.status_code != 200:
+                        continue
+                    result["pages_checked"].append(page_url)
+                    all_emails |= extract_emails(sub_resp.text)
+                    phones |= set(phone_re.findall(sub_resp.text))
+                    # The first sub-page is the About page — use it for the summary.
+                    if i == 0 and result["about"] is None:
+                        sub_soup = BeautifulSoup(sub_resp.text, "html.parser")
+                        for tag in sub_soup(["script", "style", "nav", "header", "footer"]):
+                            tag.decompose()
+                        about_text = sub_soup.get_text(" ", strip=True)
+                        result["about"] = about_text[:500] if about_text else None
 
-                # Try contact page too
-                contact_links = []
-                for link in soup.find_all("a", href=True):
-                    href = link["href"].lower()
-                    text = link.get_text(strip=True).lower()
-                    if "contact" in href or "contact" in text:
-                        contact_url = urljoin(url, link["href"])
-                        contact_links.append(contact_url)
-
-                if contact_links:
-                    try:
-                        contact_resp = await self._safe_get(client, contact_links[0])
-                        if contact_resp.status_code == 200:
-                            result["pages_checked"].append(contact_links[0])
-                            more_emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', contact_resp.text))
-                            more_phones = set(re.findall(r'[\+]?[(]?[0-9]{3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}', contact_resp.text))
-                            result["emails"] = list(set(result["emails"]) | more_emails)[:10]
-                            result["phones"] = list(set(result["phones"]) | more_phones)[:5]
-                    except Exception:
-                        pass
+                result["phones"] = list(phones)[:5]
+                result["emails"] = usable_emails(all_emails)
 
         except Exception as e:
             logger.error("Scrape failed for %s: %s", domain, str(e))

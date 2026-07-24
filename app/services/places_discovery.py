@@ -679,8 +679,12 @@ class PlacesDiscoveryService:
                     "named": bool(business.contact_first_name),
                 }
 
-        # Free fallback. The scraper already strips noreply/info/support-style
-        # inboxes, so what survives is at least plausibly a person.
+        # Free fallback. The scraper drops only automated/technical inboxes
+        # (noreply, postmaster, …) and ranks any personal-looking address ahead
+        # of a generic one, so ``emails[0]`` is the best sendable candidate it
+        # found — which for most small shops is a monitored ``info@``/``sales@``
+        # box, and one of those beats importing a business with no contact at
+        # all.
         from app.services.web_scraper import get_web_scraper
 
         try:
