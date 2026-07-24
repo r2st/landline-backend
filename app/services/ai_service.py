@@ -44,6 +44,12 @@ REPLY_CATEGORIES = (
 # narrow (explicit opt-out language, unambiguous OOO markers) to keep false
 # positives near zero. Anything not matched here falls through to the LLM.
 
+# The Anthropic model, named once. Used both as the native backend's model and
+# as the cross-provider fallback when OpenRouter's free-tier quota is spent —
+# ``self.model`` holds an OpenRouter model id in that case, which Anthropic
+# would reject.
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
 # Where a client stops the sender's own words and starts quoting ours. Used by
 # ``strip_quoted_reply``; see it for why scanning quoted text is destructive.
 # One pattern per client family actually seen in this mailbox:
@@ -344,7 +350,7 @@ class AIService:
         else:
             self._openrouter_key = ""
             self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-            self.model = "claude-sonnet-4-6"
+            self.model = ANTHROPIC_MODEL
             logger.info("AIService using Anthropic backend, model=%s", self.model)
 
     @property
@@ -464,13 +470,47 @@ class AIService:
                     if attempt:
                         logger.info("OpenRouter fell back to model %s", model)
                     return content
-            # Every model in the chain was rate-limited / erroring. Raise so the
-            # caller's existing degradation path (static copy, neutral score)
-            # runs, exactly as before this fallback existed.
+            # Every OpenRouter model in the chain is exhausted. Before giving up,
+            # cross to Anthropic if a key is configured.
+            #
+            # The free tier's daily quota is a *routine* condition, not an
+            # incident — it is reached every day that outreach runs at any
+            # volume, and it answers 429 to everything after that. Without this,
+            # each exhaustion silently downgrades every email to the static
+            # mail-merge and every reply classification to keyword-only, which is
+            # exactly the "healthy-looking degradation" this audit kept finding.
+            # ``openrouter_fallback_models`` cannot cover it: that chain is
+            # OpenRouter-only, and on the free tier the quota is account-level,
+            # so a second free model shares the same exhausted allowance.
+            if self._anthropic_key:
+                logger.warning(
+                    "OpenRouter exhausted (%s) — falling back to Anthropic for this call",
+                    last_exc,
+                )
+                return await self._anthropic_completion(
+                    messages, max_tokens=max_tokens, temperature=temperature, system=system
+                )
+            # Nothing left. Raise so the caller's existing degradation path
+            # (static copy, neutral score) runs, exactly as before.
             raise last_exc if last_exc else RuntimeError("no OpenRouter model configured")
 
-        # Anthropic backend.
-        kwargs = {"model": self.model, "max_tokens": max_tokens, "messages": messages}
+        return await self._anthropic_completion(
+            messages, max_tokens=max_tokens, temperature=temperature, system=system
+        )
+
+    async def _anthropic_completion(
+        self,
+        messages: list,
+        *,
+        max_tokens: int = 1024,
+        temperature: float | None = None,
+        system: str | None = None,
+    ) -> str:
+        """Call the Anthropic backend. Shared by the native path and the fallback."""
+        # ``self.model`` names an OpenRouter model when that is the active
+        # backend, and Anthropic would reject it — so the fallback names its own.
+        model = self.model if self.provider == "anthropic" else ANTHROPIC_MODEL
+        kwargs = {"model": model, "max_tokens": max_tokens, "messages": messages}
         if temperature is not None:
             kwargs["temperature"] = temperature
         if system:

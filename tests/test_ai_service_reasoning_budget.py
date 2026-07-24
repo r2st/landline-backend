@@ -215,3 +215,119 @@ async def test_email_generation_survives_a_reasoning_model(monkeypatch):
     assert out["ai_generated"] is True, "fell back to the static template"
     assert out["subject"] == "cavity 4 drift"
     assert "cavity" in out["body"]
+
+
+# ---------------------------------------------------------------------------
+# Cross-provider fallback: OpenRouter's free quota is exhausted every day
+# ---------------------------------------------------------------------------
+class _FakeAnthropicMessages:
+    calls: list = []
+    reply: str = "anthropic answered"
+
+    async def create(self, **kwargs):
+        _FakeAnthropicMessages.calls.append(kwargs)
+
+        class _Block:
+            text = _FakeAnthropicMessages.reply
+
+        class _Msg:
+            content = [_Block()]
+
+        return _Msg()
+
+
+class _FakeAnthropicClient:
+    def __init__(self, *a, **k):
+        self.messages = _FakeAnthropicMessages()
+
+
+def _rate_limited(status=429):
+    resp = _FakeResponse({}, status=status)
+    return resp
+
+
+@pytest.fixture(autouse=True)
+def _reset_anthropic():
+    _FakeAnthropicMessages.calls = []
+    _FakeAnthropicMessages.reply = "anthropic answered"
+    yield
+
+
+@pytest.mark.asyncio
+async def test_exhausted_openrouter_falls_back_to_anthropic(monkeypatch):
+    """The free tier answers 429 to everything once the daily quota is spent.
+
+    Without this the whole app silently downgrades for the rest of the day:
+    static mail-merge instead of composed copy, keyword-only reply routing. That
+    is the "healthy-looking degradation" this audit kept turning up.
+    """
+    monkeypatch.setattr(ai_module.anthropic, "AsyncAnthropic", _FakeAnthropicClient)
+    svc = _service(monkeypatch, anthropic_api_key="sk-ant-test")
+    _FakeAsyncClient.responses = [_rate_limited()]
+
+    out = await svc._chat("hi", max_tokens=800)
+
+    assert out == "anthropic answered"
+    assert len(_FakeAnthropicMessages.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_uses_an_anthropic_model_id(monkeypatch):
+    """``self.model`` holds an OpenRouter id here; Anthropic would reject it."""
+    monkeypatch.setattr(ai_module.anthropic, "AsyncAnthropic", _FakeAnthropicClient)
+    svc = _service(monkeypatch, anthropic_api_key="sk-ant-test")
+    _FakeAsyncClient.responses = [_rate_limited()]
+
+    await svc._chat("hi", max_tokens=800)
+
+    assert _FakeAnthropicMessages.calls[0]["model"] == ai_module.ANTHROPIC_MODEL
+    assert ":free" not in _FakeAnthropicMessages.calls[0]["model"]
+
+
+@pytest.mark.asyncio
+async def test_empty_content_also_crosses_to_anthropic(monkeypatch):
+    """A reasoning model that returns nothing is as exhausted as a 429."""
+    monkeypatch.setattr(ai_module.anthropic, "AsyncAnthropic", _FakeAnthropicClient)
+    svc = _service(monkeypatch, anthropic_api_key="sk-ant-test")
+    _FakeAsyncClient.responses = [
+        _FakeResponse(_completion("", finish_reason="length", reasoning_tokens=797))
+    ]
+
+    assert await svc._chat("hi", max_tokens=800) == "anthropic answered"
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_survives_the_crossing(monkeypatch):
+    """Anthropic takes ``system`` as a top-level kwarg, not a leading message."""
+    monkeypatch.setattr(ai_module.anthropic, "AsyncAnthropic", _FakeAnthropicClient)
+    svc = _service(monkeypatch, anthropic_api_key="sk-ant-test")
+    _FakeAsyncClient.responses = [_rate_limited()]
+
+    await svc._chat("hi", max_tokens=800, system="you are a copywriter")
+
+    call = _FakeAnthropicMessages.calls[0]
+    assert call["system"] == "you are a copywriter"
+    assert call["messages"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_without_an_anthropic_key_the_error_still_surfaces(monkeypatch):
+    """No second provider configured — the caller's degradation path must run."""
+    monkeypatch.setattr(ai_module.anthropic, "AsyncAnthropic", _FakeAnthropicClient)
+    svc = _service(monkeypatch, anthropic_api_key="")
+    _FakeAsyncClient.responses = [_rate_limited()]
+
+    with pytest.raises(Exception):
+        await svc._chat("hi", max_tokens=800)
+    assert _FakeAnthropicMessages.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_openrouter_call_never_touches_anthropic(monkeypatch):
+    """The fallback is a backstop, not a second opinion — it must not double-spend."""
+    monkeypatch.setattr(ai_module.anthropic, "AsyncAnthropic", _FakeAnthropicClient)
+    svc = _service(monkeypatch, anthropic_api_key="sk-ant-test")
+    _FakeAsyncClient.responses = [_FakeResponse(_completion("openrouter answered"))]
+
+    assert await svc._chat("hi", max_tokens=800) == "openrouter answered"
+    assert _FakeAnthropicMessages.calls == []
