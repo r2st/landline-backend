@@ -607,11 +607,17 @@ async def score_company_rule_based(
 async def score_company_ai(
     db: AsyncSession,
     company: Company,
-    anthropic_client,
+    anthropic_client=None,
 ) -> LeadScore:
-    """Use Claude API to produce an AI-driven lead score.
+    """Use the LLM provider chain to produce an AI-driven lead score.
 
-    Sends company data to Claude and asks it to evaluate fit for
+    ``anthropic_client`` is retained for the existing signature but is optional
+    and defaults to the chain: passing a raw Anthropic handle pinned this to a
+    single provider. The call below was also never awaited, so with a genuine
+    async client this function raised on ``message.content`` every time — it has
+    no callers, which is presumably why that went unnoticed.
+
+    Sends company data to the model and asks it to evaluate fit for
     Apprend Technologies' manufacturing software products.
     """
     result = await db.execute(
@@ -650,7 +656,10 @@ Respond with ONLY the JSON object, no markdown fences."""
     try:
         # Keep the AI scorer on the same current model as the rest of the app.
         from app.services.ai_service import get_ai_service
-        message = anthropic_client.messages.create(
+        from app.services.llm_providers import chain_client
+
+        client = anthropic_client or chain_client(get_settings().anthropic_api_key)
+        message = await client.messages.create(
             model=get_ai_service().model,
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],

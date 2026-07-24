@@ -96,7 +96,10 @@ class Settings(BaseSettings):
     # sequence engine ended up sending un-personalised template copy while
     # looking healthy. Leave empty to disable fallback. Paid ids belong here: the
     # free tier shares one quota across models, so a second ":free" id buys
-    # nothing when the 429 is the account-level daily cap.
+    # nothing when the 429 is the account-level daily cap — which is exactly why
+    # ``llm_provider_chain`` (below) exists. This knob is now for reaching a
+    # *paid* OpenRouter model before crossing to another provider; if you only
+    # want free headroom, add provider keys instead of model ids.
     openrouter_fallback_models: str = ""
     # Reasoning budget for reasoning models (gpt-oss, nemotron-*-reasoning, o-series).
     #
@@ -121,6 +124,43 @@ class Settings(BaseSettings):
     # (classification, scoring) would otherwise spend the entire allowance
     # thinking and return "". Only ever raises a caller's budget, never lowers it.
     openrouter_min_max_tokens: int = 1024
+
+    # --- Multi-provider LLM fallback chain ---
+    # OpenAI-compatible providers tried IN ORDER by app.services.llm_providers.
+    # A provider with no API key is skipped when the chain is built, so leaving
+    # a key unset simply removes that hop.
+    #
+    # This exists because a single backend's quota wall is indistinguishable, in
+    # the logs, from a healthy system: every AI call raises, every caller catches,
+    # and outreach quietly reverts to static mail-merge copy and keyword-only
+    # reply routing. It has happened twice — Anthropic credits, then OpenRouter's
+    # free-tier daily cap. ``openrouter_fallback_models`` cannot fix it, because
+    # on the free tier the quota is ACCOUNT-level: a second ":free" model id
+    # shares the same exhausted allowance. Independent providers do fix it.
+    #
+    # Gemini, Groq and Cerebras all offer free tiers that need no credit card.
+    llm_provider_chain: str = "openrouter,gemini,groq,cerebras"
+    # Google Gemini via its OpenAI-compatibility endpoint (note the trailing
+    # "/openai/" — the path is the compatibility shim, not the native API).
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_model: str = "gemini-2.0-flash"
+    # Groq — free tier, very fast, generous per-day request cap.
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_model: str = "llama-3.3-70b-versatile"
+    # Cerebras — free tier, same Llama 3.3 70B under a different model id.
+    cerebras_api_key: str = ""
+    cerebras_base_url: str = "https://api.cerebras.ai/v1"
+    cerebras_model: str = "llama-3.3-70b"
+    # Circuit breaker. A provider that fails this many times IN A ROW is skipped
+    # for the cooldown. Without it, a provider that is out of quota for the rest
+    # of the day is re-tried on every call and pays its full timeout each time —
+    # on a batch send that is a minute of added latency per email rather than a
+    # few hundred milliseconds. Per-process, by design: it is a latency
+    # optimisation, not a distributed lock.
+    llm_breaker_threshold: int = 3
+    llm_breaker_cooldown_seconds: int = 300
 
     # Apollo.io
     apollo_api_key: str = ""

@@ -3,15 +3,22 @@
 Supports two backends behind one interface:
 
 * **anthropic** — Claude via the Anthropic Messages API (the historical default).
-* **openrouter** — any model served through OpenRouter's OpenAI-compatible
-  ``/chat/completions`` endpoint, including free-tier models. Used as a drop-in
-  when the Anthropic account runs out of credits.
+* **openrouter** — the OpenAI-compatible *provider chain* owned by
+  :mod:`app.services.llm_providers`: OpenRouter, then Google Gemini, Groq and
+  Cerebras, each tried in turn until one answers.
 
-The backend is chosen in :meth:`__init__` from settings (see
-``ai_provider`` / ``openrouter_api_key`` in :mod:`app.config`). All the public
-methods build the same prompts regardless of backend and route the actual call
-through :meth:`_chat` / :meth:`_chat_completion`, which normalise the request
-and response shapes so the rest of the code never sees the difference.
+The name "openrouter" is kept for that second backend because it is what
+``AI_PROVIDER``, the per-org agent configs and the existing logs all say; it now
+means "the OpenAI-compatible chain, headed by OpenRouter" rather than "OpenRouter
+alone". A single provider's quota wall used to take every AI feature down to
+static templates at once — see :mod:`app.services.llm_providers` for why that
+kept going unnoticed.
+
+The backend is chosen in :meth:`__init__` from settings (see ``ai_provider`` /
+``openrouter_api_key`` / ``llm_provider_chain`` in :mod:`app.config`). All the
+public methods build the same prompts regardless of backend and route the actual
+call through :meth:`_chat` / :meth:`_chat_completion`, which normalise the
+request and response shapes so the rest of the code never sees the difference.
 """
 
 import logging
@@ -21,8 +28,15 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 import anthropic
-import httpx
+import httpx  # noqa: F401  (kept importable for tests that patch httpx.AsyncClient)
 from app.config import get_settings
+from app.services.llm_providers import (
+    LLMChainExhausted,
+    build_provider_chain,
+    chat_completion as chain_chat_completion,
+    has_any_provider_key,
+    to_openai_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,25 +342,36 @@ class AIService:
         # backend — the caller has chosen the credential and the model.
         forced_key = (openrouter_api_key or "").strip()
 
-        # Resolve the backend. "auto" prefers OpenRouter when a key is present
-        # (e.g. Anthropic credits depleted) and otherwise stays on Anthropic.
+        # Resolve the backend. "auto" prefers the OpenAI-compatible chain when
+        # ANY of its providers is keyed (e.g. Anthropic credits depleted) and
+        # otherwise stays on Anthropic. Asking only about the OpenRouter key here
+        # — which is what this used to do — means a deployment carrying only a
+        # Gemini or Groq key silently answers every call from a static template.
         if forced_key or force_openrouter:
             provider = "openrouter"
         else:
             provider = (getattr(settings, "ai_provider", "auto") or "auto").lower()
             if provider == "auto":
-                provider = "openrouter" if settings.openrouter_api_key else "anthropic"
+                provider = "openrouter" if has_any_provider_key(settings) else "anthropic"
         self.provider = provider
         self._anthropic_key = settings.anthropic_api_key
+        # Which provider/model actually answered the most recent call. Populated
+        # by _chat_completion; surfaced by GET /api/v1/ai/providers. Before this,
+        # "which provider wrote this email?" was unanswerable.
+        self.last_provider: str | None = None
+        self.last_model: str | None = None
 
         if self.provider == "openrouter":
             self._openrouter_key = forced_key or settings.openrouter_api_key
-            self._openrouter_base = settings.openrouter_base_url.rstrip("/")
             self.model = openrouter_model or settings.openrouter_model
             # AsyncAnthropic is still constructed lazily-free (no network) so any
-            # stray direct references don't explode; it is simply never called.
+            # stray direct references don't explode; it is simply never called
+            # unless the whole provider chain is exhausted.
             self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key or "unused")
-            logger.info("AIService using OpenRouter backend, model=%s", self.model)
+            logger.info(
+                "AIService using the OpenAI-compatible provider chain, "
+                "OpenRouter model=%s", self.model,
+            )
         else:
             self._openrouter_key = ""
             self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
@@ -355,14 +380,20 @@ class AIService:
 
     @property
     def is_configured(self) -> bool:
-        """True when the *active* backend has the credential it needs.
+        """True when the *active* backend has a credential it can use.
 
         Callers gate on this instead of on ``anthropic_api_key`` directly: with
         AI_PROVIDER=openrouter the Anthropic key is legitimately absent, and
         checking the wrong one silently degrades a working backend to templates.
+
+        On the chain backend this is true when ANY chain provider is keyed —
+        including the Anthropic cross-fallback — not just OpenRouter, for the
+        same reason.
         """
         if self.provider == "openrouter":
-            return bool(self._openrouter_key)
+            if self._openrouter_key or self._anthropic_key:
+                return True
+            return has_any_provider_key(get_settings())
         return bool(self._anthropic_key)
 
     # ------------------------------------------------------------------
@@ -387,116 +418,70 @@ class AIService:
         try/except degradation.
         """
         if self.provider == "openrouter":
-            openai_messages = [self._to_openai_message(m) for m in messages]
-            if system:
-                openai_messages.insert(0, {"role": "system", "content": system})
-            headers = {
-                "Authorization": f"Bearer {self._openrouter_key}",
-                "Content-Type": "application/json",
-                # Optional attribution headers OpenRouter recommends.
-                "HTTP-Referer": "https://apprend.tech",
-                "X-Title": "Landline",
-            }
+            settings = get_settings()
+            # A reasoning model bills its chain-of-thought against the same
+            # max_tokens budget as the answer, and emits it first — so an
+            # unbounded trace returns an empty answer with
+            # finish_reason="length" rather than an error. Give the answer a
+            # floor. See ``openrouter_min_max_tokens``.
+            budget = max(max_tokens, settings.openrouter_min_max_tokens)
+            providers = build_provider_chain(
+                settings,
+                openrouter_key=self._openrouter_key,
+                openrouter_models=self._model_chain(),
+            )
             last_exc: Exception | None = None
-            async with httpx.AsyncClient(timeout=60.0) as http:
-                # Try the configured model, then each fallback in turn. A 429 on
-                # the free tier is a *quota* answer, not a transport blip, so
-                # retrying the same model is pointless — only a different model
-                # (realistically a paid one) can succeed.
-                settings = get_settings()
-                # A reasoning model bills its chain-of-thought against the same
-                # max_tokens budget as the answer, and emits it first — so an
-                # unbounded trace returns an empty answer with
-                # finish_reason="length" rather than an error. Give the trace a
-                # ceiling and the answer a floor. See ``openrouter_reasoning_effort``.
-                effort = (settings.openrouter_reasoning_effort or "").strip()
-                budget = max(max_tokens, settings.openrouter_min_max_tokens)
-                for attempt, model in enumerate(self._model_chain()):
-                    payload = {
-                        "model": model,
-                        "max_tokens": budget,
-                        "messages": openai_messages,
-                    }
-                    if effort:
-                        payload["reasoning"] = {"effort": effort}
-                    if temperature is not None:
-                        payload["temperature"] = temperature
-                    try:
-                        resp = await http.post(
-                            f"{self._openrouter_base}/chat/completions",
-                            headers=headers,
-                            json=payload,
-                        )
-                        resp.raise_for_status()
-                    except httpx.HTTPStatusError as exc:
-                        status = exc.response.status_code
-                        if status != 429 and status < 500:
-                            raise
-                        last_exc = exc
-                        logger.warning(
-                            "OpenRouter model %s returned %s — %s",
-                            model, status,
-                            "trying fallback" if attempt == 0 else "fallback also failed",
-                        )
-                        continue
-                    data = resp.json()
-                    choice = (data.get("choices") or [{}])[0]
-                    content = (choice.get("message") or {}).get("content") or ""
-                    if not content.strip():
-                        # An empty answer is a failure, not an answer. Returning
-                        # "" here is what made this invisible: every caller's
-                        # JSON parse failed and degraded to a static template,
-                        # so a broken model looked exactly like a healthy one
-                        # writing un-personalised copy. Log the cause and try the
-                        # next model instead of laundering it into a success.
-                        usage = data.get("usage") or {}
-                        reasoning_tokens = (
-                            usage.get("completion_tokens_details") or {}
-                        ).get("reasoning_tokens")
-                        last_exc = RuntimeError(
-                            f"OpenRouter model {model} returned empty content "
-                            f"(finish_reason={choice.get('finish_reason')}, "
-                            f"reasoning_tokens={reasoning_tokens})"
-                        )
-                        logger.warning(
-                            "OpenRouter model %s returned empty content — "
-                            "finish_reason=%s reasoning_tokens=%s of max_tokens=%s. "
-                            "A reasoning trace that consumes the whole budget leaves "
-                            "no room for the answer; lower OPENROUTER_REASONING_EFFORT "
-                            "or raise OPENROUTER_MIN_MAX_TOKENS.",
-                            model, choice.get("finish_reason"), reasoning_tokens, budget,
-                        )
-                        continue
-                    if attempt:
-                        logger.info("OpenRouter fell back to model %s", model)
+            if providers:
+                try:
+                    content, served_by, served_model = await chain_chat_completion(
+                        messages,
+                        providers=providers,
+                        max_tokens=budget,
+                        temperature=temperature,
+                        system=system,
+                    )
+                    self.last_provider = served_by
+                    self.last_model = served_model
                     return content
-            # Every OpenRouter model in the chain is exhausted. Before giving up,
-            # cross to Anthropic if a key is configured.
+                except LLMChainExhausted as exc:
+                    last_exc = exc
+            else:
+                last_exc = LLMChainExhausted("no OpenAI-compatible provider is configured")
+
+            # Every provider in the chain is exhausted. Before giving up, cross
+            # to Anthropic if a key is configured.
             #
-            # The free tier's daily quota is a *routine* condition, not an
+            # A free tier's daily quota is a *routine* condition, not an
             # incident — it is reached every day that outreach runs at any
-            # volume, and it answers 429 to everything after that. Without this,
-            # each exhaustion silently downgrades every email to the static
-            # mail-merge and every reply classification to keyword-only, which is
-            # exactly the "healthy-looking degradation" this audit kept finding.
-            # ``openrouter_fallback_models`` cannot cover it: that chain is
-            # OpenRouter-only, and on the free tier the quota is account-level,
-            # so a second free model shares the same exhausted allowance.
+            # volume, and the provider answers 429 to everything after that.
+            # Without a cross-provider hop, each exhaustion silently downgrades
+            # every email to the static mail-merge and every reply
+            # classification to keyword-only: the "healthy-looking degradation"
+            # this whole chain exists to end.
             if self._anthropic_key:
                 logger.warning(
-                    "OpenRouter exhausted (%s) — falling back to Anthropic for this call",
+                    "LLM provider chain exhausted (%s) — falling back to Anthropic "
+                    "for this call",
                     last_exc,
                 )
-                return await self._anthropic_completion(
+                content = await self._anthropic_completion(
                     messages, max_tokens=max_tokens, temperature=temperature, system=system
                 )
+                self.last_provider = "anthropic"
+                self.last_model = ANTHROPIC_MODEL
+                logger.info("LLM request served by anthropic (model=%s)", ANTHROPIC_MODEL)
+                return content
             # Nothing left. Raise so the caller's existing degradation path
             # (static copy, neutral score) runs, exactly as before.
-            raise last_exc if last_exc else RuntimeError("no OpenRouter model configured")
+            raise last_exc if last_exc else LLMChainExhausted("no LLM provider configured")
 
-        return await self._anthropic_completion(
+        content = await self._anthropic_completion(
             messages, max_tokens=max_tokens, temperature=temperature, system=system
         )
+        self.last_provider = "anthropic"
+        self.last_model = self.model
+        logger.info("LLM request served by anthropic (model=%s)", self.model)
+        return content
 
     async def _anthropic_completion(
         self,
@@ -534,28 +519,11 @@ class AIService:
     def _to_openai_message(message: dict) -> dict:
         """Translate one Anthropic-shaped message to OpenAI chat format.
 
-        Plain string content passes through unchanged. A list of content blocks
-        (used by the vision card-scanner) has its ``image``/``text`` blocks
-        rewritten to the OpenAI ``image_url``/``text`` block form.
+        The implementation moved to :mod:`app.services.llm_providers` when the
+        transport did; this stays as the name the rest of the codebase (and the
+        tests) already reach for.
         """
-        content = message.get("content")
-        if not isinstance(content, list):
-            return {"role": message.get("role", "user"), "content": content}
-
-        blocks = []
-        for block in content:
-            btype = block.get("type")
-            if btype == "text":
-                blocks.append({"type": "text", "text": block.get("text", "")})
-            elif btype == "image":
-                source = block.get("source", {})
-                media_type = source.get("media_type", "image/jpeg")
-                data = source.get("data", "")
-                blocks.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{media_type};base64,{data}"},
-                })
-        return {"role": message.get("role", "user"), "content": blocks}
+        return to_openai_message(message)
 
     async def _chat(
         self,

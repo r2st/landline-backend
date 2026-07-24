@@ -25,7 +25,6 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-import anthropic
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +33,7 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.relationship import OrgRelationship, StakeholderMap
 from app.services.call_queue import engagement_by_contact
+from app.services.llm_providers import ChainClient, any_llm_available, chain_client
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +69,18 @@ class RelationshipIntelligence:
         settings = get_settings()
         self.model = _MODEL
         self._api_key = settings.anthropic_api_key
-        self._client: anthropic.AsyncAnthropic | None = None
+        self._client: ChainClient | None = None
 
     @property
     def available(self) -> bool:
-        return bool(self._api_key)
+        # Any chain provider counts, not just the Anthropic key: this service is
+        # chain-backed now, and gating on one credential would keep it dark on a
+        # deployment that carries only a Gemini or Groq key.
+        return any_llm_available()
 
-    def _get_client(self) -> anthropic.AsyncAnthropic:
+    def _get_client(self) -> ChainClient:
         if self._client is None:
-            self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
+            self._client = chain_client(self._api_key)
         return self._client
 
     def _parse_json(self, text: str) -> dict:

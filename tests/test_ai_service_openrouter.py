@@ -15,6 +15,7 @@ import pytest
 from app.config import Settings
 from app.services import ai_service as ai_module
 from app.services.ai_service import AIService
+from app.services.llm_providers import LLMChainExhausted
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +427,19 @@ async def test_5xx_also_falls_through(monkeypatch, _sequenced):
 async def test_4xx_that_is_not_429_raises_without_burning_the_fallback(
     monkeypatch, _sequenced
 ):
-    """A bad request is our bug — retrying a paid model would just cost money."""
+    """A bad request is our bug — retrying a paid model would just cost money.
+
+    The raised type is now ``LLMChainExhausted`` rather than the raw
+    ``httpx.HTTPStatusError``: with a provider chain there is no longer one
+    error to re-raise, and it stays a ``RuntimeError`` so every caller's
+    ``except Exception`` degradation path is unchanged. What this test still
+    pins is the part that costs money — the sibling model is NOT tried.
+    """
     svc = _openrouter_service(monkeypatch, openrouter_fallback_models="openai/gpt-4o-mini")
     _install_sequenced(monkeypatch)
     _sequenced.responses = {"meta-llama/llama-3.1-8b-instruct:free": 400}
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(LLMChainExhausted):
         await svc._chat_completion([{"role": "user", "content": "x"}])
     assert _sequenced.models_tried == ["meta-llama/llama-3.1-8b-instruct:free"]
 
@@ -447,6 +455,6 @@ async def test_every_model_rate_limited_raises_for_the_callers_degradation_path(
         "openai/gpt-4o-mini": 429,
     }
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(LLMChainExhausted):
         await svc._chat_completion([{"role": "user", "content": "x"}])
     assert len(_sequenced.models_tried) == 2

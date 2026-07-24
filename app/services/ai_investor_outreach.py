@@ -20,10 +20,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-import anthropic
 
 from app.config import get_settings
 from app.models.investor import Investor
+from app.services.llm_providers import any_llm_available, chain_client
 
 logger = logging.getLogger(__name__)
 
@@ -136,13 +136,13 @@ def _fallback(investor: Investor) -> dict:
 
 
 def _available() -> bool:
-    return bool(get_settings().anthropic_api_key)
+    return any_llm_available()
 
 
 async def _generate_json(prompt: str) -> dict:
     """Single-shot prompt → parsed JSON. Returns ``{"error": ...}`` on failure."""
     try:
-        client = anthropic.AsyncAnthropic(api_key=get_settings().anthropic_api_key)
+        client = chain_client(get_settings().anthropic_api_key)
         message = await asyncio.wait_for(
             client.messages.create(
                 model=_MODEL,

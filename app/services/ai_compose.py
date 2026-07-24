@@ -48,6 +48,7 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment
 from app.models.sequence import SequenceStep
+from app.services.llm_providers import has_any_provider_key
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +267,12 @@ async def compose_step(
     # configuration *now*. A key that is present but rejected at call time still
     # lands on the AI-error path below and falls back to static, so guessing
     # generously here costs one wasted call, never a dropped touch.
-    if not (settings.openrouter_api_key or settings.anthropic_api_key):
+    #
+    # Ask the provider chain, not one key: the gate now has four OpenAI-compatible
+    # providers plus Anthropic to choose from, and naming only OpenRouter here
+    # would re-introduce the exact failure above one level up — a deployment
+    # holding a Gemini key would report "no API key" and mail static copy.
+    if not (has_any_provider_key(settings) or settings.anthropic_api_key):
         return static.because("no API key")
 
     template_type = template_type_for(step.step_number)

@@ -368,13 +368,12 @@ Return ONLY valid JSON:
   "outreach_angle": "how to reference this in outreach"
 }}"""
 
-            message = await ai.client.messages.create(
-                model=ai.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text.strip()
+            # Go through AIService's own completion path, not ``ai.client``.
+            # Reaching into ``.client`` grabbed the raw Anthropic SDK handle,
+            # which on the OpenRouter/chain backend is constructed with the
+            # literal key "unused" — so this call could only ever work on the
+            # Anthropic backend, and silently 401'd everywhere else.
+            response_text = (await ai.complete_text(prompt, max_tokens=512)).strip()
             if response_text.startswith("```"):
                 response_text = response_text.split("```")[1]
                 if response_text.startswith("json"):

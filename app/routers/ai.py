@@ -309,6 +309,23 @@ async def get_pending_replies(db: AsyncSession = Depends(get_db)):
 
     return {"pending_replies": items}
 
+
+@router.get("/providers")
+async def ai_provider_status():
+    """Which LLM providers are configured, which are serving, which are tripped.
+
+    The two silent AI outages this codebase has had (Anthropic credits, then
+    OpenRouter's free-tier daily cap) both went unnoticed because nothing
+    reported *which* provider answered a request — a chain running entirely on
+    its last hop looks identical to one running on its first. This is the
+    read-out for that. Never returns key material; the counters are per-process,
+    so the API and each Celery worker report their own view.
+    """
+    from app.services.llm_providers import llm_status
+
+    return llm_status()
+
+
 @router.post("/scan-card")
 @limiter.limit(AI_RATE_LIMIT)
 async def scan_business_card(request: Request, file: UploadFile = File(...)):

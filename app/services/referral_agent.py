@@ -7,10 +7,11 @@ without Celery or FastAPI:
   long-tenured clients we haven't over-asked, ranked by health.
 * **AI drafting** — :func:`generate_referral_ask` / :func:`generate_followup` /
   :func:`generate_thankyou` craft personalized copy. Every AI call routes through
-  :func:`_agent_complete_json`, which sends the request to **OpenRouter's
-  OpenAI-compatible chat/completions endpoint** using *the agent's own*
-  ``llm_model`` and ``llm_api_key`` — falling back to the org-level
-  ``openrouter_api_key`` (system_settings) and finally the global config key.
+  :func:`_agent_complete_json`, which sends the request down the
+  **OpenAI-compatible provider chain** (:mod:`app.services.llm_providers`) with
+  *the agent's own* ``llm_model`` and ``llm_api_key`` pinning the OpenRouter
+  hop — falling back to the org-level ``openrouter_api_key`` (system_settings),
+  then the global config key, then Gemini/Groq/Cerebras.
 * **Chain tracking** — :func:`track_referral_chain` links a referred contact
   back to the referrer once they enter the CRM.
 
@@ -29,11 +30,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.services.llm_providers import (
+    build_provider_chain,
+    chat_completion as chain_chat_completion,
+)
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.referral import (
@@ -106,43 +110,39 @@ async def _agent_complete_json(
     max_tokens: int = 700,
     system: Optional[str] = None,
 ) -> dict:
-    """Send a single-shot prompt to OpenRouter using the agent's model + key.
+    """Send a single-shot prompt through the provider chain, agent model first.
+
+    The agent's resolved key + model pin the OpenRouter hop; the rest of the
+    chain (Gemini → Groq → Cerebras) comes from process settings. This used to
+    be a bare single-provider POST, so an agent whose OpenRouter allowance was
+    spent fell straight back to the org's static templates — the same
+    healthy-looking degradation the chain exists to end. A per-org key running
+    dry now costs a hop, not the copy.
 
     Returns the parsed JSON object, or ``{"error": ...}`` on any failure — never
     raises, so a scan over many candidates isn't aborted by one bad response.
     """
     api_key = await resolve_api_key(db, agent)
-    if not api_key:
-        return {"error": "No OpenRouter API key configured (agent, org, or global)."}
-
     settings = get_settings()
-    base = settings.openrouter_base_url.rstrip("/")
     model = agent.llm_model or DEFAULT_LLM_MODEL
+    providers = build_provider_chain(
+        settings, openrouter_key=api_key or "", openrouter_models=(model,)
+    )
+    if not providers:
+        return {"error": "No LLM API key configured (agent, org, or global)."}
 
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-
-    payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://apprend.tech",
-        "X-Title": "Landline Referral Agent",
-    }
+    messages = [{"role": "user", "content": prompt}]
     try:
-        async with httpx.AsyncClient(timeout=60.0) as http:
-            resp = await http.post(
-                f"{base}/chat/completions", headers=headers, json=payload
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        text = data["choices"][0]["message"]["content"] or ""
-        return _parse_json(text)
+        text, served_by, served_model = await chain_chat_completion(
+            messages, providers=providers, max_tokens=max_tokens, system=system
+        )
     except Exception as exc:  # noqa: BLE001 — degrade, never raise into a scan
         logger.warning("Referral agent AI call failed (model=%s): %s", model, exc)
         return {"error": str(exc)}
+    logger.info(
+        "Referral agent AI call served by %s (model=%s)", served_by, served_model
+    )
+    return _parse_json(text)
 
 
 def _parse_json(text: str) -> dict:

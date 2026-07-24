@@ -34,7 +34,6 @@ from types import SimpleNamespace
 from typing import Optional
 from uuid import UUID
 
-import anthropic
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,6 +47,7 @@ from app.models.orchestration import (
     OrchestrationPolicy,
 )
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.services.llm_providers import ChainClient, any_llm_available, chain_client
 
 logger = logging.getLogger(__name__)
 
@@ -115,15 +115,18 @@ class Orchestrator:
         settings = get_settings()
         self.model = _MODEL
         self._api_key = settings.anthropic_api_key
-        self._client: anthropic.AsyncAnthropic | None = None
+        self._client: ChainClient | None = None
 
     @property
     def available(self) -> bool:
-        return bool(self._api_key)
+        # Any chain provider counts, not just the Anthropic key: this service is
+        # chain-backed now, and gating on one credential would keep it dark on a
+        # deployment that carries only a Gemini or Groq key.
+        return any_llm_available()
 
-    def _get_client(self) -> anthropic.AsyncAnthropic:
+    def _get_client(self) -> ChainClient:
         if self._client is None:
-            self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
+            self._client = chain_client(self._api_key)
         return self._client
 
     # ------------------------------------------------------------------ #

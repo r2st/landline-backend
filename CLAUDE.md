@@ -60,3 +60,27 @@ Push to main. Deploy is handled externally via SSM to EC2 at `/opt/landline`.
 
 ## Environment Variables
 Key vars in `.env.production`: `DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`, `APOLLO_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`, `FRONTEND_URL`, `FERNET_KEY`
+
+## AI provider chain
+Every AI feature routes through `AIService` → `app/services/llm_providers.py`, which
+tries providers in order (`LLM_PROVIDER_CHAIN`, default
+`openrouter,gemini,groq,cerebras`), then Anthropic, then the caller's static
+template. Keys: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`,
+`CEREBRAS_API_KEY` — an unkeyed provider is skipped, not attempted.
+
+A provider failing 3× in a row is skipped for 5 minutes
+(`LLM_BREAKER_THRESHOLD` / `LLM_BREAKER_COOLDOWN_SECONDS`).
+
+Services that predate `AIService` and call `client.messages.create(...)` directly
+(sales coach, orchestrator, meeting/relationship/competitive intelligence,
+sentiment, script generator, investor outreach) use `chain_client()` from the
+same module — it keeps the Anthropic call shape and response
+(`message.content[0].text`) but serves it from the chain. Gate those on
+`any_llm_available()`, **not** on `settings.anthropic_api_key`: a box carrying
+only a Groq key has working AI, and the narrow gate would report it dark.
+
+**Never add a bare `httpx.post` to a model endpoint, and never construct
+`anthropic.AsyncAnthropic` in a service.** Twice now a single-provider
+call has run out of quota and silently degraded outreach to static mail-merge
+copy while every log line said "fine". `GET /api/v1/ai/providers` reports which
+provider is actually serving.

@@ -16,8 +16,8 @@ import logging
 import json
 from typing import Optional
 
-import anthropic
 from app.config import get_settings
+from app.services.llm_providers import chain_client
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,9 @@ class SentimentAnalyzer:
 
     def __init__(self):
         settings = get_settings()
-        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # Chain-backed: reply sentiment is a Dialtone hot path, and it was
+        # Anthropic-only, so it went dark the moment those credits ran out.
+        self.client = chain_client(settings.anthropic_api_key)
         self.model = "claude-sonnet-4-6"
 
     def _score_to_label(self, score: float) -> str:

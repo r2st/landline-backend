@@ -140,6 +140,24 @@ def _patch_pg_types_for_sqlite():
 _patch_pg_types_for_sqlite()
 
 
+@pytest.fixture(autouse=True)
+def _reset_llm_breaker():
+    """Clear the process-wide LLM circuit breaker around every test.
+
+    The breaker is deliberately long-lived in production — a provider that is
+    out of quota stays skipped for the cooldown so a batch send doesn't pay its
+    timeout on every email. Under pytest that same longevity means one test's
+    simulated provider failures trip the breaker for every test that follows,
+    which reads as a mysterious cascade of "provider skipped" failures in files
+    that never touched the breaker at all.
+    """
+    from app.services.llm_providers import reset_breaker
+
+    reset_breaker()
+    yield
+    reset_breaker()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_org_context():
     """Clear the multi-tenant org contextvar around every test.

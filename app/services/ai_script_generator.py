@@ -34,7 +34,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-import anthropic
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +49,7 @@ from app.schemas.call import CallScriptRead, CustomScript, CustomScriptResponse
 from app.services import call_scripts_data, industry_verticals as iv
 from app.services.call_queue import engagement_by_contact
 from app.services.outreach import ai_sales_guidelines as guidelines
+from app.services.llm_providers import ChainClient, any_llm_available, chain_client
 
 logger = logging.getLogger(__name__)
 
@@ -763,18 +763,16 @@ class AIScriptGenerator:
     """Wraps the Anthropic client; lazily created so a missing key is harmless."""
 
     def __init__(self):
-        self._client: Optional[anthropic.AsyncAnthropic] = None
+        self._client: Optional[ChainClient] = None
         self._model = _MODEL
 
     @property
     def available(self) -> bool:
-        return bool(get_settings().anthropic_api_key)
+        return any_llm_available()
 
-    def _get_client(self) -> anthropic.AsyncAnthropic:
+    def _get_client(self) -> ChainClient:
         if self._client is None:
-            self._client = anthropic.AsyncAnthropic(
-                api_key=get_settings().anthropic_api_key
-            )
+            self._client = chain_client(get_settings().anthropic_api_key)
         return self._client
 
     async def generate_script_json(self, prompt: str) -> dict:

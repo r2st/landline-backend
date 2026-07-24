@@ -246,7 +246,12 @@ async def test_agent_complete_json_uses_agent_model_and_key(db_session: AsyncSes
             captured["payload"] = json
             return _FakeResp()
 
-    monkeypatch.setattr(svc.httpx, "AsyncClient", _FakeClient)
+    # The transport now lives in the shared provider chain, so patch it there.
+    # The agent's own model + key still pin the OpenRouter hop, which is what
+    # this test exists to prove.
+    from app.services import llm_providers as chain_module
+
+    monkeypatch.setattr(chain_module.httpx, "AsyncClient", _FakeClient)
 
     out = await svc._agent_complete_json(db_session, agent, "draft something")
 
