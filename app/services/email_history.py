@@ -27,7 +27,7 @@ from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.inbox_label import InboxLabel, InboxThreadLabel
 from app.models.inbox_thread_state import InboxThreadState
-from app.models.outreach import OutreachEnrollment
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import crypto, google_oauth
 from app.services.bounce_ingestion import is_bounce_message
 from app.services.gmail_sender import GmailSender
@@ -544,6 +544,24 @@ class EmailHistoryService:
                 )
             )
 
+        # Sequence sends for these contacts (no EmailSend row exists for them).
+        sequence_rows = await self._fetch_sequence_sends(db, contact_ids=contact_ids)
+        engagement = await self._sequence_engagement(
+            db, {enr.id for _, enr in sequence_rows}
+        )
+        for event, enrollment in sequence_rows:
+            messages.append(
+                self._sequence_send_to_message(
+                    event,
+                    enrollment,
+                    contact_map.get(enrollment.contact_id),
+                    company_name,
+                    company_id,
+                    account_email_map,
+                    engagement.get((enrollment.id, event.step_number)),
+                )
+            )
+
         # Group into threads
         threads = self._group_into_threads(messages, company_name, company_id)
 
@@ -557,6 +575,236 @@ class EmailHistoryService:
         paginated = threads[start:end]
 
         return {"threads": paginated, "total_messages": total_messages}
+
+    # ------------------------------------------------------------------
+    # Sequence sends (OutreachEvent)
+    # ------------------------------------------------------------------
+    #
+    # The sequence engine (``app.tasks.outreach.send_sequence_step``) records a
+    # real send as ``OutreachEvent(event_type="sent")`` and deliberately writes
+    # NO ``EmailSend`` row — see the comments around the event construction
+    # there. Every mail surface in this service was built on ``EmailSend``
+    # alone, so the outbound half of Dialtone's own outreach was invisible: the
+    # email sat in the sender's Gmail "Sent" folder, and the Landline inbox
+    # showed nothing (or, worse, showed a prospect's reply hanging under a
+    # thread with no preceding message).
+    #
+    # The event's ``metadata`` already carries everything needed to render the
+    # message — ``to_email``, ``subject``, ``body_html`` (the human copy, before
+    # tracking instrumentation), plus ``from_email`` / ``sender_account_id`` /
+    # ``gmail_thread_id`` / ``gmail_message_id`` merged in from the dispatcher's
+    # send result. So this is a read-side union, not a second write path: the
+    # send accounting (warm-up counters, deliverability, A/B attribution) keeps
+    # its single source of truth and only the *view* is made whole.
+
+    @staticmethod
+    def _sequence_send_identity(
+        event: OutreachEvent, enrollment: OutreachEnrollment
+    ) -> tuple[Optional[uuid.UUID], Optional[str]]:
+        """The (account id, from address) a sequence send actually went out on.
+
+        The event's metadata is authoritative: sender rotation can move a later
+        step onto a different mailbox, and the enrollment column only remembers
+        the *most recent* one. The enrollment is the fallback for older events
+        recorded before the dispatcher merged its result into the metadata.
+        """
+        meta = event.event_metadata or {}
+        account_id = None
+        raw_id = meta.get("sender_account_id")
+        if raw_id:
+            try:
+                account_id = uuid.UUID(str(raw_id))
+            except (ValueError, AttributeError, TypeError):
+                account_id = None
+        if account_id is None:
+            account_id = enrollment.sender_account_id
+
+        from_email = meta.get("from_email") or meta.get("sender")
+        return account_id, (from_email.lower() if from_email else None)
+
+    async def _fetch_sequence_sends(
+        self,
+        db: AsyncSession,
+        *,
+        scopes: Optional[list[tuple[set, set]]] = None,
+        gmail_thread_id: Optional[str] = None,
+        contact_ids: Optional[list] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        limit: Optional[int] = None,
+    ) -> list[tuple[OutreachEvent, OutreachEnrollment]]:
+        """Load ``sent`` outreach events with their enrollment, newest first.
+
+        ``scopes`` is a list of ``(account_ids, emails)`` pairs; a send is kept
+        only if it satisfies EVERY pair (its sending account id is in that
+        pair's id set, or its from-address is in that pair's address set). That
+        mirrors how ``get_inbox`` layers the caller's own-mailbox scope on top
+        of an optional single-account filter — both must hold.
+
+        The scope test needs the event's JSON metadata, so it runs in Python
+        rather than SQL (the column is JSONB in Postgres but a plain JSON string
+        under the SQLite test shim, and no portable predicate spans both).
+        ``limit`` therefore bounds the rows *scanned*, exactly like the
+        ``scan_cap`` the send/reply queries use.
+        """
+        query = (
+            select(OutreachEvent, OutreachEnrollment)
+            .join(
+                OutreachEnrollment,
+                OutreachEvent.enrollment_id == OutreachEnrollment.id,
+            )
+            .where(OutreachEvent.event_type == "sent")
+        )
+        if gmail_thread_id is not None:
+            query = query.where(
+                OutreachEnrollment.gmail_thread_id == gmail_thread_id
+            )
+        if contact_ids is not None:
+            if not contact_ids:
+                return []
+            query = query.where(OutreachEnrollment.contact_id.in_(contact_ids))
+        if date_from is not None:
+            query = query.where(OutreachEvent.occurred_at >= date_from)
+        if date_to is not None:
+            query = query.where(OutreachEvent.occurred_at <= date_to)
+
+        query = query.order_by(OutreachEvent.occurred_at.desc())
+        if limit is not None:
+            query = query.limit(limit)
+
+        rows = (await db.execute(query)).all()
+
+        if not scopes:
+            return [(event, enrollment) for event, enrollment in rows]
+
+        kept = []
+        for event, enrollment in rows:
+            account_id, from_email = self._sequence_send_identity(event, enrollment)
+            if all(
+                (account_id is not None and account_id in account_ids)
+                or (from_email is not None and from_email in emails)
+                for account_ids, emails in scopes
+            ):
+                kept.append((event, enrollment))
+        return kept
+
+    async def _sequence_engagement(
+        self, db: AsyncSession, enrollment_ids
+    ) -> dict[tuple, dict]:
+        """First open / click per ``(enrollment_id, step_number)``.
+
+        Sequence engagement lands on sibling ``opened`` / ``clicked`` events
+        rather than on columns of the send row, so the inbox's ``opened`` filter
+        and the per-message open/click stamps have to be assembled here.
+        """
+        ids = list(enrollment_ids)
+        if not ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(
+                    OutreachEvent.enrollment_id,
+                    OutreachEvent.step_number,
+                    OutreachEvent.event_type,
+                    func.min(OutreachEvent.occurred_at),
+                )
+                .where(
+                    OutreachEvent.enrollment_id.in_(ids),
+                    OutreachEvent.event_type.in_(("opened", "clicked")),
+                )
+                .group_by(
+                    OutreachEvent.enrollment_id,
+                    OutreachEvent.step_number,
+                    OutreachEvent.event_type,
+                )
+            )
+        ).all()
+
+        engagement: dict[tuple, dict] = {}
+        for enrollment_id, step_number, event_type, occurred_at in rows:
+            entry = engagement.setdefault((enrollment_id, step_number), {})
+            key = "opened_at" if event_type == "opened" else "clicked_at"
+            entry[key] = occurred_at
+        return engagement
+
+    def _sequence_send_to_message(
+        self,
+        event: OutreachEvent,
+        enrollment: OutreachEnrollment,
+        contact: Optional[Contact],
+        company_name: Optional[str],
+        company_id: Optional[uuid.UUID],
+        account_email_map: Optional[dict[uuid.UUID, str]] = None,
+        engagement: Optional[dict] = None,
+    ) -> dict:
+        """Convert a ``sent`` OutreachEvent to a unified message dict."""
+        meta = event.event_metadata or {}
+        account_id, from_email = self._sequence_send_identity(event, enrollment)
+
+        account_email = None
+        if account_email_map is not None and account_id:
+            account_email = account_email_map.get(account_id)
+            if account_email is None:
+                # An id that resolves to no connected Gmail account is an SMTP
+                # sender (the dispatcher reports both under the same key). Don't
+                # publish it as ``gmail_account_id`` — the frontend filters on
+                # that field and would match it against Gmail accounts.
+                account_id = None
+        if not from_email:
+            from_email = account_email.lower() if account_email else None
+        if not account_email:
+            account_email = from_email
+
+        engagement = engagement or {}
+
+        return {
+            "id": event.id,
+            "direction": "sent",
+            "from_email": from_email or "",
+            "to_email": meta.get("to_email")
+            or (contact.email if contact is not None else "")
+            or "",
+            "subject": meta.get("subject"),
+            "body_html": meta.get("body_html"),
+            "body_text": None,
+            "snippet": None,
+            "status": "sent",
+            "gmail_thread_id": meta.get("gmail_thread_id")
+            or enrollment.gmail_thread_id,
+            "gmail_message_id": meta.get("gmail_message_id"),
+            "timestamp": event.occurred_at,
+            "opened_at": engagement.get("opened_at"),
+            "clicked_at": engagement.get("clicked_at"),
+            "is_read": True,  # Sent messages are always "read"
+            "contact_id": enrollment.contact_id,
+            "contact_name": contact.full_name if contact is not None else None,
+            "company_id": company_id,
+            "company_name": company_name,
+            "gmail_account_id": account_id,
+            "gmail_account_email": account_email,
+            # Classification/priority live only on incoming replies.
+            "reply_classification": None,
+            "priority_flag": False,
+        }
+
+    @staticmethod
+    def _message_matches_search(message: dict, search: str) -> bool:
+        """Case-insensitive substring match over a message's readable fields.
+
+        The SQL side of the inbox does this with ILIKE; sequence sends carry
+        their copy in JSON metadata and are filtered in Python, so this keeps
+        the two paths matching on the same fields.
+        """
+        needle = search.lower()
+        return any(
+            value and needle in value.lower()
+            for value in (
+                message.get("subject"),
+                message.get("to_email"),
+                message.get("from_email"),
+                message.get("body_html"),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Unified inbox
@@ -638,6 +886,13 @@ class EmailHistoryService:
         # Build sent messages query
         sends_query = select(EmailSend).where(EmailSend.status != "skipped")
         replies_query = select(EmailReply)
+        # Sequence sends live on OutreachEvent, not EmailSend (see
+        # ``_fetch_sequence_sends``). They are outbound, so they follow the
+        # sends query: present in every view that shows sent mail, absent from
+        # the received-only ones. ``seq_scopes`` accumulates the same mailbox
+        # scoping the two SQL queries below apply.
+        include_sequence_sends = True
+        seq_scopes: list[tuple[set, set]] = []
 
         # Scope to user's accounts when authenticated. A message belongs to the
         # user if it carries one of their account-id FKs OR its header address is
@@ -645,6 +900,7 @@ class EmailHistoryService:
         # address covers SMTP mail, which carries no FK).
         if user_gmail_emails is not None and user_gmail_emails:
             user_account_ids = _account_ids_for(user_gmail_emails)
+            seq_scopes.append((set(user_account_ids), set(user_gmail_emails)))
             sends_query = sends_query.where(
                 or_(
                     EmailSend.sender_account_id.in_(user_account_ids),
@@ -667,6 +923,7 @@ class EmailHistoryService:
             replies_query = replies_query.where(
                 EmailReply.gmail_account_id == gmail_account_id
             )
+            seq_scopes.append(({gmail_account_id}, set()))
 
         # Scope to a single email account by address. Matches on the connected
         # account's id FK *or* the header address, for the same reason as the
@@ -690,6 +947,7 @@ class EmailHistoryService:
                     func.lower(EmailReply.to_email) == addr,
                 )
             )
+            seq_scopes.append((set(addr_account_ids), {addr}))
 
         if filter_type == "sent":
             # Only sent emails
@@ -697,6 +955,7 @@ class EmailHistoryService:
         elif filter_type == "received":
             # Only received — exclude replies from our own connected accounts
             sends_query = None
+            include_sequence_sends = False
             if connected_emails:
                 replies_query = replies_query.where(
                     ~func.lower(EmailReply.from_email).in_(connected_emails)
@@ -704,6 +963,9 @@ class EmailHistoryService:
         elif filter_type == "opened":
             sends_query = sends_query.where(EmailSend.opened_at.isnot(None))
             replies_query = None
+            # Sequence sends carry no ``opened_at`` column — the open is a
+            # sibling event — so they are narrowed after the engagement map is
+            # assembled below.
         elif filter_type == "needs_reply":
             # Threads where the last message is a received email (needs reply)
             pass  # We'll filter after grouping
@@ -779,6 +1041,31 @@ class EmailHistoryService:
             else []
         )
 
+        # Sequence sends — the outbound mail Dialtone's own sequences put on the
+        # wire, which has no EmailSend row to be found by the query above.
+        sequence_rows: list[tuple[OutreachEvent, OutreachEnrollment]] = []
+        sequence_engagement: dict[tuple, dict] = {}
+        if include_sequence_sends:
+            sequence_rows = await self._fetch_sequence_sends(
+                db,
+                scopes=seq_scopes,
+                date_from=date_from,
+                date_to=date_to,
+                limit=scan_cap,
+            )
+            sequence_engagement = await self._sequence_engagement(
+                db, {enr.id for _, enr in sequence_rows}
+            )
+            if filter_type == "opened":
+                sequence_rows = [
+                    (event, enr)
+                    for event, enr in sequence_rows
+                    if sequence_engagement.get((enr.id, event.step_number), {}).get(
+                        "opened_at"
+                    )
+                    is not None
+                ]
+
         # Batch-load the contacts and companies referenced by this page of rows.
         # Inbox assembly used to be an N+1 — up to two queries per send and per
         # reply (contact, then company) — which with the scan cap of ~500 rows a
@@ -787,7 +1074,7 @@ class EmailHistoryService:
         # message dicts from the in-memory maps.
         contact_ids = {
             row.contact_id
-            for row in (*sends, *replies)
+            for row in (*sends, *replies, *(enr for _, enr in sequence_rows))
             if getattr(row, "contact_id", None)
         }
         contacts_by_id: dict[uuid.UUID, Contact] = {}
@@ -842,6 +1129,31 @@ class EmailHistoryService:
                     r, contact, company_name, cid, connected_emails, account_email_map
                 )
             )
+
+        for event, enrollment in sequence_rows:
+            contact = (
+                contacts_by_id.get(enrollment.contact_id)
+                if enrollment.contact_id
+                else None
+            )
+            company_name, cid = None, None
+            if contact and contact.company_id in company_name_by_id:
+                cid = contact.company_id
+                company_name = company_name_by_id[cid]
+            message = self._sequence_send_to_message(
+                event,
+                enrollment,
+                contact,
+                company_name,
+                cid,
+                account_email_map,
+                sequence_engagement.get((enrollment.id, event.step_number)),
+            )
+            # The SQL arms of this query already applied ``search``; the
+            # sequence arm can only be filtered once its JSON copy is unpacked.
+            if search and not self._message_matches_search(message, search):
+                continue
+            messages.append(message)
 
         # Group into threads
         threads = self._group_into_threads(messages)
@@ -1497,6 +1809,47 @@ class EmailHistoryService:
                     r, contact, company_name, cid, None, account_email_map
                 )
             )
+
+        # Sequence sends in this thread. Without these a thread opened from the
+        # inbox showed only the prospect's reply — the outreach it replied to
+        # was missing, because the sequence path records no EmailSend row.
+        sequence_rows = await self._fetch_sequence_sends(
+            db, gmail_thread_id=gmail_thread_id
+        )
+        engagement = await self._sequence_engagement(
+            db, {enr.id for _, enr in sequence_rows}
+        )
+        for event, enrollment in sequence_rows:
+            contact = await self._load_contact(db, enrollment.contact_id)
+            company_name, cid = await self._load_company_for_contact(db, contact)
+            if company_name and not lead_name:
+                lead_name = company_name
+                lead_id = cid
+            messages.append(
+                self._sequence_send_to_message(
+                    event,
+                    enrollment,
+                    contact,
+                    company_name,
+                    cid,
+                    account_email_map,
+                    engagement.get((enrollment.id, event.step_number)),
+                )
+            )
+
+        # Drop any sequence send already represented by an EmailSend / EmailReply
+        # row for the same Gmail message (mirrors ``_group_into_threads``, which
+        # this single-thread path bypasses).
+        deduped: list[dict] = []
+        seen_message_ids: set[str] = set()
+        for message in messages:
+            message_id = message.get("gmail_message_id")
+            if message_id:
+                if message_id in seen_message_ids:
+                    continue
+                seen_message_ids.add(message_id)
+            deduped.append(message)
+        messages = deduped
 
         # Sort by timestamp
         messages.sort(key=lambda m: m["timestamp"])

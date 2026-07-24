@@ -3,7 +3,17 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Integer, String, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    desc,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -114,6 +124,16 @@ class OutreachEvent(Base, OrgScopedMixin):
         CheckConstraint(
             "event_type IN ('sent','delivered','opened','clicked','replied','bounced','unsubscribed')",
             name="ck_event_type",
+        ),
+        # The unified inbox reads sequence sends from here (this path records no
+        # ``EmailSend`` row), scanning the most recent ``sent`` events for the
+        # current org. Without this the query is a full scan plus a sort on
+        # every inbox page load. Migration 101.
+        Index(
+            "ix_outreach_events_org_type_occurred",
+            "org_id",
+            "event_type",
+            desc("occurred_at"),
         ),
     )
 

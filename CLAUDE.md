@@ -84,3 +84,26 @@ only a Groq key has working AI, and the narrow gate would report it dark.
 call has run out of quota and silently degraded outreach to static mail-merge
 copy while every log line said "fine". `GET /api/v1/ai/providers` reports which
 provider is actually serving.
+
+## Sent mail lives in two tables
+
+There is **no single "sent emails" table**. A send lands in one of two places
+depending on which path put it on the wire:
+
+- `email_sends` (`EmailSend`) — manual sends, template sends, inbox replies,
+  smart-reply auto-sends.
+- `outreach_events` (`OutreachEvent`, `event_type='sent'`) — **the sequence
+  engine** (`app.tasks.outreach.send_sequence_step`), which is where the bulk of
+  outreach volume goes. It writes **no** `EmailSend` row; the message body,
+  subject, recipient and dispatcher result live in the event's `metadata`.
+
+Anything that answers "what did we send?" must read **both**. Reading only
+`EmailSend` is how the unified inbox went blind to every sequence send — mail
+sitting in Gmail's Sent folder, nothing in Landline, and prospect replies shown
+as threads with no opening message. `EmailHistoryService._fetch_sequence_sends`
+is the read-side union (inbox, thread view, lead view); mirror it rather than
+adding a second write path, because the send accounting (warm-up counters,
+deliverability, A/B attribution) is keyed on today's split.
+
+Inbox surfaces that still read `EmailSend` alone — `get_inbox_analytics`,
+the dashboard's `emails_sent` tile — therefore under-report sequence volume.
