@@ -34,6 +34,7 @@ from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import crypto, google_oauth
 from app.services.ai_service import get_ai_service
+from app.services.bounce_ingestion import is_bounce_message
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,22 @@ class SmartReplyService:
         else:
             sender_name = from_email.split("@")[0]
         from_email = from_email.strip().lower()
+
+        # A delivery-status notification is a bounce, not a reply. It lands in
+        # the *same thread* as the send it failed, so the header/thread matcher
+        # below ties it straight to the enrollment and files it as a prospect
+        # reply. The damage is threefold: the enrollment is marked 'replied' —
+        # permanently stopping outreach to a contact who never answered — the
+        # funnel counts a reply that never happened, and the auto-responder can
+        # draft a reply *to mailer-daemon*. ``email_history`` already gates its
+        # own sync this way; this path was missing the same guard.
+        # Bounces belong to the bounce-ingestion sweep (bounce_records).
+        if is_bounce_message(from_email, subject):
+            logger.debug(
+                "Skipping delivery-status notification from %s (%s)",
+                from_email, subject,
+            )
+            return None
 
         body_text = self._extract_body(msg.get("payload", {}))
         if not body_text:
