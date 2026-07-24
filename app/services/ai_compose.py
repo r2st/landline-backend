@@ -255,7 +255,18 @@ async def compose_step(
         return static
     if step.step_number != 1 and not settings.ai_compose_all_steps:
         return static.because("not a first touch — optimizer handles later steps")
-    if not settings.anthropic_api_key:
+    # Either backend will do. AIService picks OpenRouter *or* Anthropic (see its
+    # docstring), so the old bare ``anthropic_api_key`` check disabled
+    # composition for every OpenRouter-only deployment — silently, and in the
+    # one direction that looks like healthy static copy rather than an outage.
+    #
+    # Read the keys off settings rather than asking ``get_ai_service()``: that
+    # singleton resolves its backend once, at first use, so it answers from
+    # whatever configuration was live then. This gate has to reflect the
+    # configuration *now*. A key that is present but rejected at call time still
+    # lands on the AI-error path below and falls back to static, so guessing
+    # generously here costs one wasted call, never a dropped touch.
+    if not (settings.openrouter_api_key or settings.anthropic_api_key):
         return static.because("no API key")
 
     template_type = template_type_for(step.step_number)
@@ -333,9 +344,13 @@ async def compose_step(
     if not await _scan_is_safe(db, subject, body):
         return static.because("AI copy failed the spam scan")
 
-    # Review gate: the first N per sequence step go to a human.
+    # Review gate: the first N per sequence step go to a human — but, by
+    # default, only for the first touch. Gating follow-ups too is what froze
+    # mid-sequence enrollments in ``pending_review`` when nobody was reviewing;
+    # see ``ai_compose_review_first_step_only``.
+    gated = not settings.ai_compose_review_first_step_only or step.step_number == 1
     already = await _reviewed_count(db, enrollment.sequence_id, step.step_number)
-    if already < settings.ai_compose_review_batch_size:
+    if gated and already < settings.ai_compose_review_batch_size:
         draft = AiEmailDraft(
             enrollment_id=enrollment.id,
             sequence_id=enrollment.sequence_id,

@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.contact import Contact
-from app.models.outreach import OutreachEnrollment
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,27 @@ async def _suppress_contact(db: AsyncSession, contact: Contact) -> int:
         enr.status = "bounced"
         enr.completed_at = now
         paused += 1
+        # Book the bounce on the funnel too. ``funnel_analytics`` derives both
+        # ``bounce_rate`` and ``delivered`` (= sent − bounced) from a "bounced"
+        # OutreachEvent, and nothing in the codebase wrote one — so the funnel
+        # reported 0 bounces and 100% delivered however many addresses were
+        # actually dead. Measured in production 2026-07-24: one real hard bounce
+        # on the enrollment, ``bounce_rate: 0.0`` on the funnel.
+        #
+        # Recorded against the step that was last sent, which is the step whose
+        # send bounced. Deliberately not deduplicated here: ``record_bounce``
+        # only reaches this for an *active* enrollment and flips it to "bounced"
+        # in the same breath, so a second DSN for the same address finds nothing
+        # active and writes nothing.
+        db.add(
+            OutreachEvent(
+                enrollment_id=enr.id,
+                step_number=enr.current_step,
+                event_type="bounced",
+                occurred_at=now,
+                event_metadata={"email": contact.email, "source": "bounce_handler"},
+            )
+        )
     return paused
 
 

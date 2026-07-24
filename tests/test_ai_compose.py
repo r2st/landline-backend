@@ -203,18 +203,28 @@ async def test_later_steps_are_left_to_the_optimizer_when_all_steps_is_off(
 # Every step writes as itself
 # ---------------------------------------------------------------------------
 
-def test_only_first_step_is_gated_by_default():
-    """Follow-ups (steps 2+) send freely; only step 1 goes through the AI gate.
+def test_every_step_is_composed_but_only_the_first_is_gated():
+    """Compose every step; review only the first touch.
 
-    Reversed from the earlier default (all-steps-on): gating every step parks
-    follow-ups behind a human review too, which froze mid-sequence enrollments
-    and depressed reply rates. With this off, ``compose_step`` short-circuits to
-    the static template for steps 2+ (the optimizer still rewrites them off
-    engagement), so a follow-up never waits on a reviewer.
+    History, because this default has now moved twice and the reason matters
+    more than the value. All-steps composition was first turned ON so a
+    sequence's tone reached more than one email, then turned back OFF because
+    composing a step also *gated* it: a follow-up with no reviewer sat in
+    ``pending_review`` and froze the enrollment mid-sequence. But off, steps 2-4
+    fell back to the static template and shipped byte-identical copy to every
+    recipient — production sends of the same step differed only in the greeting.
+
+    Both failures came from one coupling: "compose this step" implied "gate this
+    step". They are now separate settings. Every step is written for the
+    recipient; only step 1 — the first impression, to someone who has never
+    heard from us, unrecoverable once sent — waits on a human. A follow-up
+    lands in a thread they have already seen and still passes the spam scan,
+    the truthfulness guardrail, and the static fallback.
     """
     from app.config import Settings
 
-    assert Settings.model_fields["ai_compose_all_steps"].default is False
+    assert Settings.model_fields["ai_compose_all_steps"].default is True
+    assert Settings.model_fields["ai_compose_review_first_step_only"].default is True
 
 
 def test_every_step_template_type_is_a_real_prompt_hint():
@@ -424,12 +434,20 @@ async def test_quota_is_counted_per_step_not_per_sequence(
     """A step-1 quota must not buy autonomy for step 2.
 
     Step 1 runs on every enrollment and it runs first, so a per-sequence quota is
-    one the first touch always exhausts alone. Composition now covers every step,
-    and each writes a different email under a different hint — so without this,
-    the model's follow-ups would send from the very first one with no human
-    having ever read one.
+    one the first touch always exhausts alone. Composition covers every step, and
+    each writes a different email under a different hint — so without this, the
+    model's follow-ups would send from the very first one with no human having
+    ever read one.
+
+    Exercised with ``ai_compose_review_first_step_only`` OFF, which is the only
+    configuration where a step-2 quota is consulted at all. On (the default),
+    step 2 is deliberately never gated — that is a separate decision, pinned by
+    ``test_every_step_is_composed_but_only_the_first_is_gated``. What this test
+    owns is the *counting*: that the quota is keyed by step and not shared
+    across the sequence.
     """
     monkeypatch.setattr(ai_on, "ai_compose_all_steps", True)
+    monkeypatch.setattr(ai_on, "ai_compose_review_first_step_only", False)
     _patch_generator(monkeypatch, AI_REPLY)
     seq, _, enr = await _setup(db_session, sample_company, sample_contact)
 

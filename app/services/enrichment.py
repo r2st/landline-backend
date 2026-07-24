@@ -53,6 +53,31 @@ APOLLO_BACKOFF_BASE = 0.5
 # the day it returns an HTML error page.
 APOLLO_ERROR_BODY_LIMIT = 300
 
+# How Apollo says "your account is out of lead credits". It answers 422 for this
+# and for genuine request faults alike, so the body is the only discriminator.
+# Matched on the stable phrases rather than the whole sentence, which carries an
+# HTML upgrade link that Apollo is free to reword.
+_APOLLO_CREDIT_EXHAUSTION_PHRASES = (
+    "insufficient credits",
+    "out of credits",
+    "no credits remaining",
+    "credit limit",
+)
+
+
+def _is_provider_credit_exhaustion(response: httpx.Response) -> bool:
+    """True when a 4xx is Apollo reporting *its own* depleted account credits.
+
+    Distinct from the local ledger gate: that one stops us before we call, this
+    one is the provider refusing after we did. Same operational meaning — every
+    remaining contact in the sweep gets the same answer — so it maps onto the
+    same ``budget_exhausted`` status rather than a generic error.
+    """
+    if response.status_code != 422:
+        return False
+    body = (response.text or "").lower()
+    return any(phrase in body for phrase in _APOLLO_CREDIT_EXHAUSTION_PHRASES)
+
 # Fallback title lists for contact discovery. Hardcoded to Apprend's
 # manufacturing motion — moving these onto the ICP (`icp.job_titles`) is P1's
 # job, at which point callers pass `titles=` and these stop being reached.
@@ -256,7 +281,20 @@ class ApolloEnrichmentService:
                     # a rejected key or an unaffordable endpoint answers the same
                     # way three times, so retrying only spends credits.
                     last_error = self._error_detail(response)
-                    status = "error"
+                    # Apollo's *own* account credits being gone is not a bad
+                    # request — it is the same condition as our local budget
+                    # gate, arriving from the other side, and it will answer
+                    # identically for every remaining contact in the sweep.
+                    # Naming it lets a caller stop rather than walk the whole
+                    # batch, and stops it reading as a request bug: production
+                    # logged ten identical "Apollo enrich error … HTTP 422" lines
+                    # every five minutes for days, with nothing saying the
+                    # provider was simply out of credits (observed 2026-07-24).
+                    status = (
+                        "budget_exhausted"
+                        if _is_provider_credit_exhaustion(response)
+                        else "error"
+                    )
                     break
                 data = response.json()
                 status = "ok"
@@ -289,7 +327,17 @@ class ApolloEnrichmentService:
                     "params": {k: v for k, v in params.items() if k != "api_key"},
                 },
             )
-        if status != "ok":
+        if status == "budget_exhausted":
+            # Distinct from an error, and said once with the remedy attached:
+            # this is an account-level condition a human has to resolve, not
+            # something the sweep can retry its way out of.
+            logger.warning(
+                "Apollo %s halted: the Apollo account is out of lead credits. "
+                "Enrichment will keep returning nothing until the plan is topped "
+                "up — https://app.apollo.io/#/settings/plans/upgrade (%s)",
+                operation, last_error,
+            )
+        elif status != "ok":
             logger.warning(
                 "Apollo %s %s after %d attempt(s): %s",
                 operation, status, attempts, last_error,

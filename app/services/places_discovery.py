@@ -656,12 +656,27 @@ class PlacesDiscoveryService:
                 business.email_source = "hunter"
                 business.email_confidence = found.get("score")
                 business.status = "enriched"
+                # Keep the person, not just the address. Hunter ranks a
+                # *personal* address first and returns the name attached to it;
+                # dropping that is what left every Places-sourced contact
+                # nameless and every cold email opening "Hi there,". The name
+                # belongs to the winning address, so read it off the same entry
+                # rather than the top of the unranked list.
+                best = next(
+                    (e for e in (found.get("emails") or []) if e.get("email") == found["email"]),
+                    None,
+                )
+                if best:
+                    business.contact_first_name = (best.get("first_name") or None)
+                    business.contact_last_name = (best.get("last_name") or None)
+                    business.contact_title = (best.get("position") or None)
                 await db.flush()
                 return {
                     "status": "enriched",
                     "source": "hunter",
                     "email": business.email,
                     "score": found.get("score"),
+                    "named": bool(business.contact_first_name),
                 }
 
         # Free fallback. The scraper already strips noreply/info/support-style
@@ -699,6 +714,13 @@ class PlacesDiscoveryService:
                 ContactRecord(
                     email=business.email,
                     phone=business.phone,
+                    # Present only when the enrichment hop named a person (in
+                    # practice, Hunter). None here is honest — it becomes a
+                    # nameless contact, which the copy layer renders as a
+                    # generic greeting rather than a broken merge field.
+                    first_name=business.contact_first_name,
+                    last_name=business.contact_last_name,
+                    title=business.contact_title,
                     source=PROVIDER,
                     raw={"email_source": business.email_source},
                 )

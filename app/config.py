@@ -98,6 +98,29 @@ class Settings(BaseSettings):
     # free tier shares one quota across models, so a second ":free" id buys
     # nothing when the 429 is the account-level daily cap.
     openrouter_fallback_models: str = ""
+    # Reasoning budget for reasoning models (gpt-oss, nemotron-*-reasoning, o-series).
+    #
+    # This is not a tuning knob, it is a correctness one. OpenRouter bills a
+    # reasoning model's chain-of-thought against the SAME ``max_tokens`` budget
+    # as its visible answer, and reasoning is emitted FIRST. The default model
+    # here (openai/gpt-oss-20b) reasons hard about a long instruction list, so
+    # against this repo's cold-email system prompt at max_tokens=800 it spent
+    # 797 tokens thinking and returned an EMPTY content string with
+    # finish_reason="length" — measured in production 2026-07-24. Every AI email
+    # was silently falling back to the static mail-merge, which is precisely the
+    # un-personalised copy the whole compose path exists to replace.
+    #
+    # "low" caps deliberation (~105 reasoning tokens on the same prompt) and
+    # leaves the budget for the answer. Set "" to omit the parameter entirely —
+    # correct for a non-reasoning model, which has no chain-of-thought to bill.
+    # Note ``reasoning.exclude`` is NOT a substitute: it only hides the trace
+    # from the response, it still burns the budget.
+    openrouter_reasoning_effort: str = "low"
+    # Floor applied to max_tokens on the OpenRouter backend. A reasoning model
+    # needs headroom for the trace *plus* the answer; callers asking for 256
+    # (classification, scoring) would otherwise spend the entire allowance
+    # thinking and return "". Only ever raises a caller's budget, never lowers it.
+    openrouter_min_max_tokens: int = 1024
 
     # Apollo.io
     apollo_api_key: str = ""
@@ -363,13 +386,33 @@ class Settings(BaseSettings):
     # ``ai_compose.STEP_TEMPLATE_TYPES``) so the arc survives — a follow-up is
     # still written as a follow-up, not as a second first touch. The optimizer
     # still rewrites off engagement history afterwards.
-    ai_compose_all_steps: bool = False
+    #
+    # Default ON since 2026-07-24. Off, steps 2-4 shipped byte-identical copy to
+    # every recipient — production sends of the same step differed only in the
+    # greeting, which is the "reads identically to 500 other shops" failure the
+    # copy prompt explicitly forbids. The review gate below still applies per
+    # step, so turning this on queues drafts for a human before it sends any.
+    ai_compose_all_steps: bool = True
     # How many AI-composed emails per sequence *step* go to a human before that
     # step is trusted to send them unattended. Cold outreach is irreversible and
     # charged against the sending domain, so the first batch gets read. Counted
     # per step, not per sequence: a quota the first touch can exhaust on its own
     # would let every follow-up the model has ever written send unread.
     ai_compose_review_batch_size: int = 3
+    # Restrict that review quota to the first touch.
+    #
+    # This is what makes ``ai_compose_all_steps`` safe to leave on. The two used
+    # to be welded together: composing every step also *gated* every step, so a
+    # follow-up with no reviewer sat in ``pending_review`` and froze the whole
+    # enrollment mid-sequence — which is why all-steps was turned back off, and
+    # why steps 2-4 then shipped byte-identical copy to every recipient.
+    #
+    # Step 1 is the touch that deserves the gate: it is the first impression, it
+    # goes to someone who has never heard from us, and it is unrecoverable. A
+    # follow-up lands in a thread the prospect has already seen, and it still
+    # passes the spam scan, the truthfulness guardrail, and the static fallback
+    # before it ships. Set False to gate every step (the old coupled behaviour).
+    ai_compose_review_first_step_only: bool = True
     # A ``pending_review`` draft parks its enrollment (the outreach queue only
     # dispatches ``active``). If no human clears it, the whole enrollment stalls
     # indefinitely. After this many hours the auto-expire sweep releases the

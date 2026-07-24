@@ -31,6 +31,7 @@ from sqlalchemy import or_, select
 from app.config import get_settings
 from app.models.discovered_business import DiscoveredBusiness
 from app.models.discovery_search import DiscoverySearch
+from app.org_context import get_current_org_id
 from app.services.places_discovery import get_places_service
 from app.tasks.celery_app import celery_app
 from app.tasks.org_runner import for_each_org
@@ -226,3 +227,38 @@ def run_scheduled_discoveries():
 def enrich_discovered_emails():
     """Recover emails for staged businesses that have a website but no address."""
     return _run_async(_enrich_discovered_emails())
+
+
+async def _seed_discovery_grid() -> dict:
+    from app.services.discovery_seed import ensure_default_searches
+
+    summary = {"orgs": 0, "created": 0, "existing": 0}
+
+    async def _body(db):
+        # ``for_each_org`` binds the org as the ambient context for the session;
+        # read it back rather than re-querying, so the rows we stamp are
+        # guaranteed to be the org this iteration is actually scoped to.
+        org_id = get_current_org_id()
+        if org_id is None:  # pragma: no cover - for_each_org always sets it
+            return
+        result = await ensure_default_searches(db, org_id)
+        await db.commit()
+        summary["orgs"] += 1
+        summary["created"] += result["created"]
+        summary["existing"] += result["existing"]
+
+    await for_each_org(_body, label="seed_discovery_grid")
+    logger.info("Discovery grid seed: %s", summary)
+    return summary
+
+
+@celery_app.task(name="app.tasks.places_discovery.seed_discovery_grid")
+def seed_discovery_grid():
+    """Insert any missing cell of the default category x metro search grid.
+
+    **Not on the beat, by design.** Deactivating a cell is an operator decision,
+    and a seeder that ran weekly would quietly overrule it. This exists so the
+    grid can be restored or extended (a new vertical, a new metro) without a
+    migration — an explicit action, explicitly triggered.
+    """
+    return _run_async(_seed_discovery_grid())

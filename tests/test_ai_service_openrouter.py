@@ -111,7 +111,10 @@ async def test_chat_posts_openai_compatible_request(monkeypatch):
     svc = _openrouter_service(monkeypatch)
     _FakeAsyncClient.reply_content = "hello there"
 
-    text = await svc._chat("say hi", max_tokens=32, temperature=0.5)
+    # Above ``openrouter_min_max_tokens`` so this stays a test about request
+    # *shape*. The floor that raises a smaller budget — and why a reasoning
+    # model needs one — is pinned by test_ai_service_reasoning_budget.py.
+    text = await svc._chat("say hi", max_tokens=2048, temperature=0.5)
 
     assert text == "hello there"
     cap = _FakeAsyncClient.captured
@@ -119,7 +122,7 @@ async def test_chat_posts_openai_compatible_request(monkeypatch):
     assert cap["headers"]["Authorization"] == "Bearer or-test-key"
     body = cap["json"]
     assert body["model"] == "meta-llama/llama-3.1-8b-instruct:free"
-    assert body["max_tokens"] == 32
+    assert body["max_tokens"] == 2048
     assert body["temperature"] == 0.5
     assert body["messages"] == [{"role": "user", "content": "say hi"}]
 

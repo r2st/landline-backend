@@ -98,6 +98,16 @@ class DiscoveredBusiness(Base, OrgScopedMixin):
     email_source: Mapped[str | None] = mapped_column(String(10))
     # Hunter's 0-100 confidence, when the email came from Hunter.
     email_confidence: Mapped[int | None] = mapped_column(Integer)
+    # The person behind ``email``, when the source named one. Hunter's
+    # domain-search returns first_name/last_name/position alongside the address
+    # and this pipeline used to discard all three — which is why 29 of 39
+    # production contacts had no first name and every cold email opened "Hi
+    # there," (audited 2026-07-24). Places itself never yields a person, so
+    # Hunter is the only hop that can fill these; a scraped address stays
+    # nameless and is honestly recorded as such.
+    contact_first_name: Mapped[str | None] = mapped_column(String(100))
+    contact_last_name: Mapped[str | None] = mapped_column(String(100))
+    contact_title: Mapped[str | None] = mapped_column(String(150))
     # Places primaryType / the search's business_type, e.g. 'hardware_store'.
     category: Mapped[str | None] = mapped_column(String(100), index=True)
     rating: Mapped[float | None] = mapped_column(Float)

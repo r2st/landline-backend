@@ -44,6 +44,22 @@ REPLY_CATEGORIES = (
 # narrow (explicit opt-out language, unambiguous OOO markers) to keep false
 # positives near zero. Anything not matched here falls through to the LLM.
 
+# Where a client stops the sender's own words and starts quoting ours. Used by
+# ``strip_quoted_reply``; see it for why scanning quoted text is destructive.
+# One pattern per client family actually seen in this mailbox:
+#   Gmail / Apple Mail  "On Tue, Jul 22, 2026 at 4:02 PM Suman <s@x> wrote:"
+#   Outlook (EN)        "-----Original Message-----" / "From: … Sent: …"
+#   Outlook (web)       a long underscore rule above the quoted header
+#   Our own footer      the sentinel that made this necessary at all
+_QUOTE_HEADER_RE = re.compile(
+    r"(^On\b.{0,200}\bwrote:\s*$)"
+    r"|(^-{2,}\s*Original Message\s*-{2,})"
+    r"|(^_{10,}$)"
+    r"|(^From:\s.+)"
+    r"|(^\s*Don'?t want these emails\?)",
+    re.IGNORECASE,
+)
+
 # Explicit, legally-meaningful opt-out language. Matching any of these ALWAYS
 # wins — unsubscribe is never gated by AI confidence.
 _UNSUBSCRIBE_PATTERNS = [
@@ -134,6 +150,41 @@ _MONTHS = {
 }
 
 
+def strip_quoted_reply(body_text: Optional[str]) -> str:
+    """Return only what the sender actually typed, dropping the quoted thread.
+
+    A mail client quotes the message being replied to, so the text of *our own
+    email* — signature, CAN-SPAM footer and all — arrives inside every genuine
+    reply. Scanning that for intent reads our words as theirs.
+
+    This is not hypothetical. The outbound footer reads "Don't want these
+    emails? Reply UNSUBSCRIBE or click: …", so a bare ``\\bunsubscribe\\b`` scan
+    matched on every quoted reply. In production a real prospect answer to
+    "Suman, quick question about Apprend Tech…" was classified ``unsubscribe``
+    with confidence 1.0, the contact was suppressed, and its enrollments were
+    stopped — the reply the whole system exists to catch, converted into an
+    opt-out and an audit notification. Observed 2026-07-24 while auditing why
+    Dialtone had no replies.
+
+    Cuts at the first quote marker, covering the shapes every major client
+    emits. Deliberately conservative: an unrecognised marker means we scan a bit
+    of quoted text (the old behaviour), never that we drop something the sender
+    wrote.
+    """
+    if not body_text:
+        return ""
+    lines = body_text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">"):
+            return "\n".join(lines[:i])
+        if _QUOTE_HEADER_RE.search(stripped):
+            return "\n".join(lines[:i])
+    return body_text
+
+
 def keyword_prefilter(
     subject: Optional[str],
     body_text: Optional[str],
@@ -151,12 +202,21 @@ def keyword_prefilter(
     dead address as if it had opted out. Unsubscribe is checked before OOO so an
     autoreply that also says "unsubscribe" is treated as the compliance-critical
     opt-out.
+
+    The opt-out pass reads only the *unquoted* portion, for the same reason the
+    bounce check runs first: our own footer invites the reader to "Reply
+    UNSUBSCRIBE", and a quoted copy of it is our sentence, not theirs. A human
+    who actually types "unsubscribe" types it above the quote, so no true
+    positive is lost. OOO keeps scanning the whole body — an autoresponder's
+    marker is machine-generated and its quoting is unpredictable, and the action
+    it triggers (re-queue the next touch) is recoverable, unlike suppression.
     """
     if is_bounce(subject, body_text, from_email):
         return "bounce"
-    text = f"{subject or ''}\n{body_text or ''}"
-    if any(p.search(text) for p in _UNSUBSCRIBE_PATTERNS):
+    authored = f"{subject or ''}\n{strip_quoted_reply(body_text)}"
+    if any(p.search(authored) for p in _UNSUBSCRIBE_PATTERNS):
         return "unsubscribe"
+    text = f"{subject or ''}\n{body_text or ''}"
     if any(p.search(text) for p in _OOO_PATTERNS):
         return "out_of_office"
     return None
@@ -337,12 +397,22 @@ class AIService:
                 # the free tier is a *quota* answer, not a transport blip, so
                 # retrying the same model is pointless — only a different model
                 # (realistically a paid one) can succeed.
+                settings = get_settings()
+                # A reasoning model bills its chain-of-thought against the same
+                # max_tokens budget as the answer, and emits it first — so an
+                # unbounded trace returns an empty answer with
+                # finish_reason="length" rather than an error. Give the trace a
+                # ceiling and the answer a floor. See ``openrouter_reasoning_effort``.
+                effort = (settings.openrouter_reasoning_effort or "").strip()
+                budget = max(max_tokens, settings.openrouter_min_max_tokens)
                 for attempt, model in enumerate(self._model_chain()):
                     payload = {
                         "model": model,
-                        "max_tokens": max_tokens,
+                        "max_tokens": budget,
                         "messages": openai_messages,
                     }
+                    if effort:
+                        payload["reasoning"] = {"effort": effort}
                     if temperature is not None:
                         payload["temperature"] = temperature
                     try:
@@ -363,10 +433,37 @@ class AIService:
                             "trying fallback" if attempt == 0 else "fallback also failed",
                         )
                         continue
+                    data = resp.json()
+                    choice = (data.get("choices") or [{}])[0]
+                    content = (choice.get("message") or {}).get("content") or ""
+                    if not content.strip():
+                        # An empty answer is a failure, not an answer. Returning
+                        # "" here is what made this invisible: every caller's
+                        # JSON parse failed and degraded to a static template,
+                        # so a broken model looked exactly like a healthy one
+                        # writing un-personalised copy. Log the cause and try the
+                        # next model instead of laundering it into a success.
+                        usage = data.get("usage") or {}
+                        reasoning_tokens = (
+                            usage.get("completion_tokens_details") or {}
+                        ).get("reasoning_tokens")
+                        last_exc = RuntimeError(
+                            f"OpenRouter model {model} returned empty content "
+                            f"(finish_reason={choice.get('finish_reason')}, "
+                            f"reasoning_tokens={reasoning_tokens})"
+                        )
+                        logger.warning(
+                            "OpenRouter model %s returned empty content — "
+                            "finish_reason=%s reasoning_tokens=%s of max_tokens=%s. "
+                            "A reasoning trace that consumes the whole budget leaves "
+                            "no room for the answer; lower OPENROUTER_REASONING_EFFORT "
+                            "or raise OPENROUTER_MIN_MAX_TOKENS.",
+                            model, choice.get("finish_reason"), reasoning_tokens, budget,
+                        )
+                        continue
                     if attempt:
                         logger.info("OpenRouter fell back to model %s", model)
-                    data = resp.json()
-                    return data["choices"][0]["message"]["content"] or ""
+                    return content
             # Every model in the chain was rate-limited / erroring. Raise so the
             # caller's existing degradation path (static copy, neutral score)
             # runs, exactly as before this fallback existed.
