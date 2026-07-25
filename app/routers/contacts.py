@@ -313,10 +313,23 @@ async def list_tags(db: AsyncSession = Depends(get_db)):
 
     Aggregated in Python rather than SQL because the counts come from unnesting a
     JSON array, whose syntax differs per dialect, and the cardinality here is
-    "how many distinct labels has one team typed" — tens, not millions. The scan
-    is over a single column with the tag filter's own index available.
+    "how many distinct labels has one team typed" — tens, not millions.
+
+    Untagged contacts are excluded in SQL. They are the overwhelming majority and
+    contribute nothing to the result, so shipping them to Python only to discard
+    them is the difference between a payload the size of the tag vocabulary and
+    one the size of the contact list.
     """
-    rows = (await db.execute(select(Contact.tags))).scalars().all()
+    from sqlalchemy import Text as _Text, cast as _cast
+
+    rows = (
+        await db.execute(
+            select(Contact.tags).where(
+                Contact.tags.isnot(None),
+                _cast(Contact.tags, _Text) != "[]",
+            )
+        )
+    ).scalars().all()
     counts: dict[str, int] = {}
     for tags in rows:
         for tag in set(tag_service.normalize_tags(tags)):
