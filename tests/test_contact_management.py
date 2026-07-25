@@ -372,6 +372,32 @@ async def test_engagement_counts_both_send_tables(client, db_session):
     assert sequence_send["sequence_name"] == "Molding outreach"
 
 
+async def test_engagement_ignores_sends_that_never_left(client, db_session):
+    """A send declined by the warm-up cap is not a send.
+
+    Counting it inflates the denominator every rate divides by, so a contact
+    we've never actually emailed reads as 0% open rate rather than "untouched".
+    """
+    company = await _company(db_session)
+    contact = await _contact(db_session, company)
+    now = datetime.now(timezone.utc)
+    for status in ("skipped", "halted", "error"):
+        db_session.add(EmailSend(
+            id=uuid.uuid4(), contact_id=contact.id, to_email=contact.email,
+            subject="never sent", status=status, sent_at=now,
+        ))
+    db_session.add(EmailSend(
+        id=uuid.uuid4(), contact_id=contact.id, to_email=contact.email,
+        subject="really sent", status="sent", sent_at=now, opened_at=now,
+    ))
+    await db_session.commit()
+
+    body = (await client.get(f"/api/v1/contacts/{contact.id}/engagement")).json()
+    assert body["sent"] == 1
+    assert body["open_rate"] == 1.0
+    assert [e["subject"] for e in body["events"]] == ["really sent", "really sent"]
+
+
 async def test_engagement_of_an_untouched_contact_is_zeroed_not_undefined(
     client, db_session
 ):

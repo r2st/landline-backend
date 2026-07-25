@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 # into "sent".
 _COUNTED = ("sent", "opened", "clicked", "replied", "bounced")
 
+# ``EmailSend.status`` values where nothing reached the wire. Counting these as
+# sends inflates the denominator every rate is divided by, so a contact whose
+# sends were all declined by the warm-up cap would read as 0% open rate rather
+# than "we haven't emailed them".
+_NON_SENDS = frozenset({"skipped", "suppressed", "halted", "error", "failed", "scheduled"})
+
 
 def _aware(dt: Optional[datetime]) -> Optional[datetime]:
     """SQLite hands back naive datetimes; comparisons below need one tz basis."""
@@ -95,6 +101,9 @@ async def contact_engagement(
     for send in sends:
         # ``status`` records the send's outcome; the *_at stamps record what the
         # recipient did afterwards. Both matter and they are not the same thing.
+        if send.status in _NON_SENDS:
+            # Nothing went out — not a send, not a bounce, not history.
+            continue
         if send.status == "bounced":
             counts["bounced"] += 1
             events.append({
