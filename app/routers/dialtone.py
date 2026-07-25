@@ -19,14 +19,13 @@ what Dialtone has already logged.
 import logging
 import uuid
 from collections import Counter
-from datetime import date as date_cls, datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.database import get_db
 from app.models.ab_test import AbTest, AbTestVariant
 from app.models.company import Company
@@ -56,7 +55,9 @@ from app.schemas.dialtone import (
     DIALTONE_EVENT_TYPES,
     DialtoneActivityFeed,
     DialtoneConsole,
+    DialtoneDeltas,
     DialtoneEvent,
+    DialtoneFunnelRates,
     DialtoneSenderStatus,
     DialtoneSending,
     DialtoneTodayCounts,
@@ -68,6 +69,15 @@ from app.services import suppression, system_settings, warmup
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
+from app.services.timeframes import (
+    DEFAULT_TIMEFRAME,
+    TIMEFRAMES,
+    Timeframe,
+    ensure_aware as _aware,
+    in_range as _in_range,
+    pct_change,
+    resolve_timeframe,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/dialtone", tags=["dialtone"])
@@ -91,17 +101,6 @@ _SEVERITY = {
     "error": "error",
     "unsubscribed": "warn",
 }
-
-
-def _aware(dt: Optional[datetime]) -> Optional[datetime]:
-    """Normalize a possibly-naive datetime to aware UTC.
-
-    SQLite (tests) returns naive datetimes, Postgres returns aware ones; the feed
-    sorts across sources so they must be comparable.
-    """
-    if dt is None:
-        return None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def _parse_bound(value: Optional[str]) -> Optional[datetime]:
@@ -134,20 +133,25 @@ def _sev(event_type: str) -> str:
     return _SEVERITY.get(event_type, "ok")
 
 
-def _reporting_today() -> tuple[date_cls, datetime, datetime]:
-    """Return (today, day_start_utc, day_end_utc) in the reporting timezone."""
-    tz_name = get_settings().daily_summary_timezone
-    try:
-        from zoneinfo import ZoneInfo
+_TIMEFRAME_QUERY = Query(
+    DEFAULT_TIMEFRAME,
+    description=(
+        "Reporting window for the numbers: " + ", ".join(TIMEFRAMES) +
+        ". Anchored to the reporting timezone; weeks start Monday."
+    ),
+)
 
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-    now_local = datetime.now(tz)
-    today = now_local.date()
-    start_local = datetime.combine(today, time.min, tzinfo=tz)
-    end_local = start_local + timedelta(days=1)
-    return today, start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+def _timeframe(value: Optional[str]) -> Timeframe:
+    """Resolve a ``timeframe`` query value, 400-ing on an unknown key.
+
+    A typo must not silently report the default window — the operator would read
+    the wrong period's numbers and never know.
+    """
+    try:
+        return resolve_timeframe(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 async def _collect_events(
@@ -532,6 +536,13 @@ async def _collect_events(
 async def get_dialtone_activity(
     start: Optional[str] = Query(None, description="ISO date/datetime lower bound (inclusive)"),
     end: Optional[str] = Query(None, description="ISO date/datetime upper bound (inclusive)"),
+    timeframe: Optional[str] = Query(
+        None,
+        description=(
+            "Named reporting window (" + ", ".join(TIMEFRAMES) + ") used when "
+            "neither start nor end is given. Explicit bounds win."
+        ),
+    ),
     types: Optional[str] = Query(None, description="Comma-separated event types to include"),
     status: Optional[str] = Query(None, description="Filter to events whose underlying send status matches"),
     contact_id: Optional[uuid.UUID] = Query(None, description="Restrict to one contact"),
@@ -540,8 +551,20 @@ async def get_dialtone_activity(
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    """Chronological (newest-first) log of everything Dialtone has done."""
+    """Chronological (newest-first) log of everything Dialtone has done.
+
+    Accepts either explicit ``start``/``end`` bounds or a named ``timeframe`` so a
+    console stat tile can drill down into exactly the window its number counted.
+    """
     lo, hi = _parse_bound(start), _parse_bound(end)
+    if lo is None and hi is None and timeframe:
+        tf = _timeframe(timeframe)
+        lo, hi = tf.start, tf.end
+        # `_in_window` treats `end` as inclusive while a timeframe's end is the
+        # exclusive next-period boundary; step back so the last event of the
+        # period is included and the first of the next one isn't.
+        if hi is not None:
+            hi -= timedelta(microseconds=1)
 
     wanted: Optional[set[str]] = None
     if types:
@@ -574,57 +597,100 @@ async def get_dialtone_activity(
     )
 
 
-async def _today_counts(db: AsyncSession, day_start: datetime, day_end: datetime) -> DialtoneTodayCounts:
-    """Tally today's Dialtone activity across EmailSend + OutreachEvent + leads."""
-    counts: Counter = Counter()
+_WINDOW = tuple[Optional[datetime], Optional[datetime]]
 
-    # EmailSend engagement (each timestamp column counts once when in-window).
-    for send in (await db.execute(select(EmailSend))).scalars().all():
-        if send.status == "skipped":
+# OutreachEvent.event_type → the counter it increments. Sequence sends only exist
+# here (see CLAUDE.md: there is no EmailSend row for them), so dropping this half
+# would under-report the bulk of outreach volume.
+_OUTREACH_COUNTERS = {
+    "sent": "emails_sent",
+    "opened": "opens",
+    "clicked": "clicks",
+    "replied": "replies",
+    "bounced": "bounces",
+}
+
+
+async def _period_counts(
+    db: AsyncSession, windows: list[_WINDOW]
+) -> list[DialtoneTodayCounts]:
+    """Tally Dialtone activity across EmailSend + OutreachEvent + leads, once per
+    window in ``windows``.
+
+    Both the selected timeframe and the previous period are tallied in a single
+    pass over each source table: the row scan is the expensive part, and asking
+    for a delta shouldn't double the cost of the console.
+    """
+    tallies: list[Counter] = [Counter() for _ in windows]
+
+    def bump(metric: str, ts: Optional[datetime]) -> None:
+        for counts, (start, end) in zip(tallies, windows):
+            if _in_range(ts, start, end):
+                counts[metric] += 1
+
+    # EmailSend engagement (each timestamp column counts once when in-window):
+    # manual sends, template sends, inbox replies, smart-reply auto-sends.
+    send_cols = select(
+        EmailSend.status, EmailSend.sent_at, EmailSend.opened_at,
+        EmailSend.clicked_at, EmailSend.replied_at,
+    )
+    for status, sent_at, opened_at, clicked_at, replied_at in (await db.execute(send_cols)).all():
+        if status == "skipped":
             continue
-        if _in_window(send.sent_at, day_start, day_end):
-            if send.status in _ERROR_STATUSES:
-                counts["errors"] += 1
-            elif send.status == "bounced":
-                counts["bounces"] += 1
-            else:
-                counts["emails_sent"] += 1
-        if _in_window(send.opened_at, day_start, day_end):
-            counts["opens"] += 1
-        if _in_window(send.clicked_at, day_start, day_end):
-            counts["clicks"] += 1
-        if _in_window(send.replied_at, day_start, day_end):
-            counts["replies"] += 1
+        if status in _ERROR_STATUSES:
+            bump("errors", sent_at)
+        elif status == "bounced":
+            bump("bounces", sent_at)
+        else:
+            bump("emails_sent", sent_at)
+        bump("opens", opened_at)
+        bump("clicks", clicked_at)
+        bump("replies", replied_at)
 
-    # OutreachEvent (Dialtone's sequence log).
-    for event in (await db.execute(select(OutreachEvent))).scalars().all():
-        if not _in_window(event.occurred_at, day_start, day_end):
-            continue
-        etype = event.event_type
-        if etype == "sent":
-            counts["emails_sent"] += 1
-        elif etype == "opened":
-            counts["opens"] += 1
-        elif etype == "clicked":
-            counts["clicks"] += 1
-        elif etype == "replied":
-            counts["replies"] += 1
-        elif etype == "bounced":
-            counts["bounces"] += 1
+    # OutreachEvent (Dialtone's sequence log) — the other half of sent mail.
+    event_cols = select(OutreachEvent.event_type, OutreachEvent.occurred_at)
+    for event_type, occurred_at in (await db.execute(event_cols)).all():
+        metric = _OUTREACH_COUNTERS.get(event_type)
+        if metric:
+            bump(metric, occurred_at)
 
-    # Leads discovered today.
-    for cand in (await db.execute(select(ProspectCandidate.created_at))).scalars().all():
-        if _in_window(cand, day_start, day_end):
-            counts["leads_discovered"] += 1
+    # Leads discovered.
+    for created_at in (await db.execute(select(ProspectCandidate.created_at))).scalars().all():
+        bump("leads_discovered", created_at)
 
-    return DialtoneTodayCounts(
-        emails_sent=counts["emails_sent"],
-        opens=counts["opens"],
-        clicks=counts["clicks"],
-        replies=counts["replies"],
-        bounces=counts["bounces"],
-        errors=counts["errors"],
-        leads_discovered=counts["leads_discovered"],
+    return [
+        DialtoneTodayCounts(
+            emails_sent=c["emails_sent"],
+            opens=c["opens"],
+            clicks=c["clicks"],
+            replies=c["replies"],
+            bounces=c["bounces"],
+            errors=c["errors"],
+            leads_discovered=c["leads_discovered"],
+        )
+        for c in tallies
+    ]
+
+
+def _deltas(current: DialtoneTodayCounts, previous: Optional[DialtoneTodayCounts]) -> DialtoneDeltas:
+    """Percent change per metric vs the previous period (all ``None`` if absent)."""
+    if previous is None:
+        return DialtoneDeltas()
+    return DialtoneDeltas(**{
+        field: pct_change(getattr(current, field), getattr(previous, field))
+        for field in DialtoneDeltas.model_fields
+    })
+
+
+def _funnel_rates(counts: DialtoneTodayCounts) -> DialtoneFunnelRates:
+    """Open/click/reply rates against sends, bounce rate against attempts."""
+    sent = counts.emails_sent
+    attempted = sent + counts.bounces
+    return DialtoneFunnelRates(
+        open_rate=_rate(counts.opens, sent),
+        click_rate=_rate(counts.clicks, sent),
+        reply_rate=_rate(counts.replies, sent),
+        bounce_rate=_rate(counts.bounces, attempted),
     )
 
 
@@ -660,11 +726,20 @@ async def _sender_statuses(db: AsyncSession) -> list[DialtoneSenderStatus]:
 
 
 @router.get("/console", response_model=DialtoneConsole)
-async def get_dialtone_console(db: AsyncSession = Depends(get_db)):
-    """The Dialtone Console header: sending state, warm-up ramp, today's tallies,
-    and per-sender warm-up/health — everything the console's top section needs in
-    one call."""
-    today, day_start, day_end = _reporting_today()
+async def get_dialtone_console(
+    timeframe: Optional[str] = _TIMEFRAME_QUERY,
+    db: AsyncSession = Depends(get_db),
+):
+    """The Dialtone Console header: sending state, warm-up ramp, the selected
+    timeframe's tallies (with a vs-previous-period delta and funnel rates), and
+    per-sender warm-up/health — everything the console's top section needs in one
+    call.
+
+    ``timeframe`` defaults to ``today``, which is what this endpoint has always
+    returned; the console UI asks for ``this_week``. Warm-up and sender numbers
+    are daily by nature and ignore the timeframe.
+    """
+    tf = _timeframe(timeframe)
 
     status = await system_settings.get_sending_status(db)
     sending = DialtoneSending(
@@ -688,16 +763,35 @@ async def get_dialtone_console(db: AsyncSession = Depends(get_db)):
         warmup_week=stats.get("warmup_week"),
     )
 
-    today_counts = await _today_counts(db, day_start, day_end)
+    windows = [tf.window]
+    if tf.has_previous:
+        windows.append(tf.previous_window)
+    tallies = await _period_counts(db, windows)
+    current = tallies[0]
+    previous = tallies[1] if tf.has_previous else None
+
     senders = await _sender_statuses(db)
+
+    def iso(d) -> Optional[str]:
+        return d.isoformat() if d is not None else None
 
     return DialtoneConsole(
         generated_at=datetime.now(timezone.utc),
-        date=today.isoformat(),
+        date=tf.today.isoformat(),
         sending=sending,
         warmup=warmup,
-        today=today_counts,
+        stats=current,
+        today=current,
         senders=senders,
+        timeframe=tf.key,
+        timeframe_label=tf.label,
+        range_start=iso(tf.start_date),
+        range_end=iso(tf.end_date),
+        previous=previous,
+        previous_range_start=iso(tf.previous_start_date),
+        previous_range_end=iso(tf.previous_end_date),
+        deltas=_deltas(current, previous),
+        rates=_funnel_rates(current),
     )
 
 
@@ -712,18 +806,35 @@ _SOURCE_LABELS = {"apollo": "direct dial", "company": "company line"}
 @router.get("/phone-enrichment/summary", response_model=PhoneEnrichmentSummary)
 async def phone_enrichment_summary(
     recent_limit: int = Query(8, ge=0, le=50),
+    timeframe: Optional[str] = Query(
+        "all_time",
+        description=(
+            "Reporting window for the roll-up (" + ", ".join(TIMEFRAMES) + "), "
+            "measured on when each number was found. Defaults to all_time — the "
+            "card is a standing scoreboard."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """Roll-up of the warm-lead phone-enrichment sweep: how many contacts were
     enriched, the hit rate against attempts, the Apollo-vs-company-line split,
     and the most recent finds — the numbers behind the Console's enrichment card.
     """
+    tf = _timeframe(timeframe)
+
+    def within(*extra):
+        """Enrichment-stamped rows inside the selected window."""
+        clauses = [Contact.phone_enriched_at.isnot(None), *extra]
+        if tf.start is not None:
+            clauses.append(Contact.phone_enriched_at >= tf.start)
+        if tf.end is not None:
+            clauses.append(Contact.phone_enriched_at < tf.end)
+        return clauses
+
     # Attempts: every contact the sweep has looked up (hit or miss).
     attempts = (
         await db.execute(
-            select(func.count())
-            .select_from(Contact)
-            .where(Contact.phone_enriched_at.isnot(None))
+            select(func.count()).select_from(Contact).where(*within())
         )
     ).scalar() or 0
 
@@ -731,10 +842,7 @@ async def phone_enrichment_summary(
     by_source_rows = (
         await db.execute(
             select(Contact.phone_source, func.count())
-            .where(
-                Contact.phone_enriched_at.isnot(None),
-                Contact.phone_source.in_(_ENRICHED_SOURCES),
-            )
+            .where(*within(Contact.phone_source.in_(_ENRICHED_SOURCES)))
             .group_by(Contact.phone_source)
         )
     ).all()
@@ -750,10 +858,7 @@ async def phone_enrichment_summary(
             await db.execute(
                 select(Contact, Company)
                 .outerjoin(Company, Contact.company_id == Company.id)
-                .where(
-                    Contact.phone_enriched_at.isnot(None),
-                    Contact.phone_source.in_(_ENRICHED_SOURCES),
-                )
+                .where(*within(Contact.phone_source.in_(_ENRICHED_SOURCES)))
                 .order_by(Contact.phone_enriched_at.desc())
                 .limit(recent_limit)
             )
@@ -778,6 +883,8 @@ async def phone_enrichment_summary(
         apollo=apollo,
         company=company,
         recent=recent,
+        timeframe=tf.key,
+        timeframe_label=tf.label,
     )
 
 

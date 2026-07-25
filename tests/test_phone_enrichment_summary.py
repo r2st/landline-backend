@@ -15,6 +15,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.contact import Contact
+from app.services.timeframes import resolve_timeframe
 
 
 def _now():
@@ -143,4 +144,54 @@ async def test_summary_empty_when_nothing_enriched(client: AsyncClient):
         "apollo": 0,
         "company": 0,
         "recent": [],
+        # The card is a standing scoreboard, so it defaults to all of history.
+        "timeframe": "all_time",
+        "timeframe_label": "All time",
     }
+
+
+# ─── timeframe scoping ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_summary_scopes_to_timeframe(
+    client: AsyncClient, db_session: AsyncSession, sample_company
+):
+    """`timeframe` narrows the roll-up by when each number was found."""
+    tf = resolve_timeframe("this_week")
+    cid = sample_company.id
+    await _make_contact(
+        db_session, cid, source="apollo",
+        enriched_at=tf.start + timedelta(minutes=1), first="Thisweek",
+    )
+    await _make_contact(
+        db_session, cid, source="company",
+        enriched_at=tf.previous_start + timedelta(minutes=1), first="Lastweek",
+    )
+
+    resp = await client.get(
+        "/api/v1/dialtone/phone-enrichment/summary", params={"timeframe": "this_week"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["timeframe"] == "this_week"
+    assert body["enriched"] == 1
+    assert body["attempts"] == 1
+    assert body["apollo"] == 1
+    assert body["company"] == 0
+    # The recent strip is scoped too, or the card's list would contradict its count.
+    assert [r["contact_name"] for r in body["recent"]] == ["Thisweek Doe"]
+
+    # All time still sees both.
+    resp = await client.get(
+        "/api/v1/dialtone/phone-enrichment/summary", params={"timeframe": "all_time"}
+    )
+    assert resp.json()["enriched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_summary_rejects_unknown_timeframe(client: AsyncClient):
+    resp = await client.get(
+        "/api/v1/dialtone/phone-enrichment/summary", params={"timeframe": "someday"}
+    )
+    assert resp.status_code == 400, resp.text

@@ -14,6 +14,7 @@ from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate, ProspectingRun
 from app.models.sequence import OutreachSequence
+from app.services.timeframes import resolve_timeframe
 
 
 # ─── /dialtone/activity ──────────────────────────────────────────────────────
@@ -256,6 +257,71 @@ async def test_activity_date_range_filter(
 
 
 @pytest.mark.asyncio
+async def test_activity_timeframe_filter(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    """A stat tile drills into the same window its number counted."""
+    tf = resolve_timeframe("this_week")
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="ThisWeek", status="sent", sent_at=tf.start + timedelta(minutes=1),
+    ))
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="LastWeek", status="sent", sent_at=tf.previous_start + timedelta(minutes=1),
+    ))
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/v1/dialtone/activity", params={"timeframe": "this_week"}
+    )
+    assert resp.status_code == 200, resp.text
+    subjects = {i["metadata"].get("subject") for i in resp.json()["items"]}
+    assert "ThisWeek" in subjects
+    assert "LastWeek" not in subjects
+
+    # last_week sees the other one, and only the other one.
+    resp = await client.get(
+        "/api/v1/dialtone/activity", params={"timeframe": "last_week"}
+    )
+    subjects = {i["metadata"].get("subject") for i in resp.json()["items"]}
+    assert subjects == {"LastWeek"}
+
+
+@pytest.mark.asyncio
+async def test_activity_explicit_bounds_beat_timeframe(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    now = datetime.now(timezone.utc)
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Old", status="sent", sent_at=now - timedelta(days=90),
+    ))
+    await db_session.commit()
+
+    # `start` is given, so the narrow `today` window must not be applied on top.
+    resp = await client.get("/api/v1/dialtone/activity", params={
+        "timeframe": "today",
+        "start": (now - timedelta(days=120)).date().isoformat(),
+    })
+    assert resp.status_code == 200, resp.text
+    subjects = {i["metadata"].get("subject") for i in resp.json()["items"]}
+    assert "Old" in subjects
+
+
+@pytest.mark.asyncio
+async def test_activity_rejects_unknown_timeframe(client: AsyncClient):
+    resp = await client.get(
+        "/api/v1/dialtone/activity", params={"timeframe": "since_forever"}
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
 async def test_activity_pagination(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -313,6 +379,200 @@ async def test_console_today_counts(
     today = resp.json()["today"]
     assert today["emails_sent"] >= 1
     assert today["opens"] >= 1
+    # No timeframe asked for → the endpoint's historical default, today.
+    assert resp.json()["timeframe"] == "today"
+
+
+# ─── /dialtone/console?timeframe= ────────────────────────────────────────────
+#
+# Windows come from the resolver rather than hand-rolled dates so the seeded
+# timestamps land inside whatever reporting timezone the suite runs under.
+
+
+@pytest.mark.asyncio
+async def test_console_reports_timeframe_context(client: AsyncClient):
+    resp = await client.get(
+        "/api/v1/dialtone/console", params={"timeframe": "this_week"}
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["timeframe"] == "this_week"
+    assert data["timeframe_label"] == "This week"
+    tf = resolve_timeframe("this_week")
+    assert data["range_start"] == tf.start_date.isoformat()
+    assert data["range_end"] == tf.end_date.isoformat()
+    assert data["previous_range_start"] == tf.previous_start_date.isoformat()
+    # `stats` is the timeframe-aware field; `today` mirrors it for old clients.
+    assert data["stats"] == data["today"]
+    for k in ("open_rate", "click_rate", "reply_rate", "bounce_rate"):
+        assert k in data["rates"]
+
+
+@pytest.mark.asyncio
+async def test_console_rejects_unknown_timeframe(client: AsyncClient):
+    resp = await client.get(
+        "/api/v1/dialtone/console", params={"timeframe": "last_fortnight"}
+    )
+    # A typo must 400, not silently report a different period's numbers.
+    assert resp.status_code == 400, resp.text
+    assert "this_week" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_console_timeframe_widens_the_window(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    """A send earlier this week counts for this_week but not for today."""
+    week = resolve_timeframe("this_week")
+    today = resolve_timeframe("today")
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Monday", status="sent", sent_at=week.start + timedelta(minutes=1),
+    ))
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Today", status="sent", sent_at=today.start + timedelta(minutes=1),
+    ))
+    await db_session.commit()
+
+    week_resp = await client.get(
+        "/api/v1/dialtone/console", params={"timeframe": "this_week"}
+    )
+    assert week_resp.json()["stats"]["emails_sent"] == 2
+
+    day_resp = await client.get("/api/v1/dialtone/console", params={"timeframe": "today"})
+    # Monday's send only collapses into "today" when today *is* Monday.
+    expected = 2 if week.start == today.start else 1
+    assert day_resp.json()["stats"]["emails_sent"] == expected
+
+
+@pytest.mark.asyncio
+async def test_console_previous_period_and_deltas(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    tf = resolve_timeframe("today")
+    # Two sends yesterday, one today → -50%.
+    for i in range(2):
+        db_session.add(EmailSend(
+            id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+            subject=f"Yesterday {i}", status="sent",
+            sent_at=tf.previous_start + timedelta(minutes=i + 1),
+        ))
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Today", status="sent", sent_at=tf.start + timedelta(minutes=1),
+    ))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/dialtone/console", params={"timeframe": "today"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["stats"]["emails_sent"] == 1
+    assert data["previous"]["emails_sent"] == 2
+    assert data["deltas"]["emails_sent"] == -50.0
+    # Nothing opened in either period → no baseline, so no percentage.
+    assert data["deltas"]["opens"] is None
+
+
+@pytest.mark.asyncio
+async def test_console_all_time_has_no_baseline(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    now = datetime.now(timezone.utc)
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Ancient", status="sent", sent_at=now - timedelta(days=400),
+    ))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/dialtone/console", params={"timeframe": "all_time"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # Unbounded: even a year-old send counts.
+    assert data["stats"]["emails_sent"] == 1
+    assert data["previous"] is None
+    assert data["range_start"] is None and data["range_end"] is None
+    assert all(v is None for v in data["deltas"].values())
+
+
+@pytest.mark.asyncio
+async def test_console_counts_sequence_sends_in_timeframe(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    """Sequence sends live only on OutreachEvent — the timeframe filter must read
+    that table too, or the console under-reports most outreach volume."""
+    tf = resolve_timeframe("this_week")
+    seq = OutreachSequence(id=_uuid.uuid4(), name="Cold Seq")
+    db_session.add(seq)
+    await db_session.flush()
+    enrollment = OutreachEnrollment(
+        id=_uuid.uuid4(), sequence_id=seq.id, contact_id=sample_contact.id, status="active",
+    )
+    db_session.add(enrollment)
+    await db_session.flush()
+    db_session.add(OutreachEvent(
+        id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1, event_type="sent",
+        occurred_at=tf.start + timedelta(minutes=1),
+    ))
+    db_session.add(OutreachEvent(
+        id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1, event_type="opened",
+        occurred_at=tf.start + timedelta(minutes=2),
+    ))
+    # Last week's send belongs to the baseline, not the current window.
+    db_session.add(OutreachEvent(
+        id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1, event_type="sent",
+        occurred_at=tf.previous_start + timedelta(minutes=1),
+    ))
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/v1/dialtone/console", params={"timeframe": "this_week"}
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["stats"]["emails_sent"] == 1
+    assert data["stats"]["opens"] == 1
+    assert data["previous"]["emails_sent"] == 1
+    # One open on one send → 100% open rate, expressed as a fraction.
+    assert data["rates"]["open_rate"] == 1.0
+    assert data["rates"]["click_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_console_funnel_rates(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    tf = resolve_timeframe("today")
+    at = tf.start + timedelta(minutes=1)
+    for i in range(4):
+        db_session.add(EmailSend(
+            id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+            subject=f"S{i}", status="sent", sent_at=at,
+            opened_at=at if i < 2 else None,
+            replied_at=at if i < 1 else None,
+        ))
+    # A bounce isn't a send, so it lands in the bounce-rate denominator only.
+    db_session.add(EmailSend(
+        id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Bounced", status="bounced", sent_at=at,
+    ))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/dialtone/console", params={"timeframe": "today"})
+    rates = resp.json()["rates"]
+    assert rates["open_rate"] == 0.5       # 2 of 4 sends
+    assert rates["reply_rate"] == 0.25     # 1 of 4 sends
+    assert rates["bounce_rate"] == 0.2     # 1 of 5 attempts
 
 
 @pytest.mark.asyncio

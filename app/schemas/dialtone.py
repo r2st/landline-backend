@@ -84,7 +84,11 @@ class DialtoneSenderStatus(BaseModel):
 
 
 class DialtoneTodayCounts(BaseModel):
-    """Today's activity tallies (in the reporting timezone)."""
+    """Activity tallies for one reporting window (in the reporting timezone).
+
+    Named for the console's original today-only header; it now carries whichever
+    timeframe was requested (see ``DialtoneConsole.timeframe``).
+    """
 
     emails_sent: int = 0
     opens: int = 0
@@ -93,6 +97,38 @@ class DialtoneTodayCounts(BaseModel):
     bounces: int = 0
     errors: int = 0
     leads_discovered: int = 0
+
+
+class DialtoneDeltas(BaseModel):
+    """Percent change per metric vs the previous period of the same length.
+
+    ``None`` on a field means there's no comparable baseline — either the
+    timeframe is ``all_time``, or the previous period was zero, where a
+    percentage would be meaningless (0 → 5 is new activity, not "+500%").
+    """
+
+    emails_sent: Optional[float] = None
+    opens: Optional[float] = None
+    clicks: Optional[float] = None
+    replies: Optional[float] = None
+    bounces: Optional[float] = None
+    errors: Optional[float] = None
+    leads_discovered: Optional[float] = None
+
+
+class DialtoneFunnelRates(BaseModel):
+    """Engagement rates for the selected window, as fractions (0..1) of sends —
+    the same convention as ``SequenceAnalytics``.
+
+    All four are 0.0 when nothing was sent in the window. ``bounce_rate`` is
+    measured against attempted deliveries (sends + bounces), since a bounce never
+    counts as a send.
+    """
+
+    open_rate: float = 0.0
+    click_rate: float = 0.0
+    reply_rate: float = 0.0
+    bounce_rate: float = 0.0
 
 
 class DialtoneWarmup(BaseModel):
@@ -116,14 +152,36 @@ class DialtoneSending(BaseModel):
 
 
 class DialtoneConsole(BaseModel):
-    """The Dialtone Console header — a single call powers the whole top-of-page."""
+    """The Dialtone Console header — a single call powers the whole top-of-page.
+
+    ``stats`` covers the requested ``timeframe``; ``previous`` and ``deltas``
+    cover the period immediately before it (absent for ``all_time``). ``warmup``
+    and ``senders`` stay today-only by nature — a daily send cap has no weekly
+    equivalent — so they don't move with the timeframe.
+    """
 
     generated_at: datetime
-    date: str  # the reporting-day these "today" numbers cover (YYYY-MM-DD)
+    date: str  # the current reporting day (YYYY-MM-DD)
     sending: DialtoneSending
     warmup: DialtoneWarmup
+    # Counts for the selected window. ``today`` is the pre-timeframe field name,
+    # kept as an alias of ``stats`` so existing clients don't break.
+    stats: DialtoneTodayCounts
     today: DialtoneTodayCounts
     senders: list[DialtoneSenderStatus] = []
+
+    # ── Timeframe context ────────────────────────────────────────────────────
+    timeframe: str = "today"
+    timeframe_label: str = "Today"
+    # Inclusive local calendar bounds of the window (None for all_time) — what
+    # the activity-feed drill-down links pass as start/end.
+    range_start: Optional[str] = None
+    range_end: Optional[str] = None
+    previous: Optional[DialtoneTodayCounts] = None
+    previous_range_start: Optional[str] = None
+    previous_range_end: Optional[str] = None
+    deltas: DialtoneDeltas = DialtoneDeltas()
+    rates: DialtoneFunnelRates = DialtoneFunnelRates()
 
 
 # ─── Phone enrichment summary ────────────────────────────────────────────────
@@ -156,3 +214,6 @@ class PhoneEnrichmentSummary(BaseModel):
     apollo: int = 0        # Apollo people-match direct dials
     company: int = 0       # company main-line fallbacks
     recent: list[PhoneEnrichmentRecent] = []
+    # Which reporting window these numbers cover (see app.services.timeframes).
+    timeframe: str = "all_time"
+    timeframe_label: str = "All time"
