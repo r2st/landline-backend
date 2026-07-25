@@ -303,6 +303,22 @@ def send_sequence_step(self, enrollment_id: str):
                                 "sender_capped": True,
                             }
 
+                # Global daily cap — the cheap read, for the same reason as the
+                # warm-up check above. This is the advisory row count, so it does
+                # NOT make the send safe (the atomic reservation right before the
+                # wire does that); what it does is stop us paying for research,
+                # verification and an LLM composition to rediscover, every five
+                # minutes, that today's volume is already spent.
+                _pre_ok, _pre_reason = await get_send_limiter().can_send_today(db)
+                if not _pre_ok:
+                    await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+                    logger.info("Enrollment %s held: %s", enrollment_id, _pre_reason)
+                    return {
+                        "status": "skipped",
+                        "reason": _pre_reason,
+                        "daily_limit_reached": True,
+                    }
+
                 from app.services.email_validation import validate_contact
 
                 if contact.email_status is None:
