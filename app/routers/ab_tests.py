@@ -278,11 +278,62 @@ async def create_ab_test(payload: AbTestCreate, db: AsyncSession = Depends(get_d
     return await _build_detail(db, test)
 
 
+@router.post("/generate-subjects/{step_id}", response_model=AbTestDetail, status_code=201)
+async def generate_subject_test(
+    step_id: uuid.UUID,
+    count: int = Query(3, ge=2, le=3, description="How many challenger subjects to write"),
+    strategy: str = Query("even"),
+    metric: str = Query(
+        "opened",
+        description="Metric the test optimises. Subject tests default to opens — "
+                    "the subject decides whether a message is opened and barely "
+                    "touches what happens after.",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Write subject-line challengers for one step with AI and start the test.
+
+    The static bank only covers steps someone hand-wrote alternatives for. This
+    generates them for any step: control A inherits the step's own subject,
+    challengers vary the subject only, and the body is held constant so what the
+    test measures is the subject.
+
+    Falls back to deterministic subject transforms when no LLM is reachable, so
+    it always produces a runnable test.
+    """
+    if strategy not in AB_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"strategy must be one of {list(AB_STRATEGIES)}")
+    if metric not in AB_METRICS:
+        raise HTTPException(status_code=400, detail=f"metric must be one of {list(AB_METRICS)}")
+
+    step = (
+        await db.execute(select(SequenceStep).where(SequenceStep.id == step_id))
+    ).scalar_one_or_none()
+    if step is None:
+        raise HTTPException(status_code=404, detail="sequence step not found")
+
+    from app.services.ab_test_seed import generate_subject_test_for_step
+
+    try:
+        result = await generate_subject_test_for_step(
+            db, step, count=count, strategy=strategy, metric=metric
+        )
+    except ValueError as exc:
+        # "already has a test" is a conflict; anything else is a bad request.
+        status = 409 if "already exists" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc))
+
+    return await _build_detail(db, result["test"])
+
+
 @router.post("/seed-subjects/{sequence_id}")
 async def seed_subject_tests(
     sequence_id: uuid.UUID,
     strategy: str = Query("even"),
-    metric: str = Query("replied"),
+    metric: str = Query(
+        "opened",
+        description="Subject tests default to open rate; see generate-subjects.",
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """Seed subject-line A/B tests for a sequence from the static variant bank.

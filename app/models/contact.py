@@ -103,6 +103,12 @@ class Contact(Base, OrgScopedMixin):
     email_verified_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), index=True
     )
+    # Free-form operator labels ("trade-show-2026", "warm-intro", "do-not-call").
+    # Mirrors ``Company.tags``. Segmentation the taxonomy columns can't express:
+    # ``status`` is a lifecycle marker with fixed meanings and ``contact_group``
+    # is genuine-vs-test, so neither can carry "people I met at IMTS". Defaults to
+    # [] rather than NULL so every read can iterate without a guard.
+    tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
     source: Mapped[str | None] = mapped_column(String(50), index=True)
     # 'genuine' (real business lead) or 'test' (internal/test data), or NULL if
     # unclassified. Lets the UI and outreach keep test contacts out of the way.

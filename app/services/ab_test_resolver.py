@@ -397,8 +397,11 @@ async def evaluate_test(
         both_ready = (
             control["sent"] >= test.min_sample and leader["sent"] >= test.min_sample
         )
+        # Judge on the metric the test was created to optimise. Without this a
+        # subject-line test (which exists to move OPEN rate) was decided on reply
+        # rate — the body's work, credited to the subject.
         if both_ready:
-            evaluation = auto_declare_winner(shim, now)
+            evaluation = auto_declare_winner(shim, now, metric=test.metric)
             # Honour a stricter confidence target than the engine's 0.95 gate.
             if shim.winner in ("A", "B") and (shim.confidence_level or 0.0) < test.confidence_target:
                 shim.winner = None
@@ -406,7 +409,7 @@ async def evaluate_test(
                 shim.completed_at = None
             result["confidence"] = evaluation.get("overall_confidence")
         else:
-            evaluation = evaluate_experiment(shim)
+            evaluation = evaluate_experiment(shim, test.metric)
             result["confidence"] = evaluation.get("overall_confidence")
 
         if shim.winner in ("A", "B"):
@@ -422,7 +425,11 @@ async def evaluate_test(
     max_sent = max((s["sent"] for s in stats), default=0)
     age_days = (now - _aware(test.created_at)).days if test.created_at else 0
     if stats and (max_sent >= HARD_CAP_SENDS or age_days >= HARD_CAP_DAYS):
-        best = max(stats, key=lambda s: (s["reply_rate"], s["sent"], -ord(s["label"])))
+        # "Best" means best on the metric under test. Picking by reply rate for a
+        # subject-line test would promote whichever subject happened to sit above
+        # the better-replying body — an outcome the subject didn't cause.
+        cap_rate_key = _RATE_KEY.get(test.metric, "reply_rate")
+        best = max(stats, key=lambda s: (s[cap_rate_key], s["sent"], -ord(s["label"])))
         result["default_winner"] = True
         result["winner_variant_id"] = str(best["variant_id"])
         result["status"] = "completed"
@@ -499,11 +506,16 @@ async def _apply_winner(
     for v in variants:
         v.is_active = False
 
-    await _notify_concluded(test, step, winner_stat, default=default)
+    await _notify_concluded(test, step, variants, winner_stat, default=default)
 
 
 async def _notify_concluded(
-    test: AbTest, step: SequenceStep, winner_stat: dict, *, default: bool
+    test: AbTest,
+    step: SequenceStep,
+    variants: list[AbTestVariant],
+    winner_stat: dict,
+    *,
+    default: bool,
 ) -> None:
     """Best-effort operator alert that a test concluded (never raises)."""
     try:
@@ -511,21 +523,39 @@ async def _notify_concluded(
 
         label = winner_stat["label"]
         rate = winner_stat.get(_RATE_KEY.get(test.metric, "reply_rate"), 0.0)
+        # Count for the metric under test — reporting "4 replies / 300 sends" on a
+        # test decided by open rate makes the alert unreadable.
+        metric_count = winner_stat.get(test.metric, winner_stat.get("replied", 0))
+        metric_noun = {"opened": "opens", "clicked": "clicks"}.get(test.metric, "replies")
+        subject_only = all(
+            getattr(v, "body_template", None) is None for v in variants
+        ) and any(getattr(v, "subject_template", None) for v in variants)
+        what = "subject line" if subject_only else "copy"
         if default:
-            subject = f"🅰️🅱️ A/B test concluded (no clear winner) — step {step.step_number}"
+            subject = f"🅰️🅱️ {what.capitalize()} test concluded (no clear winner) — step {step.step_number}"
             lead = (
                 "No statistically significant difference within the cap "
                 f"({HARD_CAP_SENDS} sends/variant or {HARD_CAP_DAYS} days). "
                 f"Defaulting to the best performer, variant {label}."
             )
         else:
-            subject = f"🅰️🅱️ A/B test winner: variant {label} — step {step.step_number}"
+            subject = f"🅰️🅱️ {what.capitalize()} test winner: variant {label} — step {step.step_number}"
             lead = f"Variant {label} won on {test.metric} rate at ≥{test.confidence_target:.0%} confidence."
+
+        winning_copy = ""
+        winner_variant = next(
+            (v for v in variants if v.id == winner_stat["variant_id"]), None
+        )
+        if subject_only and winner_variant is not None:
+            won_subject = winner_variant.subject_template or step.subject_template
+            winning_copy = f'Winning subject: "{won_subject}"\n'
+
         body = (
             f"{lead}\n\n"
             f"Winning {test.metric} rate: {rate:.1%} "
-            f"({winner_stat['replied']} replies / {winner_stat['sent']} sends).\n"
-            f"Variant {label} is now the step's active template; future sends use it.\n\n"
+            f"({metric_count} {metric_noun} / {winner_stat['sent']} sends).\n"
+            f"{winning_copy}"
+            f"Variant {label} is now the step's active {what}; future sends use it.\n\n"
             f"Test id: {test.id}"
         )
         await get_notification_service()._send_notification(subject, body)

@@ -1258,6 +1258,35 @@ def auto_expire_review_drafts():
         return {"status": "error", "error": str(exc)}
 
 
+@celery_app.task(name="app.tasks.outreach.resume_out_of_office")
+def resume_out_of_office():
+    """Bring back sequences paused by an out-of-office autoresponder.
+
+    The other half of :func:`app.services.out_of_office.pause_for_ooo`. Without
+    it, an OOO pause is a one-way door: the queue only dispatches ``active``, so
+    every contact who ever sent an autoreply would drop out of outreach for good.
+
+    Hourly is the right cadence — return dates are day-granular, so being up to
+    an hour late costs nothing, and the sweep is one indexed query per org.
+    """
+
+    async def _run():
+        from app.services import out_of_office
+
+        async def _body(db):
+            summary = await out_of_office.resume_due(db)
+            await db.commit()
+            return summary
+
+        return await for_each_org(_body, label="resume_out_of_office")
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:
+        logger.error("resume_out_of_office failed: %s", str(exc))
+        return {"status": "error", "error": str(exc)}
+
+
 @celery_app.task(name="app.tasks.outreach.check_email_replies")
 def check_email_replies():
     """Periodic dispatcher: fan out one reply-processing task per mailbox.

@@ -8,7 +8,9 @@ dispatches the per-category auto-action:
 
 * ``interested``     → flag for the priority inbox + notify the operator.
 * ``not_interested`` → complete the contact's active enrollments.
-* ``out_of_office``  → re-queue the next step until the return date (or +7d).
+* ``out_of_office``  → pause the contact's sequences until the parsed return
+  date (or +7d), resumed automatically by
+  ``app.tasks.outreach.resume_out_of_office``.
 * ``wrong_person``   → mark the contact for list cleanup + stash any referral.
 * ``unsubscribe``    → suppress the contact everywhere + write a consent record.
 * ``bounce``         → record the failed recipient in the bounce pipeline (hard
@@ -48,8 +50,9 @@ logger = logging.getLogger(__name__)
 # by construction, and unsubscribe must never be gated).
 AUTO_ACTION_THRESHOLD = 0.75
 
-# Default OOO re-queue delay when no return date is parseable.
-OOO_DEFAULT_REQUEUE_DAYS = 7
+# Default OOO hold when no return date is parseable. Re-exported from the
+# service that owns the pause so the two can't drift apart.
+from app.services.out_of_office import OOO_DEFAULT_PAUSE_DAYS as OOO_DEFAULT_REQUEUE_DAYS  # noqa: E402,F401
 
 # Enrollment statuses that a reply can still act on (a completed/bounced/
 # unsubscribed enrollment is already terminal).
@@ -202,31 +205,21 @@ async def route_auto_action(
         return "unsubscribed"
 
     if effective_category == "out_of_office":
-        # Re-queue: push the next step out to the return date (parsed) or +7d.
-        # Keep the enrollment active so the queue resumes it automatically.
-        return_date = result.get("return_date")
-        resume_at = None
-        if return_date:
-            try:
-                parsed = datetime.fromisoformat(str(return_date))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                resume_at = parsed
-            except (ValueError, TypeError):
-                resume_at = None
-        if resume_at is None:
-            resume_at = now + timedelta(days=OOO_DEFAULT_REQUEUE_DAYS)
-        # Never let an OOO permanently drop an enrollment — only ever push it
-        # forward, never backward.
-        if resume_at <= now:
-            resume_at = now + timedelta(days=OOO_DEFAULT_REQUEUE_DAYS)
+        # Genuinely pause, don't just push the date out. Leaving the enrollment
+        # ``active`` with a future ``next_send_at`` reads as a live sequence on
+        # every dashboard and count, and anything that recomputes that date (an
+        # adaptive-delay pass, a manual re-queue, a kill-switch resume) silently
+        # undoes the hold and mails someone on parental leave. ``pause_reason``
+        # marks it as ours to un-pause; ``resume_out_of_office`` brings it back.
+        from app.services import out_of_office
 
-        enrollments = await _enrollments_for_contact(db, reply.contact_id, statuses=("active",))
-        for enr in enrollments:
-            enr.next_send_at = resume_at
+        summary = await out_of_office.pause_for_ooo(
+            db, reply.contact_id, return_date=result.get("return_date"), now=now
+        )
         reply.classification_meta = {
             **(reply.classification_meta or {}),
-            "requeued_until": resume_at.isoformat(),
+            "ooo_paused": summary["paused"],
+            "requeued_until": summary["resume_at"],
         }
         return "requeued"
 

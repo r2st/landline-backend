@@ -79,6 +79,14 @@ celery_app.conf.update(
             "task": "app.tasks.outreach.auto_expire_review_drafts",
             "schedule": 3600.0,  # hourly
         },
+        # Bring back sequences paused by an out-of-office autoresponder. Without
+        # this the pause is a one-way door — the queue only dispatches 'active',
+        # so anyone who ever sent an autoreply would leave outreach for good.
+        # Hourly: return dates are day-granular, so an hour of lag costs nothing.
+        "resume-out-of-office": {
+            "task": "app.tasks.outreach.resume_out_of_office",
+            "schedule": 3600.0,  # hourly
+        },
         "check-company-news": {
             "task": "app.tasks.news.check_company_news_batch",
             "schedule": 21600.0,  # every 6 hours

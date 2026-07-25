@@ -359,9 +359,22 @@ async def test_route_ooo_requeues_until_return_date(
 
     await db_session.refresh(enr)
     assert reply.handled_action == "requeued"
-    assert enr.status == "active"  # never dropped
+    # The enrollment is genuinely paused now rather than left "active" with a
+    # future date — that read as a live sequence on every dashboard, and anything
+    # recomputing next_send_at silently undid the hold. It is still never
+    # dropped: pause_reason marks it as ours and resume_due brings it back.
+    assert enr.status == "paused"
+    assert enr.pause_reason == "out_of_office"
     assert enr.next_send_at is not None
     assert enr.next_send_at.date().isoformat() == return_iso
+
+    from app.services import out_of_office
+
+    later = datetime.fromisoformat(return_iso).replace(tzinfo=timezone.utc) + timedelta(hours=1)
+    assert (await out_of_office.resume_due(db_session, now=later))["resumed"] == 1
+    await db_session.flush()
+    await db_session.refresh(enr)
+    assert enr.status == "active"
 
 
 @pytest.mark.asyncio

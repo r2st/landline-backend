@@ -145,10 +145,21 @@ def evaluate_ab_test(
     }
 
 
-def evaluate_experiment(experiment) -> dict:
+def evaluate_experiment(experiment, metric: Optional[str] = None) -> dict:
     """Evaluate a full ABTestExperiment model instance across all metrics.
 
     Returns separate analyses for open rate, click rate, and reply rate.
+
+    ``metric`` names the outcome the experiment is actually optimising and, when
+    given, is the **only** one that can declare a winner. This matters for
+    subject-line tests: the subject is the entire lever on whether a message gets
+    opened and has almost no bearing on what happens after, so a subject test
+    scored on reply rate is measuring the body's work and attributing it to the
+    subject. Passing ``metric="opened"`` scores it on the thing under test.
+
+    Omitting ``metric`` keeps the historical behaviour — reply rate first, falling
+    back to open rate when replies aren't significant — for callers that never
+    declared what they were testing.
     """
     open_result = evaluate_ab_test(
         experiment.variant_a_sent, experiment.variant_a_opened,
@@ -163,12 +174,21 @@ def evaluate_experiment(experiment) -> dict:
         experiment.variant_b_sent, experiment.variant_b_replied,
     )
 
-    # Overall winner uses reply rate as primary (most valuable), then opens
-    primary = reply_result if reply_result["is_significant"] else open_result
+    by_metric = {
+        "opened": open_result,
+        "clicked": click_result,
+        "replied": reply_result,
+    }
+    if metric is not None:
+        primary = by_metric[_METRIC_ALIASES.get(metric, "replied")]
+    else:
+        # Legacy: reply rate is the most valuable signal, opens are the fallback.
+        primary = reply_result if reply_result["is_significant"] else open_result
 
     return {
         "experiment_id": str(experiment.id),
         "name": experiment.name,
+        "primary_metric": _METRIC_ALIASES.get(metric, "replied") if metric else None,
         "open_rate": open_result,
         "click_rate": click_result,
         "reply_rate": reply_result,
@@ -467,15 +487,21 @@ def select_next_variant(experiment, metric: str = "replied") -> str:
 # ---------------------------------------------------------------------------
 
 
-def auto_declare_winner(experiment, now: Optional[datetime] = None) -> dict:
+def auto_declare_winner(
+    experiment, now: Optional[datetime] = None, metric: Optional[str] = None
+) -> dict:
     """Evaluate an experiment and, if a variant is significant, declare it.
 
     Mutates the experiment in place: sets ``winner``, ``confidence_level``,
     ``is_significant`` and ``status``, and stamps ``completed_at`` when a winner
     is reached. Returns the full evaluation dict from :func:`evaluate_experiment`.
     Idempotent — re-running after a winner is set leaves it unchanged.
+
+    ``metric`` is passed straight through: a test declares its winner on the
+    outcome it was set up to optimise, not on whichever outcome happens to reach
+    significance first.
     """
-    evaluation = evaluate_experiment(experiment)
+    evaluation = evaluate_experiment(experiment, metric)
 
     experiment.confidence_level = evaluation["overall_confidence"]
     experiment.is_significant = evaluation["overall_significant"]

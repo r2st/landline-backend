@@ -68,6 +68,16 @@ class OutreachEnrollment(Base, OrgScopedMixin):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
+    # Why this enrollment is ``paused``, when the pause is one we intend to undo
+    # by ourselves. Currently only ``'out_of_office'``: an autoresponder says the
+    # contact is away, so the sequence stops and ``next_send_at`` carries the date
+    # to resume on. The reason is what makes an automatic resume safe — every
+    # other pause (no email address, bad domain, consent block, an operator's
+    # decision) has a human or a different rule behind it and must never be
+    # un-paused by a sweep looking for due dates. NULL = paused for one of those
+    # reasons; leave it alone.
+    pause_reason: Mapped[str | None] = mapped_column(String(30))
+
     # AI-Optimized Sequence Engine (feature 1.2): per-enrollment record of the
     # optimizer's decisions and reasoning. Each entry is one decision dict
     # ({step, action, reasoning, ...}) appended by sequence_optimizer before a
