@@ -41,7 +41,6 @@ from app.services.ingestion import (
 from app.services.normalize import normalize_domain
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 # Apollo caps a company search page at 25 results.
 APOLLO_MAX_PER_PAGE = 25
@@ -169,8 +168,11 @@ class ApolloEnrichmentService:
 
     def __init__(self):
         self.settings = get_settings()
-        self.api_key = self.settings.apollo_api_key
         self.base_url = self.settings.apollo_base_url
+        # Explicit override slot for callers/tests that assign ``svc.api_key``.
+        # None (not "") means "no override" — an assigned empty string is a
+        # deliberate "pretend the key is missing" and must be honoured.
+        self._api_key_override: Optional[str] = None
         # The key is *not* baked in here: callers (and tests) reassign
         # ``self.api_key`` after construction, and a header snapshotted in
         # __init__ would silently keep authenticating as the old key.
@@ -178,6 +180,36 @@ class ApolloEnrichmentService:
             "Content-Type": "application/json",
             "Cache-Control": "no-cache",
         }
+
+    @property
+    def api_key(self) -> str:
+        """The Apollo key, resolved at *access* time.
+
+        Reading the key in ``__init__`` freezes whatever the environment looked
+        like when this module was first imported. That is the wrong moment: the
+        service is constructed at import in some call sites, config is reloaded
+        in others, and a key added after boot would never be picked up. Resolving
+        on access also means a *missing* key is a runtime condition every caller
+        already handles (``skipped``/``no_api_key``) rather than something that
+        could ever surface at import.
+        """
+        if self._api_key_override is not None:
+            return self._api_key_override
+        return get_settings().apollo_api_key or ""
+
+    @api_key.setter
+    def api_key(self, value: Optional[str]) -> None:
+        self._api_key_override = value
+
+    @property
+    def enabled(self) -> bool:
+        """False when no key is configured — enrichment is simply off.
+
+        Never an error: a deployment with no Apollo key is a supported
+        configuration, and every entry point degrades to ``skipped`` rather than
+        raising. Mirrors ``HunterVerificationService.enabled``.
+        """
+        return bool(self.api_key)
 
     def _auth_headers(self) -> dict:
         """Request headers including Apollo's key header.

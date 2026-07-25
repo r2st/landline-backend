@@ -1,4 +1,25 @@
-"""Send rate limiter — prevents spam by enforcing sending limits."""
+"""Send rate limiter — prevents spam by enforcing sending limits.
+
+**The daily cap is enforced by an atomic Redis reservation, not by counting
+rows.** ``can_send_today`` reads ``COUNT(*)`` of today's sends and compares it to
+the limit; between that read and the ``OutreachEvent`` insert there is a window
+several seconds wide (recipient validation, Hunter verification, AI composition,
+the SMTP round-trip). Every concurrent worker reads the same pre-send count, so
+N workers each see "499/500, fine" and 500+N emails go out. At the volumes that
+matter — a queue sweep dispatching dozens of ``send_sequence_step`` tasks at once
+across the worker pool — that overshoot is exactly the thing the cap exists to
+prevent.
+
+:func:`reserve_daily_send` closes the window: one ``INCR`` per intended send,
+checked against the limit *before* the send, with :func:`release_daily_send`
+handing the slot back when the send doesn't happen. The counter is seeded from
+the DB on first use each day (``SET … NX``) so a worker restart, a Redis
+eviction, or a mid-day deploy resumes from the real count rather than zero.
+
+When Redis is unreachable the reservation degrades to the row-count check — the
+same per-worker enforcement as before, never *more* permissive — and says so in
+the returned reason so the degradation is visible rather than silent.
+"""
 
 import logging
 from datetime import datetime, timezone, timedelta
@@ -9,8 +30,64 @@ from sqlalchemy import select, func
 from app.config import get_settings
 from app.models.outreach import OutreachEvent, OutreachEnrollment
 from app.models.contact import Contact
+from app.org_context import get_current_org_id
 
 logger = logging.getLogger(__name__)
+
+# Lazily-created, cached async Redis client (mirrors app.services.api_key_auth).
+# Disabled on first failure so a persistent outage doesn't retry a dead socket
+# on every send.
+_redis = None
+_redis_disabled = False
+
+
+async def _get_redis():
+    global _redis, _redis_disabled
+    if _redis_disabled:
+        return None
+    if _redis is not None:
+        return _redis
+    try:
+        import redis.asyncio as aioredis
+
+        _redis = aioredis.from_url(
+            get_settings().redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_connect_timeout=0.5,
+            socket_timeout=0.5,
+        )
+        return _redis
+    except Exception as exc:  # noqa: BLE001 — any redis failure → DB-count fallback
+        logger.info("Send-limit redis unavailable, falling back to row counts: %s", exc)
+        _redis_disabled = True
+        return None
+
+
+def _reset_redis_for_tests() -> None:
+    """Drop the cached client so a test can swap in its own fake."""
+    global _redis, _redis_disabled
+    _redis = None
+    _redis_disabled = False
+
+
+def _daily_key(now: Optional[datetime] = None) -> str:
+    """Per-org, per-UTC-day counter key.
+
+    Org-scoped because the daily cap is a tenant's cap: one busy org must not be
+    able to spend another's allowance.
+    """
+    now = now or datetime.now(timezone.utc)
+    return f"dialtone:daily_sends:{get_current_org_id() or 'global'}:{now:%Y-%m-%d}"
+
+
+def _seconds_until_utc_midnight(now: Optional[datetime] = None) -> int:
+    """TTL for the daily key — the key expires when the day it counts ends."""
+    now = now or datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return max(60, int((tomorrow - now).total_seconds()) + 300)
 
 
 class SendLimiter:
@@ -101,16 +178,14 @@ class SendLimiter:
         return True, f"within send window ({now_local:%a %H:%M} {used_tz_name})"
 
     async def can_send_today(self, db: AsyncSession) -> tuple[bool, str]:
-        """Check if we have hit the daily sending limit."""
-        now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        """Whether today's recorded sends are still under the daily limit.
 
-        result = await db.execute(
-            select(func.count(OutreachEvent.id))
-            .where(OutreachEvent.event_type == "sent")
-            .where(OutreachEvent.occurred_at >= today_start)
-        )
-        today_count = result.scalar() or 0
+        An *advisory* pre-check, safe for dispatchers and dashboards: it counts
+        rows already written, so concurrent in-flight sends are invisible to it.
+        The send path must claim its slot with :meth:`reserve_daily_send`, which
+        is the only check that holds under concurrency.
+        """
+        today_count = await self._db_sent_today(db)
 
         daily_limit = await self._get_daily_limit_db(db)
 
@@ -119,6 +194,95 @@ class SendLimiter:
             return False, f"Daily limit reached ({today_count}/{daily_limit}).{warmup_note}"
 
         return True, f"OK ({today_count}/{daily_limit} sent today)"
+
+    async def _db_sent_today(self, db: AsyncSession, now: Optional[datetime] = None) -> int:
+        """Sends recorded in the current UTC day (the counter's seed value)."""
+        now = now or datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        result = await db.execute(
+            select(func.count(OutreachEvent.id))
+            .where(OutreachEvent.event_type == "sent")
+            .where(OutreachEvent.occurred_at >= today_start)
+        )
+        return result.scalar() or 0
+
+    async def reserve_daily_send(
+        self, db: AsyncSession, *, now: Optional[datetime] = None
+    ) -> tuple[bool, str]:
+        """Atomically claim one slot against today's send limit.
+
+        Call this immediately before putting a message on the wire, and hand the
+        slot back with :meth:`release_daily_send` if the send doesn't happen. The
+        claim is a single Redis ``INCR``, so N concurrent workers get N distinct
+        numbers and only the ones at or below the limit proceed — unlike
+        :meth:`can_send_today`, where every worker reads the same stale count and
+        they all think they're the last one under the cap.
+
+        The counter is seeded from ``COUNT(*)`` of today's sends on first use
+        (``SET … NX``, so exactly one worker's seed wins), which makes a restart,
+        an eviction, or a deploy resume from the real number instead of zero.
+
+        Returns ``(allowed, reason)``. With Redis down it falls back to the
+        row-count check — per-worker enforcement, identical to the pre-Redis
+        behaviour, and the reason says so.
+        """
+        now = now or datetime.now(timezone.utc)
+        limit = await self._get_daily_limit_db(db)
+
+        client = await _get_redis()
+        if client is None:
+            allowed, reason = await self.can_send_today(db)
+            return allowed, f"{reason} [degraded: no redis, per-worker count]"
+
+        key = _daily_key(now)
+        try:
+            # Seed from the DB only when this is the first send of the day (or
+            # the key was lost). NX makes the seed race-safe: the loser's SET is
+            # a no-op and both workers then INCR the same seeded counter.
+            seeded = await client.set(
+                key, await self._db_sent_today(db, now),
+                nx=True, ex=_seconds_until_utc_midnight(now),
+            )
+            if seeded:
+                logger.info("Seeded daily send counter %s from DB", key)
+            count = int(await client.incr(key))
+            # Belt and braces: a key that somehow lost its TTL would otherwise
+            # freeze today's count into tomorrow.
+            if await client.ttl(key) < 0:
+                await client.expire(key, _seconds_until_utc_midnight(now))
+        except Exception as exc:  # noqa: BLE001 — any redis failure → DB fallback
+            logger.warning("Daily send reservation failed (%s); using row count", exc)
+            allowed, reason = await self.can_send_today(db)
+            return allowed, f"{reason} [degraded: redis error, per-worker count]"
+
+        if count > limit:
+            # Give the slot straight back — this worker isn't sending.
+            try:
+                await client.decr(key)
+            except Exception:  # noqa: BLE001 — best effort; TTL bounds the damage
+                logger.debug("Could not release over-limit reservation on %s", key)
+            warmup_note = " Warmup mode active." if self.settings.warmup_enabled else ""
+            return False, f"Daily limit reached ({limit}/{limit}).{warmup_note}"
+
+        return True, f"OK (reserved {count}/{limit} today)"
+
+    async def release_daily_send(self, *, now: Optional[datetime] = None) -> None:
+        """Return an unused reservation to today's pool.
+
+        Called when a claimed send is declined downstream (warm-up cap, kill
+        switch, dispatcher error). Never raises and never drops the counter below
+        zero, so a double release can't manufacture extra allowance.
+        """
+        client = await _get_redis()
+        if client is None:
+            return
+        key = _daily_key(now)
+        try:
+            remaining = int(await client.decr(key))
+            if remaining < 0:
+                await client.set(key, 0, ex=_seconds_until_utc_midnight(now))
+        except Exception as exc:  # noqa: BLE001 — release is best-effort
+            logger.debug("Could not release daily send reservation: %s", exc)
 
     def _daily_limit_for_start(self, start_date: Optional[str]) -> int:
         """Daily limit for a given warm-up start date (ISO string or None)."""

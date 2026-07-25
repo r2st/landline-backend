@@ -48,8 +48,45 @@ class SendingStatusResponse(BaseModel):
     enrollments_affected: Optional[int] = None
 
 
+class ProviderStatus(BaseModel):
+    name: str
+    configured: bool
+    capability: str
+    degraded_behaviour: str
+
+
 def _actor(user: Optional[User]) -> Optional[str]:
     return user.email if user is not None else None
+
+
+@router.get("/providers", response_model=list[ProviderStatus])
+async def provider_status():
+    """Which optional third-party data providers are actually keyed.
+
+    An unkeyed provider is a *supported* configuration — every call site skips it
+    rather than raising — but that also makes it invisible: enrichment quietly
+    returns nothing and the logs say the sweep "completed". This endpoint is how
+    you tell "no results because nothing matched" apart from "no results because
+    the key was never set", without reading the environment on the box. Mirrors
+    ``GET /api/v1/ai/providers`` for the LLM chain.
+    """
+    from app.services.enrichment import ApolloEnrichmentService
+    from app.services.hunter_verification import get_hunter_service
+
+    return [
+        ProviderStatus(
+            name="apollo",
+            configured=ApolloEnrichmentService().enabled,
+            capability="company/contact enrichment, phone lookup, prospecting",
+            degraded_behaviour="enrichment calls return status=skipped (no_api_key); nothing raises",
+        ),
+        ProviderStatus(
+            name="hunter",
+            configured=get_hunter_service().enabled,
+            capability="per-mailbox email verification + email finder",
+            degraded_behaviour="verification fails open — contacts keep their MX verdict and stay sendable",
+        ),
+    ]
 
 
 @router.get("/sending-status", response_model=SendingStatusResponse)

@@ -18,6 +18,23 @@ logger = logging.getLogger(__name__)
 # an internal address can't bypass the SSRF check.
 _MAX_REDIRECTS = 5
 
+# Hard ceiling on how much of a page body we will hold in memory, in bytes.
+#
+# ``client.get()`` reads the whole response before returning, so the size of the
+# thing we allocate is decided entirely by the remote host. A misconfigured CMS
+# serving a 400 MB "page", a tarball behind a content-type lie, or a deliberate
+# zip-bomb-shaped response is enough to OOM the worker — and the research agent
+# scrapes a homepage plus up to three sub-pages per company, concurrently across
+# companies, so one bad domain takes the whole box with it. Nothing downstream
+# needs more than this: ``about`` is truncated to 500 chars, the summary prompt
+# to 1500, and emails/phones live in the head of the document in practice.
+MAX_PAGE_BYTES = 500_000
+
+# Content types worth parsing as HTML. A PDF/zip/video served at a company's
+# root is downloaded to no purpose, so it's rejected on the header before the
+# body is streamed at all.
+_TEXTUAL_CONTENT_PREFIXES = ("text/", "application/xhtml", "application/xml")
+
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 # Local-parts of addresses no human reads — automated/technical inboxes. These
@@ -179,13 +196,82 @@ class WebScraper:
         "User-Agent": "Mozilla/5.0 (compatible; LandlineBot/1.0; +https://apprendtechnologies.com)",
     }
 
-    async def _safe_get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+    async def _fetch_capped(
+        self, client: httpx.AsyncClient, url: str, max_bytes: int
+    ) -> httpx.Response:
+        """GET *url*, reading at most ``max_bytes`` of the body.
+
+        The response is streamed and the connection dropped the moment the cap is
+        reached, so a hostile or broken host can never make us allocate more than
+        this — which ``client.get()`` (read-it-all-then-return) allows it to do.
+        Over-cap bodies are *truncated*, not discarded: the metadata we're after
+        (title, description, contact links, emails) lives near the top of the
+        document, so a truncated parse still returns useful signal.
+
+        Non-textual responses (PDF, zip, video at a company root) are cut off
+        immediately with an empty body — there is nothing in them for the HTML
+        parser, and downloading them is pure cost.
+        """
+        request = client.build_request("GET", url, headers=self.HEADERS)
+        resp = await client.send(request, stream=True, follow_redirects=False)
+        try:
+            if resp.is_redirect:
+                # Caller handles the hop; the body of a 3xx is noise.
+                return httpx.Response(
+                    resp.status_code, headers=resp.headers, content=b"", request=request
+                )
+
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype and not ctype.startswith(_TEXTUAL_CONTENT_PREFIXES):
+                logger.debug("Skipping non-textual body at %s (%s)", url, ctype)
+                return httpx.Response(
+                    resp.status_code, headers=resp.headers, content=b"", request=request
+                )
+
+            chunks: list[bytes] = []
+            total = 0
+            truncated = False
+            async for chunk in resp.aiter_bytes():
+                remaining = max_bytes - total
+                if remaining <= 0:
+                    truncated = True
+                    break
+                if len(chunk) > remaining:
+                    chunks.append(chunk[:remaining])
+                    total = max_bytes
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if truncated:
+                logger.info("Truncated %s at %d bytes (page exceeds cap)", url, max_bytes)
+            # Drop Content-Length/Content-Encoding: they described the full
+            # upstream body, and httpx would try to reconcile them against the
+            # shorter content we're handing it.
+            headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in ("content-length", "content-encoding")
+            }
+            return httpx.Response(
+                resp.status_code, headers=headers, content=b"".join(chunks), request=request
+            )
+        finally:
+            await resp.aclose()
+
+    async def _safe_get(
+        self, client: httpx.AsyncClient, url: str, max_bytes: Optional[int] = None
+    ) -> httpx.Response:
         """GET *url*, validating the SSRF guard on the initial URL and every
-        redirect hop. Redirects are followed manually so an internal Location
-        can't slip past validation."""
+        redirect hop, and reading at most ``max_bytes`` of the body. Redirects are
+        followed manually so an internal Location can't slip past validation.
+
+        ``max_bytes`` defaults to :data:`MAX_PAGE_BYTES`, resolved on each call
+        rather than bound at definition time so the cap stays a single knob.
+        """
+        max_bytes = MAX_PAGE_BYTES if max_bytes is None else max_bytes
         for _ in range(_MAX_REDIRECTS + 1):
             await _validate_public_url_async(url)
-            resp = await client.get(url, headers=self.HEADERS, follow_redirects=False)
+            resp = await self._fetch_capped(client, url, max_bytes)
             if resp.is_redirect and "location" in resp.headers:
                 url = urljoin(url, resp.headers["location"])
                 continue

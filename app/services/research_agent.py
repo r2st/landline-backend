@@ -34,6 +34,29 @@ from app.services.web_scraper import get_web_scraper
 
 logger = logging.getLogger(__name__)
 
+# Per-field caps on what a scrape may contribute to a research brief.
+#
+# The scraper now bounds the *page body* it downloads (``web_scraper.
+# MAX_PAGE_BYTES``), but the fields lifted out of it are still attacker-shaped:
+# a single ``<title>`` or ``<meta name="description">`` can carry the whole
+# remaining budget, and every one of them is persisted verbatim into
+# ``CompanyResearch.raw_signals`` and pasted into the Claude prompt. Clip at the
+# point of use so neither the row nor the prompt can be inflated by a page we
+# don't control. These are generous next to what real pages carry.
+_MAX_TITLE = 300
+_MAX_DESCRIPTION = 1_000
+_MAX_ABOUT = 4_000
+_MAX_TECHNOLOGIES = 25
+_MAX_SOCIAL_LINKS = 10
+_MAX_LINK = 500
+
+
+def _clip(value, limit: int):
+    """Truncate a string field to ``limit`` characters; pass anything else through."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit]
+    return value
+
 
 class ResearchAgent:
     """Orchestrates multi-source research + Claude synthesis for one company."""
@@ -78,12 +101,19 @@ class ResearchAgent:
             try:
                 scrape = await self.scraper.scrape_company(domain)
                 if scrape and not scrape.get("error"):
+                    social = scrape.get("social_links") or {}
                     signals["website_scrape"] = {
-                        "title": scrape.get("title"),
-                        "description": scrape.get("description"),
-                        "about": scrape.get("about"),
-                        "technologies": scrape.get("technologies", []),
-                        "social_links": scrape.get("social_links", {}),
+                        "title": _clip(scrape.get("title"), _MAX_TITLE),
+                        "description": _clip(scrape.get("description"), _MAX_DESCRIPTION),
+                        "about": _clip(scrape.get("about"), _MAX_ABOUT),
+                        "technologies": [
+                            _clip(t, 100)
+                            for t in (scrape.get("technologies") or [])[:_MAX_TECHNOLOGIES]
+                        ],
+                        "social_links": {
+                            k: _clip(v, _MAX_LINK)
+                            for k, v in list(social.items())[:_MAX_SOCIAL_LINKS]
+                        },
                     }
                     sources_used.append("website")
             except Exception as e:  # noqa: BLE001 — never block synthesis

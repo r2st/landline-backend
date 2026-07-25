@@ -745,16 +745,46 @@ def send_sequence_step(self, enrollment_id: str):
                     enabled=tracking_applied,
                 )
 
-                send_result = await send_outreach_email(
-                    db,
-                    to_email=contact.email,
-                    subject=subject,
-                    body_html=body,
-                    sender_account_id=send_account_id,
-                    thread_id=thread_id,
-                    in_reply_to=in_reply_to,
-                    references=references,
-                )
+                # --- Daily cap: claim the slot atomically, right before the wire.
+                # The queue sweep's ``can_send_today`` is advisory — it counts
+                # rows, and every concurrent worker reads the same pre-send count,
+                # so a burst of dispatches all pass a cap they collectively blow
+                # through. This INCR is per-intended-send, so exactly `limit`
+                # workers get a slot no matter how many ask at once. The slot is
+                # handed back below on any outcome that isn't a real send.
+                _limiter = get_send_limiter()
+                _reserved, _reserve_reason = await _limiter.reserve_daily_send(db)
+                if not _reserved:
+                    await db.rollback()
+                    await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+                    logger.warning(
+                        "Enrollment %s held: %s", enrollment_id, _reserve_reason
+                    )
+                    return {"status": "skipped", "reason": _reserve_reason,
+                            "daily_limit_reached": True}
+
+                try:
+                    send_result = await send_outreach_email(
+                        db,
+                        to_email=contact.email,
+                        subject=subject,
+                        body_html=body,
+                        sender_account_id=send_account_id,
+                        thread_id=thread_id,
+                        in_reply_to=in_reply_to,
+                        references=references,
+                    )
+                except Exception:
+                    # The dispatcher blew up — nothing went out, so the slot must
+                    # not stay spent or a flapping SMTP host silently eats the
+                    # day's allowance.
+                    await _limiter.release_daily_send()
+                    raise
+
+                # A send that didn't happen (soft skip) or bounced outright never
+                # consumed real sending volume; return its slot.
+                if send_result.get("status") != "sent":
+                    await _limiter.release_daily_send()
 
                 # Soft-skip statuses: the dispatcher declined to send but this is
                 # NOT a bounce (warm-up cap hit, suppression, kill switch). Record

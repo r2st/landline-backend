@@ -122,8 +122,28 @@ class HunterVerificationService:
 
     def __init__(self):
         self.settings = get_settings()
-        self.api_key = self.settings.hunter_api_key
         self.base_url = (self.settings.hunter_base_url or "").rstrip("/")
+        # Override slot for callers/tests that assign ``svc.api_key``. None means
+        # "no override"; an assigned "" is a deliberate "act as if unkeyed".
+        self._api_key_override: Optional[str] = None
+
+    @property
+    def api_key(self) -> str:
+        """The Hunter key, resolved at *access* time, never at construction.
+
+        A key read once in ``__init__`` is the environment as it was when the
+        object was built — wrong for a long-lived worker, wrong after a config
+        reload, and it turns "no key yet" into a property of the process rather
+        than of the request. Resolving on access keeps a missing key exactly what
+        the fail-open design says it is: a runtime skip, not a startup failure.
+        """
+        if self._api_key_override is not None:
+            return self._api_key_override
+        return get_settings().hunter_api_key or ""
+
+    @api_key.setter
+    def api_key(self, value: Optional[str]) -> None:
+        self._api_key_override = value
 
     @property
     def enabled(self) -> bool:
