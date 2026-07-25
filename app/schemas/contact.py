@@ -35,6 +35,10 @@ class ContactBase(BaseModel):
     # 'genuine' or 'test' — see app.services.contact_grouping. Omit to let the
     # server auto-classify from the email/source/name.
     contact_group: Optional[str] = Field(None, max_length=20)
+    # Free-form operator labels. Normalised server-side (trimmed, lowercased,
+    # de-duplicated) so "IMTS 2026", "imts 2026 " and "imts 2026" are one tag and
+    # not three near-identical entries in the filter list.
+    tags: list[str] = Field(default_factory=list)
 
 
 class ContactCreate(ContactBase):
@@ -63,6 +67,10 @@ class ContactUpdate(BaseModel):
     is_primary: Optional[bool] = None
     source: Optional[str] = Field(None, max_length=50)
     contact_group: Optional[str] = Field(None, max_length=20)
+    # Replaces the whole tag set when given. Use the dedicated tag endpoints for
+    # add/remove semantics — a PATCH that half-knows the current tags would
+    # clobber a tag added by someone else between the read and the write.
+    tags: Optional[list[str]] = None
 
 
 class ContactRead(ContactBase):
@@ -74,6 +82,13 @@ class ContactRead(ContactBase):
     company_id: uuid.UUID
     source: Optional[str] = None
     has_card_image: bool = False
+    # Compliance state, surfaced in lists so the management view can show at a
+    # glance who is off-limits without a second call per row.
+    suppressed: bool = False
+    unsubscribed: bool = False
+    status: Optional[str] = None
+    email_status: Optional[str] = None
+    bounce_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -163,3 +178,95 @@ class DuplicateMatch(BaseModel):
 
 class DuplicateCheckResponse(BaseModel):
     matches: list[DuplicateMatch] = []
+
+
+# --- Contact management (tags, bulk suppression, engagement) ---
+
+class TagUpdate(BaseModel):
+    """Add and/or remove tags on one contact.
+
+    Deliberately *not* a whole-set replacement. Two people tagging from the same
+    stale list view would each write the set they last read, and whoever saved
+    second would silently drop the other's tag. Add/remove deltas commute.
+    """
+    add: list[str] = Field(default_factory=list, max_length=50)
+    remove: list[str] = Field(default_factory=list, max_length=50)
+
+
+class BulkTagRequest(BaseModel):
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=1000)
+    add: list[str] = Field(default_factory=list, max_length=50)
+    remove: list[str] = Field(default_factory=list, max_length=50)
+
+
+class TagCount(BaseModel):
+    tag: str
+    count: int
+
+
+class TagListResponse(BaseModel):
+    """Every tag in use, with how many contacts carry it.
+
+    The counts are what make the list usable as a filter menu — a tag on two
+    contacts and a tag on two thousand should not look the same.
+    """
+    tags: list[TagCount] = []
+
+
+class TagRenameRequest(BaseModel):
+    old: str = Field(..., min_length=1, max_length=60)
+    new: str = Field(..., min_length=1, max_length=60)
+
+
+class BulkSuppressRequest(BaseModel):
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=1000)
+    # False lifts the suppression. Un-suppressing is deliberately possible: the
+    # usual reason is that someone suppressed the wrong row, and forcing a
+    # database edit to undo a UI mistake is worse than allowing the reversal.
+    suppressed: bool = True
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+class BulkSuppressResponse(BaseModel):
+    updated: int
+    enrollments_stopped: int
+    # Ids asked for that don't exist (or aren't visible to this org). Reported
+    # rather than silently ignored, so a bad paste doesn't look like a success.
+    not_found: list[uuid.UUID] = []
+
+
+class BulkTagResponse(BaseModel):
+    updated: int
+    not_found: list[uuid.UUID] = []
+
+
+class EngagementEvent(BaseModel):
+    """One thing that happened between us and this contact."""
+    type: str          # sent | opened | clicked | replied | bounced
+    occurred_at: datetime
+    subject: Optional[str] = None
+    step_number: Optional[int] = None
+    sequence_name: Optional[str] = None
+    source: str = "outreach"   # outreach | email_send | reply
+
+
+class ContactEngagement(BaseModel):
+    """Per-contact engagement roll-up + recent history.
+
+    Reads BOTH send tables. Sequence sends live only in ``outreach_events`` and
+    manual/template sends only in ``email_sends``; counting one of them is how a
+    surface ends up telling an operator we never emailed someone we have emailed
+    nine times.
+    """
+    contact_id: uuid.UUID
+    sent: int = 0
+    opened: int = 0
+    clicked: int = 0
+    replied: int = 0
+    bounced: int = 0
+    open_rate: float = 0.0
+    reply_rate: float = 0.0
+    first_touch_at: Optional[datetime] = None
+    last_touch_at: Optional[datetime] = None
+    active_enrollments: int = 0
+    events: list[EngagementEvent] = []

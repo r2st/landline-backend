@@ -58,6 +58,7 @@ from app.schemas.dialtone import (
     DialtoneDeltas,
     DialtoneEvent,
     DialtoneFunnelRates,
+    DialtoneLiveFeed,
     DialtoneSenderStatus,
     DialtoneSending,
     DialtoneTodayCounts,
@@ -530,6 +531,84 @@ async def _collect_events(
     if start is not None or end is not None:
         items = [i for i in items if _in_window(i.timestamp, start, end)]
     return items
+
+
+@router.get("/activity/live", response_model=DialtoneLiveFeed)
+async def get_live_activity(
+    limit: int = Query(50, ge=1, le=200, description="Newest N events to return"),
+    since: Optional[str] = Query(
+        None,
+        description="ISO timestamp from a previous response's `latest_at`. Only "
+                    "events strictly newer than this are returned.",
+    ),
+    window_hours: int = Query(
+        24, ge=1, le=168,
+        description="How far back to look. Bounds the query cost — a live feed "
+                    "must not get slower as the send history grows.",
+    ),
+    types: Optional[str] = Query(None, description="Comma-separated event types to include"),
+    db: AsyncSession = Depends(get_db),
+):
+    """The newest activity, cheap enough to poll.
+
+    ``GET /activity`` is the *archive*: it scans up to 5,000 rows per source and
+    pages through the whole history, which is the right shape for someone
+    scrolling back through last month and the wrong shape for a widget asking
+    "anything new?" every few seconds.
+
+    This is the live view. A fixed lookback window bounds the work regardless of
+    how much history exists, and ``since`` makes every poll after the first
+    return only what has happened in the meantime — usually nothing, for the
+    price of an indexed range scan.
+
+    Ordering is newest-first. A client that polls with ``since`` and prepends the
+    result gets a correct running feed; one that drops ``since`` gets a correct
+    snapshot. Both are safe, because ``since`` is exclusive and events carry
+    stable ids, so a reconnect can't duplicate or lose an entry.
+    """
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=window_hours)
+
+    cursor = _parse_bound(since)
+    if cursor is not None and cursor > window_start:
+        # A caller that's been polling steadily only needs what's new; don't
+        # re-scan the whole window for it.
+        window_start = cursor
+
+    wanted: Optional[set[str]] = None
+    if types:
+        wanted = {t.strip() for t in types.split(",") if t.strip()}
+        invalid = wanted - set(DIALTONE_EVENT_TYPES)
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown event type(s): {sorted(invalid)}. "
+                       f"Valid types: {list(DIALTONE_EVENT_TYPES)}",
+            )
+
+    # Cap per source generously above ``limit`` — one source can dominate a quiet
+    # window (a sequence blast produces only outreach events), and under-pulling
+    # would let it crowd every other source out of the merged result.
+    items = await _collect_events(
+        db, start=window_start, end=None, contact_id=None, q=None,
+        cap=max(limit * 4, 200),
+    )
+
+    if wanted is not None:
+        items = [i for i in items if i.type in wanted]
+    if cursor is not None:
+        # Strictly newer: the client already has the event at exactly `since`.
+        items = [i for i in items if i.timestamp > cursor]
+
+    items.sort(key=lambda i: i.timestamp, reverse=True)
+    items = items[:limit]
+
+    return DialtoneLiveFeed(
+        items=items,
+        server_time=now,
+        latest_at=items[0].timestamp if items else None,
+        window_hours=window_hours,
+    )
 
 
 @router.get("/activity", response_model=DialtoneActivityFeed)

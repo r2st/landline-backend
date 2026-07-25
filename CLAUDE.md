@@ -107,3 +107,62 @@ deliverability, A/B attribution) is keyed on today's split.
 
 Inbox surfaces that still read `EmailSend` alone — `get_inbox_analytics`,
 the dashboard's `emails_sent` tile — therefore under-report sequence volume.
+
+## The daily send cap is a Redis reservation, not a row count
+
+`SendLimiter.can_send_today` counts `OutreachEvent(event_type='sent')` rows and
+compares them to the limit. It is **advisory only** — safe for dashboards and
+for the queue sweep's cheap pre-check, and wrong for anything that then sends.
+Between that read and the event insert sit recipient validation, Hunter
+verification, AI composition and an SMTP round-trip, and every concurrent worker
+reads the same pre-send count. N workers each conclude they are the last one
+under the cap, and the cap is exceeded by N.
+
+The send path must claim its slot with `await limiter.reserve_daily_send(db)`
+immediately before the wire, and hand it back with `release_daily_send()` on any
+outcome that isn't a real send (soft skip, dispatcher exception, bounce). One
+`INCR` per intended send, so exactly `limit` workers get a slot however many ask
+at once. The counter seeds from the DB (`SET … NX`) so a restart or an eviction
+resumes at the real number. With Redis unreachable it degrades to the row-count
+check — per-worker, never looser — and says `[degraded: …]` in the reason.
+
+## Pre-send spam gate
+
+Every outbound path runs the deterministic content scan
+(`app.services.spam_guard`) on the final rendered copy. `flag` records the score
+on the send; `block` is a **soft skip** that holds the enrollment for a copy
+edit. Blocking is off by default (`SPAM_GUARD_BLOCK_ENABLED`) — a content
+heuristic that stops outreach on its own judgement is a worse failure than the
+spam it prevents.
+
+The sequence path scans **before** `apply_tracking` and passes
+`skip_spam_scan=True` to the dispatcher: scoring the post-tracking body would
+count our own rewrapped links as "too many links". Any new send path either
+scans its own pre-tracking copy or lets `send_outreach_email` do it.
+
+## Auto-pause: match the response to the scope
+
+- **Global-scope** danger breach → the system-wide kill switch. An aggregate
+  bounce rate that high is a shared domain/IP reputation problem.
+- **Account-scope** breach → `DangerMonitor.pause_accounts` disables just that
+  mailbox (`sending_enabled = False`) and the rest of the fleet keeps sending.
+  One pause and one alert per account; a breach that persists across sweeps
+  stays silent, because an alert that repeats every 5 minutes gets muted.
+- **Out-of-office reply** → `out_of_office.pause_for_ooo` sets the enrollment to
+  `paused` with `pause_reason='out_of_office'` and `next_send_at` carrying the
+  return date; the hourly `resume_out_of_office` task brings it back.
+
+`OutreachEnrollment.pause_reason` is what makes an automatic resume safe. A
+sweep that resumed every paused enrollment with a past due date would also
+revive the ones paused for a missing address, a dead domain, a consent block, or
+an operator's decision. **NULL means "not ours — leave it alone."**
+
+## A/B tests are judged on their own metric
+
+`evaluate_experiment(experiment, metric)` and `auto_declare_winner(..., metric=)`
+take the metric the test declared; the resolver passes `test.metric` through, the
+hard-cap default winner sorts by that metric's rate, and the conclusion alert
+counts it. Subject-line tests default to `opened` — the subject decides whether a
+message is opened and barely touches what happens after, and cold reply rates
+(a few percent) need an order of magnitude more volume than open rates to reach
+significance. Omitting `metric` keeps the legacy reply-then-open behaviour.

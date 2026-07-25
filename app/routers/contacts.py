@@ -19,14 +19,24 @@ from app.schemas.communication import CommunicationHistoryResponse
 from app.services.communication_history import get_contact_communications
 from app.services.contact_grouping import classify_group
 from app.schemas.contact import (
+    BulkSuppressRequest,
+    BulkSuppressResponse,
+    BulkTagRequest,
+    BulkTagResponse,
     ContactCreate,
     ContactDetailRead,
+    ContactEngagement,
     ContactListResponse,
     ContactRead,
     ContactUpdate,
     DuplicateCheckResponse,
     DuplicateMatch,
+    TagCount,
+    TagListResponse,
+    TagRenameRequest,
+    TagUpdate,
 )
+from app.services import contact_tags as tag_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/contacts", tags=["contacts"])
@@ -46,6 +56,7 @@ async def create_contact(
         raise HTTPException(status_code=404, detail="Company not found")
 
     data = payload.model_dump()
+    data["tags"] = tag_service.normalize_tags(data.get("tags"))
     # Auto-classify genuine vs test when the caller didn't set a group.
     if not data.get("contact_group"):
         data["contact_group"] = classify_group(
@@ -75,6 +86,21 @@ async def list_contacts(
     source: Optional[str] = Query(None, description="Filter by source"),
     group: Optional[str] = Query(None, description="Filter by contact group: 'genuine' or 'test'"),
     company_name: Optional[str] = Query(None, description="Filter by company name"),
+    tags: Optional[str] = Query(
+        None,
+        description="Comma-separated tags. Matches contacts carrying ALL of them "
+                    "(see tag_match to widen to ANY).",
+    ),
+    tag_match: str = Query("all", pattern="^(all|any)$"),
+    suppressed: Optional[bool] = Query(
+        None, description="Filter by hard compliance suppression"
+    ),
+    email_status: Optional[str] = Query(
+        None, description="Verification verdict: valid | invalid | unknown"
+    ),
+    has_bounced: Optional[bool] = Query(
+        None, description="Only contacts that have (or haven't) ever bounced"
+    ),
     sort_by: str = Query("created_at", description="created_at, first_name, last_name, email, title, company_name"),
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
@@ -128,6 +154,29 @@ async def list_contacts(
     # Contact group filter (genuine / test, exact match)
     if group:
         conditions.append(Contact.contact_group == group)
+
+    if suppressed is not None:
+        conditions.append(Contact.suppressed == suppressed)
+
+    if email_status:
+        conditions.append(Contact.email_status == email_status)
+
+    if has_bounced is not None:
+        conditions.append(
+            Contact.bounce_count > 0 if has_bounced else
+            or_(Contact.bounce_count == 0, Contact.bounce_count.is_(None))
+        )
+
+    # Tag filter. Expressed as per-tag JSON containment rather than one
+    # ``tags @> '[...]'`` so ``any`` is expressible at all, and so the same code
+    # path works on SQLite (tests) where JSONB containment doesn't exist —
+    # ``.contains`` renders to the dialect's own form.
+    if tags:
+        wanted = tag_service.normalize_tags(tags.split(","))
+        if wanted:
+            dialect = db.bind.dialect.name if db.bind is not None else ""
+            clauses = [tag_service.tag_clause(Contact.tags, t, dialect) for t in wanted]
+            conditions.append(and_(*clauses) if tag_match == "all" else or_(*clauses))
 
     # Company name filter (case-insensitive partial match, requires Company join)
     if company_name:
@@ -253,6 +302,162 @@ async def check_duplicate_contact(
     return DuplicateCheckResponse(matches=matches)
 
 
+# --- Tags -------------------------------------------------------------------
+#
+# Declared before ``/{contact_id}`` so "tags" isn't swallowed as a contact id.
+
+
+@router.get("/tags", response_model=TagListResponse)
+async def list_tags(db: AsyncSession = Depends(get_db)):
+    """Every tag in use, with the number of contacts carrying it.
+
+    Aggregated in Python rather than SQL because the counts come from unnesting a
+    JSON array, whose syntax differs per dialect, and the cardinality here is
+    "how many distinct labels has one team typed" — tens, not millions. The scan
+    is over a single column with the tag filter's own index available.
+    """
+    rows = (await db.execute(select(Contact.tags))).scalars().all()
+    counts: dict[str, int] = {}
+    for tags in rows:
+        for tag in set(tag_service.normalize_tags(tags)):
+            counts[tag] = counts.get(tag, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return TagListResponse(tags=[TagCount(tag=t, count=c) for t, c in ordered])
+
+
+@router.post("/tags/rename", response_model=BulkTagResponse)
+async def rename_tag(payload: TagRenameRequest, db: AsyncSession = Depends(get_db)):
+    """Rename a tag everywhere it appears.
+
+    Free-form labels acquire typos and near-duplicates ("tradeshow" next to
+    "trade show"), and without this the only fix is re-tagging by hand. Merging
+    into an existing tag is allowed and de-duplicates rather than doubling up.
+    """
+    old = tag_service.normalize_tag(payload.old)
+    new = tag_service.normalize_tag(payload.new)
+    if not old or not new:
+        raise HTTPException(status_code=400, detail="tag names cannot be empty")
+    if old == new:
+        return BulkTagResponse(updated=0)
+
+    dialect = db.bind.dialect.name if db.bind is not None else ""
+    contacts = (
+        await db.execute(
+            select(Contact).where(tag_service.tag_clause(Contact.tags, old, dialect))
+        )
+    ).scalars().all()
+
+    updated = 0
+    for contact in contacts:
+        contact.tags = tag_service.apply_tag_delta(
+            contact.tags, add=[new], remove=[old]
+        )
+        updated += 1
+    await db.flush()
+    logger.info("Renamed tag %r → %r on %d contact(s)", old, new, updated)
+    return BulkTagResponse(updated=updated)
+
+
+@router.post("/bulk-tag", response_model=BulkTagResponse)
+async def bulk_tag(payload: BulkTagRequest, db: AsyncSession = Depends(get_db)):
+    """Add and/or remove tags across many contacts in one call.
+
+    Deltas, not a replacement set: a bulk action driven from a list view has no
+    business knowing what other tags those contacts carry, and sending a whole
+    set would wipe every tag it didn't happen to know about.
+    """
+    add = tag_service.normalize_tags(payload.add)
+    remove = tag_service.normalize_tags(payload.remove)
+    if not add and not remove:
+        raise HTTPException(status_code=400, detail="nothing to add or remove")
+
+    contacts = (
+        await db.execute(select(Contact).where(Contact.id.in_(payload.contact_ids)))
+    ).scalars().all()
+    found = {c.id for c in contacts}
+
+    for contact in contacts:
+        contact.tags = tag_service.apply_tag_delta(contact.tags, add=add, remove=remove)
+    await db.flush()
+
+    return BulkTagResponse(
+        updated=len(contacts),
+        not_found=[cid for cid in payload.contact_ids if cid not in found],
+    )
+
+
+@router.post("/bulk-suppress", response_model=BulkSuppressResponse)
+async def bulk_suppress(
+    payload: BulkSuppressRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user_optional),
+):
+    """Suppress (or un-suppress) many contacts at once.
+
+    Suppression is the hard do-not-email gate every send path reads, so
+    suppressing also **stops their live enrollments** — leaving those active
+    would mean the queue keeps selecting a contact it will then refuse to mail,
+    forever. Enrollments are marked ``unsubscribed``, not ``bounced``: a
+    compliance stop must not dent sender deliverability metrics.
+
+    Un-suppressing lifts the flag but deliberately does **not** restart
+    sequences. Re-enrolling someone is a decision, and quietly resuming cold
+    outreach because a checkbox was un-ticked is not a decision anyone made.
+    """
+    from datetime import datetime, timezone
+
+    from app.models.consent import ConsentRecord
+    from app.models.outreach import OutreachEnrollment
+
+    contacts = (
+        await db.execute(select(Contact).where(Contact.id.in_(payload.contact_ids)))
+    ).scalars().all()
+    found = {c.id for c in contacts}
+    now = datetime.now(timezone.utc)
+    actor = user.email if user is not None else "system"
+    stopped = 0
+
+    for contact in contacts:
+        contact.suppressed = payload.suppressed
+        if not payload.suppressed:
+            # Only clear the legacy flag when it was suppression that set it —
+            # a genuine link-based unsubscribe must survive.
+            continue
+
+        contact.unsubscribed = True
+        db.add(ConsentRecord(
+            contact_id=contact.id,
+            consent_type="none",
+            basis=(payload.reason or f"bulk suppression by {actor}")[:2000],
+            granted_at=None,
+            revoked_at=now,
+        ))
+        enrollments = (
+            await db.execute(
+                select(OutreachEnrollment).where(
+                    OutreachEnrollment.contact_id == contact.id,
+                    OutreachEnrollment.status.in_(("active", "paused", "pending_review")),
+                )
+            )
+        ).scalars().all()
+        for enr in enrollments:
+            enr.status = "unsubscribed"
+            enr.completed_at = now
+            stopped += 1
+
+    await db.flush()
+    logger.info(
+        "Bulk %s %d contact(s) by %s — %d enrollment(s) stopped",
+        "suppressed" if payload.suppressed else "un-suppressed",
+        len(contacts), actor, stopped,
+    )
+    return BulkSuppressResponse(
+        updated=len(contacts),
+        enrollments_stopped=stopped,
+        not_found=[cid for cid in payload.contact_ids if cid not in found],
+    )
+
+
 @router.get("/{contact_id}", response_model=ContactDetailRead)
 async def get_contact(
     contact_id: uuid.UUID,
@@ -266,6 +471,51 @@ async def get_contact(
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     return contact
+
+
+@router.post("/{contact_id}/tags", response_model=ContactRead)
+async def update_contact_tags(
+    contact_id: uuid.UUID,
+    payload: TagUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Add and/or remove tags on one contact."""
+    contact = (
+        await db.execute(select(Contact).where(Contact.id == contact_id))
+    ).scalar_one_or_none()
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    contact.tags = tag_service.apply_tag_delta(
+        contact.tags, add=payload.add, remove=payload.remove
+    )
+    await db.flush()
+    await db.refresh(contact)
+    return contact
+
+
+@router.get("/{contact_id}/engagement", response_model=ContactEngagement)
+async def get_contact_engagement(
+    contact_id: uuid.UUID,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """What we've sent this contact and what came back.
+
+    Reads **both** send tables — sequence sends exist only in
+    ``outreach_events`` and manual/template sends only in ``email_sends``, so
+    reading one of them under-reports whichever half the operator happened to
+    use (see CLAUDE.md).
+    """
+    contact = (
+        await db.execute(select(Contact.id).where(Contact.id == contact_id))
+    ).scalar_one_or_none()
+    if contact is None:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    from app.services.contact_engagement import contact_engagement
+
+    return ContactEngagement(**await contact_engagement(db, contact_id, limit=limit))
 
 
 @router.get("/{contact_id}/timeline")
@@ -396,6 +646,11 @@ async def update_contact(
         raise HTTPException(status_code=404, detail="Contact not found")
 
     update_data = payload.model_dump(exclude_unset=True)
+    if "tags" in update_data:
+        # Normalise here too, not only on the tag endpoints — otherwise a PATCH
+        # is a back door that writes un-canonicalised labels the filter menu
+        # then shows as separate tags.
+        update_data["tags"] = tag_service.normalize_tags(update_data["tags"])
     for field, value in update_data.items():
         setattr(contact, field, value)
 

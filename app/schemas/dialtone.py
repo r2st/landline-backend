@@ -68,6 +68,28 @@ class DialtoneActivityFeed(BaseModel):
     page_size: int
 
 
+class DialtoneLiveFeed(BaseModel):
+    """The newest N events, shaped for repeated polling.
+
+    Distinct from ``DialtoneActivityFeed``: no pagination (there is no "page 2"
+    of *now*), a bounded lookback so the cost doesn't grow with history, and a
+    ``latest_at`` cursor the client echoes back as ``since`` so each poll after
+    the first returns only what's new.
+    """
+
+    items: list[DialtoneEvent] = []
+    # Server clock at the time of the response. The client uses this rather than
+    # its own for "3 minutes ago" — a laptop with a skewed clock otherwise shows
+    # sends happening in the future.
+    server_time: datetime
+    # Timestamp of the newest event returned; echo it back as ``since``. None
+    # when nothing was returned, in which case the client keeps its old cursor.
+    latest_at: Optional[datetime] = None
+    # How far back this response looked, so the UI can say so honestly rather
+    # than implying an empty feed means "nothing ever happened".
+    window_hours: int = 24
+
+
 class DialtoneSenderStatus(BaseModel):
     """Per-sender warm-up + deliverability snapshot for the console."""
 
