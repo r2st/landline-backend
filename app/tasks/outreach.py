@@ -745,6 +745,31 @@ def send_sequence_step(self, enrollment_id: str):
                     enabled=tracking_applied,
                 )
 
+                # --- Pre-send spam gate ---
+                # Score the copy that is actually about to ship — after the
+                # merge, after spintax resolved, after any AI rewrite, but before
+                # the tracking pixel (which is ours, not the author's, and would
+                # otherwise show up as "another link"). A flag rides along on the
+                # send event; a block soft-skips so the enrollment is held for a
+                # copy edit rather than spent on a message filters would eat.
+                from app.services import spam_guard
+
+                _spam_ok, _spam_verdict = spam_guard.scan_for_send(subject, human_body)
+                if not _spam_ok:
+                    _spam_reason = _spam_verdict.reason()
+                    await db.rollback()
+                    await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+                    logger.error(
+                        "Enrollment %s blocked by spam gate: %s",
+                        enrollment_id, _spam_reason,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": _spam_reason,
+                        "spam_blocked": True,
+                        "spam_scan": _spam_verdict.as_metadata(),
+                    }
+
                 # --- Daily cap: claim the slot atomically, right before the wire.
                 # The queue sweep's ``can_send_today`` is advisory — it counts
                 # rows, and every concurrent worker reads the same pre-send count,
@@ -773,6 +798,8 @@ def send_sequence_step(self, enrollment_id: str):
                         thread_id=thread_id,
                         in_reply_to=in_reply_to,
                         references=references,
+                        # Already scanned above, on the pre-tracking body.
+                        skip_spam_scan=True,
                     )
                 except Exception:
                     # The dispatcher blew up — nothing went out, so the slot must
@@ -842,6 +869,14 @@ def send_sequence_step(self, enrollment_id: str):
                         # Which spintax variant shipped (when the copy used any),
                         # so downstream engagement can be attributed per variant.
                         **({"spintax": spintax_meta} if spintax_meta else {}),
+                        # Only recorded when the scan actually had something to
+                        # say — a score of 0 on every clean send is noise, and
+                        # this metadata is read by hand during incidents.
+                        **(
+                            {"spam_scan": _spam_verdict.as_metadata()}
+                            if _spam_verdict.flagged
+                            else {}
+                        ),
                     },
                 )
                 db.add(event)

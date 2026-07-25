@@ -348,8 +348,27 @@ class Settings(BaseSettings):
     # the UI) takes precedence over this static default.
     warmup_start_date: str = "2026-07-15"
 
+    # Pre-send spam gate (app/services/spam_guard.py). The deterministic content
+    # scan runs on the final rendered copy of every outbound message.
+    #  - flag  (>= flag threshold): send proceeds, score recorded on the send.
+    #  - block (>= block threshold AND block_enabled): soft-skip, enrollment held.
+    # Blocking is OFF by default on purpose. A content heuristic that stops
+    # outreach on its own judgement is a worse failure than the spam it prevents,
+    # so an operator turns it on after watching the flag lane for a while.
+    spam_guard_enabled: bool = True
+    spam_guard_flag_threshold: int = 25                  # "medium" risk band
+    spam_guard_block_threshold: int = 50                 # "high" risk band
+    spam_guard_block_enabled: bool = False
+
+    # Per-sender auto-pause on danger signals. When only individual accounts
+    # breach (no global-scope breach), pause just those mailboxes instead of
+    # halting all sending — a single bad list on one inbox shouldn't stop the
+    # other senders. A global-scope breach still trips the global kill switch,
+    # because shared domain/IP reputation endangers everything.
+    danger_account_auto_pause_enabled: bool = True
+
     # Smart auto-reply
-    auto_reply_enabled: bool = True                        # Auto-send AI-drafted replies for clear positive intents
+    auto_reply_enabled: bool = True                      # Auto-send AI-drafted replies for clear positive intents
     # Safety floor for auto-send (P1 fix). An AI-drafted reply is only auto-sent
     # when the reply analysis is at least this confident about the intent; below
     # it we draft-only and leave the send to a human. Guards against replying to

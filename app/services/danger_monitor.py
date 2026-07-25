@@ -17,11 +17,19 @@ meaningless at low volume (1 bounce of 20 = 5%). The hard-bounce count is the
 low-volume backstop and is NOT sample-gated, so a bad list still burns the
 domain during warm-up.
 
-Scope decision (v1): auto-pause is **global** — it flips the single system-wide
-kill switch even when only one account trips, because a shared domain/IP
-reputation problem endangers all sending. Per-account soft throttling already
-exists (``sender_health.throttle_factor``); this is the hard, all-stop
-escalation.
+Scope decision: the *response* now matches the scope of the problem.
+
+* A **global-scope** breach flips the system-wide kill switch. An aggregate
+  bounce rate that high is a shared domain/IP reputation problem, and the
+  accounts that look healthy usually just haven't sent yet.
+* An **account-scope** breach pauses *that mailbox* (``sending_enabled = False``)
+  and leaves every other sender running — see :meth:`DangerMonitor.pause_accounts`.
+  One inbox working a bad list slice is a local fault; halting all outreach,
+  freezing every enrollment, and requiring a manual resume with a trip id is a
+  disproportionate answer that costs a day of pipeline.
+
+Per-account soft throttling (``sender_health.throttle_factor``) remains the
+gradual response; this is the hard stop, now aimed at whatever actually broke.
 
 Design rules borrowed from the existing services:
 
@@ -142,6 +150,47 @@ class DangerReport:
     @property
     def breach(self) -> bool:
         return bool(self.breaches)
+
+    @property
+    def global_breaches(self) -> list[MetricResult]:
+        """Breaches on the aggregate across every sender.
+
+        These are the ones that justify stopping *everything*: a bounce rate that
+        high across all mail is a shared domain/IP reputation problem, and the
+        healthy-looking accounts are only healthy because they haven't sent yet.
+        """
+        return [m for m in self.breaches if m.scope == "global"]
+
+    @property
+    def account_breaches(self) -> list[MetricResult]:
+        """Breaches attributable to one sending account.
+
+        A single mailbox that got a bad list slice is a *local* problem, and
+        halting every other sender to punish it costs a day of pipeline for
+        nothing. These are paused individually — see
+        :meth:`DangerMonitor.pause_accounts`.
+        """
+        return [m for m in self.breaches if m.scope == "account" and m.account_id]
+
+    def worst_breach_per_account(self) -> dict:
+        """``{account_id: MetricResult}`` — the most-over-threshold breach each.
+
+        One account can trip bounce rate *and* hard-bounce count in the same
+        window; it should be paused once, with the reason naming the worst of
+        them, not paused three times with three alerts.
+        """
+        worst: dict = {}
+        for m in self.account_breaches:
+            ratio = (m.observed_value / m.threshold) if m.threshold else float("inf")
+            current = worst.get(m.account_id)
+            current_ratio = (
+                (current.observed_value / current.threshold)
+                if current is not None and current.threshold
+                else -1.0
+            )
+            if current is None or ratio > current_ratio:
+                worst[m.account_id] = m
+        return worst
 
     @property
     def overall_status(self) -> str:
@@ -579,6 +628,119 @@ class DangerMonitor:
         except Exception:
             logger.exception("danger monitor: trip() failed to fully record — %s", reason)
             return None
+
+    async def pause_accounts(
+        self, db: AsyncSession, report: DangerReport
+    ) -> list[dict]:
+        """Pause each individually-breaching sender instead of halting everything.
+
+        The v1 rule was "any breach flips the global kill switch". That is right
+        when the *aggregate* breaches — a shared domain reputation problem — but
+        wrong when one mailbox out of five got a bad list slice: it stops four
+        healthy senders, freezes every active enrollment, and needs a manual
+        resume with a trip id. This is the surgical version: the offending
+        account's ``sending_enabled`` goes False, rotation stops picking it, and
+        the rest of the system keeps working.
+
+        One pause and one alert per account, keyed on its worst breach. Idempotent
+        — an account already disabled is left alone, so a breach that persists
+        across 5-minute sweeps doesn't re-alert every 5 minutes. Never raises:
+        this is monitoring, and a bug here must not take the worker down.
+
+        Returns one summary dict per account actually paused.
+        """
+        if not self.settings.danger_account_auto_pause_enabled:
+            return []
+
+        paused: list[dict] = []
+        for account_id, metric in report.worst_breach_per_account().items():
+            try:
+                from app.services.email_dispatch import get_account
+
+                account = await get_account(db, account_id)
+                if account is None:
+                    logger.info(
+                        "danger monitor: breaching account %s no longer exists", account_id
+                    )
+                    continue
+                if not getattr(account, "sending_enabled", True):
+                    # Already paused — say nothing. Re-alerting every sweep for a
+                    # condition the operator has already been told about is how
+                    # alerts get muted, and a muted alert is worse than none.
+                    continue
+
+                account.sending_enabled = False
+                reason = self._reason(metric)
+                event = DangerSignalEvent(
+                    metric=metric.metric,
+                    scope="account",
+                    account_id=metric.account_id,
+                    account_email=metric.account_email,
+                    window=metric.window,
+                    observed_value=float(metric.observed_value),
+                    threshold=float(metric.threshold),
+                    sample_size=int(metric.sample_size),
+                    action_taken="account_paused",
+                    details={
+                        "reason": reason,
+                        "hard_bounces": metric.hard_bounces,
+                        "account_breaches": [
+                            m.as_dict()
+                            for m in report.account_breaches
+                            if m.account_id == account_id
+                        ],
+                        "thresholds": report.thresholds.as_dict(),
+                        "generated_at": report.generated_at.isoformat(),
+                    },
+                )
+                db.add(event)
+                await db.flush()
+
+                logger.error("Sender AUTO-PAUSED — %s", reason)
+                await self._notify_account_paused(account, metric, event)
+                paused.append({
+                    "account_id": str(account_id),
+                    "account_email": metric.account_email,
+                    "metric": metric.metric,
+                    "observed_value": metric.observed_value,
+                    "threshold": metric.threshold,
+                    "sample_size": metric.sample_size,
+                    "reason": reason,
+                    "event_id": str(event.id),
+                })
+            except Exception:
+                logger.exception(
+                    "danger monitor: could not pause account %s", account_id
+                )
+        return paused
+
+    async def _notify_account_paused(
+        self, account, metric: MetricResult, event: DangerSignalEvent
+    ) -> None:
+        """Best-effort per-sender alert. Never raises."""
+        try:
+            from app.services.notifications import get_notification_service
+
+            email = getattr(account, "email", None) or str(metric.account_id)
+            body = "\n".join([
+                f"Sending from {email} has been paused automatically.",
+                "",
+                f"Trigger: {self._reason(metric)}",
+                "",
+                "Other senders are unaffected and outreach continues on them — "
+                "this is a per-mailbox pause, not a system halt.",
+                "",
+                "What to check: the list this mailbox has been working (a bad "
+                "import slice is the usual cause), then its authentication "
+                "(SPF/DKIM/DMARC) and recent volume ramp.",
+                "",
+                f"Re-enable it from Sender Health once the cause is fixed. Event id: {event.id}",
+            ])
+            await get_notification_service()._send_notification(
+                f"⚠️ Sender paused — {email} ({metric.metric})", body
+            )
+        except Exception:  # pragma: no cover - notification is best-effort
+            logger.info("danger monitor: per-sender alert skipped", exc_info=True)
 
     async def _notify(
         self, report: DangerReport, primary: MetricResult, event: DangerSignalEvent

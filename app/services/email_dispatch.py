@@ -373,6 +373,7 @@ async def send_outreach_email(
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
     bypass_kill_switch: bool = False,
+    skip_spam_scan: bool = False,
 ) -> dict:
     """Send one outreach email via the resolved sender.
 
@@ -416,6 +417,29 @@ async def send_outreach_email(
             "transport": "none",
             "sender": None,
         }
+
+    # --- Pre-send spam gate ---------------------------------------------------
+    # The backstop for every path that doesn't scan its own copy first (manual
+    # compose, template blasts, smart-reply auto-sends). The sequence path scans
+    # the body *before* tracking is baked in — a rewrapped link set would read as
+    # "too many links" here — so it passes ``skip_spam_scan=True`` rather than
+    # being scored twice on copy it already cleared.
+    if not skip_spam_scan:
+        from app.services import spam_guard
+
+        allowed, verdict = spam_guard.scan_for_send(
+            subject, body_html, has_unsubscribe=include_unsubscribe
+        )
+        if not allowed:
+            logger.error("Send to %s blocked by spam gate: %s", to_email, verdict.reason())
+            return {
+                "status": "skipped",
+                "reason": verdict.reason(),
+                "spam_blocked": True,
+                "spam_scan": verdict.as_metadata(),
+                "transport": "none",
+                "sender": None,
+            }
 
     account = None
     if sender_account_id is not None:
