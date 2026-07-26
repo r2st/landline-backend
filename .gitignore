@@ -18,6 +18,9 @@ build/
 .venv-test2/
 venv/
 
+# API keys / credentials — NEVER commit
+keys/
+
 # Alembic
 alembic/versions/__pycache__/
 
