@@ -16,39 +16,62 @@
    ssh -i keys/vk.pem ubuntu@18.209.12.106
    ```
 
-2. Run initial setup (first time only):
+2. Give the instance read access to the private repo (first time only).
+   The repo is private and the remote carries **no** credentials, so the box
+   authenticates with its own read-only SSH deploy key. Run as `ec2-user`:
+   ```bash
+   ssh-keygen -t ed25519 -N "" -C "landline-deploy@$(hostname)" -f ~/.ssh/landline_deploy
+   cat >> ~/.ssh/config <<'EOF'
+
+   Host github.com
+     HostName github.com
+     User git
+     IdentityFile ~/.ssh/landline_deploy
+     IdentitiesOnly yes
+   EOF
+   chmod 600 ~/.ssh/config ~/.ssh/landline_deploy
+   cat ~/.ssh/landline_deploy.pub
+   ```
+   Add that public key at **Settings → Deploy keys → Add deploy key** on
+   `Apprend-Technologies/landline-backend`, leaving *Allow write access*
+   **unchecked**. Confirm with `ssh -T git@github.com`.
+
+   Never put a PAT back in the remote URL — it ends up in `.git/config`, in
+   `ps` output, and in every log line that echoes the remote.
+
+3. Run initial setup (first time only):
    ```bash
    cd /opt
-   sudo git clone https://github.com/Apprend-Technologies/landline-backend.git forge
+   sudo git clone git@github.com:Apprend-Technologies/landline-backend.git landline
    cd landline
    sudo chmod +x deploy/ec2-setup.sh
    sudo ./deploy/ec2-setup.sh
    ```
 
-3. Configure environment:
+4. Configure environment:
    ```bash
    cp .env.example .env.production
    nano .env.production  # Fill in real secrets
    ```
 
-4. Start services:
+5. Start services:
    ```bash
    docker compose -f docker-compose.prod.yml up -d
    ```
 
-5. Run migrations:
+6. Run migrations:
    ```bash
    docker exec landline-api alembic upgrade head
    ```
 
-6. Set up nginx:
+7. Set up nginx:
    ```bash
    sudo cp deploy/nginx-landline.conf /etc/nginx/sites-available/landline
    sudo ln -sf /etc/nginx/sites-available/landline /etc/nginx/sites-enabled/
    sudo nginx -t && sudo systemctl reload nginx
    ```
 
-7. Verify:
+8. Verify:
    ```bash
    curl http://127.0.0.1:8001/health
    ```
