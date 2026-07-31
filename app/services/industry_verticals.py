@@ -399,6 +399,27 @@ def get_vertical(key: str) -> IndustryVertical | None:
     return VERTICALS_BY_KEY.get(key)
 
 
+# Generic manufacturing terms that mark an industry string as in-ICP even when
+# it isn't a keyword of any specific vertical ("Precision Manufacturing",
+# "Metal Fabrication", ...). Substring-matched case-insensitively. Shared by
+# the companies scorer and the prospect-candidate qualifier so the two scoring
+# paths agree on what counts as manufacturing.
+MANUFACTURING_TERMS: tuple[str, ...] = (
+    "manufactur", "fabricat", "molding", "moulding", "casting", "forging",
+    "extrusion", "tool and die", "tool & die", "sheet metal", "welding",
+    "plastics", "aerospace", "automotive supplier",
+)
+
+
+def matches_manufacturing(industry: str = "", company_name: str = "") -> bool:
+    """True when the industry/name matches a vertical keyword or a generic
+    manufacturing term."""
+    if resolve_vertical(industry, company_name) is not None:
+        return True
+    search = f"{industry} {company_name}".lower()
+    return any(term in search for term in MANUFACTURING_TERMS)
+
+
 def resolve_vertical(industry: str = "", company_name: str = "") -> IndustryVertical | None:
     """Best-match vertical for a company's industry/name, or None if no match.
 

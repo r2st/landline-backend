@@ -21,7 +21,7 @@ nothing (see ``_source_candidates``).
 
 import logging
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -40,7 +40,7 @@ from app.models.prospecting import (
     ProspectingRun,
 )
 from app.models.sequence import OutreachSequence
-from app.services.industry_verticals import resolve_vertical
+from app.services.industry_verticals import matches_manufacturing, resolve_vertical
 from app.services.ingestion import (
     ROUTE_AUTO_ENROLL,
     ROUTE_DISCARD,
@@ -107,6 +107,45 @@ PLACES_SOURCE = "google_places"
 # spent one. Mirrors the sweep's own filter in tasks/places_discovery.py.
 SOURCEABLE_PLACES_STATUSES = frozenset({"new", "enriched"})
 
+# ---------------------------------------------------------------------------
+# Places query rotation
+#
+# Places hard-caps every distinct textQuery at 60 results. A fixed query
+# ("CNC Machining" in one state, every day) therefore re-fetches the same 60
+# businesses forever: once they're imported or rejected the source goes
+# permanently quiet while looking healthy. Rotating query × metro makes each
+# day a *different* textQuery with its own 60-result ceiling.
+# ---------------------------------------------------------------------------
+
+# US metro areas with dense SMB manufacturing. City-level beats state-level:
+# "CNC Machining in Texas" and "CNC Machining in Houston, TX" are different
+# textQueries with different result sets, and the metro form surfaces shops the
+# state-wide ranking buries.
+PLACES_METRO_AREAS: tuple[str, ...] = (
+    "Chicago, IL", "Houston, TX", "Los Angeles, CA", "Detroit, MI",
+    "Cleveland, OH", "Milwaukee, WI", "Minneapolis, MN", "Dallas, TX",
+    "Cincinnati, OH", "Pittsburgh, PA", "Grand Rapids, MI", "Rockford, IL",
+    "Wichita, KS", "Dayton, OH", "Greenville, SC", "Hartford, CT",
+    "Charlotte, NC", "Phoenix, AZ", "Portland, OR", "St. Louis, MO",
+)
+
+# Baseline query breadth beyond whatever the ICP has learned. Each is an ICP
+# term by construction (the query doubles as the staged row's industry signal —
+# see 183d5a9 and places_discovery._stage), so everything found under one of
+# these scores as in-vertical.
+DEFAULT_PLACES_QUERIES: tuple[str, ...] = (
+    "CNC Machining",
+    "Injection Molding",
+    "Metal Stamping",
+    "Precision Machining",
+    "Metal Fabrication",
+    "Sheet Metal Fabrication",
+    "Tool and Die",
+    "Plastics Manufacturing",
+    "Aerospace Manufacturing",
+    "Food Processing Plant",
+)
+
 
 class AutonomousProspector:
     def __init__(self) -> None:
@@ -167,8 +206,11 @@ class AutonomousProspector:
             "Injection Molding": 0.8,
             "CNC Machining": 0.8,
             "Metal Stamping": 0.8,
+            "Precision Machining": 0.8,
+            "Metal Fabrication": 0.7,
             "Plastics": 0.7,
             "Aerospace": 0.6,
+            "Food & Beverage Manufacturing": 0.6,
         }
         industry_weights = dict(default_industries)
         if industry_counts:
@@ -284,6 +326,16 @@ class AutonomousProspector:
                 for seg, w in weights.items():
                     if seg.lower() in industry.lower() or industry.lower() in seg.lower():
                         iw = max(iw, w)
+            # An in-taxonomy industry that just isn't among the ICP's learned
+            # keys ("Tool and Die" when the ICP only knows "CNC Machining")
+            # still gets credit. Without this, a rotated Places query outside
+            # the learned keys re-creates the structurally-disqualified bug the
+            # query-as-industry fix (183d5a9) solved for the primary query.
+            # 0.6 lands a typical Places candidate in the review queue rather
+            # than auto-enrolling: manufacturing-by-taxonomy is worth a human
+            # look, while auto-enroll stays reserved for learned ICP segments.
+            if iw == 0.0 and matches_manufacturing(industry, candidate.get("name") or ""):
+                iw = 0.6
         industry_pts = round(40 * iw, 1)
 
         # Size fit (0-30) — full points inside [min,max], decaying outside.
@@ -417,7 +469,23 @@ class AutonomousProspector:
             record.icp_profile_id = icp.id
         return search.records, notes
 
-    def _places_search_from_icp(self, icp: IcpProfile) -> DiscoverySearch:
+    def _places_query_rotation(self, icp: IcpProfile) -> list[str]:
+        """The ICP's industry queries (weight desc), then the built-in breadth
+        queries, deduped case-insensitively in that priority order."""
+        weights = icp.industry_weights or {}
+        ranked = [k for k, _ in sorted(weights.items(), key=lambda kv: (-kv[1], kv[0]))]
+        queries: list[str] = []
+        seen: set[str] = set()
+        for q in [*ranked, *DEFAULT_PLACES_QUERIES]:
+            key = q.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                queries.append(q.strip())
+        return queries
+
+    def _places_search_from_icp(
+        self, icp: IcpProfile, today: Optional[date] = None
+    ) -> DiscoverySearch:
         """An unsaved ``DiscoverySearch`` describing what the ICP wants from Places.
 
         Transient on purpose. ``DiscoverySearch`` rows are the operator's saved,
@@ -426,17 +494,34 @@ class AutonomousProspector:
         keeps the audit trail anyway — it copies ``query`` onto every staged
         business and leaves the nullable ``search_id`` NULL, which reads
         correctly as "not from a saved search".
+
+        The (query, location) pair rotates by day: query changes daily, and the
+        metro advances each time the query list wraps, so a daily run walks the
+        full query × metro grid before any pair repeats. Deterministic on the
+        date — a retry the same day fetches the same thing, not a fresh spend.
         """
         prefs = icp.location_preferences or {}
         countries = [c for c in (prefs.get("countries") or []) if c]
         states = [s for s in (prefs.get("states") or []) if s]
         country = countries[0].strip().upper()[:2] if countries else None
+
+        day = (today or datetime.now(timezone.utc).date()).toordinal()
+        queries = self._places_query_rotation(icp)
+        query = queries[day % len(queries)]
+
+        if country in (None, "US"):
+            location = PLACES_METRO_AREAS[(day // len(queries)) % len(PLACES_METRO_AREAS)]
+        elif states:
+            # Non-US ICP: the metro list doesn't apply; rotate the ICP's own states.
+            location = states[day % len(states)]
+        else:
+            location = country
         return DiscoverySearch(
             name="autonomous-prospector",
-            query=self._top_industry(icp),
+            query=query,
             # Places resolves a place name better than we can, and it costs no
-            # extra call. Prefer the ICP's strongest state, else the country.
-            location_text=states[0] if states else country,
+            # extra call.
+            location_text=location,
             country=country,
         )
 
@@ -456,12 +541,13 @@ class AutonomousProspector:
             return [], {"places_status": "skipped", "places_error": "no_api_key"}
 
         search = self._places_search_from_icp(icp)
-        # Page to the API's own per-query ceiling rather than to ``limit``. The
-        # ICP-derived query is stable, so a limit-sized fetch returns the *same*
-        # first N businesses every run; once those are imported the source would
-        # go quiet with the rest of the ceiling never looked at. Fetching the
-        # ceiling and filtering costs a page or two more per run and lets
-        # successive runs walk the whole result set.
+        # Page to the API's own per-query ceiling rather than to ``limit``. A
+        # given (query, metro) pair recurs once per rotation cycle, and a
+        # limit-sized fetch would return the *same* first N businesses each
+        # time; once those are imported the pair would go quiet with the rest
+        # of the ceiling never looked at. Fetching the ceiling and filtering
+        # costs a page or two more per run and lets successive visits walk the
+        # whole result set.
         outcome = await svc.discover(db, search)
         notes = {
             "places_status": outcome.status,

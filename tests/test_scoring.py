@@ -47,6 +47,56 @@ class TestIndustryScore:
         assert "No NAICS" in reason
 
 
+class TestIndustrySegmentFallback:
+    """No NAICS (the Places-sourced shape) falls back to the segment taxonomy."""
+
+    def test_cnc_machining_segment_scores_full(self):
+        score, reason = _industry_score(None, "CNC Machining")
+        assert score == 40
+        assert "CNC Machining" in reason
+
+    def test_metal_stamping_segment_scores_full(self):
+        score, _ = _industry_score(None, "Metal Stamping")
+        assert score == 40
+
+    def test_injection_molding_segment_scores_full(self):
+        score, _ = _industry_score(None, "Plastic Injection Molding")
+        assert score == 40
+
+    def test_generic_manufacturing_segment_scores_full(self):
+        score, _ = _industry_score(None, "Precision Sheet Metal Fabrication")
+        assert score == 40
+
+    def test_company_name_alone_can_match(self):
+        score, _ = _industry_score(None, None, "Acme CNC Machining LLC")
+        assert score == 40
+
+    def test_unrelated_segment_scores_zero(self):
+        score, reason = _industry_score(None, "Restaurants")
+        assert score == 0
+        assert "Restaurants" in reason
+
+    def test_manufacturing_naics_still_wins(self):
+        score, reason = _industry_score("3327", "Restaurants")
+        assert score == 40
+        assert "NAICS" in reason
+
+    def test_unrelated_naics_defers_to_segment(self):
+        # A wrong/unrelated NAICS shouldn't zero a company whose segment is
+        # squarely in the ICP.
+        score, _ = _industry_score("7211", "CNC Machining")
+        assert score == 40
+
+    def test_unrelated_naics_and_segment_keeps_naics_reason(self):
+        score, reason = _industry_score("7211", "Hotels")
+        assert score == 0
+        assert "NAICS 7211" in reason
+
+    def test_related_naics_still_scores_partial(self):
+        score, _ = _industry_score("4231", "Hotels")
+        assert score == 20
+
+
 class TestSizeScore:
     """Test employee count scoring."""
 

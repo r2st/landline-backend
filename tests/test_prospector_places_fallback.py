@@ -9,6 +9,8 @@ Only the HTTP boundary is faked. ``discover``, ``_stage`` and ``to_candidate``
 run for real, so a change to the Places → CandidateRecord mapping fails here.
 """
 
+from datetime import date
+
 import pytest
 from sqlalchemy import select
 
@@ -19,7 +21,11 @@ from app.services import places_discovery
 from app.services.enrichment import ApolloSearchResult
 from app.services.ingestion import CandidateRecord
 from app.services.places_discovery import PROVIDER, PlaceResult, PlacesSearchResult
-from app.services.autonomous_prospector import PLACES_SOURCE, get_prospector
+from app.services.autonomous_prospector import (
+    PLACES_METRO_AREAS,
+    PLACES_SOURCE,
+    get_prospector,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -315,15 +321,25 @@ async def test_already_imported_businesses_are_not_resourced(
     assert notes["places_candidates"] == 1
 
 
-async def test_places_query_is_derived_from_the_icp(db_session, places_on):
+async def test_places_query_rotation_starts_from_the_icp(db_session, places_on):
+    # The ICP's own segments lead the rotation (weight desc), the built-in
+    # breadth queries follow, and a day where the rotation index lands on 0
+    # gets the ICP's strongest segment.
     prospector = get_prospector()
     icp = await prospector.ensure_icp(db_session)
     icp.industry_weights = {"Injection Molding": 0.9, "Woodworking": 0.1}
     icp.location_preferences = {"countries": ["IN"], "states": ["Maharashtra"]}
 
-    search = prospector._places_search_from_icp(icp)
+    queries = prospector._places_query_rotation(icp)
+    assert queries[0] == "Injection Molding"
+    assert queries[1] == "Woodworking"
+    # "Injection Molding" is also a built-in query; it must not repeat.
+    assert len(queries) == len({q.lower() for q in queries})
 
+    day0 = date.fromordinal(len(queries) * 7)  # index 0 in the rotation
+    search = prospector._places_search_from_icp(icp, today=day0)
     assert search.query == "Injection Molding"
+    # Non-US ICP: the US metro list doesn't apply; the ICP's states rotate.
     assert search.location_text == "Maharashtra"
     assert search.country == "IN"
     # Transient on purpose: saved searches are the operator's, not the agent's.
@@ -334,13 +350,62 @@ async def test_places_query_falls_back_to_country_without_states(db_session, pla
     prospector = get_prospector()
     icp = await prospector.ensure_icp(db_session)
     icp.industry_weights = {"CNC Machining": 1.0}
-    icp.location_preferences = {"countries": ["US"], "states": []}
+    icp.location_preferences = {"countries": ["IN"], "states": []}
 
     search = prospector._places_search_from_icp(icp)
 
-    assert search.query == "CNC Machining"
-    assert search.location_text == "US"
+    assert search.location_text == "IN"
+    assert search.country == "IN"
+
+
+async def test_us_places_search_rotates_metros(db_session, places_on):
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    icp.industry_weights = {"CNC Machining": 1.0}
+    icp.location_preferences = {"countries": ["US"], "states": ["OH"]}
+
+    search = prospector._places_search_from_icp(icp)
+
+    # US runs always target a specific manufacturing metro, never a whole state:
+    # each (query, metro) pair is a distinct textQuery with its own 60-result cap.
+    assert search.location_text in PLACES_METRO_AREAS
     assert search.country == "US"
+
+
+async def test_places_rotation_changes_query_daily_and_walks_the_grid(
+    db_session, places_on
+):
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    icp.industry_weights = {"CNC Machining": 1.0}
+    icp.location_preferences = {"countries": ["US"], "states": []}
+
+    queries = prospector._places_query_rotation(icp)
+    n_days = len(queries) * len(PLACES_METRO_AREAS)
+    seen: set[tuple[str, str]] = set()
+    prev = None
+    for ordinal in range(1000, 1000 + n_days):
+        s = prospector._places_search_from_icp(icp, today=date.fromordinal(ordinal))
+        assert (s.query, s.location_text) not in seen  # no repeats within a cycle
+        seen.add((s.query, s.location_text))
+        if prev is not None:
+            assert s.query != prev  # consecutive days never run the same query
+        prev = s.query
+    # The full query × metro grid is covered before any pair repeats.
+    assert len(seen) == n_days
+
+
+async def test_places_rotation_is_deterministic_for_a_given_day(db_session, places_on):
+    # A same-day retry must re-fetch the same textQuery (a cache-friendly no-op
+    # against the dedup), not burn budget on a fresh 60-result grid cell.
+    prospector = get_prospector()
+    icp = await prospector.ensure_icp(db_session)
+    d = date.fromordinal(739000)
+
+    a = prospector._places_search_from_icp(icp, today=d)
+    b = prospector._places_search_from_icp(icp, today=d)
+
+    assert (a.query, a.location_text) == (b.query, b.location_text)
 
 
 async def test_places_candidate_carries_no_invented_firmographics(
@@ -613,15 +678,36 @@ def _places_candidate(industry: str) -> dict:
     }
 
 
-async def test_places_category_alone_scores_below_the_review_line():
-    # The bug, pinned to its arithmetic: 0 industry + 10 unknown-size + 20
-    # location + 8 completeness = 38. The 40 industry points are unreachable, so
-    # no Places business could clear 50 no matter how good a fit it was.
+async def test_places_category_alone_reaches_review_but_not_auto_enroll():
+    # "manufacturer" isn't a learned ICP key, but it *is* manufacturing by
+    # taxonomy, so it now gets the 0.6 fallback weight: 24 industry + 10
+    # unknown-size + 20 location + 8 completeness = 62. Enough for the review
+    # queue (>= 50), deliberately short of auto-enroll (>= 65) — taxonomy-only
+    # matches get a human look, learned segments auto-enroll.
     q = get_prospector().qualify(_places_candidate("manufacturer"), _learned_icp())
+
+    assert q["components"]["industry"] == 24.0
+    assert q["fit_score"] == 62
+    assert 50 <= q["fit_score"] < 65
+
+
+async def test_unrelated_industry_still_scores_below_the_review_line():
+    # The fallback is taxonomy-gated, not a blanket floor: an off-ICP industry
+    # keeps the original failing arithmetic (0 + 10 + 20 + 8 = 38).
+    q = get_prospector().qualify(_places_candidate("Restaurants"), _learned_icp())
 
     assert q["components"]["industry"] == 0.0
     assert q["fit_score"] == 38
-    assert q["fit_score"] < 50
+
+
+async def test_rotated_query_outside_learned_keys_reaches_review():
+    # A rotation query like "Tool and Die" that the learned ICP has no key for
+    # must not re-create the structurally-disqualified bug: taxonomy fallback
+    # puts it in the review queue.
+    q = get_prospector().qualify(_places_candidate("Tool and Die"), _learned_icp())
+
+    assert q["components"]["industry"] == 24.0
+    assert q["fit_score"] >= 50
 
 
 async def test_search_query_as_industry_clears_the_auto_enroll_line():
@@ -683,9 +769,12 @@ async def test_sourced_records_carry_the_icp_query_as_their_industry(
 
     records, notes = await prospector._source_from_places(db_session, icp, 10)
 
-    assert [r.industry for r in records] == [prospector._top_industry(icp)]
+    # The query rotates daily, but within a day it's deterministic — whatever
+    # today's query is, that's the industry the record must carry.
+    todays_query = prospector._places_search_from_icp(icp).query
+    assert [r.industry for r in records] == [todays_query]
     assert records[0].industry != "manufacturer"
-    assert notes["places_query"] == prospector._top_industry(icp)
+    assert notes["places_query"] == todays_query
 
 
 # ── dispositioned rows must not come back ───────────────────────────────────

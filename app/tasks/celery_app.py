@@ -62,6 +62,7 @@ celery_app.conf.update(
         "app.tasks.social_listening.*": {"queue": "enrichment"},
         "app.tasks.meeting_booking.*": {"queue": "enrichment"},
         "app.tasks.inbox.*": {"queue": "enrichment"},
+        "app.tasks.lead_monitor.*": {"queue": "enrichment"},
     },
     beat_schedule={
         "process-outreach-queue": {
@@ -412,6 +413,15 @@ celery_app.conf.update(
             "task": "app.tasks.inbox.clear_expired_snoozes",
             "schedule": 300.0,  # every 5 minutes
         },
+        # Lead-gen health: poll the tracking tallies (the /leads/stats numbers)
+        # and log a LEADGEN ALERT when today saw zero sends or zero AI-composed
+        # copy. 21:30 UTC — after the US-business-hours send window has had its
+        # full day, so "0 sends today" means the pipeline really was dark, not
+        # that the day hasn't started.
+        "check-lead-gen-health": {
+            "task": "app.tasks.lead_monitor.check_lead_gen_health",
+            "schedule": crontab(hour=21, minute=30),
+        },
     },
 )
 
@@ -455,6 +465,7 @@ import app.tasks.deal_agent  # noqa: F401
 import app.tasks.referral_agent  # noqa: F401
 import app.tasks.social_listening  # noqa: F401
 import app.tasks.meeting_booking  # noqa: F401
+import app.tasks.lead_monitor  # noqa: F401
 import app.tasks.client_success  # noqa: F401
 # Registers generate_daily_summary — referenced by the "daily-summary" beat
 # schedule above. Without this force-import the task is never registered and the

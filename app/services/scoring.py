@@ -27,6 +27,7 @@ from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
+from app.services.industry_verticals import matches_manufacturing, resolve_vertical
 
 logger = logging.getLogger(__name__)
 
@@ -202,24 +203,47 @@ def classify_account_tier(
     return "non_target", 0.25
 
 
-def _industry_score(naics_code: Optional[str]) -> tuple[int, str]:
-    """Score based on NAICS code. Manufacturing = 31-33."""
-    if not naics_code:
-        return 0, "No NAICS code available"
-    prefix = naics_code[:2]
-    if prefix in ("31", "32", "33"):
-        return 40, f"Manufacturing NAICS {naics_code} — perfect fit"
-    # Related industries
-    related = {
-        "42": "Wholesale trade — often serves manufacturing",
-        "48": "Transportation — logistics for manufacturing",
-        "49": "Warehousing — supports manufacturing supply chain",
-        "54": "Professional/technical services — may serve manufacturing",
-        "56": "Admin/support services — may serve manufacturing",
-    }
-    if prefix in related:
-        return 20, related[prefix]
-    return 0, f"NAICS {naics_code} not related to manufacturing"
+def _industry_score(
+    naics_code: Optional[str],
+    industry_segment: Optional[str] = None,
+    company_name: Optional[str] = None,
+) -> tuple[int, str]:
+    """Score based on NAICS code (manufacturing = 31-33), falling back to the
+    industry-vertical taxonomy when NAICS is absent.
+
+    Places-sourced companies have no NAICS code — Places speaks its own
+    taxonomy — but they do carry ``industry_segment`` (the ICP query that found
+    them, e.g. "CNC Machining"; see ingestion + 183d5a9). Scoring only NAICS
+    gave exactly those companies industry=0 and structurally disqualified the
+    leads prospecting was built to find, so a missing/unrelated NAICS now defers
+    to the segment before concluding "not manufacturing".
+    """
+    if naics_code:
+        prefix = naics_code[:2]
+        if prefix in ("31", "32", "33"):
+            return 40, f"Manufacturing NAICS {naics_code} — perfect fit"
+
+    vertical = resolve_vertical(industry_segment or "", company_name or "")
+    if vertical is not None:
+        return 40, f"Industry segment matches vertical '{vertical.name}' — perfect fit"
+    if matches_manufacturing(industry_segment or "", company_name or ""):
+        return 40, f"Industry segment '{industry_segment}' — manufacturing"
+
+    if naics_code:
+        # Related industries
+        related = {
+            "42": "Wholesale trade — often serves manufacturing",
+            "48": "Transportation — logistics for manufacturing",
+            "49": "Warehousing — supports manufacturing supply chain",
+            "54": "Professional/technical services — may serve manufacturing",
+            "56": "Admin/support services — may serve manufacturing",
+        }
+        if naics_code[:2] in related:
+            return 20, related[naics_code[:2]]
+        return 0, f"NAICS {naics_code} not related to manufacturing"
+    if industry_segment:
+        return 0, f"Segment '{industry_segment}' not related to manufacturing"
+    return 0, "No NAICS code available"
 
 
 def _size_score(employee_count: Optional[int]) -> tuple[int, str]:
@@ -507,7 +531,9 @@ async def score_company_rule_based(
     )
     contacts = list(result.scalars().all())
 
-    industry_pts, industry_reason = _industry_score(company.naics_code)
+    industry_pts, industry_reason = _industry_score(
+        company.naics_code, company.industry_segment, company.name
+    )
     size_pts, size_reason = _size_score(company.employee_count)
     loc_pts, loc_reason = _location_score(company.country)
     completeness_pts, completeness_breakdown = _completeness_score(company, contacts)
