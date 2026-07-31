@@ -273,6 +273,14 @@ async def compose_step(
     # would re-introduce the exact failure above one level up — a deployment
     # holding a Gemini key would report "no API key" and mail static copy.
     if not (has_any_provider_key(settings) or settings.anthropic_api_key):
+        # Silent until now: this gate returning static looks identical to a
+        # healthy send in every metric the sequence path reports (open rate,
+        # send count), so a deployment with a stale/missing key sends nothing
+        # but mail-merge indefinitely without a single log line to find it by.
+        logger.warning(
+            "AI composition disabled for step %d (enrollment %s): no provider key configured",
+            step.step_number, enrollment.id,
+        )
         return static.because("no API key")
 
     template_type = template_type_for(step.step_number)
@@ -340,11 +348,25 @@ async def compose_step(
     if not generated or not generated.get("ai_generated"):
         # The generator's own template fallback — no better than the static step,
         # and the static step is at least the one a human wrote for this sequence.
+        # ``generate_email`` already logs the specific provider error at the
+        # point it happened; this is the second, louder signal — at the call
+        # site that decides what actually ships — because a chain that is
+        # exhausted on every single call produces exactly this outcome, on
+        # every send, with nothing in the sequence's own metrics to show it.
+        logger.warning(
+            "AI generator fell back to its own template for step %d (enrollment %s) "
+            "— sending static sequence copy instead",
+            step.step_number, enrollment.id,
+        )
         return static.because("generator fell back to template")
 
     subject = (generated.get("subject") or "").strip()
     body = (generated.get("body") or "").strip()
     if not subject or not body:
+        logger.warning(
+            "AI generator returned empty copy for step %d (enrollment %s)",
+            step.step_number, enrollment.id,
+        )
         return static.because("generator returned empty copy")
 
     if not await _scan_is_safe(db, subject, body):

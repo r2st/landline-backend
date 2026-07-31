@@ -53,7 +53,7 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 def _blank_counts() -> dict:
-    return {stage: 0 for stage in _STAGES} | {"bounced": 0, "positive": 0}
+    return {stage: 0 for stage in _STAGES} | {"bounced": 0, "positive": 0, "ai_composed": 0}
 
 
 def _with_rates(counts: dict) -> dict:
@@ -76,6 +76,12 @@ def _with_rates(counts: dict) -> dict:
         "reply_rate": _rate(replied, sent),
         "positive_rate": _rate(counts.get("positive", 0), sent),
         "positive_rate_of_replies": _rate(counts.get("positive", 0), replied),
+        # What fraction of sends were the AI-personalized copy rather than the
+        # static sequence template — see ``ai_compose.compose_step``. Answers
+        # "is AI composition actually shipping" directly, instead of via
+        # "is it enabled" (config) or "did it error" (logs), both of which can
+        # say yes while this number is zero.
+        "ai_composed_rate": _rate(counts.get("ai_composed", 0), sent),
     }
 
 
@@ -151,6 +157,29 @@ async def compute_funnel(
         if isinstance(metadata, dict) and metadata.get("positive"):
             key = (seq_id, int(step_number))
             per_step.setdefault(key, _blank_counts())["positive"] += 1
+
+    # AI-composed sends: same "read metadata in Python" approach as positives
+    # above, and for the same reason — ``ai_generated`` lives in JSON, not a
+    # column, and the volume (sent events only) is small enough that a second
+    # query beats a JSON-operator filter that would only work on Postgres.
+    ai_q = (
+        select(
+            OutreachEnrollment.sequence_id,
+            OutreachEvent.step_number,
+            OutreachEvent.event_metadata,
+        )
+        .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+        .where(OutreachEvent.event_type == "sent")
+    )
+    if sequence_id is not None:
+        ai_q = ai_q.where(OutreachEnrollment.sequence_id == sequence_id)
+    if since is not None:
+        ai_q = ai_q.where(OutreachEvent.occurred_at >= since)
+
+    for seq_id, step_number, metadata in (await db.execute(ai_q)).all():
+        if isinstance(metadata, dict) and metadata.get("ai_generated"):
+            key = (seq_id, int(step_number))
+            per_step.setdefault(key, _blank_counts())["ai_composed"] += 1
 
     # Sequence names for labelling (only those that appeared).
     seq_ids = {seq_id for (seq_id, _step) in per_step}

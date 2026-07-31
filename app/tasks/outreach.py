@@ -882,6 +882,15 @@ def send_sequence_step(self, enrollment_id: str):
                         "to_email": contact.email,
                         "subject": subject,
                         "body_html": human_body,
+                        # Whether this send was the AI-personalized copy or the
+                        # static sequence template, and why. Without this, "AI
+                        # composition is configured and enabled" and "AI
+                        # composition is actually shipping" are indistinguishable
+                        # from the outside — every metric the sequence reports
+                        # (sent, opened, reply rate) looks identical either way.
+                        "ai_generated": bool(composed.ai_generated),
+                        "compose_reason": composed.reason,
+                        "research_used": bool(composed.research_used),
                         # Which spintax variant shipped (when the copy used any),
                         # so downstream engagement can be attributed per variant.
                         **({"spintax": spintax_meta} if spintax_meta else {}),
