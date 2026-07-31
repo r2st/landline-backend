@@ -66,7 +66,9 @@ from app.schemas.dialtone import (
     PhoneEnrichmentRecent,
     PhoneEnrichmentSummary,
 )
-from app.services import suppression, system_settings, warmup
+from app.schemas.lead_tracking import DialtoneStatus, LeadOrgBreakdown
+from app.dependencies import OrgScope, get_org_scope
+from app.services import lead_metrics, suppression, system_settings, warmup
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
@@ -871,6 +873,98 @@ async def get_dialtone_console(
         previous_range_end=iso(tf.previous_end_date),
         deltas=_deltas(current, previous),
         rates=_funnel_rates(current),
+    )
+
+
+@router.get("/status", response_model=DialtoneStatus)
+async def get_dialtone_status(
+    start: Optional[str] = Query(None, description="ISO date/datetime lower bound (inclusive)"),
+    end: Optional[str] = Query(None, description="ISO date/datetime upper bound (exclusive); overrides timeframe"),
+    timeframe: Optional[str] = _TIMEFRAME_QUERY,
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dialtone agent status + performance: kill-switch state, warm-up ramp,
+    sender health, and the selected window's send/engagement funnel.
+
+    Meant for an external poller (Claude or otherwise) rather than the console
+    UI — same underlying counters as ``/dialtone/console``, plus a per-org
+    breakdown (``by_org``; more than one entry only for a platform_admin caller,
+    see ``app.services.lead_metrics.tally_by_org``).
+    """
+    lo, hi = _parse_bound(start), _parse_bound(end)
+    if lo is not None or hi is not None:
+        tf_key, tf_label, range_start, range_end = "custom", "Custom range", start, end
+    else:
+        tf = _timeframe(timeframe)
+        lo, hi = tf.start, tf.end
+        tf_key, tf_label = tf.key, tf.label
+        range_start = tf.start_date.isoformat() if tf.start_date else None
+        range_end = tf.end_date.isoformat() if tf.end_date else None
+
+    sending_status = await system_settings.get_sending_status(db)
+    sending = DialtoneSending(
+        enabled=sending_status.get("enabled", True),
+        reason=sending_status.get("reason"),
+        updated_by=sending_status.get("updated_by"),
+        updated_at=sending_status.get("updated_at"),
+    )
+
+    try:
+        send_stats = await get_send_limiter().get_send_stats(db)
+    except Exception as exc:  # pragma: no cover - best-effort context
+        logger.info("send stats unavailable: %s", exc)
+        send_stats = {}
+    warmup_progress = DialtoneWarmup(
+        today_sent=send_stats.get("today_sent", 0) or 0,
+        daily_limit=send_stats.get("daily_limit", 0) or 0,
+        daily_remaining=send_stats.get("daily_remaining", 0) or 0,
+        monthly_sent=send_stats.get("monthly_sent", 0) or 0,
+        warmup_active=bool(send_stats.get("warmup_active", False)),
+        warmup_week=send_stats.get("warmup_week"),
+    )
+
+    tallies = await lead_metrics.tally_by_org(db, lo, hi)
+    names = await lead_metrics.org_names(db, set(tallies))
+    total = Counter()
+    breakdown: list[LeadOrgBreakdown] = []
+    for org_id, c in tallies.items():
+        total.update(c)
+        open_rate, click_rate, reply_rate, bounce_rate = lead_metrics.funnel_rates(c)
+        breakdown.append(LeadOrgBreakdown(
+            org_id=str(org_id) if org_id else None,
+            org_name=names.get(org_id),
+            counts=DialtoneTodayCounts(**{
+                f: c.get(f, 0) for f in
+                ("emails_sent", "opens", "clicks", "replies", "bounces", "errors", "leads_discovered")
+            }),
+            rates=DialtoneFunnelRates(
+                open_rate=open_rate, click_rate=click_rate, reply_rate=reply_rate, bounce_rate=bounce_rate,
+            ),
+        ))
+    breakdown.sort(key=lambda b: b.counts.emails_sent, reverse=True)
+    total_open, total_click, total_reply, total_bounce = lead_metrics.funnel_rates(total)
+
+    senders = await _sender_statuses(db)
+
+    return DialtoneStatus(
+        generated_at=datetime.now(timezone.utc),
+        timeframe=tf_key,
+        timeframe_label=tf_label,
+        range_start=range_start,
+        range_end=range_end,
+        sending=sending,
+        warmup=warmup_progress,
+        counts=DialtoneTodayCounts(**{
+            f: total.get(f, 0) for f in
+            ("emails_sent", "opens", "clicks", "replies", "bounces", "errors", "leads_discovered")
+        }),
+        rates=DialtoneFunnelRates(
+            open_rate=total_open, click_rate=total_click, reply_rate=total_reply, bounce_rate=total_bounce,
+        ),
+        active_senders=len(senders),
+        healthy_senders=sum(1 for s in senders if s.health_status == "healthy"),
+        by_org=breakdown,
     )
 
 
