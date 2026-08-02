@@ -338,16 +338,62 @@ Return ONLY valid JSON: {{"variants": ["...", "...", "..."]}}"""
     return _fallback_subject_variants(base_subject, count)
 
 
+def _shorten_body(base: str) -> str:
+    """The base body cut to its first two sentences, tags preserved.
+
+    Length is the one body hypothesis that can be tested without writing new
+    copy — and on cold email it is a real one, since a shorter message is read
+    on a phone and a longer one is skimmed. Deliberately built by *removing*
+    text: anything that generated new sentences here would be inventing claims
+    about a business, with no model and no human in the loop to check them.
+    """
+    import re as _re
+
+    if not base:
+        return ""
+    is_html = "<" in base and ">" in base
+    text = _re.sub(r"<[^>]+>", " ", base) if is_html else base
+    text = _re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    sentences = _re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", text)
+    kept = "".join(sentences[:2]).strip()
+    if not kept or kept == text:
+        return ""
+    return f"<p>{kept}</p>" if is_html else kept
+
+
 def _fallback_body_variants(base_body: str, count: int) -> list[str]:
     """Deterministic body variants when AI generation is unavailable.
 
-    Returns the original body first so the control is always present; the caller
-    can accept/edit the alternatives. Never raises, always returns ≥1 option.
+    Returns the original body first so the control is always present, then a
+    genuinely different arm to split against — the short version.
+
+    Returning the base alone (the previous behaviour) meant that with no LLM
+    reachable this produced no *distinct* variant at all, and the caller that
+    needs two arms to run a test got an error instead of a test. On a deployment
+    where the provider chain is exhausted — which is the state cold outreach
+    spends most of its time in — that made body testing unavailable exactly when
+    every other AI feature had already degraded to static copy.
+
+    Never raises, always returns ≥1 option.
     """
     base = (base_body or "").strip()
-    out = [base] if base else []
-    if not out:
-        out = ["Quick note — thought this might be relevant to your team."]
+    candidates = [base] if base else [
+        "Quick note — thought this might be relevant to your team."
+    ]
+    short = _shorten_body(base)
+    if short:
+        candidates.append(short)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate.lower() not in seen:
+            seen.add(candidate.lower())
+            out.append(candidate)
     return out[: max(1, count)]
 
 

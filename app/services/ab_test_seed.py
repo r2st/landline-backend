@@ -259,3 +259,115 @@ async def generate_subject_test_for_step(
         "control_subject": control_subject,
         "challengers": challengers,
     }
+
+
+async def generate_body_test_for_step(
+    db: AsyncSession,
+    step: SequenceStep,
+    *,
+    count: int = 3,
+    strategy: str = "even",
+    # Body tests default to REPLY rate, where subject tests default to opens.
+    # The body has almost no influence on whether a message is opened — the
+    # subject and the sender name decide that — and all of its influence on
+    # whether anyone answers. Scoring a body test on opens measures the subject's
+    # work and credits it to the body. The cost is volume: cold reply rates run a
+    # few percent, so a body test needs an order of magnitude more sends than a
+    # subject test to conclude. ``HARD_CAP_SENDS`` in the resolver stops it
+    # running forever regardless.
+    metric: str = "replied",
+    min_sample: int = 200,
+    confidence_target: float = 0.95,
+    industry: Optional[str] = None,
+    ai=None,
+) -> dict:
+    """Write body challengers for one step with AI and start the test.
+
+    The mirror of :func:`generate_subject_test_for_step` for the other half of a
+    cold email. ``generate_body_variants`` has existed in the statistics service
+    since A/B testing shipped and had no caller — a step could test what its
+    subject said and never what its body did, which is the half that decides
+    replies.
+
+    Same shape as the subject tests: **A is the control and inherits the step's
+    body** (so editing the step keeps the control in sync), challengers vary the
+    body only, and the *subject* is held constant so the comparison is clean.
+
+    Generation never fails the caller — ``generate_body_variants`` falls back to
+    deterministic transforms with no LLM. Raises ``ValueError`` if the step
+    already has a test (one test per step) or if nothing distinct came back.
+    """
+    from app.services.ab_testing_service import generate_body_variants
+
+    if strategy not in AB_STRATEGIES:
+        raise ValueError(f"strategy must be one of {AB_STRATEGIES}")
+    if metric not in AB_METRICS:
+        raise ValueError(f"metric must be one of {AB_METRICS}")
+
+    existing = (
+        await db.execute(
+            select(func.count()).select_from(AbTest).where(AbTest.sequence_step_id == step.id)
+        )
+    ).scalar_one()
+    if existing:
+        raise ValueError("an A/B test already exists for this step")
+
+    control_body = (step.body_template or "").strip()
+    generated = await generate_body_variants(
+        control_body,
+        industry=industry,
+        subject=(step.subject_template or ""),
+        count=count,
+        ai=ai,
+    )
+
+    challengers: list[str] = []
+    for candidate in generated:
+        text = (candidate or "").strip()
+        if not text or text == control_body or text in challengers:
+            continue
+        challengers.append(text)
+    challengers = challengers[: len(VARIANT_LABELS) - 1]
+    if not challengers:
+        raise ValueError("could not generate any body distinct from the step's own")
+
+    test = AbTest(
+        sequence_step_id=step.id,
+        status="running",
+        strategy=strategy,
+        metric=metric,
+        min_sample=min_sample,
+        confidence_target=confidence_target,
+    )
+    db.add(test)
+    db.add(
+        AbTestVariant(
+            sequence_step_id=step.id,
+            label=VARIANT_LABELS[0],
+            subject_template=None,
+            body_template=None,  # inherit the step body
+            is_control=True,
+            is_active=True,
+        )
+    )
+    for idx, body in enumerate(challengers, start=1):
+        db.add(
+            AbTestVariant(
+                sequence_step_id=step.id,
+                label=VARIANT_LABELS[idx],
+                subject_template=None,  # body-only test
+                body_template=body,
+                is_control=False,
+                is_active=True,
+            )
+        )
+    await db.flush()
+    logger.info(
+        "Generated body A/B test for step %s (1 control + %d challengers, metric=%s)",
+        step.id, len(challengers), metric,
+    )
+    return {
+        "test": test,
+        "control_body": control_body,
+        "challengers": challengers,
+    }

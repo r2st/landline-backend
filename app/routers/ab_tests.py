@@ -10,6 +10,13 @@ Endpoints:
 * ``POST /dialtone/ab-tests``                      — create a test for a step.
 * ``PUT  /dialtone/ab-tests/{test_id}/variants``   — add / edit variants.
 * ``POST /dialtone/ab-tests/{test_id}/declare-winner`` — manual override.
+* ``POST /dialtone/ab-tests/generate-subjects/{step_id}`` — AI subject test.
+* ``POST /dialtone/ab-tests/generate-bodies/{step_id}``   — AI body test.
+* ``POST /dialtone/ab-tests/seed-subjects/{sequence_id}`` — static variant bank.
+
+A step holds at most one test, so subject and body are tested in sequence, not
+at once — two variables moving together on cold volume this thin would leave
+neither attributable.
 """
 
 import logging
@@ -316,6 +323,57 @@ async def generate_subject_test(
 
     try:
         result = await generate_subject_test_for_step(
+            db, step, count=count, strategy=strategy, metric=metric
+        )
+    except ValueError as exc:
+        # "already has a test" is a conflict; anything else is a bad request.
+        status = 409 if "already exists" in str(exc) else 400
+        raise HTTPException(status_code=status, detail=str(exc))
+
+    return await _build_detail(db, result["test"])
+
+
+@router.post("/generate-bodies/{step_id}", response_model=AbTestDetail, status_code=201)
+async def generate_body_test(
+    step_id: uuid.UUID,
+    count: int = Query(3, ge=2, le=3, description="How many challenger bodies to write"),
+    strategy: str = Query("even"),
+    metric: str = Query(
+        "replied",
+        description="Metric the test optimises. Body tests default to replies — "
+                    "the body has almost no say in whether a message is opened "
+                    "and all of the say in whether anyone answers.",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Write email-body challengers for one step with AI and start the test.
+
+    The other half of the email. ``generate-subjects`` tests what the subject
+    says; this tests what the message does once opened — control A inherits the
+    step's own body, challengers vary the body only, and the subject is held
+    constant so what the test measures is the body.
+
+    Expect this to need materially more volume than a subject test: it is scored
+    on reply rate, which for cold outreach runs a few percent.
+
+    Falls back to deterministic body transforms when no LLM is reachable, so it
+    always produces a runnable test.
+    """
+    if strategy not in AB_STRATEGIES:
+        raise HTTPException(status_code=400, detail=f"strategy must be one of {list(AB_STRATEGIES)}")
+    if metric not in AB_METRICS:
+        raise HTTPException(status_code=400, detail=f"metric must be one of {list(AB_METRICS)}")
+
+    step = (
+        await db.execute(select(SequenceStep).where(SequenceStep.id == step_id))
+    ).scalar_one_or_none()
+    if step is None:
+        raise HTTPException(status_code=404, detail="sequence step not found")
+
+    from app.services.ab_test_seed import generate_body_test_for_step
+
+    try:
+        result = await generate_body_test_for_step(
             db, step, count=count, strategy=strategy, metric=metric
         )
     except ValueError as exc:
