@@ -31,8 +31,76 @@ class EmailTemplateRead(EmailTemplateBase):
 
     id: uuid.UUID
     is_default: bool
+    is_archived: bool = False
+    archived_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+
+# --- Validation ---
+
+class TemplateValidateRequest(BaseModel):
+    """Check a template without saving it.
+
+    The point of a separate endpoint is that an author wants the warnings while
+    they are still editing. Create/update reject only on *errors*, so warnings
+    are otherwise invisible until someone reads the mail that went out.
+    """
+
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    template_id: Optional[uuid.UUID] = None
+
+
+class TemplateValidateResponse(BaseModel):
+    """Errors block a save; warnings do not.
+
+    The split matters: an unknown merge field is not a style preference, it is a
+    field that will render as empty text in real mail — ``{{firstname}}`` for
+    ``first_name`` produces ``Hi ,`` and no error anywhere. A missing unsubscribe
+    line, by contrast, has legitimate exceptions.
+    """
+
+    valid: bool
+    errors: list[str] = []
+    warnings: list[str] = []
+    fields_used: list[str] = []
+    valid_fields: list[str] = []
+
+
+# --- Per-template performance ---
+
+class TemplatePerformance(BaseModel):
+    """What one template actually achieved, from its own send log.
+
+    Scope is ``email_sends`` — the manual and template send paths. Sequence-step
+    copy lives in ``sequence_steps`` and reports through
+    ``/dialtone/sequences/{id}/analytics``; the two are separate send paths with
+    separate tables and merging them here would produce a number belonging to
+    neither. See ``failed``: a template whose sends are erroring is a very
+    different problem from one whose sends are ignored, and a bare open rate
+    cannot tell them apart because failed sends never open.
+    """
+
+    template_id: uuid.UUID
+    name: str
+    is_default: bool
+    is_archived: bool
+
+    sent: int
+    delivered: int
+    failed: int
+    opened: int
+    clicked: int
+    replied: int
+
+    open_rate: float
+    click_rate: float
+    reply_rate: float
+    failure_rate: float
+
+    first_send_at: Optional[datetime] = None
+    last_send_at: Optional[datetime] = None
 
 
 # --- Preview ---

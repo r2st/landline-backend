@@ -29,6 +29,17 @@ class EmailTemplate(Base, OrgScopedMixin):
     subject: Mapped[str] = mapped_column(String(500), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Retired, but kept. Deleting a used template detaches every send it
+    # produced (``email_sends.template_id`` is ON DELETE SET NULL), which throws
+    # away the only record of which copy earned which replies — and the
+    # templates worth retiring are precisely the ones with history. Archiving
+    # takes it out of the pickers and leaves the attribution intact.
+    is_archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

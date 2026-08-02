@@ -4,14 +4,41 @@ When outreach bounces we must stop emailing that address — repeatedly hitting
 an invalid mailbox tanks sender reputation and gets the domain blocklisted.
 
 * A **hard** bounce (permanent: unknown user, mailbox not found, 5.x.x) → the
-  contact is suppressed immediately (``unsubscribed = True``, the existing
-  do-not-email gate) and its active enrollments are set to ``bounced``.
+  address is suppressed immediately and the contact's active enrollments are set
+  to ``bounced``.
 * A **soft** bounce (transient: mailbox full, greylisted, 4.x.x) → tracked; the
-  contact is only suppressed after ``soft_bounce_suppress_threshold`` of them,
+  address is only suppressed after ``soft_bounce_suppress_threshold`` of them,
   since transient failures often clear on their own.
 
 Both increment ``Contact.bounce_count`` and stamp ``last_bounce_type`` /
 ``last_bounced_at`` for the deliverability report.
+
+Suppression is by **address**, not only by contact row
+-----------------------------------------------------
+
+A bounce suppresses three things, and it needs all three:
+
+1. ``Contact.suppressed`` — the per-contact flag the send paths actually read
+   (``tasks/outreach.py`` and the template send both gate on ``suppressed``, and
+   on the suppression list; **neither reads ``unsubscribed``**). This module used
+   to set ``unsubscribed`` alone, which stopped the enrollment that bounced and
+   nothing else: the autonomous prospector de-duplicates enrollments per
+   *(contact, sequence)* pair and filters on nothing else, so the next sequence
+   picked up the same dead address and mailed it again. Every such send is
+   another hard bounce against our own reputation, which is the one number the
+   whole deliverability stack exists to protect.
+2. ``Contact.unsubscribed`` — kept for the enrollment gate in
+   ``routers/sequences.py`` and the contact filters, as before.
+3. A ``SuppressionEntry`` on the org do-not-contact list, keyed by the **email
+   address**. This is what survives the contact row. Discovery re-imports create
+   a *new* ``Contact`` for an address we already know is dead — fresh row, fresh
+   ``suppressed = False`` — and the address-level list is the only thing that
+   catches it. ``reason="bounce"`` has been in the suppression enum since the
+   list shipped and nothing but a manual CSV upload had ever written one.
+
+A bounce for an address with **no** contact row suppresses too. We only receive a
+DSN for mail we sent, so a hard bounce is proof the address is dead whether or
+not we can still find the row that mailed it.
 
 Classification is heuristic on the SMTP status code + diagnostic text, which is
 what bounce webhooks (SES, Postmark) and mailer-daemon DSNs give us.
@@ -86,11 +113,31 @@ async def _contacts_for_email(db: AsyncSession, email: str) -> list[Contact]:
     return list(rows.scalars().all())
 
 
+async def _suppress_address(db: AsyncSession, email: str, kind: str) -> bool:
+    """Put ``email`` on the org do-not-contact list. Returns True if newly added.
+
+    Idempotent by way of ``suppression.add_entry``, which is a no-op for an
+    address already on the list — so a second DSN for the same mailbox, or a
+    bounce for an address a compliance upload already covered, adds nothing.
+    """
+    from app.services import suppression as _suppression
+
+    _, status = await _suppression.add_entry(
+        db, email, reason="bounce", source="auto"
+    )
+    if status == "added":
+        logger.info("Suppression list: added %s after a %s bounce", email, kind)
+    return status == "added"
+
+
 async def _suppress_contact(db: AsyncSession, contact: Contact) -> int:
     """Mark a contact do-not-email and stop its active enrollments.
 
     Returns the number of enrollments paused. Idempotent.
     """
+    # ``suppressed`` is the flag the send paths gate on; ``unsubscribed`` is the
+    # one the enrollment gate and the contact filters read. A bounce means both.
+    contact.suppressed = True
     contact.unsubscribed = True
     rows = await db.execute(
         select(OutreachEnrollment).where(
@@ -147,12 +194,25 @@ async def record_bounce(
 
     contacts = await _contacts_for_email(db, email)
     if not contacts:
-        logger.info("Bounce for %s matched no contact (kind=%s)", email, bounce_kind)
+        # No contact row, but we only get a DSN for mail we sent. A hard bounce
+        # is proof the address is dead, so it goes on the address-level list
+        # regardless — that is precisely the case the list exists for. A lone
+        # soft bounce is not proof of anything and is left alone.
+        listed = False
+        if bounce_kind == "hard":
+            listed = await _suppress_address(db, email, bounce_kind)
+            await db.flush()
+        logger.info(
+            "Bounce for %s matched no contact (kind=%s, listed=%s)",
+            email, bounce_kind, listed,
+        )
         return {"email": email, "kind": bounce_kind, "matched_contacts": 0,
-                "suppressed": 0, "enrollments_paused": 0}
+                "suppressed": 0, "enrollments_paused": 0,
+                "list_entry_added": listed}
 
     suppressed = 0
     enrollments_paused = 0
+    any_suppression = False
     for contact in contacts:
         contact.bounce_count = (contact.bounce_count or 0) + 1
         contact.last_bounce_type = bounce_kind
@@ -161,17 +221,29 @@ async def record_bounce(
         should_suppress = bounce_kind == "hard" or (
             contact.bounce_count >= settings.soft_bounce_suppress_threshold
         )
-        if should_suppress and not contact.unsubscribed:
-            enrollments_paused += await _suppress_contact(db, contact)
+        if not should_suppress:
+            continue
+        any_suppression = True
+        # ``suppressed`` counts contacts this bounce newly took out of play.
+        # Re-running suppression on an already-suppressed contact is deliberate
+        # and cheap: it re-checks for enrollments created since (the prospector
+        # can enroll a suppressed contact into a *different* sequence), so a
+        # repeat DSN closes them rather than leaving them due forever.
+        if not contact.suppressed:
             suppressed += 1
-        elif should_suppress:
-            # Already unsubscribed — still ensure enrollments are stopped.
-            enrollments_paused += await _suppress_contact(db, contact)
+        enrollments_paused += await _suppress_contact(db, contact)
+
+    # One list entry per address, not per matched contact row.
+    list_entry_added = False
+    if any_suppression:
+        list_entry_added = await _suppress_address(db, email, bounce_kind)
 
     await db.flush()
     logger.info(
-        "Recorded %s bounce for %s — %d contact(s), suppressed=%d, enrollments_paused=%d",
+        "Recorded %s bounce for %s — %d contact(s), suppressed=%d, "
+        "enrollments_paused=%d, listed=%s",
         bounce_kind, email, len(contacts), suppressed, enrollments_paused,
+        list_entry_added,
     )
     return {
         "email": email,
@@ -179,4 +251,5 @@ async def record_bounce(
         "matched_contacts": len(contacts),
         "suppressed": suppressed,
         "enrollments_paused": enrollments_paused,
+        "list_entry_added": list_entry_added,
     }

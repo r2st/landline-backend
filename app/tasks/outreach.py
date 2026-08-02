@@ -1125,6 +1125,14 @@ def send_sequence_step(self, enrollment_id: str):
                 elif event_type == "bounced":
                     enrollment.status = "bounced"
 
+                # A send that reached the wire clears the failure state. Done in
+                # this transaction so the reset and the send it describes commit
+                # together — a counter cleared by a send that then rolled back
+                # would forgive a failure that still happened.
+                from app.services import send_failures
+
+                send_failures.clear_failures(enrollment)
+
                 await db.commit()
                 logger.info(
                     "Sent step %d to %s (thread=%s) — result: %s",
@@ -1143,8 +1151,48 @@ def send_sequence_step(self, enrollment_id: str):
                 await db.rollback()
                 raise
 
+    # Decided out here, where ``self`` is: Celery's retry counter lives on the
+    # request, and the attempt below needs to know whether this is the last one.
+    retries_left = self.request.retries < self.max_retries
+
+    async def _attempt():
+        """One send, plus what to do with a failure that has run out of retries."""
+        try:
+            return await _run()
+        except Exception as exc:
+            if retries_left:
+                # Let it out to the sync wrapper, which turns it into a Celery
+                # retry. Most faults are transient and clear inside the chain,
+                # and recording every attempt would make ``consecutive_failures``
+                # count attempts rather than incidents.
+                raise
+
+            # Out of retries: this is one failed *incident*, and the enrollment
+            # has to remember it. Nothing did until now, so the row was left
+            # ``active`` with a due date in the past and the queue sweep re-sent
+            # it every five minutes for as long as the fault lasted.
+            #
+            # On its own session: the send's session died with the transaction
+            # that failed, and the whole point is that this record outlives it.
+            from app.services import send_failures
+
+            async with celery_session() as db:
+                outcome = await send_failures.record_failure(db, enrollment_id, exc)
+
+            # Returned rather than re-raised. The failure is now durably on the
+            # enrollment and reported by ``GET /dialtone/failures``; re-raising
+            # would add a Celery traceback nobody reads and mark a task failed
+            # that has, by this point, been handled.
+            return {
+                "status": "failed",
+                "enrollment_id": enrollment_id,
+                "error": str(exc)[:500],
+                "consecutive_failures": (outcome or {}).get("consecutive_failures"),
+                "quarantined": (outcome or {}).get("quarantined", False),
+            }
+
     try:
-        return _run_async(_run())
+        return _run_async(_attempt())
     except Exception as exc:
         logger.error("Outreach step failed for enrollment %s: %s", enrollment_id, str(exc))
         raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))

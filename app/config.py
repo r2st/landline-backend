@@ -343,6 +343,26 @@ class Settings(BaseSettings):
     # immediately, regardless of whether anyone ever does it.
     manual_step_blocks_cadence: bool = True
 
+    # --- Repeated send failures ---
+    # A send that throws all the way through its Celery retries is one failure
+    # incident. After this many *consecutive* incidents the enrollment is paused
+    # (``pause_reason='send_failures'``) instead of being re-dispatched every
+    # sweep forever, which is what a permanent fault used to cost.
+    #
+    # 5 rather than 1: transient faults are the common case — a provider blip, a
+    # timeout, a token refresh landing badly — and pausing a live sequence on the
+    # first one would turn a self-healing hiccup into manual work. 5 consecutive
+    # incidents, spread over the backoff below, is roughly a day of a thing
+    # genuinely not working.
+    #
+    # 0 disables quarantine; the backoff still applies. See
+    # ``app.services.send_failures``.
+    send_failure_quarantine_threshold: int = 5
+    # Base for the exponential backoff between incidents (15m, 30m, 1h, 2h, 4h…),
+    # clamped to [10m, 12h]. The floor is deliberately above the 5-minute queue
+    # sweep: a backoff shorter than the sweep interval does nothing.
+    send_failure_backoff_base_minutes: int = 15
+
     # --- CAN-SPAM sender identity ---
     # Legal sender name + a FULL physical postal address are required on every
     # commercial email (CAN-SPAM / CASL). ``company_postal_address`` must be a

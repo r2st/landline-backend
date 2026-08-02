@@ -119,6 +119,66 @@ class CampaignAnalytics(BaseModel):
 
     last_send_at: datetime | None = None
 
+    # --- Ranking honesty ----------------------------------------------------
+    # The lower bound of the 95% Wilson score interval on the reply rate, as a
+    # fraction like every other rate here. Sorting a campaign table by the
+    # *observed* rate reliably puts
+    # the smallest campaign on top: 1 reply in 12 sends is 8.3%, which beats
+    # every mature campaign in the table and is indistinguishable from luck. The
+    # lower bound is the rate we can defend, so ranking by it puts a campaign at
+    # the top only once it has earned the position.
+    reply_rate_ci_low: float = 0.0
+    # Whether this campaign has enough sends for its rates to be worth reading
+    # at all. False is not a criticism of the campaign — only of the number.
+    sample_sufficient: bool = True
+
+    # Populated only when the caller asked for a period-over-period comparison.
+    trend: "CampaignTrend | None" = None
+
+
+class CampaignTrend(BaseModel):
+    """One campaign's current period against the period immediately before it.
+
+    Rate deltas are **absolute differences between the two fractions** (0.020 →
+    0.030 is ``+0.010``), matching how every other rate in this response is
+    expressed, and volume deltas are plain counts. Deliberately not a relative
+    change: "reply rate up 50%" is the most reliably misread number on a
+    dashboard, and it is unbounded besides — any improvement off a zero base is
+    infinite.
+    """
+
+    # The comparison window, same length as the current one, ending where it
+    # begins. Both are echoed so a reader can see what "previous" meant.
+    previous_start: datetime
+    previous_end: datetime
+
+    previous_sent: int
+    previous_replied: int
+    previous_reply_rate: float
+    previous_bounce_rate: float
+
+    sent_delta: int
+    reply_rate_delta: float
+    bounce_rate_delta: float
+
+    # 'improving' | 'declining' | 'flat' | 'insufficient_data'
+    #
+    # ``insufficient_data`` when either period is too small to compare, which is
+    # the common case and the one a naive dashboard gets loudly wrong: a campaign
+    # that sent 4 last week and 6 this week has not "improved 50%".
+    direction: str
+    # True when the campaign sent in this period but not the previous one — a
+    # new campaign, not a recovering one. Without this a first period of activity
+    # reads as infinite growth.
+    newly_active: bool = False
+
+
+# ``CampaignAnalytics.trend`` forward-references this, which is defined below it
+# so the reading order matches the nesting. Resolve it explicitly rather than
+# relying on Pydantic's lazy first-use rebuild — a model that only fails to
+# build when something first validates against it fails at request time.
+CampaignAnalytics.model_rebuild()
+
 
 class CampaignAnalyticsResponse(BaseModel):
     """Every campaign, plus the totals across them."""
@@ -126,6 +186,12 @@ class CampaignAnalyticsResponse(BaseModel):
     timeframe_days: int | None = None
     campaigns: list[CampaignAnalytics]
     totals: CampaignAnalytics | None = None
+    # Set when ``compare`` was requested: campaigns whose reply rate moved
+    # materially, already filtered for sample size. The point of the field is
+    # that it is usually short — a dashboard's job is to name the two campaigns
+    # that changed, not to hand back thirty rows and a scroll bar.
+    improving: list[str] = []
+    declining: list[str] = []
 
 
 class RankedLead(BaseModel):

@@ -181,8 +181,13 @@ class BounceReport(BaseModel):
 async def report_bounce(payload: BounceReport, db: AsyncSession = Depends(get_db)):
     """Record a bounce (webhook or manual) and suppress the address if warranted.
 
-    Hard bounces suppress the contact immediately; soft bounces are tracked and
-    suppress after the configured threshold.
+    Hard bounces suppress immediately; soft bounces are tracked and suppress
+    after the configured threshold. Suppression is by **address**, not only by
+    contact row: the contact is flagged, its live enrollments stop, and the
+    address goes on the org do-not-contact list (``list_entry_added`` in the
+    response). The list is the half that survives a re-import — discovery creates
+    a fresh ``Contact`` for an address we already know is dead, and nothing on
+    that new row remembers.
     """
     if not (payload.email or "").strip():
         raise HTTPException(status_code=400, detail="email is required")

@@ -9,7 +9,7 @@ import csv
 import io
 import logging
 import uuid
-from datetime import datetime, date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -36,13 +36,17 @@ from app.schemas.email_template import (
     EmailTemplateCreate,
     EmailTemplateRead,
     EmailTemplateUpdate,
+    TemplatePerformance,
     TemplatePreviewRequest,
     TemplatePreviewResponse,
+    TemplateValidateRequest,
+    TemplateValidateResponse,
     SendTestRequest,
     SendTestResponse,
     AIEmailGenerateRequest,
     AIEmailGenerateResponse,
 )
+from app.services import template_validation
 from app.services.email_compose import SAMPLE_CONTEXT, build_merge_context, render
 from app.services.ai_email_generator import generate_email as ai_generate_email
 from app.services.email_dispatch import get_account, resolve_sender_info, send_outreach_email
@@ -50,6 +54,11 @@ from app.routers.tracking import generate_tracking_pixel_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["email"])
+
+# ``EmailSend.status`` values that mean the message never left. ``bounced`` is
+# here too: a bounce is a delivery failure, and counting it in the denominator of
+# an open rate reports a copy problem for what is a list problem.
+FAILURE_STATUSES = ("error", "failed", "bounced")
 
 
 # --- Helpers ---
@@ -69,6 +78,19 @@ async def _get_default_template(db: AsyncSession) -> Optional[EmailTemplate]:
     return result.scalar_one_or_none()
 
 
+def _reject_invalid(subject: Optional[str], body: Optional[str]) -> None:
+    """400 if the template would not render correctly. Warnings do not block.
+
+    Called on every write path, because the alternative is where these mistakes
+    used to surface: a syntax error raises inside the dispatcher on a live
+    enrollment days later, and an unknown merge field never surfaces at all — it
+    renders as empty text and the mail goes out reading ``Hi ,``.
+    """
+    result = template_validation.validate_template(subject, body)
+    if not result["valid"]:
+        raise HTTPException(status_code=400, detail="; ".join(result["errors"]))
+
+
 async def _clear_default(db: AsyncSession, except_id: Optional[uuid.UUID] = None) -> None:
     """Unset is_default on all templates (optionally except one), to keep a single default."""
     stmt = update(EmailTemplate).where(EmailTemplate.is_default == True).values(is_default=False)  # noqa: E712
@@ -81,12 +103,23 @@ async def _clear_default(db: AsyncSession, except_id: Optional[uuid.UUID] = None
 # --- Template CRUD ---
 
 @router.get("/email-templates", response_model=list[EmailTemplateRead])
-async def list_email_templates(db: AsyncSession = Depends(get_db)):
-    """List all email templates (default first, then newest)."""
+async def list_email_templates(
+    include_archived: bool = Query(
+        False, description="Include retired templates. Off by default — the "
+                           "common caller is a picker."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """List email templates (default first, then newest).
+
+    Archived templates are excluded unless asked for. They still exist and still
+    own their send history; they are simply not something to pick for a new send.
+    """
+    query = select(EmailTemplate)
+    if not include_archived:
+        query = query.where(EmailTemplate.is_archived == False)  # noqa: E712
     result = await db.execute(
-        select(EmailTemplate).order_by(
-            EmailTemplate.is_default.desc(), EmailTemplate.created_at.desc()
-        )
+        query.order_by(EmailTemplate.is_default.desc(), EmailTemplate.created_at.desc())
     )
     return list(result.scalars().all())
 
@@ -99,7 +132,13 @@ async def create_email_template(
     """Create a new email template. If marked default, any prior default is cleared.
 
     If no template is currently marked default, the first one created becomes default.
+
+    Rejects a template that would not render: a Jinja syntax error (which used to
+    surface as a send failure on a live enrollment days later) or a merge field
+    that is not in the render context (which used to surface as nothing at all —
+    Jinja substitutes an empty string, so ``{{firstname}}`` ships ``Hi ,``).
     """
+    _reject_invalid(payload.subject, payload.body)
     make_default = payload.is_default
     if not make_default and await _get_default_template(db) is None:
         make_default = True
@@ -130,9 +169,21 @@ async def update_email_template(
     payload: EmailTemplateUpdate,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update an email template's fields."""
+    """Update an email template's fields.
+
+    Content changes are validated against the final state of the template, not
+    against the patch: editing only the subject still has to render alongside the
+    body already stored, and a partial update is exactly where a merge field can
+    lose the context that used to satisfy it.
+    """
     template = await _get_template_or_404(db, template_id)
     update_data = payload.model_dump(exclude_unset=True)
+
+    if "subject" in update_data or "body" in update_data:
+        _reject_invalid(
+            update_data.get("subject", template.subject),
+            update_data.get("body", template.body),
+        )
 
     # Handle default toggling carefully to preserve the single-default invariant.
     if update_data.get("is_default") is True:
@@ -161,16 +212,242 @@ async def delete_email_template(
     template_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete an email template. The default template cannot be deleted."""
+    """Delete an email template that has never been used.
+
+    A template with sends is refused, because ``email_sends.template_id`` is
+    ``ON DELETE SET NULL``: removing the row silently detaches every send it
+    produced, and the answer to "which copy earned those replies" goes with it.
+    That is backwards — the templates worth retiring are the used ones, which
+    are the only ones whose history is worth anything. Archive those instead.
+
+    Delete stays available for a template that never sent, where there is no
+    history to protect and a typo'd draft should not be immortal.
+    """
     template = await _get_template_or_404(db, template_id)
     if template.is_default:
         raise HTTPException(
             status_code=400,
             detail="Cannot delete the default template — set another template as default first",
         )
+
+    sends = (
+        await db.execute(
+            select(func.count(EmailSend.id)).where(EmailSend.template_id == template_id)
+        )
+    ).scalar() or 0
+    if sends:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Template has {sends} send(s) — deleting it would detach them and "
+                f"lose the attribution. Archive it instead "
+                f"(POST /email-templates/{template_id}/archive)."
+            ),
+        )
+
     await db.delete(template)
     await db.flush()
-    logger.info("Deleted email template %s", template_id)
+    logger.info("Deleted email template %s (no sends)", template_id)
+
+
+@router.post("/email-templates/{template_id}/archive", response_model=EmailTemplateRead)
+async def archive_email_template(
+    template_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retire a template without touching what it sent.
+
+    It leaves the pickers and keeps its send history, so
+    ``/email-templates/{id}/performance`` still answers for it — which is the
+    whole point, since the reason to retire a template is usually that you have
+    just finished measuring it.
+
+    Refuses the default template: archiving the one every un-templated send falls
+    back to would leave that path resolving to a template nobody can see.
+    """
+    template = await _get_template_or_404(db, template_id)
+    if template.is_default:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot archive the default template — set another template as default first",
+        )
+    if not template.is_archived:
+        template.is_archived = True
+        template.archived_at = datetime.now(timezone.utc)
+        await db.flush()
+        logger.info("Archived email template %s", template_id)
+    await db.refresh(template)
+    return template
+
+
+@router.post("/email-templates/{template_id}/unarchive", response_model=EmailTemplateRead)
+async def unarchive_email_template(
+    template_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Bring an archived template back into the pickers."""
+    template = await _get_template_or_404(db, template_id)
+    template.is_archived = False
+    template.archived_at = None
+    await db.flush()
+    await db.refresh(template)
+    logger.info("Unarchived email template %s", template_id)
+    return template
+
+
+@router.post(
+    "/email-templates/{template_id}/clone",
+    response_model=EmailTemplateRead,
+    status_code=201,
+)
+async def clone_email_template(
+    template_id: uuid.UUID,
+    name: Optional[str] = Query(
+        None, description="Name for the copy. Defaults to '<name> (copy)'."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Copy a template so a variant can be written without editing the original.
+
+    The alternative people actually do is edit the live template in place, which
+    silently changes what every future send says *and* makes the existing send
+    history describe copy that no longer exists — the sends stay attributed to a
+    template whose text has moved underneath them.
+
+    The copy is never the default and never archived, whatever the source was: a
+    clone is a draft, and inheriting default status would silently repoint every
+    un-templated send at untested copy.
+    """
+    source = await _get_template_or_404(db, template_id)
+    new_name = (name or f"{source.name} (copy)").strip()[:255]
+
+    clone = EmailTemplate(
+        name=new_name,
+        subject=source.subject,
+        body=source.body,
+        is_default=False,
+        is_archived=False,
+    )
+    db.add(clone)
+    try:
+        await db.flush()
+    except Exception:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409, detail=f"A template named '{new_name}' already exists"
+        )
+    await db.refresh(clone)
+    logger.info("Cloned email template %s into %s", template_id, clone.id)
+    return clone
+
+
+@router.get(
+    "/email-templates/{template_id}/performance", response_model=TemplatePerformance
+)
+async def email_template_performance(
+    template_id: uuid.UUID,
+    days: Optional[int] = Query(
+        None, ge=1, le=365, description="Only count sends from the last N days."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """What this template actually achieved.
+
+    Templates could be created, previewed, sent and A/B-tested, and nothing
+    reported how any single one performed — the closest thing was an org-wide
+    roll-up over every send. So the question the template library exists to
+    answer, "which of these should we keep using", had no answer.
+
+    ``failed`` is reported next to the engagement counts on purpose. Rates here
+    are over sends *attempted*, and a template whose sends are erroring looks
+    identical to one being ignored if you only read the open rate — failed sends
+    never open. A high ``failure_rate`` means the numbers below it are describing
+    a smaller campaign than the send count suggests.
+
+    Scope is ``email_sends``: the manual and template send paths. Sequence-step
+    copy is a different send path with a different table and reports through
+    ``/dialtone/sequences/{id}/analytics``.
+    """
+    template = await _get_template_or_404(db, template_id)
+
+    conditions = [EmailSend.template_id == template_id]
+    if days:
+        conditions.append(
+            EmailSend.sent_at >= datetime.now(timezone.utc) - timedelta(days=days)
+        )
+
+    row = (
+        await db.execute(
+            select(
+                func.count(EmailSend.id),
+                func.count(EmailSend.opened_at),
+                func.count(EmailSend.clicked_at),
+                func.count(EmailSend.replied_at),
+                func.min(EmailSend.sent_at),
+                func.max(EmailSend.sent_at),
+            ).where(*conditions)
+        )
+    ).one()
+    sent, opened, clicked, replied, first_at, last_at = row
+
+    failed = (
+        await db.execute(
+            select(func.count(EmailSend.id)).where(
+                *conditions, EmailSend.status.in_(FAILURE_STATUSES)
+            )
+        )
+    ).scalar() or 0
+    delivered = max(0, sent - failed)
+
+    def _rate(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 4) if denominator else 0.0
+
+    return TemplatePerformance(
+        template_id=template.id,
+        name=template.name,
+        is_default=template.is_default,
+        is_archived=template.is_archived,
+        sent=sent,
+        delivered=delivered,
+        failed=failed,
+        opened=opened,
+        clicked=clicked,
+        replied=replied,
+        # Engagement is measured against mail that actually left, not against
+        # attempts — dividing opens by a send count padded with failures reports
+        # a copy problem for what is a delivery problem.
+        open_rate=_rate(opened, delivered),
+        click_rate=_rate(clicked, delivered),
+        reply_rate=_rate(replied, delivered),
+        failure_rate=_rate(failed, sent),
+        first_send_at=first_at,
+        last_send_at=last_at,
+    )
+
+
+@router.post("/email-templates/validate", response_model=TemplateValidateResponse)
+async def validate_email_template(
+    payload: TemplateValidateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Check a template without saving it, and get the warnings too.
+
+    Create and update reject on **errors** only, so the warnings — a merge field
+    inside a URL, copy with no personalization at all, a missing unsubscribe line
+    — are otherwise invisible until someone reads the mail that went out. This is
+    the endpoint an editor calls while the author is still typing.
+
+    Accepts inline ``subject``/``body``, or a ``template_id`` to check what is
+    already stored (each field falls back to the stored one, so an author can
+    check an edit to the subject against the live body).
+    """
+    subject, body = payload.subject, payload.body
+    if payload.template_id is not None:
+        template = await _get_template_or_404(db, payload.template_id)
+        subject = subject if subject is not None else template.subject
+        body = body if body is not None else template.body
+
+    return TemplateValidateResponse(**template_validation.validate_template(subject, body))
 
 
 @router.post("/email-templates/{template_id}/set-default", response_model=EmailTemplateRead)

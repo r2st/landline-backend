@@ -17,6 +17,7 @@ what Dialtone has already logged.
 """
 
 import logging
+import math
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -46,10 +47,22 @@ from app.schemas.booking import BookingConfig, BookingConfigUpdate
 from app.schemas.sequence_analytics import (
     CampaignAnalytics,
     CampaignAnalyticsResponse,
+    CampaignTrend,
     RankedLead,
     RankedLeadsResponse,
     SequenceAnalytics,
     SequenceStepAnalytics,
+)
+from app.schemas.bounce_analytics import (
+    BounceListResponse,
+    BounceSummary,
+    RecipientDomainReport,
+)
+from app.schemas.outreach_trends import OutreachTrends
+from app.schemas.send_failures import (
+    FailingEnrollment,
+    FailingEnrollmentsResponse,
+    QuarantineReleaseResult,
 )
 from app.schemas.suppression import (
     SuppressionEntryCreate,
@@ -75,7 +88,16 @@ from app.schemas.dialtone import (
 )
 from app.schemas.lead_tracking import DialtoneStatus, LeadOrgBreakdown
 from app.dependencies import OrgScope, get_org_scope
-from app.services import lead_metrics, step_delay, suppression, system_settings, warmup
+from app.services import (
+    bounce_analytics,
+    lead_metrics,
+    outreach_trends,
+    send_failures,
+    step_delay,
+    suppression,
+    system_settings,
+    warmup,
+)
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
@@ -1464,7 +1486,44 @@ async def sequence_analytics(sequence_id: uuid.UUID, db: AsyncSession = Depends(
 _CAMPAIGN_SORTS = {
     "reply_rate", "open_rate", "click_rate", "bounce_rate", "conversion_rate",
     "sent", "total_enrollments", "deals_attributed", "ai_composed_rate",
+    # The defensible reply rate rather than the observed one — see
+    # ``_wilson_lower``. The honest default for "which campaign is best".
+    "reply_rate_ci_low",
 }
+
+# Sends below which a campaign's rates are not worth ranking on. A cold reply
+# rate is a few percent, so a campaign needs low-hundreds of sends before one
+# reply moves it less than a whole point; this is well under that and only
+# claims to exclude the campaigns whose rates are pure noise.
+CAMPAIGN_MIN_SENDS = 30
+
+# Reply-rate movement (in absolute rate, so 0.005 = half a percentage point)
+# below which a campaign counts as flat between two periods.
+_TREND_EPSILON = 0.005
+
+
+def _wilson_lower(successes: int, trials: int, z: float = 1.96) -> float:
+    """Lower bound of the 95% Wilson score interval, as a fraction.
+
+    Why this rather than the observed rate: a campaign with 1 reply in 12 sends
+    has an observed reply rate of 8.3%, which beats every mature campaign in the
+    table and is indistinguishable from luck. Ranking on the lower bound asks
+    "what reply rate can this campaign defend?" — 12 sends defend almost
+    nothing, 400 sends at 4% defend nearly 4% — so a campaign reaches the top of
+    the list only once it has earned the position.
+
+    Wilson rather than the textbook normal interval because the normal one is
+    badly behaved exactly where cold outreach lives: small samples and rates near
+    zero, where it happily returns a negative lower bound.
+    """
+    if trials <= 0:
+        return 0.0
+    phat = successes / trials
+    denominator = 1 + z * z / trials
+    centre = phat + z * z / (2 * trials)
+    margin = z * math.sqrt((phat * (1 - phat) + z * z / (4 * trials)) / trials)
+    return round(max(0.0, (centre - margin) / denominator), 4)
+
 
 
 @router.get("/campaigns/analytics", response_model=CampaignAnalyticsResponse)
@@ -1476,6 +1535,16 @@ async def campaign_analytics(
     sort_by: str = Query("reply_rate", description=f"One of {sorted(_CAMPAIGN_SORTS)}"),
     include_empty: bool = Query(
         False, description="Include campaigns that have never sent anything."
+    ),
+    min_sent: int = Query(
+        0, ge=0,
+        description="Drop campaigns below this many sends. They are noise in a "
+                    "ranked table; 0 keeps everything.",
+    ),
+    compare: bool = Query(
+        False,
+        description="Add each campaign's previous equal-length period and the "
+                    "movement between them. Requires `days`.",
     ),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1494,13 +1563,31 @@ async def campaign_analytics(
     provider chain going dark silently converts a personalized campaign into a
     mail-merge campaign with an unchanged name, an unchanged send count, and a
     quietly different reply rate.
+
+    Two things keep the ranking honest. ``reply_rate_ci_low`` is the lower bound
+    of the 95% Wilson interval — the reply rate the campaign can *defend* — and
+    sorting by it stops a campaign with 1 reply in 12 sends from outranking a
+    mature one at 4%; ``sample_sufficient`` says outright when a row's rates are
+    too thin to read. ``compare=true`` adds the previous equal-length period and
+    the movement between them, which is what turns a table of levels into a
+    dashboard: a 3% reply rate means something different on the way up than on
+    the way down, and a lifetime average cannot tell you which it is.
     """
     if sort_by not in _CAMPAIGN_SORTS:
         raise HTTPException(
             status_code=400, detail=f"sort_by must be one of {sorted(_CAMPAIGN_SORTS)}"
         )
+    if compare and not days:
+        # "The period before all time" has no meaning, and silently comparing
+        # against an empty window would report every campaign as newly active.
+        raise HTTPException(
+            status_code=400,
+            detail="compare=true requires days — there is no period before all time",
+        )
 
-    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days) if days else None
+    previous_start = since - timedelta(days=days) if (compare and days and since) else None
 
     sequences = (
         await db.execute(select(OutreachSequence).order_by(OutreachSequence.name))
@@ -1523,6 +1610,28 @@ async def campaign_analytics(
     counts: dict[uuid.UUID, dict[str, int]] = {}
     for sequence_id, event_type, n in (await db.execute(event_query)).all():
         counts.setdefault(sequence_id, {})[event_type] = n
+
+    # --- The same counts for the period immediately before, when comparing ---
+    previous: dict[uuid.UUID, dict[str, int]] = {}
+    if previous_start is not None and since is not None:
+        previous_query = (
+            select(
+                OutreachEnrollment.sequence_id,
+                OutreachEvent.event_type,
+                func.count(OutreachEvent.id),
+            )
+            .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+            # Half-open on the upper bound so an event exactly on the boundary is
+            # counted once, in the current period. Two inclusive windows would
+            # double-count it and the totals would not reconcile.
+            .where(
+                OutreachEvent.occurred_at >= previous_start,
+                OutreachEvent.occurred_at < since,
+            )
+            .group_by(OutreachEnrollment.sequence_id, OutreachEvent.event_type)
+        )
+        for sequence_id, event_type, n in (await db.execute(previous_query)).all():
+            previous.setdefault(sequence_id, {})[event_type] = n
 
     # --- Last send + AI-composition mix, per sequence ---
     # The composition markers live in the send event's metadata (there is no
@@ -1589,10 +1698,50 @@ async def campaign_analytics(
         sent = c.get("sent", 0)
         if not sent and not include_empty:
             continue
+        if sent < min_sent:
+            continue
         by_status = enrollments.get(sequence.id, {})
         total_enrollments = sum(by_status.values())
         composed = ai_composed.get(sequence.id, 0)
         depth_count = depth_n.get(sequence.id, 0)
+
+        trend = None
+        if previous_start is not None and since is not None:
+            p = previous.get(sequence.id, {})
+            p_sent = p.get("sent", 0)
+            p_replied = p.get("replied", 0)
+            p_reply_rate = _rate(p_replied, p_sent)
+            p_bounce_rate = _rate(p.get("bounced", 0), p_sent)
+            reply_delta = round(_rate(c.get("replied", 0), sent) - p_reply_rate, 4)
+
+            # A direction needs both periods to carry enough volume to have a
+            # rate worth differencing. Otherwise this is the classic dashboard
+            # lie: 4 sends last week, 6 this week, "up 50%".
+            if p_sent < CAMPAIGN_MIN_SENDS or sent < CAMPAIGN_MIN_SENDS:
+                direction = "insufficient_data"
+            elif reply_delta > _TREND_EPSILON:
+                direction = "improving"
+            elif reply_delta < -_TREND_EPSILON:
+                direction = "declining"
+            else:
+                direction = "flat"
+
+            trend = CampaignTrend(
+                previous_start=previous_start,
+                previous_end=since,
+                previous_sent=p_sent,
+                previous_replied=p_replied,
+                previous_reply_rate=p_reply_rate,
+                previous_bounce_rate=p_bounce_rate,
+                sent_delta=sent - p_sent,
+                reply_rate_delta=reply_delta,
+                bounce_rate_delta=round(
+                    _rate(c.get("bounced", 0), sent) - p_bounce_rate, 4
+                ),
+                direction=direction,
+                newly_active=p_sent == 0 and sent > 0,
+            )
+
         campaigns.append(CampaignAnalytics(
             sequence_id=sequence.id,
             name=sequence.name,
@@ -1621,6 +1770,9 @@ async def campaign_analytics(
                 round(depth_sum.get(sequence.id, 0) / depth_count, 2) if depth_count else 0.0
             ),
             last_send_at=last_send.get(sequence.id),
+            reply_rate_ci_low=_wilson_lower(c.get("replied", 0), sent),
+            sample_sufficient=sent >= CAMPAIGN_MIN_SENDS,
+            trend=trend,
         ))
 
     campaigns.sort(key=lambda c: getattr(c, sort_by, 0), reverse=True)
@@ -1666,11 +1818,26 @@ async def campaign_analytics(
             ai_composed_rate=_rate(t_ai, t_sent),
             avg_personalization_depth=round(weighted / t_sent, 2) if t_sent else 0.0,
             last_send_at=max((c.last_send_at for c in campaigns if c.last_send_at), default=None),
+            reply_rate_ci_low=_wilson_lower(t_replied, t_sent),
+            sample_sufficient=t_sent >= CAMPAIGN_MIN_SENDS,
         )
 
-    return CampaignAnalyticsResponse(
-        timeframe_days=days, campaigns=campaigns, totals=totals
+    # Named movers, filtered for sample size by ``direction`` already — a
+    # dashboard's job is to say which two campaigns changed, not to hand back
+    # thirty rows and a scroll bar. Biggest move first.
+    movers = sorted(
+        (c for c in campaigns if c.trend is not None),
+        key=lambda c: abs(c.trend.reply_rate_delta),
+        reverse=True,
     )
+    return CampaignAnalyticsResponse(
+        timeframe_days=days,
+        campaigns=campaigns,
+        totals=totals,
+        improving=[c.name for c in movers if c.trend.direction == "improving"],
+        declining=[c.name for c in movers if c.trend.direction == "declining"],
+    )
+
 
 
 # ─── Engagement-ranked leads ─────────────────────────────────────────────────
@@ -1706,4 +1873,295 @@ async def ranked_leads(
         leads=[RankedLead(**row) for row in ranked],
         tier_counts=engagement_scoring.summarize(ranked),
         total_ranked=len(ranked),
+    )
+
+
+# ─── Send failures ───────────────────────────────────────────────────────────
+
+
+@router.get("/failures", response_model=FailingEnrollmentsResponse)
+async def failing_enrollments(
+    limit: int = Query(100, ge=1, le=500),
+    quarantined_only: bool = Query(
+        False, description="Only enrollments that were paused after repeated failures."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Enrollments whose sends are throwing, worst first.
+
+    This exists because a failing enrollment used to be indistinguishable from a
+    healthy one. A hard failure left it ``active`` with a due date in the past,
+    so the queue re-dispatched the same doomed send every five minutes and every
+    dashboard counted it as live outreach — the only symptom being a contact who
+    quietly stopped receiving mail.
+
+    ``quarantined`` rows have stopped and need a human. The rest are still
+    retrying on an exponential backoff and may well recover on their own; they
+    are here so a fault that is about to become a quarantine can be seen
+    beforehand.
+    """
+    conditions = [OutreachEnrollment.consecutive_failures > 0]
+    if quarantined_only:
+        conditions.append(OutreachEnrollment.pause_reason == send_failures.QUARANTINE_REASON)
+
+    rows = (
+        await db.execute(
+            select(OutreachEnrollment, Contact, Company, OutreachSequence)
+            .outerjoin(Contact, OutreachEnrollment.contact_id == Contact.id)
+            .outerjoin(Company, Contact.company_id == Company.id)
+            .outerjoin(
+                OutreachSequence, OutreachEnrollment.sequence_id == OutreachSequence.id
+            )
+            .where(*conditions)
+            # Worst first: most failures, then most recent. A row that has failed
+            # nine times is a different problem from one that has failed once,
+            # and ordering by time alone would bury it under fresher noise.
+            .order_by(
+                OutreachEnrollment.consecutive_failures.desc(),
+                OutreachEnrollment.last_error_at.desc(),
+            )
+            .limit(limit)
+        )
+    ).all()
+
+    items: list[FailingEnrollment] = []
+    for enrollment, contact, company, sequence in rows:
+        quarantined = enrollment.pause_reason == send_failures.QUARANTINE_REASON
+        name = None
+        if contact is not None:
+            name = " ".join(
+                p for p in (contact.first_name, contact.last_name) if p
+            ).strip() or None
+        items.append(FailingEnrollment(
+            enrollment_id=enrollment.id,
+            contact_id=enrollment.contact_id,
+            contact_email=contact.email if contact is not None else None,
+            contact_name=name,
+            company_name=company.name if company is not None else None,
+            sequence_id=enrollment.sequence_id,
+            sequence_name=sequence.name if sequence is not None else None,
+            step_number=enrollment.current_step,
+            status=enrollment.status,
+            quarantined=quarantined,
+            consecutive_failures=enrollment.consecutive_failures or 0,
+            last_error=enrollment.last_error,
+            last_error_at=enrollment.last_error_at,
+            next_send_at=enrollment.next_send_at,
+        ))
+
+    # Totals come from the table, not from ``items`` — the list is capped by
+    # ``limit`` and a count that shrank as you paged would be worse than none.
+    total = (
+        await db.execute(
+            select(func.count(OutreachEnrollment.id))
+            .where(OutreachEnrollment.consecutive_failures > 0)
+        )
+    ).scalar() or 0
+    quarantined_total = (
+        await db.execute(
+            select(func.count(OutreachEnrollment.id)).where(
+                OutreachEnrollment.pause_reason == send_failures.QUARANTINE_REASON
+            )
+        )
+    ).scalar() or 0
+
+    # Grouped on the first line of the error: one fault usually explains most of
+    # the list, and the tail of a traceback is where the ids and addresses live,
+    # which would split one fault into N unique strings.
+    error_rows = (
+        await db.execute(
+            select(OutreachEnrollment.last_error)
+            .where(
+                OutreachEnrollment.consecutive_failures > 0,
+                OutreachEnrollment.last_error.isnot(None),
+            )
+        )
+    ).scalars().all()
+    tally = Counter(
+        (e or "").strip().splitlines()[0][:120]
+        for e in error_rows if (e or "").strip()
+    )
+
+    return FailingEnrollmentsResponse(
+        total=total,
+        quarantined=quarantined_total,
+        retrying=max(0, total - quarantined_total),
+        top_errors=[{"error": e, "count": n} for e, n in tally.most_common(5)],
+        enrollments=items,
+    )
+
+
+@router.post(
+    "/failures/{enrollment_id}/release", response_model=QuarantineReleaseResult
+)
+async def release_quarantine(
+    enrollment_id: uuid.UUID,
+    resume: bool = Query(
+        True,
+        description="Put the enrollment back to active and due now. False clears "
+                    "the failure count but leaves it paused.",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Release an enrollment quarantined after repeated send failures.
+
+    For a human who has dealt with the cause. Nothing releases a quarantine
+    automatically and that is deliberate: the OOO sweep and the kill switch both
+    resume only what they themselves paused, and a fault that paused a send does
+    not fix itself on a timer.
+
+    Refuses enrollments paused for any other reason — a dead domain, a consent
+    block, an operator's decision are not this endpoint's to undo.
+    """
+    enrollment = (
+        await db.execute(
+            select(OutreachEnrollment).where(OutreachEnrollment.id == enrollment_id)
+        )
+    ).scalar_one_or_none()
+    if enrollment is None:
+        raise HTTPException(status_code=404, detail="Enrollment not found")
+
+    result = send_failures.clear_quarantine(enrollment, resume=resume)
+    await db.commit()
+    return QuarantineReleaseResult(**result)
+
+
+# ─── Performance over time ───────────────────────────────────────────────────
+
+
+@router.get("/analytics/trends", response_model=OutreachTrends)
+async def outreach_trend_analytics(
+    days: int = Query(90, ge=7, le=365),
+    interval: str = Query("week", pattern="^(day|week|month)$"),
+    sequence_id: Optional[uuid.UUID] = Query(
+        None, description="Scope to a single sequence. Omit for all outreach."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Outreach performance bucketed over time, oldest period first.
+
+    Every other analytics surface here answers "what is our reply rate". This
+    answers "is it getting better", which is the question the others structurally
+    cannot: a sequence sending since March with a 2.1% lifetime reply rate might
+    be at 4% this month and 1% last, and the lifetime number is the same either
+    way. Every change made to outreach — a new tone, AI composition, a different
+    cadence, warm-up finishing — was being judged against an average that mixes
+    the weeks before it into the weeks after.
+
+    Two honesty notes about the numbers:
+
+    * The newest bucket is nearly always **partial** (two days into a week), and
+      says so. Its rates are comparable with a full period; its counts are not.
+    * ``direction`` compares the second half of the *complete* buckets against
+      the first, pooled rather than averaged, and returns ``insufficient_data``
+      rather than a number when there is too little to say. Two endpoints on a
+      noisy series is not a trend.
+
+    Scope is the sequence engine (``outreach_events``). Manual and template
+    sends live in ``email_sends`` and are excluded on purpose — real mail, but
+    not cold outreach, and folding replies to conversations we were already
+    having into a cold reply rate would flatter it.
+    """
+    result = await outreach_trends.timeline(
+        db, days=days, interval=interval, sequence_id=sequence_id
+    )
+    return OutreachTrends(**result)
+
+
+# ─── Bounce forensics + per-domain deliverability ────────────────────────────
+
+
+@router.get("/bounces/summary", response_model=BounceSummary)
+async def bounce_summary(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """What bounced in the window: how much, of what kind, and from where.
+
+    Bounce data existed only as a rate computed on the way to a decision —
+    ``danger_monitor`` derives one to decide whether to pull the kill switch, the
+    funnel reports one per campaign — and a rate is the wrong shape for the
+    question you actually have when it moves. ``bounce_records`` had every DSN
+    already classified and attributed since the ingestion sweep needed a dedup
+    key; nothing had ever read it back.
+
+    Two fields are worth reading together. ``distinct_addresses`` counts
+    addresses rather than notifications, because a mailbox that soft-bounces
+    daily for a week is one bad address and not seven. ``auto_suppressed`` counts
+    what those bounces took out of rotation — it should track the hard-bounce
+    address count, and a large shortfall means addresses are bouncing without
+    being suppressed, which is how one dead address becomes a reputation problem.
+
+    ``by_sender`` separates the two failure modes that look identical in an
+    aggregate: bounces concentrated on one mailbox are a sender problem (a cold
+    inbox, a broken SPF record), bounces spread evenly across the fleet are a
+    list problem.
+    """
+    return BounceSummary(**await bounce_analytics.summary(db, days=days))
+
+
+@router.get("/deliverability/domains", response_model=RecipientDomainReport)
+async def deliverability_by_domain(
+    days: int = Query(30, ge=1, le=365),
+    min_sends: int = Query(
+        bounce_analytics.DEFAULT_MIN_SENDS, ge=1, le=10_000,
+        description="Sends a domain needs before its rates get a risk verdict.",
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deliverability split by the domain we were mailing *into*.
+
+    This is the blind spot in every other deliverability surface here, all of
+    which measure the **sending** side — sender health, warm-up, SPF/DKIM/DMARC,
+    per-mailbox bounce rates. None of them measure the receiving side, and that
+    is where blocks actually happen: inbox providers do not block a sender
+    globally, they block per receiving domain, and quietly. Outlook starts
+    550-ing while Gmail keeps accepting, and the blended rate drifts from 1.2% to
+    2.8% — under every alarm threshold in the system, because the domain
+    rejecting *everything* is diluted by the domains that are fine. By the time a
+    blended rate breaches, the block is weeks old.
+
+    ``risk`` is only a verdict where there is volume to support one: below
+    ``min_sends`` a domain reports ``insufficient_data`` rather than a rate that
+    happens to be 50% because two sends bounced. The thresholds are tighter than
+    the global kill switch's on purpose — one domain at 5% is a much stronger
+    signal than a blended 5%, which has healthy domains holding it down.
+
+    Sort order is risk first, then volume, so the top of the list is the domain
+    costing the most reputation rather than the one with the loudest ratio.
+    """
+    return RecipientDomainReport(
+        **await bounce_analytics.by_recipient_domain(
+            db, days=days, min_sends=min_sends, limit=limit
+        )
+    )
+
+
+@router.get("/bounces", response_model=BounceListResponse)
+async def list_bounces(
+    days: int = Query(30, ge=1, le=365),
+    kind: Optional[str] = Query(None, pattern="^(hard|soft)$"),
+    domain: Optional[str] = Query(
+        None, description="Exact receiving domain, e.g. 'acme.com'."
+    ),
+    q: Optional[str] = Query(None, description="Substring match on the address."),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """The bounce ledger itself, newest first, with contact and sender resolved.
+
+    The column to look at is ``suppressed``. A **hard** bounce that reads
+    ``false`` is a live fault: the address is permanently dead and every send
+    path can still pick it up, so the next sequence will mail it again and earn
+    another hard bounce against our own reputation.
+
+    ``domain`` matches the receiving domain exactly (suffix on ``@``), not as a
+    substring — ``acme.com`` must not also return ``notacme.com``.
+    """
+    return BounceListResponse(
+        **await bounce_analytics.recent(
+            db, days=days, kind=kind, domain=domain, q=q, limit=limit, offset=offset
+        )
     )

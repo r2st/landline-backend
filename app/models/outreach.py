@@ -11,6 +11,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     desc,
     func,
 )
@@ -77,6 +78,24 @@ class OutreachEnrollment(Base, OrgScopedMixin):
     # un-paused by a sweep looking for due dates. NULL = paused for one of those
     # reasons; leave it alone.
     pause_reason: Mapped[str | None] = mapped_column(String(30))
+
+    # --- Send failure tracking (``services.send_failures``) ---
+    #
+    # Consecutive failed send *incidents*, not attempts: Celery retries one send
+    # three times, and that is one failure here. Reset by any send that actually
+    # goes out, so a non-zero value always means "currently failing", never
+    # "failed once last March".
+    #
+    # A hard failure used to leave the enrollment untouched — ``active``, with a
+    # due date in the past — so the queue sweep re-dispatched it every five
+    # minutes forever. This counter is what makes repeated failure back off, and
+    # eventually pause with ``pause_reason='send_failures'`` so a human can find
+    # it. ``last_error`` is for that human; nothing parses it.
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_error_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
     # AI-Optimized Sequence Engine (feature 1.2): per-enrollment record of the
     # optimizer's decisions and reasoning. Each entry is one decision dict
