@@ -294,6 +294,80 @@ async def test_approve_followup_without_contact_skips_send(db_session, sample_co
     assert action.status == "executed"
 
 
+@pytest.mark.asyncio
+async def test_a_declined_followup_stays_approved_for_the_next_sweep(
+    db_session, sample_company, sample_contact, monkeypatch
+):
+    """``executed`` was written whatever the dispatcher said.
+
+    So a follow-up held by a spent daily cap was retired as though it had gone
+    out, and the hourly sweep — whose entire job is to send ``approved``
+    follow-ups — never looked at it again. The action dropped is exactly the one
+    a busy day produces. A decline that will clear has to leave the action
+    where the sweep can find it.
+    """
+    from app.services import email_dispatch
+
+    deal = await _make_deal(db_session, sample_company.id)
+    action = DealAction(
+        deal_id=deal.id, action_type="auto_followup", status="approved",
+        email_subject="hi", email_body="body",
+    )
+    db_session.add(action)
+    await db_session.flush()
+
+    async def _capped(db, **kwargs):
+        return {"status": "skipped", "reason": "Daily limit reached (50/50)."}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", _capped)
+
+    result = await agent.execute_action(db_session, action)
+
+    assert result["status"] == "skipped"
+    assert action.status == "approved", "the sweep has to be able to retry it"
+    assert action.executed_at is None
+    timeline = (
+        await db_session.execute(
+            select(DealActivity).where(DealActivity.deal_id == deal.id)
+        )
+    ).scalars().all()
+    assert timeline == [], "no 'sent a follow-up' entry for mail that never went"
+
+
+@pytest.mark.asyncio
+async def test_a_suppressed_followup_is_expired_rather_than_retried_forever(
+    db_session, sample_company, sample_contact, monkeypatch
+):
+    """The one decline that never clears. Retrying it hourly is a queue that can't drain."""
+    from app.services import email_dispatch
+
+    deal = await _make_deal(db_session, sample_company.id)
+    action = DealAction(
+        deal_id=deal.id, action_type="auto_followup", status="approved",
+        email_subject="hi", email_body="body",
+    )
+    db_session.add(action)
+    await db_session.flush()
+
+    async def _suppressed(db, **kwargs):
+        return {"status": "suppressed", "reason": "on the do-not-contact list"}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", _suppressed)
+
+    await agent.execute_action(db_session, action)
+
+    assert action.status == "expired"
+    kinds = [
+        a.activity_type
+        for a in (
+            await db_session.execute(
+                select(DealActivity).where(DealActivity.deal_id == deal.id)
+            )
+        ).scalars().all()
+    ]
+    assert kinds == ["followup_skipped"]
+
+
 # --- execute_pending_actions task ---------------------------------------------
 
 @pytest.mark.asyncio

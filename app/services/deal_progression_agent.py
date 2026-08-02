@@ -678,13 +678,54 @@ async def execute_action(db: AsyncSession, action: DealAction) -> dict:
             body_text=action.email_body,
         )
         result.update(send_result)
-        # Record the outreach on the deal timeline regardless of transport result.
+        status = send_result.get("status")
+
+        if status != "sent":
+            # ``executed`` was written here unconditionally, so a follow-up the
+            # dispatcher *declined* was retired as though it had gone out — and
+            # the hourly sweep, whose whole job is to send `approved`
+            # follow-ups, never looked at it again. That was survivable while
+            # a decline meant a warm-up hold; it stopped being survivable when
+            # the daily cap started declining routinely, because the actions
+            # dropped are exactly the ones a busy day produces.
+            #
+            # ``suppressed`` is the one decline that will never clear: the
+            # recipient asked not to be contacted, so retrying it hourly is a
+            # queue that cannot drain and a gate re-answering the same question
+            # forever. That is what ``expired`` is for. Everything else — a
+            # spent cap, a warm-up hold, an engaged kill switch, a transport
+            # error — is a *later* yes, so the action stays `approved` and the
+            # next sweep picks it up once there is allowance to send it with.
+            terminal = status == "suppressed"
+            if terminal:
+                action.status = "expired"
+                db.add(
+                    DealActivity(
+                        deal_id=deal.id,
+                        activity_type="followup_skipped",
+                        description=(
+                            "Deal Progression Agent dropped a follow-up to "
+                            f"{contact.email}: on the do-not-contact list"
+                        ),
+                        new_value=status,
+                    )
+                )
+            logger.info(
+                "Deal follow-up to %s not sent (%s): %s",
+                contact.email, status, send_result.get("reason") or send_result.get("detail"),
+            )
+            await db.flush()
+            return result
+
+        # Only a real send goes on the deal timeline. Writing one per attempt
+        # would put an hourly "sent a follow-up" entry under a deal nobody has
+        # emailed, for as long as the cap holds.
         db.add(
             DealActivity(
                 deal_id=deal.id,
                 activity_type="followup_sent",
                 description=f"Deal Progression Agent sent a follow-up to {contact.email}",
-                new_value=send_result.get("status"),
+                new_value=status,
             )
         )
         action.status = "executed"
