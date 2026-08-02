@@ -457,6 +457,35 @@ def send_sequence_step(self, enrollment_id: str):
                     return {"status": "skipped", "reason": "invalid_recipient_domain",
                             "contact_email": contact.email}
 
+                # The gate above proves the domain *can* receive mail. This one
+                # asks whether it has ever received ours: several distinct
+                # addresses there hard-bounced and nothing at the domain has
+                # ever opened, clicked or replied. A folded company keeps paying
+                # for DNS and a host that has decided to 550 us still answers,
+                # so both look healthy to an MX lookup — the evidence is our own
+                # bounce history, not the resolver.
+                #
+                # ``bounce_handler`` normally suppresses these contacts the
+                # moment the domain crosses the line, which is why this is a
+                # backstop rather than the mechanism: it catches the contact
+                # discovered *after* the write-off, whose address has no
+                # suppression entry because it did not exist yet.
+                if is_email_step:
+                    from app.services import domain_reputation
+
+                    _dead, _dead_reason = await domain_reputation.is_domain_dead(
+                        db, domain_reputation.domain_of(contact.email)
+                    )
+                    if _dead:
+                        enrollment.status = "paused"
+                        await db.commit()
+                        logger.warning(
+                            "Enrollment %s paused: %s", enrollment_id, _dead_reason
+                        )
+                        return {"status": "skipped", "reason": "dead_recipient_domain",
+                                "detail": _dead_reason,
+                                "contact_email": contact.email}
+
                 # Load company for consent check
                 result = await db.execute(
                     select(Company).where(Company.id == contact.company_id)

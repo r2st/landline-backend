@@ -665,6 +665,12 @@ class Settings(BaseSettings):
     # Bounce handling: after this many soft bounces a contact is suppressed
     # (treated like a hard bounce). A single hard bounce suppresses immediately.
     soft_bounce_suppress_threshold: int = 3
+    # Write off a whole recipient domain once this many *distinct* addresses
+    # there have hard-bounced and nothing at the domain has ever engaged. The
+    # per-address gates cannot see that the same wrong address convention is
+    # failing for everybody at one company. Below 1 disables the rule.
+    # See ``app.services.domain_reputation``.
+    dead_domain_bounce_threshold: int = 3
     # DKIM has no directory record; we probe these common selectors at
     # <selector>._domainkey.<domain> when no explicit selector is supplied.
     dkim_default_selectors: List[str] = ["google", "default", "selector1", "selector2", "k1"]

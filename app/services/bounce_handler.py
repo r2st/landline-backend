@@ -175,6 +175,76 @@ async def _suppress_contact(db: AsyncSession, contact: Contact) -> int:
     return paused
 
 
+async def suppress_dead_domain(db: AsyncSession, domain: str) -> dict:
+    """Take every remaining mailable contact at ``domain`` out of play.
+
+    Called only once :func:`app.services.domain_reputation.is_domain_dead` says
+    the domain is written off — see that module for the three clauses and why
+    each is there. Here we only *act*, using exactly the machinery a single
+    address bounce uses: the contact flags, the enrollment stop with its funnel
+    event, and an address-level suppression entry so a re-import of the same
+    mailbox is caught after the contact row is gone.
+
+    Suppressing eagerly is the point. The send-time gate alone would leave the
+    colleagues enrolled and due, so every one of them would still be picked up,
+    still cost a query, and still sit in the queue looking like live outreach.
+    ``reason="bounce"`` is honest and needs no schema change: these addresses are
+    suppressed because their domain hard-bounced, and the suppression list is
+    where an operator goes to find out why an address stopped being mailed.
+    """
+    from app.services import domain_reputation
+
+    contacts = await domain_reputation.contacts_at_domain(db, domain)
+    suppressed = 0
+    enrollments_paused = 0
+    listed = 0
+    for contact in contacts:
+        suppressed += 1
+        enrollments_paused += await _suppress_contact(db, contact)
+        if await _suppress_address(db, contact.email, "hard"):
+            listed += 1
+    await db.flush()
+    if suppressed:
+        logger.warning(
+            "Domain %s written off: suppressed %d further contact(s), "
+            "paused %d enrollment(s)",
+            domain, suppressed, enrollments_paused,
+        )
+    return {
+        "domain": domain,
+        "contacts_suppressed": suppressed,
+        "enrollments_paused": enrollments_paused,
+        "list_entries_added": listed,
+    }
+
+
+async def _maybe_write_off_domain(
+    db: AsyncSession, email: str, bounce_kind: str
+) -> Optional[dict]:
+    """Write off ``email``'s domain if this bounce was the one that proved it dead.
+
+    Returns the suppression summary, or ``None`` when the domain still stands —
+    which is the overwhelmingly common answer, so the cheap clauses in
+    :func:`app.services.domain_reputation.is_domain_dead` (soft bounce, mailbox
+    provider, threshold not met) run before anything expensive.
+    """
+    if bounce_kind != "hard":
+        return None
+
+    from app.services import domain_reputation
+
+    domain = domain_reputation.domain_of(email)
+    if not domain:
+        return None
+
+    dead, reason = await domain_reputation.is_domain_dead(db, domain)
+    if not dead:
+        return None
+
+    logger.warning("Recipient domain written off — %s", reason)
+    return await suppress_dead_domain(db, domain)
+
+
 async def record_bounce(
     db: AsyncSession,
     email: str,
@@ -206,9 +276,16 @@ async def record_bounce(
             "Bounce for %s matched no contact (kind=%s, listed=%s)",
             email, bounce_kind, listed,
         )
+        # The domain still gets checked. "No contact row for the address that
+        # bounced" says nothing about the colleagues we *do* hold rows for, and
+        # a re-import that replaced the contact is precisely how an address ends
+        # up here — a case where the domain evidence is the only thing left.
         return {"email": email, "kind": bounce_kind, "matched_contacts": 0,
                 "suppressed": 0, "enrollments_paused": 0,
-                "list_entry_added": listed}
+                "list_entry_added": listed,
+                "domain_written_off": await _maybe_write_off_domain(
+                    db, email, bounce_kind
+                )}
 
     suppressed = 0
     enrollments_paused = 0
@@ -239,6 +316,12 @@ async def record_bounce(
         list_entry_added = await _suppress_address(db, email, bounce_kind)
 
     await db.flush()
+
+    # Did this bounce just prove the whole *domain* is unreachable? Checked
+    # after the flush so the stamp this call wrote is visible to the count.
+    # Only on a hard bounce: a soft one is transient by definition and is the
+    # wrong evidence to write off a company on, however many of them arrive.
+    domain_result = await _maybe_write_off_domain(db, email, bounce_kind)
     logger.info(
         "Recorded %s bounce for %s — %d contact(s), suppressed=%d, "
         "enrollments_paused=%d, listed=%s",
@@ -252,4 +335,5 @@ async def record_bounce(
         "suppressed": suppressed,
         "enrollments_paused": enrollments_paused,
         "list_entry_added": list_entry_added,
+        "domain_written_off": domain_result,
     }

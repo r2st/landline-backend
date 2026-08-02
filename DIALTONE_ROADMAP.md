@@ -175,7 +175,36 @@ before code helps:
 | **P1-4** complaint rate as a *real* number | Shipped as ingestion (096) + Postmaster (093). Whether it reports anything depends on the FBL/Postmaster verification being done on the sending domain. |
 | **Committed production secrets** in git history | Rotation, by a human with the credentials. Flagged repeatedly and still unrotated. |
 
-**Added since, and not on this roadmap:** the outreach queue was unordered
+**Added 2026-08-02 — two gaps this roadmap never had a section for, both the
+same shape: a gate keyed on one email address, blind to the set the address
+belongs to.**
+
+*Account-level burst control* (`SendLimiter.can_send_to_company`,
+`min_hours_between_company_sends`). `info@acme.com`, `sales@acme.com`,
+`jane@` and `bob@` are four addresses and one buyer, so every one of them
+passed the per-contact caps while the recipient's mail server saw an unknown
+sender hit four mailboxes at once. Reachable, not theoretical: `signal_enrollment`
+enrolled *every* un-enrolled emailable contact at a company on one signal and
+dispatched each immediately — hitting hardest on the accounts a buying signal
+says are most worth winning. Two guards: the send-chokepoint gate (defers by the
+real remaining gap, so a 23-hour wait costs one wake-up), and a fan-out cap at
+enrolment that ranks primary-then-named-person over shared inbox rather than
+parking colleagues in a queue that drains one a day for a week.
+
+*Dead recipient domains* (`services/domain_reputation.py`,
+`dead_domain_bounce_threshold`). `bounce_analytics.by_recipient_domain` already
+computed "which domain is refusing us" and rendered it on a dashboard; nothing
+read it before sending. Meanwhile `email_pattern_generator` *derives* addresses
+when Apollo and Hunter are out of credits, and a wrong address convention is
+wrong for everybody at the company — so we walked the list one guaranteed hard
+bounce at a time, each charged against the **global** rate the kill switch reads
+at 5%. A domain is written off only on three clauses together: hard bounces at
+≥3 *distinct* addresses, no open/click/reply from anywhere at the domain across
+both send tables, and not a mailbox provider. `bounce_handler` suppresses the
+remaining colleagues the moment the domain crosses the line; the send path keeps
+a backstop for contacts discovered afterwards.
+
+**Added earlier, and not on this roadmap:** the outreach queue was unordered
 (`services/queue_priority.py`). It selected every active enrollment with no
 `ORDER BY` and then spent a finite daily cap walking that list, so a sequential
 scan's stable row order decided who got sent — the same enrollments losing every
