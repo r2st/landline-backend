@@ -1223,9 +1223,26 @@ def process_outreach_queue():
                 .where(OutreachEnrollment.status == "active")
             )
             enrollments = list(result.scalars().all())
+
+            # Capacity is finite and this sweep spends it in list order: the
+            # daily quota latches off partway through, per-contact limits ration
+            # the rest. Unordered, that spends it on whoever the planner happened
+            # to return first — and a sequential scan returns the *same* rows
+            # first tomorrow, so anything past the cap line is starved rather
+            # than delayed. Rank decides only who reaches the gates below first;
+            # every gate still runs, on every enrollment.
+            from app.services import queue_priority
+
+            now = datetime.now(timezone.utc)
+            enrollments = await queue_priority.rank(db, enrollments, now=now)
+
             dispatched = 0
             skipped_window = 0
             scheduled_smart = 0
+            # Enrollments that were due and lost the day to a spent quota. The
+            # count is the demand signal behind the ranking — "30 sent, 84 asked"
+            # is what says the cap is the constraint.
+            skipped_quota = 0
 
             # Anti-spam: don't send outside business hours / on weekends. Cold
             # mail that lands at 3 AM reads as a bot and tanks reply rates. The
@@ -1267,7 +1284,6 @@ def process_outreach_queue():
                     (seq_id, num): channel for seq_id, num, channel in channel_rows
                 }
 
-            now = datetime.now(timezone.utc)
             # Latched once the org's daily email quota is found spent, so the
             # remaining email enrollments are skipped without re-asking.
             email_quota_spent: Optional[str] = None
@@ -1358,6 +1374,7 @@ def process_outreach_queue():
                                 "dispatch this sweep", reason,
                             )
                     if email_quota_spent is not None:
+                        skipped_quota += 1
                         continue
 
                 # Load contact to check per-contact limits + timezone window
@@ -1439,6 +1456,7 @@ def process_outreach_queue():
                 "dispatched": dispatched,
                 "skipped_outside_window": skipped_window,
                 "held_for_optimal_window": scheduled_smart,
+                "skipped_daily_quota": skipped_quota,
             }
 
         return await for_each_org(_body, label="process_outreach_queue")
