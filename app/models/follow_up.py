@@ -10,7 +10,7 @@ cold" (surfaced separately via the stale-contacts query).
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, func
+from sqlalchemy import CheckConstraint, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,6 +42,25 @@ class FollowUp(Base, OrgScopedMixin):
     company_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("companies.id", ondelete="CASCADE"), nullable=True
     )
+    # --- Link back to the sequence step that asked for this touch ---
+    #
+    # Set only for the reminders a non-email sequence step files ("call them",
+    # "send the InMail"); NULL for every hand-made follow-up, which is most of
+    # them. When set, this task is the cadence: the enrollment holds at
+    # ``step_number`` until the task reaches a terminal state, so marking it done
+    # spaces the next email from when the call actually happened rather than from
+    # when the reminder was filed. See ``app.services.manual_touch``.
+    enrollment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("outreach_enrollments.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    step_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The step's channel — "call" / "linkedin" / "video" / "direct_mail". Stored
+    # rather than read through the step because it is what the task list needs to
+    # show, and it must survive the step being edited under a task already filed.
+    channel: Mapped[str | None] = mapped_column(String(20), nullable=True)
     due_date: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")

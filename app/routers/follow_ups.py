@@ -73,6 +73,9 @@ async def _serialize(db: AsyncSession, fu: FollowUp, now: datetime) -> FollowUpR
         contact_name=contact_name,
         company_name=company_name,
         is_overdue=is_overdue,
+        enrollment_id=fu.enrollment_id,
+        step_number=fu.step_number,
+        channel=fu.channel,
     )
 
 
@@ -279,6 +282,24 @@ async def update_follow_up(
         follow_up.completed_at = None
 
     await db.flush()
+
+    # A task filed by a non-email sequence step IS the cadence — the enrollment
+    # is holding on it. Advancing here rather than waiting for the hold to expire
+    # is what makes the next email follow the call by the interval the sequence
+    # asked for, instead of by however much of the deadline was left.
+    #
+    # Only on a fresh terminal transition: a PATCH that edits the notes of an
+    # already-completed task must not advance the cadence a second time.
+    if new_status in ("completed", "dismissed"):
+        from app.services import manual_touch
+
+        advanced = await manual_touch.complete_task(db, follow_up)
+        if advanced is not None:
+            logger.info(
+                "Follow-up %s advanced enrollment %s to step %s",
+                follow_up_id, advanced["enrollment_id"], advanced["next_step"],
+            )
+
     await db.refresh(follow_up)
     logger.info("Updated follow-up %s (status=%s)", follow_up_id, follow_up.status)
     return await _serialize(db, follow_up, datetime.now(timezone.utc))

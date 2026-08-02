@@ -1385,6 +1385,12 @@ async def sequence_analytics(sequence_id: uuid.UUID, db: AsyncSession = Depends(
         clicked = c.get("clicked", 0)
         replied = c.get("replied", 0)
         bounced = c.get("bounced", 0)
+        # Manual (non-email) touches. A call step sends nothing, so without these
+        # it reports as a row of zeroes and reads as a dead step rather than as
+        # one whose work is being done — or not done — by a human.
+        tasks_created = c.get("task_created", 0)
+        tasks_completed = c.get("task_completed", 0)
+        tasks_expired = c.get("task_expired", 0)
         sdef = step_defs.get(sn)
         label = None
         if sdef is not None and sdef.subject_template:
@@ -1406,6 +1412,15 @@ async def sequence_analytics(sequence_id: uuid.UUID, db: AsyncSession = Depends(
             click_rate=_rate(clicked, sent),
             reply_rate=_rate(replied, sent),
             bounce_rate=_rate(bounced, sent),
+            tasks_created=tasks_created,
+            tasks_completed=tasks_completed,
+            tasks_expired=tasks_expired,
+            # Denominator is resolved tasks, not filed ones: a task filed an hour
+            # ago and still open is not a failure to work it, and counting it as
+            # one would make the rate a function of how recently the step ran.
+            task_completion_rate=_rate(
+                tasks_completed, tasks_completed + tasks_expired
+            ),
         ))
 
     # Enrollment outcomes, grouped by status in one pass.

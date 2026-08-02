@@ -142,6 +142,13 @@ class SequenceStep(Base, OrgScopedMixin):
     delay_jitter_minutes: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # How long a non-email step waits for the human before the cadence gives up
+    # on the touch and moves on. NULL = the org default
+    # (``settings.manual_step_timeout_hours``). Per-step because the right
+    # deadline is a property of the touch: a call queue worked over a few days
+    # and a same-afternoon "ring them now" nudge are both legitimate, and one
+    # global number cannot be both. Ignored for email steps.
+    task_timeout_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
     subject_template: Mapped[str] = mapped_column(Text, nullable=False)
     body_template: Mapped[str] = mapped_column(Text, nullable=False)
     # Channel for this step — enables multi-channel cadence orchestration.

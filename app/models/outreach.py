@@ -132,7 +132,14 @@ class OutreachEvent(Base, OrgScopedMixin):
     __tablename__ = "outreach_events"
     __table_args__ = (
         CheckConstraint(
-            "event_type IN ('sent','delivered','opened','clicked','replied','bounced','unsubscribed')",
+            # The three ``task_*`` types record a manual (non-email) touch: the
+            # reminder was filed, a human did it, or nobody did it before the
+            # hold expired. Kept out of ``sent`` on purpose — a filed reminder is
+            # not a delivered message, and folding it in would put touches nobody
+            # made into the denominator of every reply rate and into the bounce
+            # rail's send count. See ``app.services.manual_touch``.
+            "event_type IN ('sent','delivered','opened','clicked','replied',"
+            "'bounced','unsubscribed','task_created','task_completed','task_expired')",
             name="ck_event_type",
         ),
         # The unified inbox reads sequence sends from here (this path records no

@@ -323,6 +323,26 @@ class Settings(BaseSettings):
     # stay tracked. Set True to restore uniform tracking across every step.
     track_first_step: bool = False
 
+    # --- Manual (non-email) sequence steps ---
+    # A "call" / "linkedin" / "video" / "direct_mail" step is a human touch. The
+    # cadence holds at that step until the person marks the task done, so the
+    # next email is spaced from when the call *happened* rather than from when
+    # the reminder was filed.
+    #
+    # Holding needs a deadline or a forgotten task strands the enrollment
+    # forever, which is a worse failure than a skipped touch: the contact goes
+    # silent mid-sequence and nothing reports it. After this long the step
+    # expires — the cadence resumes and the touch is recorded as *not made*,
+    # which is the honest thing for the funnel to count.
+    #
+    # 72h rather than 24: a rep who queues Friday's calls should not lose them to
+    # a weekend, and ``SequenceStep.task_timeout_hours`` overrides it per step
+    # for the cadences where a same-day call is the whole point.
+    manual_step_timeout_hours: int = 72
+    # Set False to restore the old behaviour: file the task and advance
+    # immediately, regardless of whether anyone ever does it.
+    manual_step_blocks_cadence: bool = True
+
     # --- CAN-SPAM sender identity ---
     # Legal sender name + a FULL physical postal address are required on every
     # commercial email (CAN-SPAM / CASL). ``company_postal_address`` must be a

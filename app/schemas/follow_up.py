@@ -41,6 +41,15 @@ class FollowUpRead(BaseModel):
     company_name: Optional[str] = None
     is_overdue: bool = False
 
+    # Set when this task was filed by a non-email sequence step. The enrollment
+    # is holding on it: marking it done advances the cadence and spaces the next
+    # email from the completion. Surfaced so a task list can say that out loud —
+    # "this is step 3 of Injection Molding Q3" is a different kind of to-do from
+    # "call Bob back", and the UI has no other way to tell them apart.
+    enrollment_id: Optional[uuid.UUID] = None
+    step_number: Optional[int] = None
+    channel: Optional[str] = None
+
 
 class StaleContact(BaseModel):
     """A contact with an email that hasn't been emailed within the threshold."""

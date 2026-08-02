@@ -37,6 +37,22 @@ class SequenceStepAnalytics(BaseModel):
     reply_rate: float
     bounce_rate: float
 
+    # --- Manual (non-email) touches ---
+    #
+    # A call/LinkedIn step sends nothing, so it scores 0 on every rate above and
+    # would read as a dead step. These are its real numbers: how many tasks were
+    # filed, how many a human actually did, and how many expired unworked while
+    # the cadence moved on without them.
+    #
+    # ``task_completion_rate`` is the one that matters. A multi-channel cadence
+    # is only multi-channel to the extent the humans work it, and a sequence
+    # whose call steps complete at 10% is an email sequence with expensive
+    # pauses in it — which is not visible anywhere else.
+    tasks_created: int = 0
+    tasks_completed: int = 0
+    tasks_expired: int = 0
+    task_completion_rate: float = 0.0
+
 
 class SequenceAnalytics(BaseModel):
     """Funnel + outcome analytics for a whole sequence."""

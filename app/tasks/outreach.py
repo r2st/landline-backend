@@ -314,6 +314,35 @@ def send_sequence_step(self, enrollment_id: str):
                     )
                     return {"status": "skipped", "reason": "contact_suppressed"}
 
+                # Load the sequence step before the deliverability gates below,
+                # because most of those gates are about *email* and this step may
+                # not be one. A "call" step is not limited by a Gmail mailbox's
+                # warm-up ceiling, does not consume the daily send budget, and
+                # cannot bounce off a missing MX record — gating it on any of
+                # those blocks a phone call on the state of an inbox.
+                result = await db.execute(
+                    select(SequenceStep).where(
+                        and_(
+                            SequenceStep.sequence_id == enrollment.sequence_id,
+                            SequenceStep.step_number == enrollment.current_step,
+                        )
+                    )
+                )
+                step = result.scalar_one_or_none()
+                if not step:
+                    enrollment.status = "completed"
+                    enrollment.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+                    return {"status": "completed", "reason": "no_more_steps"}
+
+                # A step with no channel set is an email step — that is the
+                # column's default and every step predating multi-channel.
+                is_email_step = not step.channel or step.channel == "email"
+
+                # Consent and suppression deliberately stay outside this branch
+                # and apply to every channel: "do not contact us" is about the
+                # contact, not about the transport.
+
                 # Recipient validation — a domain with no MX can't receive mail,
                 # so sending guarantees a hard bounce. Validate once (lazily) and
                 # pause the enrollment on a definitively invalid domain.
@@ -327,7 +356,7 @@ def send_sequence_step(self, enrollment_id: str):
                 # it, so a capped sender means this enrollment is going nowhere
                 # until tomorrow — paying an LLM call every 5 minutes to
                 # rediscover that is what exhausted the provider quota.
-                if enrollment.sender_account_id is not None:
+                if is_email_step and enrollment.sender_account_id is not None:
                     from app.services import warmup as _warmup
                     from app.services.email_dispatch import get_account as _get_account
 
@@ -354,19 +383,20 @@ def send_sequence_step(self, enrollment_id: str):
                 # wire does that); what it does is stop us paying for research,
                 # verification and an LLM composition to rediscover, every five
                 # minutes, that today's volume is already spent.
-                _pre_ok, _pre_reason = await get_send_limiter().can_send_today(db)
-                if not _pre_ok:
-                    await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
-                    logger.info("Enrollment %s held: %s", enrollment_id, _pre_reason)
-                    return {
-                        "status": "skipped",
-                        "reason": _pre_reason,
-                        "daily_limit_reached": True,
-                    }
+                if is_email_step:
+                    _pre_ok, _pre_reason = await get_send_limiter().can_send_today(db)
+                    if not _pre_ok:
+                        await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+                        logger.info("Enrollment %s held: %s", enrollment_id, _pre_reason)
+                        return {
+                            "status": "skipped",
+                            "reason": _pre_reason,
+                            "daily_limit_reached": True,
+                        }
 
                 from app.services.email_validation import validate_contact
 
-                if contact.email_status is None:
+                if is_email_step and contact.email_status is None:
                     await validate_contact(db, contact)
 
                 # Mailbox verification (P3) — the MX check above only proves the
@@ -381,13 +411,14 @@ def send_sequence_step(self, enrollment_id: str):
                 from app.services.hunter_verification import get_hunter_service
 
                 if (
-                    get_settings().hunter_verify_before_send
+                    is_email_step
+                    and get_settings().hunter_verify_before_send
                     and contact.email_status != "invalid"
                     and contact.email_verified_at is None
                 ):
                     await get_hunter_service().verify_contact(db, contact)
 
-                if contact.email_status == "invalid":
+                if is_email_step and contact.email_status == "invalid":
                     enrollment.status = "paused"
                     await db.commit()
                     logger.warning(
@@ -419,21 +450,7 @@ def send_sequence_step(self, enrollment_id: str):
                         "regime": consent_result.regime,
                     }
 
-                # Load the sequence step
-                result = await db.execute(
-                    select(SequenceStep).where(
-                        and_(
-                            SequenceStep.sequence_id == enrollment.sequence_id,
-                            SequenceStep.step_number == enrollment.current_step,
-                        )
-                    )
-                )
-                step = result.scalar_one_or_none()
-                if not step:
-                    enrollment.status = "completed"
-                    enrollment.completed_at = datetime.now(timezone.utc)
-                    await db.commit()
-                    return {"status": "completed", "reason": "no_more_steps"}
+                # (The step is loaded above, before the email-only gates.)
 
                 # Delay guard: verify enough time has passed since the last
                 # send before firing the next step. This prevents premature
@@ -532,25 +549,40 @@ def send_sequence_step(self, enrollment_id: str):
 
                 # --- Non-email channel step ---
                 # A "call"/"linkedin"/"video"/"direct_mail" step isn't an email:
-                # surface a human task on the right channel and advance the
-                # sequence rather than sending mail.
+                # it's a human touch. File the task and HOLD the cadence on this
+                # step until somebody does it (or the hold expires), rather than
+                # advancing on the filing of the reminder.
+                #
+                # Holding is what makes the spacing mean anything. "Call, then
+                # email two days later" used to send that email two days after
+                # the reminder was created — so a call made on Thursday was
+                # followed up on Tuesday, referring to a conversation that had
+                # not happened. See ``services.manual_touch``.
                 if step.channel and step.channel != "email":
-                    reminder = FollowUp(
-                        contact_id=contact.id,
-                        company_id=company.id,
-                        due_date=datetime.now(timezone.utc),
-                        reason=f"Sequence step {step.step_number}: reach out via {step.channel}"[:500],
-                        status="pending",
+                    from app.services import manual_touch
+
+                    existing = await manual_touch.open_task_for(
+                        db, enrollment, step.step_number
                     )
-                    db.add(reminder)
-                    await _advance_step(db, enrollment)
+                    if existing is None:
+                        follow_up, deadline = await manual_touch.create_task(
+                            db, enrollment, step, contact.id, company.id if company else None
+                        )
+                        await db.commit()
+                        return {
+                            "status": "channel_task_created",
+                            "channel": step.channel,
+                            "step": step.step_number,
+                            "follow_up_id": str(follow_up.id),
+                            "expires_at": deadline.isoformat(),
+                        }
+
+                    # Already filed — this dispatch is the deadline waking us up
+                    # (or a completion the API hook could not action). Resolve it.
+                    outcome = await manual_touch.resolve_task(db, enrollment, step)
                     await db.commit()
-                    logger.info(
-                        "Non-email step %d (%s) for enrollment %s → follow-up task created",
-                        step.step_number, step.channel, enrollment_id,
-                    )
                     return {
-                        "status": "channel_task_created",
+                        "status": f"channel_task_{outcome['status']}",
                         "channel": step.channel,
                         "step": step.step_number,
                     }
@@ -1154,8 +1186,49 @@ def process_outreach_queue():
             # emailed at 5 AM their time even when the global window is open.
             limiter = get_send_limiter()
 
+            # Channel of the step each enrollment is currently on, in one query
+            # for the whole sweep.
+            #
+            # Needed because most of the gates below are about email — the daily
+            # send cap, the recipient's inbox window, per-contact send limits,
+            # send-time optimization — and a "call"/"linkedin" step is none of
+            # those. Without this the daily email cap ``break``s out of the sweep
+            # and a call task that was waiting to expire sits blocked behind an
+            # inbox quota it does not use.
+            #
+            # Batched rather than read per enrollment: the fast path (a set
+            # ``next_send_at``) deliberately avoids loading the step at all, and
+            # reintroducing a per-enrollment query to read one column would undo
+            # that for every email enrollment to serve the few manual ones.
+            step_channels: dict[tuple, str] = {}
+            if enrollments:
+                channel_rows = (
+                    await db.execute(
+                        select(
+                            SequenceStep.sequence_id,
+                            SequenceStep.step_number,
+                            SequenceStep.channel,
+                        ).where(
+                            SequenceStep.sequence_id.in_(
+                                {e.sequence_id for e in enrollments}
+                            )
+                        )
+                    )
+                ).all()
+                step_channels = {
+                    (seq_id, num): channel for seq_id, num, channel in channel_rows
+                }
+
             now = datetime.now(timezone.utc)
+            # Latched once the org's daily email quota is found spent, so the
+            # remaining email enrollments are skipped without re-asking.
+            email_quota_spent: Optional[str] = None
             for enrollment in enrollments:
+                # A step with no row / no channel is an email step: that is the
+                # column's default and what every pre-multi-channel step is.
+                is_email_step = step_channels.get(
+                    (enrollment.sequence_id, enrollment.current_step), "email"
+                ) in (None, "email")
                 # Fast path: if next_send_at is set, use it directly
                 if enrollment.next_send_at is not None:
                     next_at = enrollment.next_send_at
@@ -1218,11 +1291,26 @@ def process_outreach_queue():
                     due_at = due_date
 
                 # --- Anti-spam checks ---
-                # Check daily limit — if hit, stop processing entirely
-                can_send, reason = await limiter.can_send_today(db)
-                if not can_send:
-                    logger.warning("Daily send limit reached: %s — stopping queue processing", reason)
-                    break
+                # Check daily limit — if hit, stop dispatching *email*, but keep
+                # walking the queue.
+                #
+                # This used to ``break``. The daily cap counts messages put on
+                # the wire, and a call task has not put one there, so abandoning
+                # the sweep on a spent email quota leaves every held manual step
+                # unresolved until the quota resets — a cadence stalled by a
+                # limit that does not apply to it. The answer is latched instead
+                # of re-queried, so a capped day still costs exactly one check.
+                if is_email_step:
+                    if email_quota_spent is None:
+                        can_send, reason = await limiter.can_send_today(db)
+                        if not can_send:
+                            email_quota_spent = reason
+                            logger.warning(
+                                "Daily send limit reached: %s — no further email "
+                                "dispatch this sweep", reason,
+                            )
+                    if email_quota_spent is not None:
+                        continue
 
                 # Load contact to check per-contact limits + timezone window
                 contact_result = await db.execute(
@@ -1246,6 +1334,10 @@ def process_outreach_queue():
                 # Timezone-aware send window: use the contact's own timezone when
                 # set, else the global default. Skip (don't drop) if it's outside
                 # their business-hours window right now.
+                #
+                # Applied to manual steps too: the window is business hours in
+                # the contact's own timezone, and "don't ring them at 3 AM" is at
+                # least as true of a phone call as of an email.
                 tz = getattr(contact, "timezone", None) if contact else None
                 in_window, window_reason = limiter.within_send_window(tz)
                 if not in_window:
@@ -1254,11 +1346,12 @@ def process_outreach_queue():
                     continue
 
                 # Skip enrollments whose recipient domain is already known-bad.
-                if contact and contact.email_status == "invalid":
+                # Email only — a dead mailbox says nothing about a phone number.
+                if is_email_step and contact and contact.email_status == "invalid":
                     logger.info("Skipping enrollment %s: invalid recipient domain", enrollment.id)
                     continue
 
-                if contact and contact.email:
+                if is_email_step and contact and contact.email:
                     can_send_contact, contact_reason = await limiter.can_send_to_contact(db, contact.email)
                     if not can_send_contact:
                         logger.info("Skipping enrollment %s: %s", enrollment.id, contact_reason)
@@ -1272,7 +1365,13 @@ def process_outreach_queue():
                 # timezone, and stamps ``scheduled_send_at``; the delay is capped
                 # (max_smart_delay) so it can never stall a sequence, and the
                 # warm-up/danger-pause guards above always take precedence.
-                if contact is not None:
+                #
+                # Email only. The optimizer picks the moment a message is most
+                # likely to be *read*, which is a fact about a mailbox — holding
+                # a call task for the recipient's best email-open hour optimizes
+                # the wrong thing, and holding a step that is waiting to expire
+                # just delays the expiry.
+                if is_email_step and contact is not None:
                     optimizer = get_send_time_optimizer()
                     if await optimizer.should_defer(db, enrollment, contact, now, due_at):
                         scheduled_smart += 1
