@@ -238,3 +238,96 @@ async def test_enrolling_twice_does_not_duplicate(db_session, verticals):
         )
     ).scalars().all()
     assert len(rows) == 1
+
+
+# ── contacts we are not allowed to email ────────────────────────────────────
+#
+# The send path re-checks and would stop these enrollments as ``unsubscribed``
+# on their first pass, so this is not what stops the mail. What it stops is the
+# row: an enrollment we will never send lands in ``total_enrollments`` and in the
+# conversion denominator, quietly diluting every campaign rate it touches. And
+# discovery walks the same company repeatedly, so without this it re-enrols the
+# same dead mailbox into whichever sequence it picks each time.
+
+
+async def test_suppressed_contact_is_not_enrolled(db_session, verticals):
+    company = await _company(db_session, "CNC Machining")
+    contact = await _contact(db_session, company, "dead@precisionparts.example.com")
+    contact.suppressed = True
+    await db_session.flush()
+
+    assert await get_prospector()._auto_enroll(db_session, company) is False
+    assert await _enrollment_for(db_session, contact.id) is None
+    # The company still advances — the call queue can work it by phone.
+    assert company.pipeline_stage == "outreach"
+
+
+async def test_unsubscribed_contact_is_not_enrolled(db_session, verticals):
+    company = await _company(db_session, "CNC Machining")
+    contact = await _contact(db_session, company, "optout@precisionparts.example.com")
+    contact.unsubscribed = True
+    await db_session.flush()
+
+    assert await get_prospector()._auto_enroll(db_session, company) is False
+    assert await _enrollment_for(db_session, contact.id) is None
+
+
+async def test_an_address_on_the_do_not_contact_list_is_not_enrolled(
+    db_session, verticals
+):
+    """The list is keyed by address, which is what catches a *re-imported*
+    contact for a mailbox that bounced under a previous row — the new row's own
+    flags are clean."""
+    from app.services.suppression import add_entry
+
+    company = await _company(db_session, "CNC Machining")
+    contact = await _contact(db_session, company, "listed@precisionparts.example.com")
+    await add_entry(db_session, contact.email, reason="bounce", source="auto")
+
+    assert contact.suppressed is False  # the row itself looks fine
+    assert await get_prospector()._auto_enroll(db_session, company) is False
+    assert await _enrollment_for(db_session, contact.id) is None
+
+
+async def test_a_mailable_contact_wins_over_a_suppressed_primary(db_session, verticals):
+    """Primary ordering must not drag a suppressed contact to the front, for the
+    same reason it must not drag one with no email."""
+    company = await _company(db_session, "CNC Machining")
+    primary = await _contact(db_session, company, "dead@precisionparts.example.com",
+                             is_primary=True)
+    primary.suppressed = True
+    secondary = await _contact(db_session, company, "live@precisionparts.example.com",
+                               is_primary=False)
+    await db_session.flush()
+
+    assert await get_prospector()._auto_enroll(db_session, company) is True
+    assert await _enrollment_for(db_session, primary.id) is None
+    assert await _enrollment_for(db_session, secondary.id) is not None
+
+
+async def test_a_bounce_stops_a_re_imported_contact_being_enrolled(db_session, verticals):
+    """End to end, the compounding failure this closes.
+
+    Discovery mails an address, it hard-bounces, and a later run re-imports the
+    same company — creating a **new** contact row for the same mailbox. The
+    (contact, sequence) dedup cannot see it, because the contact id is different;
+    the new row's own ``suppressed`` flag is False, because nothing ever set it.
+    Only the address-level list remembers, and this is the assertion that it is
+    consulted.
+    """
+    from app.services.bounce_handler import record_bounce
+
+    company = await _company(db_session, "CNC Machining")
+    original = await _contact(db_session, company, "dale@precisionparts.example.com")
+
+    assert await get_prospector()._auto_enroll(db_session, company) is True
+    await record_bounce(db_session, original.email, status_code="5.1.1")
+
+    # The re-import: same address, fresh row, clean flags.
+    reimported = await _contact(
+        db_session, company, "dale@precisionparts.example.com", is_primary=False
+    )
+    assert reimported.suppressed is False
+
+    assert await get_prospector()._auto_enroll(db_session, company) is False
+    assert await _enrollment_for(db_session, reimported.id) is None

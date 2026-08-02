@@ -699,18 +699,44 @@ class AutonomousProspector:
         # An enrollment for a contact with no email address is a row that can
         # never send: the step would come due forever and the lead would look
         # worked without a single touch. Prefer the primary among the rest.
-        contact = (
+        #
+        # Suppressed and unsubscribed contacts are excluded for the same reason,
+        # one step further along. The send path re-checks and would stop such an
+        # enrollment as ``unsubscribed`` on its first pass, so this is not what
+        # stops the mail — but the row still lands in ``total_enrollments`` and
+        # in the conversion denominator, so enrolling a contact we will never
+        # mail quietly dilutes every campaign rate it touches. Bounces are the
+        # common case: a hard bounce suppresses the address, and without this the
+        # next discovery run walks the same company and enrolls the same dead
+        # mailbox into whichever sequence it picks this time.
+        candidates = (
             await db.execute(
                 select(Contact).where(
                     Contact.company_id == company.id,
                     Contact.email.isnot(None),
                     func.trim(Contact.email) != "",
+                    Contact.suppressed.is_(False),
+                    Contact.unsubscribed.is_(False),
                 )
                 .order_by(Contact.is_primary.desc())
             )
-        ).scalars().first()
+        ).scalars().all()
         sequence = await self._pick_sequence(db, company)
-        if contact is None or sequence is None:
+        if not candidates or sequence is None:
+            return False
+
+        # The org do-not-contact list is keyed by address rather than by contact
+        # row, which is what catches a re-imported contact for an address that
+        # bounced under a previous row. Checked here rather than folded into the
+        # query above because it is a separate table with its own org scoping.
+        from app.services import suppression as _suppression
+
+        contact = None
+        for candidate in candidates:
+            if not await _suppression.is_suppressed(db, candidate.email):
+                contact = candidate
+                break
+        if contact is None:
             return False
         existing = (
             await db.execute(
