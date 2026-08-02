@@ -19,7 +19,7 @@ import pytest
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence
-from app.routers.dialtone import _wilson_lower
+from app.services.campaign_analytics import wilson_lower as _wilson_lower
 
 
 async def _campaign(db, name):
