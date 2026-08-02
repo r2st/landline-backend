@@ -216,7 +216,12 @@ app.include_router(suggestions.router, prefix=settings.api_prefix, dependencies=
 app.include_router(deals.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(tasks.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(interactions.router, prefix=settings.api_prefix, dependencies=_auth)
-app.include_router(health.router, prefix=settings.api_prefix)
+# NOT a liveness probe — this is client *health scoring* on
+# ``/companies/{id}/health``, and it needs `_auth` like every other tenant
+# surface. See tests/test_route_org_binding.py: `_auth` is what binds the
+# caller's org, so a router mounted without it runs the whole request with no
+# org context, and the read filter is a no-op rather than a filter.
+app.include_router(health.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(clients.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(reports.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(emails.router, prefix=settings.api_prefix, dependencies=_auth)

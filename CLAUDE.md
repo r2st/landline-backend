@@ -241,6 +241,45 @@ so a checker that merely asked "is the primary key mentioned?" fails its own
 suite. It does **not** catch an `id ==` whose id came from an unscoped source,
 association-table writes, or raw `text()` SQL.
 
+## The filter needs an org to filter by, and one line supplies it
+
+Exactly one thing in a request binds the caller's tenant:
+`dependencies.get_current_user` calls `set_current_org_id(user.org_id)`. A route
+that never runs it takes the **documented no-op branch** — the same one a
+platform admin takes — so every query in it runs unfiltered.
+
+What decides that, for a whole router, is one keyword argument in `app/main.py`:
+`dependencies=_auth`. It sits four screens away from the endpoints it governs,
+and a router without it looks correct from inside its own file.
+
+`health.router` sat that way. It reads as a liveness probe — the module is
+called `health`, the router is mounted alongside one — and it serves **client
+health scoring** on `/companies/{id}/health`. With no org bound, any logged-in
+user of any tenant could pull another org's account health and snapshot series
+by company id, and `POST /health/snapshot` **wrote** a row: no org context also
+means `org_id_for_insert()` falls back to the first-party org, so the row landed
+under Apprend's org pointing at a stranger's company, in that tenant's own
+history. Ids are not secrets — they come back in exports, webhooks and error
+bodies.
+
+Two things made it survive review:
+
+- **`ApiKeyMiddleware` fails closed, so the route *was* authenticated.** Every
+  reviewer's instinct that you need a valid token to reach it is correct and
+  beside the point: the request was authenticated and simply not attributed to
+  anyone. Authentication and tenancy are separate mechanisms here and only one
+  of them is in the middleware.
+- **The endpoint has nothing to see.** It reads `Company` by id like every
+  scoped read in the codebase, because in this codebase not writing an org
+  predicate *is* the correct shape.
+
+`tests/test_route_org_binding.py` walks the live route table and requires every
+route to either reach an org-binding dependency or be named in `PUBLIC_ROUTES`
+with a reason — login, the OAuth callbacks, the tracking pixel, the one-click
+unsubscribe, the HMAC'd events webhook. Adding a router and forgetting
+`dependencies=_auth` fails there instead of shipping. It self-tests by mounting
+a router the way `health` was mounted and asserting the scan names it.
+
 ## `scalar_one_or_none` asserts a uniqueness the schema rarely promises
 
 This has now cost four times, in unrelated code, the same way every time: the
