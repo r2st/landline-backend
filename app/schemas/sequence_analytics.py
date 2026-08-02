@@ -16,6 +16,14 @@ class SequenceStepAnalytics(BaseModel):
     step_number: int
     channel: str
     delay_days: int
+    delay_hours: int = 0
+    delay_business_days: bool = False
+    # The step's full cadence in words ("2 business days and 4 hours"), from
+    # ``services.step_delay.describe``. ``delay_days`` alone stopped describing
+    # the wait once steps could be configured in hours and business days, and a
+    # step-performance table that mislabels the gap between touches is reporting
+    # against the wrong variable.
+    cadence: str = "immediately"
     label: str | None = None  # a short subject/preview for the step
 
     sent: int

@@ -97,12 +97,17 @@ async def _advance_step(db: AsyncSession, enrollment: OutreachEnrollment) -> Non
         )
     ).scalar_one_or_none()
     if next_step is not None:
-        # Adaptive Step Delays (Feature 3): scale the static delay by the
-        # enrollment's engagement-driven factor.
-        from app.services.adaptive_delay import effective_delay_days
+        # One resolver for every due date in the system (``services.step_delay``):
+        # the step's days + hours, counted in business days when it asks for it,
+        # scaled by the enrollment's engagement-driven adaptive factor, spread by
+        # a stable per-enrollment jitter.
+        from app.services import step_delay
 
-        enrollment.next_send_at = now + timedelta(
-            days=effective_delay_days(next_step.delay_days, enrollment.adaptive_delay_factor)
+        enrollment.next_send_at = step_delay.due_at(
+            next_step,
+            now,
+            factor=enrollment.adaptive_delay_factor,
+            enrollment_id=enrollment.id,
         )
     else:
         enrollment.status = "completed"
@@ -434,7 +439,15 @@ def send_sequence_step(self, enrollment_id: str):
                 # send before firing the next step. This prevents premature
                 # sends when the task is dispatched by both enroll and the
                 # periodic processor (double-dispatch race).
-                if enrollment.current_step > 1 and step.delay_days > 0:
+                #
+                # Gated on the step's *total* configured wait, not on
+                # ``delay_days`` alone — an hours-only step has ``delay_days ==
+                # 0``, and the old gate would have skipped the double-dispatch
+                # guard entirely for exactly the steps whose whole point is a
+                # short, precisely-placed wait.
+                from app.services import step_delay
+
+                if enrollment.current_step > 1 and step_delay.base_delay(step) > timedelta(0):
                     now = datetime.now(timezone.utc)
 
                     # Prefer next_send_at (set by previous step completion)
@@ -470,7 +483,18 @@ def send_sequence_step(self, enrollment_id: str):
                             occurred = last_event.occurred_at
                             if occurred.tzinfo is None:
                                 occurred = occurred.replace(tzinfo=timezone.utc)
-                            due_at = occurred + timedelta(days=step.delay_days)
+                            # Same resolver, same factor as the path that would
+                            # have written ``next_send_at``. This fallback used
+                            # the raw delay while the primary path used the
+                            # factored one, so the two disagreed about when a
+                            # step was due for any enrollment whose factor had
+                            # moved off 1.0.
+                            due_at = step_delay.due_at(
+                                step,
+                                occurred,
+                                factor=enrollment.adaptive_delay_factor,
+                                enrollment_id=enrollment.id,
+                            )
                             if now < due_at:
                                 # Set next_send_at for efficiency on next check
                                 enrollment.next_send_at = due_at
@@ -1052,15 +1076,16 @@ def send_sequence_step(self, enrollment_id: str):
                     )
                     next_step = next_step_result.scalar_one_or_none()
                     if next_step:
-                        # Adaptive Step Delays (Feature 3): scale by the
-                        # enrollment's engagement-driven factor, clamped to a
-                        # sane [1, 14]-day window.
-                        from app.services.adaptive_delay import effective_delay_days
+                        # ``services.step_delay`` resolves the whole cadence:
+                        # days + hours, business-day counting, the enrollment's
+                        # adaptive factor (clamped), and the stable jitter.
+                        from app.services import step_delay
 
-                        enrollment.next_send_at = datetime.now(timezone.utc) + timedelta(
-                            days=effective_delay_days(
-                                next_step.delay_days, enrollment.adaptive_delay_factor
-                            )
+                        enrollment.next_send_at = step_delay.due_at(
+                            next_step,
+                            datetime.now(timezone.utc),
+                            factor=enrollment.adaptive_delay_factor,
+                            enrollment_id=enrollment.id,
                         )
                     else:
                         enrollment.status = "completed"
@@ -1170,16 +1195,26 @@ def process_outreach_queue():
                         enrollment.completed_at = now
                         continue
 
-                    # Check delay
-                    if last_event:
-                        due_date = last_event.occurred_at + timedelta(days=step.delay_days)
-                        if now < due_date:
-                            continue  # Not yet due
-                    else:
-                        # First step — check against enrollment date
-                        due_date = enrollment.enrolled_at + timedelta(days=step.delay_days)
-                        if now < due_date:
-                            continue
+                    # Check delay. Anchored on the last send, or on the
+                    # enrollment for a first touch. Resolved through
+                    # ``services.step_delay`` with the enrollment's adaptive
+                    # factor, so this sweep and the send task it dispatches
+                    # cannot disagree about whether a step is due — they used
+                    # different arithmetic before, and an enrollment whose factor
+                    # had extended its wait would be picked up here and then
+                    # deferred right back by the task.
+                    from app.services import step_delay
+
+                    anchor = last_event.occurred_at if last_event else enrollment.enrolled_at
+                    due_now, due_date = step_delay.is_due(
+                        step,
+                        anchor,
+                        now=now,
+                        factor=enrollment.adaptive_delay_factor,
+                        enrollment_id=enrollment.id,
+                    )
+                    if not due_now:
+                        continue
                     due_at = due_date
 
                 # --- Anti-spam checks ---

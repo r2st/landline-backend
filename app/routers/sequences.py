@@ -7,7 +7,7 @@ frontend's sequence picker and "enroll selected contacts" action call.
 
 import logging
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -455,16 +455,20 @@ async def process_sequence_queue(
                 enrollment.completed_at = now
                 continue
 
-            if last_event:
-                occurred = last_event.occurred_at
-                if occurred.tzinfo is None:
-                    occurred = occurred.replace(tzinfo=timezone.utc)
-                is_due = now >= occurred + timedelta(days=step.delay_days)
-            else:
-                enrolled = enrollment.enrolled_at
-                if enrolled.tzinfo is None:
-                    enrolled = enrolled.replace(tzinfo=timezone.utc)
-                is_due = now >= enrolled + timedelta(days=step.delay_days)
+            # Same resolver the executor uses (``services.step_delay``), with the
+            # same adaptive factor. This preview computed a raw-delay due date
+            # while the executor computed a factored one, so it could report a
+            # step as ready that the send path would immediately defer.
+            from app.services import step_delay
+
+            anchor = last_event.occurred_at if last_event else enrollment.enrolled_at
+            is_due, _due_at = step_delay.is_due(
+                step,
+                anchor,
+                now=now,
+                factor=enrollment.adaptive_delay_factor,
+                enrollment_id=enrollment.id,
+            )
 
         if not is_due:
             skipped += 1

@@ -75,7 +75,7 @@ from app.schemas.dialtone import (
 )
 from app.schemas.lead_tracking import DialtoneStatus, LeadOrgBreakdown
 from app.dependencies import OrgScope, get_org_scope
-from app.services import lead_metrics, suppression, system_settings, warmup
+from app.services import lead_metrics, step_delay, suppression, system_settings, warmup
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.send_limiter import get_send_limiter
@@ -1393,6 +1393,9 @@ async def sequence_analytics(sequence_id: uuid.UUID, db: AsyncSession = Depends(
             step_number=sn,
             channel=sdef.channel if sdef is not None else "email",
             delay_days=sdef.delay_days if sdef is not None else 0,
+            delay_hours=getattr(sdef, "delay_hours", 0) or 0 if sdef is not None else 0,
+            delay_business_days=bool(getattr(sdef, "delay_business_days", False)) if sdef is not None else False,
+            cadence=step_delay.describe(sdef) if sdef is not None else "immediately",
             label=label,
             sent=sent,
             opened=opened,

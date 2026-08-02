@@ -8,10 +8,15 @@ reacts to the contact:
 * **Silence** after a step's window has elapsed → *extend* the next delay: back
   off rather than pile on. The factor grows ×1.5, capped.
 
-The factor lives on ``OutreachEnrollment.adaptive_delay_factor``; the executor
-multiplies each step's base ``delay_days`` by it via :func:`effective_delay_days`,
-which clamps the result to ``[MIN_DELAY_DAYS, MAX_DELAY_DAYS]`` so the factor can
-neither stall a sequence nor collapse it into a burst.
+The factor lives on ``OutreachEnrollment.adaptive_delay_factor``. It is *applied*
+by ``services.step_delay``, which owns every due-date calculation in the system;
+this module owns only the factor itself and the rules that move it.
+
+:func:`effective_delay_days` is the day-granular arm of that calculation, and
+clamps to ``[MIN_DELAY_DAYS, MAX_DELAY_DAYS]`` so the factor can neither stall a
+sequence nor collapse it into a burst. A step that opts into sub-day delays takes
+``step_delay``'s proportional clamp instead — rounding it to whole days here
+would erase the thing it asked for.
 """
 
 import logging
@@ -70,11 +75,16 @@ def extend(enrollment: OutreachEnrollment) -> float:
     return enrollment.adaptive_delay_factor
 
 
-async def _current_step_delay(db: AsyncSession, enrollment: OutreachEnrollment) -> int | None:
-    """The base ``delay_days`` of the enrollment's current (pending) step."""
-    step = (
+async def _current_step(db: AsyncSession, enrollment: OutreachEnrollment) -> SequenceStep | None:
+    """The enrollment's current (pending) step.
+
+    The whole row, not just ``delay_days``: the cadence is now days *plus*
+    hours, business-day counting and jitter, and ``services.step_delay`` needs
+    all of it to place the send.
+    """
+    return (
         await db.execute(
-            select(SequenceStep.delay_days).where(
+            select(SequenceStep).where(
                 and_(
                     SequenceStep.sequence_id == enrollment.sequence_id,
                     SequenceStep.step_number == enrollment.current_step,
@@ -82,7 +92,6 @@ async def _current_step_delay(db: AsyncSession, enrollment: OutreachEnrollment) 
             )
         )
     ).scalar_one_or_none()
-    return step
 
 
 async def _last_sent_at(db: AsyncSession, enrollment: OutreachEnrollment) -> datetime:
@@ -119,14 +128,24 @@ async def reschedule_pending_step(db: AsyncSession, enrollment: OutreachEnrollme
     """
     if enrollment.status != "active":
         return False
-    base = await _current_step_delay(db, enrollment)
-    if not base or base <= 0:
+    step = await _current_step(db, enrollment)
+    if step is None:
         return False
+
+    from app.services import step_delay
+
+    if step_delay.base_delay(step) <= timedelta(0):
+        # An immediate step has no wait to reshape, and pulling one "in" would
+        # only mean scheduling it for a moment that has already passed.
+        return False
+
     anchor = await _last_sent_at(db, enrollment)
-    new_next = anchor + timedelta(
-        days=effective_delay_days(base, enrollment.adaptive_delay_factor)
+    enrollment.next_send_at = step_delay.due_at(
+        step,
+        anchor,
+        factor=enrollment.adaptive_delay_factor,
+        enrollment_id=enrollment.id,
     )
-    enrollment.next_send_at = new_next
     return True
 
 

@@ -7,6 +7,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.sequence import DEFAULT_SEQUENCE_TONE, SEQUENCE_TONES
+from app.services.step_delay import MAX_JITTER_MINUTES
 
 # Literal-ish validation without importing Literal for every tuple: the model
 # module owns the vocabulary, the schema reuses it, so they can't drift.
@@ -18,7 +19,25 @@ _TONE_DESC = f"Voice the AI copywriter writes this sequence in. One of: {', '.jo
 
 class SequenceStepCreate(BaseModel):
     step_number: int = Field(..., ge=1)
-    delay_days: int = Field(0, ge=0)
+    delay_days: int = Field(0, ge=0, description="Days to wait after the previous touch.")
+    delay_hours: int = Field(
+        0, ge=0, le=23,
+        description="Hours to wait on top of delay_days. Capped at 23 — a full "
+                    "day belongs in delay_days, where business-day counting can "
+                    "see it.",
+    )
+    delay_business_days: bool = Field(
+        False,
+        description="Count delay_days in business days, skipping Sat/Sun. The "
+                    "send window already blocks weekend sends, so without this "
+                    "a Thursday +3 and a Friday +2 both land on the same Monday.",
+    )
+    delay_jitter_minutes: int = Field(
+        0, ge=0, le=MAX_JITTER_MINUTES,
+        description="Spread the due time across this many minutes, derived from "
+                    "the enrollment so it is stable. Stops a batch enrolled "
+                    "together from coming due in one identical block.",
+    )
     subject_template: str
     body_template: str
 
@@ -29,6 +48,9 @@ class SequenceStepRead(BaseModel):
     id: uuid.UUID
     step_number: int
     delay_days: int
+    delay_hours: int = 0
+    delay_business_days: bool = False
+    delay_jitter_minutes: int = 0
     subject_template: str
     body_template: str
 

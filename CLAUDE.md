@@ -157,6 +157,36 @@ sweep that resumed every paused enrollment with a past due date would also
 revive the ones paused for a missing address, a dead domain, a consent block, or
 an operator's decision. **NULL means "not ours — leave it alone."**
 
+## One resolver decides when a step is due
+
+`app.services.step_delay.due_at(step, anchor, factor=, enrollment_id=)` computes
+every due date in the system. **Do not add a sixth `anchor + timedelta(days=step.delay_days)`.**
+
+There were five, and they had drifted: the post-send advance, the optimizer
+advance and `adaptive_delay.reschedule_pending_step` applied
+`OutreachEnrollment.adaptive_delay_factor`; the queue sweep's legacy path and the
+sequences router's preview did not. An enrollment whose factor had moved off 1.0
+was therefore "due" to the sweep and "not yet due" to the send task the sweep
+dispatched — a step that oscillates instead of sending.
+
+A step's cadence is `delay_days` + `delay_hours`, optionally counted in business
+days (`delay_business_days`) and spread by `delay_jitter_minutes`. Three rules
+worth knowing before touching it:
+
+- **Day-granular steps must keep their exact schedule.** A step with
+  `delay_hours == 0` delegates to `adaptive_delay.effective_delay_days` — whole-day
+  rounding and the `[1, 14]`-day clamp included. Every sequence in the database is
+  one of these, and changing where they land silently reschedules live outreach.
+- **Jitter is derived from the enrollment id, never drawn fresh.** The sweep
+  recomputes due dates for enrollments with no `next_send_at`, so a random offset
+  would move the deadline on every poll.
+- **This decides the schedule, not the send.** Business hours, weekends,
+  per-contact timezone, warm-up, the daily cap and per-mailbox pacing are all
+  enforced at dispatch by `send_limiter` / `send_pacing`. What `step_delay` owns is
+  the *spacing between touches*, which nothing downstream can reconstruct — the
+  send window holds a Sunday send to Monday, which is exactly why a Thursday +3
+  and a Friday +2 used to land on the same Monday.
+
 ## A/B tests are judged on their own metric
 
 `evaluate_experiment(experiment, metric)` and `auto_declare_winner(..., metric=)`

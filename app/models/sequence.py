@@ -106,7 +106,42 @@ class SequenceStep(Base, OrgScopedMixin):
         UUID(as_uuid=True), ForeignKey("outreach_sequences.id", ondelete="CASCADE"), nullable=False
     )
     step_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # --- Cadence: how long after the previous touch this step goes out. ---
+    # The wait is ``delay_days`` days plus ``delay_hours`` hours, measured from
+    # the last send (or from enrollment, for step 1). Resolved in one place —
+    # ``app.services.step_delay.due_at`` — which every scheduler goes through, so
+    # the five sites that compute a due date cannot drift from each other.
     delay_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Sub-day granularity. A whole-day floor cannot express the cadences that
+    # matter most: the same-afternoon nudge after a click, or a two-touch
+    # opener spaced across a morning. Added to ``delay_days``, so the existing
+    # day-granular steps keep behaving exactly as they did.
+    delay_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Count the day portion in business days, skipping Sat/Sun.
+    #
+    # Without this the stated cadence isn't the delivered one. The send window
+    # already refuses to put mail on the wire at the weekend, so a 3-day step
+    # from Thursday, a 2-day step from Friday and a 3-day step from Friday all
+    # collapse onto the same Monday — three different intended spacings, one
+    # actual one. Counting in business days makes a "3-day follow-up" mean three
+    # days the recipient was at work.
+    delay_business_days: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Random spread added to the due time, in minutes (0 = off).
+    #
+    # A batch enrolled together is scheduled together: every enrollment gets an
+    # identical offset and comes due in the same sweep. Per-mailbox pacing
+    # (``services.send_pacing``) spaces what reaches the wire, but the schedule
+    # underneath it is still a comb, and it is the schedule that decides who is
+    # in today's batch at all. The jitter is derived from the enrollment id, not
+    # drawn fresh, so recomputing a due date never moves it — see
+    # ``step_delay.jitter_for``.
+    delay_jitter_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     subject_template: Mapped[str] = mapped_column(Text, nullable=False)
     body_template: Mapped[str] = mapped_column(Text, nullable=False)
     # Channel for this step — enables multi-channel cadence orchestration.
