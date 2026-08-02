@@ -70,14 +70,27 @@ NO_REPLY_MIN_SENDS = 3 * campaign_analytics.CAMPAIGN_MIN_SENDS
 # a quarter of sends personalized means the fallback has become the norm.
 AI_COMPOSE_FLOOR = 0.25
 
+# How far past the day's capacity demand must run before the backlog is called
+# critical rather than a warning. At 1× the queue is rationing and today's mail
+# still goes out; at 3× the arithmetic says the backlog cannot clear even if
+# nothing new comes due, so it compounds every day until capacity changes.
+CAPACITY_CRITICAL_MULTIPLE = 3.0
+
 # Alert ordering within a severity. Reputation damage outranks lost opportunity,
 # because a bounce rate spends something that cannot be bought back.
+#
+# ``capacity`` sits directly above ``stalled`` on purpose: a fleet-wide shortfall
+# makes *every* campaign look stalled at once, and the stalled alert's advice
+# ("check the mailbox, the daily cap, the quarantine") is four investigations
+# the capacity alert has already finished. Ordered the other way, the reader
+# works through a dozen symptoms before reaching the cause.
 _KIND_ORDER = {
     "bounce_rate": 0,
-    "stalled": 1,
-    "ai_compose_dark": 2,
-    "no_replies": 3,
-    "declining": 4,
+    "capacity": 1,
+    "stalled": 2,
+    "ai_compose_dark": 3,
+    "no_replies": 4,
+    "declining": 5,
 }
 _SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
@@ -151,13 +164,77 @@ async def _overdue_by_sequence(
     return {sequence_id: n for sequence_id, n in rows}
 
 
+async def _due_now(db: AsyncSession, now: datetime) -> int:
+    """Active enrollments the queue would dispatch this minute if it could.
+
+    The demand side of the capacity question. Counted across every campaign,
+    because the daily cap is an org-wide budget — a per-campaign count cannot
+    say whether the fleet is over its limit, only that one campaign is waiting.
+    """
+    return (
+        await db.execute(
+            select(func.count(OutreachEnrollment.id)).where(
+                OutreachEnrollment.status == "active",
+                OutreachEnrollment.next_send_at.isnot(None),
+                OutreachEnrollment.next_send_at <= now,
+            )
+        )
+    ).scalar() or 0
+
+
+def _capacity_alert(due: int, limit: int, sent_today: int) -> Optional[DashboardAlert]:
+    """Demand against the day's send budget, when demand loses.
+
+    This is the one condition on the dashboard that is nobody's fault and looks
+    like everybody's. Every campaign with enrollments in the queue shows
+    overdue sends; each raises its own ``stalled`` alert pointing at a mailbox,
+    a cap and a quarantine; and the actual answer is that the org has more
+    prospects due than it is allowed to email today. Reported once, at the
+    portfolio level, with the arithmetic.
+
+    Silent when capacity covers demand — a queue draining normally is not news,
+    and a capacity line that renders every day is one nobody reads on the day it
+    matters.
+    """
+    remaining = max(limit - sent_today, 0)
+    if limit <= 0 or due <= remaining:
+        return None
+
+    unserved = due - remaining
+    critical = due > limit * CAPACITY_CRITICAL_MULTIPLE
+    return DashboardAlert(
+        severity="critical" if critical else "warning",
+        kind="capacity",
+        message=(
+            f"{due} enrollments are due now and {remaining} sends are left of "
+            f"today's {limit} ({sent_today} already sent). {unserved} will not "
+            f"go out today — the queue sends the highest-priority first and "
+            f"holds the rest, so nothing is lost, but the backlog is "
+            + (
+                "growing faster than a day of capacity can clear it. Raise the "
+                "daily limit, add a sending mailbox, or advance the warm-up plan; "
+                "pausing enrollment is the fastest lever."
+                if critical
+                else "real. Any 'stalled' alerts below are this, not a broken "
+                "campaign."
+            )
+        ),
+        metric="due_enrollments",
+        value=float(due),
+        threshold=float(remaining),
+    )
+
+
 def _alerts(
     rows: list[CampaignAnalytics],
     overdue: dict[uuid.UUID, int],
     settings: Any,
+    capacity: Optional[DashboardAlert] = None,
 ) -> list[DashboardAlert]:
     """Everything worth acting on, ranked by severity then by what it costs."""
     alerts: list[DashboardAlert] = []
+    if capacity is not None:
+        alerts.append(capacity)
 
     # Thresholds come from the danger monitor's configuration rather than a set
     # of the dashboard's own. The rail auto-pauses on a *blended* rate across
@@ -395,14 +472,31 @@ async def build(
     )
     needs_volume = [_rank(r, _reason_thin(r)) for r in thin[:list_size]]
 
+    now = datetime.now(timezone.utc)
     overdue = await _overdue_by_sequence(
-        db, datetime.now(timezone.utc) - timedelta(hours=STALLED_OVERDUE_HOURS)
+        db, now - timedelta(hours=STALLED_OVERDUE_HOURS)
     )
+
+    # Capacity is read live rather than from the analytics window: "how much
+    # mail may we send today" is a fact about right now, and averaging it over
+    # thirty days would report a limit that was never in force.
+    #
+    # Never lets a reporting call fail. A Redis blip or a missing warm-up plan
+    # costs this one alert; it must not cost the dashboard.
+    capacity: Optional[DashboardAlert] = None
+    try:
+        from app.services.send_limiter import get_send_limiter
+
+        limit, sent_today = await get_send_limiter().daily_capacity(db, now=now)
+        capacity = _capacity_alert(await _due_now(db, now), limit, sent_today)
+    except Exception as exc:
+        logger.warning("Capacity alert unavailable: %s", exc)
+
     # Alerts run over every sequence, not just the ones that sent: a campaign
     # whose enrollments are all stuck has no sends in the window *because* it is
     # broken, and filtering on sends would hide exactly the campaigns the alert
     # list exists for.
-    alerts = _alerts(every_sequence, overdue, settings)
+    alerts = _alerts(every_sequence, overdue, settings, capacity=capacity)
 
     return CampaignDashboard(
         window=window,

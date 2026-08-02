@@ -195,6 +195,22 @@ class SendLimiter:
 
         return True, f"OK ({today_count}/{daily_limit} sent today)"
 
+    async def daily_capacity(
+        self, db: AsyncSession, *, now: Optional[datetime] = None
+    ) -> tuple[int, int]:
+        """Today's ``(limit, sent_so_far)`` — the two numbers behind the verdict.
+
+        :meth:`can_send_today` answers "may I send", which is the only question
+        the dispatcher has. A reporting surface needs the arithmetic instead: how
+        much capacity exists today, and how much of it is gone. Same warm-up-aware
+        limit and same advisory row count, without parsing them back out of a
+        sentence.
+        """
+        return (
+            await self._get_daily_limit_db(db),
+            await self._db_sent_today(db, now),
+        )
+
     async def _db_sent_today(self, db: AsyncSession, now: Optional[datetime] = None) -> int:
         """Sends recorded in the current UTC day (the counter's seed value)."""
         now = now or datetime.now(timezone.utc)

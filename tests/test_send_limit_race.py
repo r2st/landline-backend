@@ -225,3 +225,40 @@ def test_key_ttl_outlives_the_day_it_counts():
     early = datetime(2026, 7, 25, 0, 30, tzinfo=timezone.utc)
     assert sl._seconds_until_utc_midnight(late) >= 30 * 60
     assert sl._seconds_until_utc_midnight(early) > 23 * 3600
+
+
+# --- The arithmetic behind the verdict ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_daily_capacity_reports_the_numbers_can_send_today_decides_on(
+    monkeypatch,
+):
+    """``daily_capacity`` and ``can_send_today`` must never disagree.
+
+    Reporting surfaces need the limit and the spend, not the boolean — and the
+    only thing worse than parsing them back out of the sentence is computing
+    them a second, subtly different way.
+    """
+    limiter = get_send_limiter()
+    monkeypatch.setattr(limiter, "_get_daily_limit_db", lambda db: _async(70))
+    monkeypatch.setattr(limiter, "_db_sent_today", lambda db, now=None: _async(45))
+
+    assert await limiter.daily_capacity(db=None) == (70, 45)
+
+    allowed, reason = await limiter.can_send_today(db=None)
+    assert allowed is True
+    assert "45/70" in reason
+
+
+@pytest.mark.asyncio
+async def test_daily_capacity_reports_a_spent_day_without_clamping(monkeypatch):
+    """A day already at (or over) its limit reports what actually happened. A
+    caller subtracting these is entitled to see the overshoot, not a floor."""
+    limiter = get_send_limiter()
+    monkeypatch.setattr(limiter, "_get_daily_limit_db", lambda db: _async(20))
+    monkeypatch.setattr(limiter, "_db_sent_today", lambda db, now=None: _async(23))
+
+    assert await limiter.daily_capacity(db=None) == (20, 23)
+    allowed, _ = await limiter.can_send_today(db=None)
+    assert allowed is False

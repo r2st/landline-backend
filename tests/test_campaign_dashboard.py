@@ -563,3 +563,148 @@ async def test_the_dashboard_and_the_table_report_the_same_numbers(
     for row in board["leaderboard"]:
         assert row["reply_rate_ci_low"] == by_name[row["name"]]["reply_rate_ci_low"]
     assert _named(board["leaderboard"])[0] == table["campaigns"][0]["name"]
+
+
+# --- Capacity: the shortfall that looks like a dozen broken campaigns --------
+#
+# A daily send cap is org-wide. When demand runs past it every campaign in the
+# queue shows overdue enrollments at once, each raising its own `stalled` alert
+# telling the reader to go check a mailbox, a cap and a quarantine. The cause is
+# one number, and it belongs on the screen once.
+
+
+def _capacity(monkeypatch, *, limit, sent_today=0):
+    """Pin today's send budget. Patched on the class, not an instance, because
+    ``get_send_limiter`` builds a fresh ``SendLimiter`` per call."""
+    from app.services.send_limiter import SendLimiter
+
+    async def _daily_capacity(self, db, *, now=None):
+        return limit, sent_today
+
+    monkeypatch.setattr(SendLimiter, "daily_capacity", _daily_capacity)
+
+
+def test_capacity_is_silent_while_the_day_covers_the_queue():
+    """A queue draining normally is not news, and an alert that renders every
+    day is one nobody reads on the day it matters."""
+    assert campaign_dashboard._capacity_alert(due=10, limit=100, sent_today=0) is None
+    assert campaign_dashboard._capacity_alert(due=39, limit=100, sent_today=60) is None
+    # Exactly enough is enough — the boundary is not a shortfall.
+    assert campaign_dashboard._capacity_alert(due=40, limit=100, sent_today=60) is None
+    # One more than the day has left is.
+    assert campaign_dashboard._capacity_alert(due=41, limit=100, sent_today=60) is not None
+
+
+def test_capacity_counts_the_day_already_spent():
+    """Demand is measured against what is *left*, not the headline limit. A cap
+    of 100 with 95 already sent has five sends in it."""
+    alert = campaign_dashboard._capacity_alert(due=30, limit=100, sent_today=95)
+    assert alert is not None
+    assert alert.kind == "capacity"
+    assert alert.severity == "warning"
+    assert alert.value == 30.0
+    assert alert.threshold == 5.0
+    assert "25 will not go out today" in alert.message
+
+
+def test_a_backlog_a_day_cannot_clear_is_critical():
+    """Past the critical multiple the arithmetic says the queue compounds: even
+    with nothing new coming due, tomorrow starts further behind than today."""
+    limit = 20
+    over = int(limit * campaign_dashboard.CAPACITY_CRITICAL_MULTIPLE) + 1
+    assert campaign_dashboard._capacity_alert(
+        due=over, limit=limit, sent_today=0
+    ).severity == "critical"
+    assert campaign_dashboard._capacity_alert(
+        due=limit + 1, limit=limit, sent_today=0
+    ).severity == "warning"
+
+
+def test_no_capacity_alert_without_a_capacity():
+    """A zero limit is sending switched off, not a shortfall. Reporting a
+    backlog against it would fire on every paused system forever."""
+    assert campaign_dashboard._capacity_alert(due=50, limit=0, sent_today=0) is None
+
+
+@pytest.mark.asyncio
+async def test_an_over_subscribed_queue_is_reported_once_at_the_portfolio(
+    client, db_session, sample_company, monkeypatch
+):
+    """Three campaigns, one cause. The capacity alert names no campaign, because
+    no campaign is at fault."""
+    now = datetime.now(timezone.utc)
+    _capacity(monkeypatch, limit=2)
+    for name in ("Alpha", "Bravo", "Charlie"):
+        seq = await _campaign(db_session, name)
+        for i in range(3):
+            contact = await _contact(db_session, sample_company, f"{name}{i}@acme.com")
+            await _enroll(db_session, seq, contact, next_send_at=now - timedelta(days=2))
+    await db_session.commit()
+
+    body = (await client.get(DASHBOARD, params={"days": 30})).json()
+
+    alert = _alert(body, "capacity")
+    assert alert is not None
+    assert alert["campaign"] is None and alert["sequence_id"] is None
+    assert alert["value"] == 9.0        # nine due
+    assert alert["threshold"] == 2.0    # two sends left today
+    assert _kinds(body).count("capacity") == 1
+
+
+@pytest.mark.asyncio
+async def test_capacity_is_read_above_the_stalled_symptoms_it_explains(
+    client, db_session, sample_company, monkeypatch
+):
+    """Ordering is the whole point. Below the stalled alerts, the reader works
+    through a dozen symptoms before reaching the cause."""
+    now = datetime.now(timezone.utc)
+    _capacity(monkeypatch, limit=1)
+    for name in ("Alpha", "Bravo"):
+        seq = await _campaign(db_session, name)
+        contact = await _contact(db_session, sample_company, f"{name}@acme.com")
+        await _enroll(db_session, seq, contact, next_send_at=now - timedelta(days=2))
+    await db_session.commit()
+
+    kinds = _kinds((await client.get(DASHBOARD, params={"days": 30})).json())
+    assert "capacity" in kinds and "stalled" in kinds
+    assert kinds.index("capacity") < kinds.index("stalled")
+
+
+@pytest.mark.asyncio
+async def test_a_queue_within_its_budget_raises_nothing(
+    client, db_session, sample_company, monkeypatch
+):
+    _capacity(monkeypatch, limit=500)
+    now = datetime.now(timezone.utc)
+    seq = await _campaign(db_session, "Comfortable")
+    contact = await _contact(db_session, sample_company, "ok@acme.com")
+    await _enroll(db_session, seq, contact, next_send_at=now - timedelta(days=2))
+    await db_session.commit()
+
+    body = (await client.get(DASHBOARD, params={"days": 30})).json()
+    assert "capacity" not in _kinds(body)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_send_budget_costs_one_alert_not_the_dashboard(
+    client, db_session, sample_company, monkeypatch
+):
+    """The limit resolves through Redis and a warm-up plan. Neither is worth a
+    500 on a reporting endpoint."""
+    from app.services.send_limiter import SendLimiter
+
+    async def _boom(self, db, *, now=None):
+        raise RuntimeError("redis is unreachable")
+
+    monkeypatch.setattr(SendLimiter, "daily_capacity", _boom)
+    now = datetime.now(timezone.utc)
+    seq = await _campaign(db_session, "Stuck")
+    contact = await _contact(db_session, sample_company, "stuck@acme.com")
+    await _enroll(db_session, seq, contact, next_send_at=now - timedelta(days=3))
+    await db_session.commit()
+
+    r = await client.get(DASHBOARD, params={"days": 30})
+    assert r.status_code == 200
+    kinds = _kinds(r.json())
+    assert "capacity" not in kinds
+    assert "stalled" in kinds  # everything else still reported
