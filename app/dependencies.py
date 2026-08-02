@@ -33,6 +33,64 @@ PRIVILEGED_ROLES = (
 _bearer = HTTPBearer(auto_error=False)
 
 
+def scope_users_to_org(stmt, caller: User):
+    """Restrict a ``User`` query to ``caller``'s org. **Use this every time.**
+
+    :class:`~app.models.user.User` is one of three models deliberately outside
+    :class:`~app.models.mixins.OrgScopedMixin` — membership *is* the ``org_id``
+    column, and login has to read a user before any org context is bound — so
+    the ``do_orm_execute`` filter that silently scopes every other SELECT in the
+    application does not scope this one. Isolation here is whatever the call
+    site remembered to write, which is why it is worth having exactly one thing
+    to remember.
+
+    There were four hand-rolled versions of this predicate and two places that
+    needed it and didn't have it: ``GET /coaching/team`` enumerated every active
+    user on the platform — and, because it generates a snapshot for each rep it
+    lists, *wrote* a RepPerformance row per stranger — and
+    ``POST /coaching/generate`` accepted any user id on the platform as
+    ``target_user_id`` and returned a snapshot labelled with that person's name.
+    Neither looked wrong: an unscoped ``select(User)`` looks exactly like every
+    scoped query in the codebase, because everywhere else the scoping is
+    invisible.
+
+    A ``platform_admin`` is exempt: the role exists to reach across orgs, and
+    ``/platform`` and ``/tenants`` are built on its doing so. The check is on the
+    *role* rather than on ``org_id is None``, so a caller who is not a platform
+    admin and somehow has no org gets ``org_id IS NULL`` — matching only other
+    org-less rows — rather than the whole table.
+    """
+    if normalize_role(caller.role) == UserRole.PLATFORM_ADMIN.value:
+        return stmt
+    return stmt.where(User.org_id == caller.org_id)
+
+
+def scope_users_to_current_org(stmt):
+    """Restrict a ``User`` query to the org bound to the current context.
+
+    The same rule as :func:`scope_users_to_org`, for code with no ``User`` in
+    hand — services and Celery tasks, which are handed a session and an org
+    binding rather than a caller. Semantics deliberately match the global filter
+    in :mod:`app.models.mixins`: no org bound (platform admin, or a background
+    run that never entered :func:`app.tasks.org_runner.for_each_org`) means no
+    filter, exactly as it does for every org-scoped model.
+
+    ``generate_weekly_coaching`` is why this exists. It runs inside
+    ``for_each_org``, which binds each org in turn precisely so that scoped reads
+    come out right — and then read users, which are not scoped, so every org's
+    pass enumerated every user *on the platform* and wrote a RepPerformance row
+    for each. The org binding that was supposed to isolate the loop instead
+    stamped N-orgs × N-users rows, each attributed to whichever tenant the loop
+    happened to be on.
+    """
+    from app.org_context import get_current_org_id
+
+    org_id = get_current_org_id()
+    if org_id is None:
+        return stmt
+    return stmt.where(User.org_id == org_id)
+
+
 async def get_current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
@@ -281,9 +339,21 @@ async def get_scope(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid view_as_user_id — expected a user id or 'all'.",
             )
-        exists = (
-            await db.execute(select(User.id).where(User.id == target))
-        ).scalar_one_or_none()
+        # Scoped to the caller's own org, by hand — see ``scope_users_to_org``
+        # for why nothing does this for us.
+        #
+        # Unscoped, an org_admin could name any user id on the platform. The org
+        # filter still stopped the *data* coming back, since every other model
+        # is scoped, so what leaked was thinner: 404-vs-200 told them whether an
+        # id existed anywhere, and any record created during the request was
+        # stamped with a ``user_id`` belonging to another tenant. Neither is a
+        # breach on its own; both are the kind of thing that becomes one as soon
+        # as a new model or a cross-org report reads ``target_user_id`` without
+        # re-checking.
+        target_q = scope_users_to_org(
+            select(User.id).where(User.id == target), current_user
+        )
+        exists = (await db.execute(target_q)).scalar_one_or_none()
         if exists is None:
             raise HTTPException(status_code=404, detail="User not found")
         return UserScope(current_user, target, see_all=False)

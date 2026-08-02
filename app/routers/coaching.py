@@ -20,7 +20,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies import PRIVILEGED_ROLES, get_current_user
+from app.dependencies import PRIVILEGED_ROLES, get_current_user, scope_users_to_org
 from app.models.rep_performance import RepPerformance
 from app.models.user import User
 from app.services.sales_coach import (
@@ -149,8 +149,15 @@ async def team_performance(
     period_start, period_end = period_bounds(period_type)
     benchmarks = await compute_team_benchmarks(db, period_start, period_end)
 
+    # "The team" is the caller's org, not the platform. Unscoped, this listed
+    # every active user of every customer — and then ran ``_get_or_generate``
+    # over them, so it did not merely read the roster, it *wrote* a
+    # RepPerformance row per stranger, stamped with the caller's org by the
+    # insert hook. See ``scope_users_to_org``: User is outside the global filter.
     reps = (
-        await db.execute(select(User).where(User.is_active.is_(True)))
+        await db.execute(
+            scope_users_to_org(select(User).where(User.is_active.is_(True)), user)
+        )
     ).scalars().all()
 
     team = []
@@ -181,8 +188,14 @@ async def generate_performance(
             raise HTTPException(
                 status_code=403, detail="Only managers/admins can generate coaching for others."
             )
+        # Same shape as ``?view_as_user_id=``, and it had the same hole: a
+        # manager could name any user id on the platform and get back a snapshot
+        # labelled with another tenant's rep name. A foreign id is a 404 — the
+        # caller learns nothing about whether it exists.
         target = (
-            await db.execute(select(User).where(User.id == target_user_id))
+            await db.execute(
+                scope_users_to_org(select(User).where(User.id == target_user_id), user)
+            )
         ).scalar_one_or_none()
         if target is None:
             raise HTTPException(status_code=404, detail="User not found")

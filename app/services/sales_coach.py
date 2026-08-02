@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.dependencies import scope_users_to_current_org
 from app.models.call import CallTask
 from app.models.contact import Contact
 from app.models.deal import Deal
@@ -194,8 +195,24 @@ async def compute_team_benchmarks(
     Returns ``{"team_averages": {...}, "top_performer": {...}, "rep_count": n}``
     where ``top_performer`` maps each benchmark metric to the best value any rep
     achieved (anonymized — a target to beat, not a name to shame).
+
+    "The team" is the current org's reps. :class:`User` sits outside the global
+    org filter, so the ``select`` below has to say so itself (see
+    :func:`app.dependencies.scope_users_to_current_org`).
+
+    This one is defence in depth rather than a fix: every metric
+    :func:`compute_rep_metrics` reads — ``EmailSend``, ``CallTask``,
+    ``Interaction``, ``Deal`` — *is* org-scoped, so a rep from another tenant
+    already came back with no activity and was dropped by the filter below
+    before reaching the averages. What the scoping buys is that the loop stops
+    running four queries per stranger, and that the guarantee stops depending on
+    "no metric this function reads will ever be unscoped".
     """
-    users = (await db.execute(select(User).where(User.is_active.is_(True)))).scalars().all()
+    users = (
+        await db.execute(
+            scope_users_to_current_org(select(User).where(User.is_active.is_(True)))
+        )
+    ).scalars().all()
     per_rep = []
     for u in users:
         m = await compute_rep_metrics(db, u.id, period_start, period_end)

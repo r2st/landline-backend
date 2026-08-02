@@ -5,6 +5,7 @@ import logging
 
 from sqlalchemy import select
 
+from app.dependencies import scope_users_to_current_org
 from app.models.user import User
 from app.services.sales_coach import compute_team_benchmarks, generate_rep_performance, period_bounds
 from app.tasks.celery_app import celery_app
@@ -37,8 +38,16 @@ def generate_weekly_coaching(period_type: str = "weekly"):
             period_start, period_end = period_bounds(period_type)
             benchmarks = await compute_team_benchmarks(db, period_start, period_end)
 
+            # ``for_each_org`` has bound this iteration's org, but User is not
+            # org-scoped, so an unscoped select here read every user on the
+            # platform on *every* pass — writing N-orgs × N-users snapshots, each
+            # stamped with whichever tenant the loop was on.
             reps = (
-                await db.execute(select(User).where(User.is_active.is_(True)))
+                await db.execute(
+                    scope_users_to_current_org(
+                        select(User).where(User.is_active.is_(True))
+                    )
+                )
             ).scalars().all()
 
             generated = 0
