@@ -155,9 +155,25 @@ finished work — which is what happened on 2026-08-02.
 | **P1-4** complaint ingestion | ✅ `services/complaint_ingestion.py` + `complaint_handler.py`, migration 096. |
 | **P2-3** engagement-driven delays | ✅ `services/adaptive_delay.py`, applied through `services/step_delay.py`. |
 | **P0-2** attribution | ✅ campaign analytics + `services/campaign_dashboard.py`. |
-| **P1-3** `cadence_pattern` dead config | ❌ Still read by nothing. |
-| **P2-1** competitor context at compose time | ❌ Still not joined at outreach time. |
-| **P2-2** CRM pull | ❌ Still push-only, contacts-only. Still blocked on "is a CRM actually in play". |
+| **P1-3** `cadence_pattern` dead config | ✅ Dropped (migration 108). The channel mix is derived from the steps (`sequence.channel_mix`) and reported as `channels`; `channel` / `send_condition` / `task_timeout_hours` are now reachable through the API, which they were not. |
+| **P2-1** competitor context at compose time | ✅ `personalization._add_competitor` — stance + battle-card *positioning* (not the weaknesses list) reach the prompt. |
+| **P2-2** CRM pull | ✅ `fetch_contacts` on both CRM connectors + `services/crm_import.py` → `IngestionService`, `POST /integrations/{id}/import/contacts`. Imports never enroll. Still unanswered whether a CRM is actually in play — the pull is there for when one is. |
+| **P2-4** click data missing from trends | ✅ `/dashboard/email-trends` now returns opened / clicked / replied / bounced across **both** send tables. The `clickRate: 0` comment was the visible half; the open and reply deltas beside it were failing the same way, silently. |
+| **P2-4** per-sender comparison | ✅ `GET /dialtone/analytics/senders` — funnel per sending mailbox. Deliberately *not* on `SenderHealth`: reply rate is not a deliverability metric. |
+| **P2-4** cohort view | ✅ Was already there — `/dialtone/analytics/trends?sequence_id=`. |
+| **P3-3** suppression list import | ✅ Was already there — `POST /dialtone/suppression/import` (migration 088). |
+| **P3-3** migrations don't apply from scratch | ✅ Fixed and verified against an empty Postgres: 015 recreated two of 005's indexes, and `alembic_version.version_num` (VARCHAR(32)) could not hold `037_add_user_id_to_email_accounts`. Chain now runs 001 → 108 clean; `tests/test_migration_chain.py` guards both. |
+
+**What is left, as of 2026-08-02.** Nothing on this roadmap is still open for
+engineering reasons. The four remaining items all need a decision or a purchase
+before code helps:
+
+| Item | Blocked on |
+|---|---|
+| **P3-2** website visitor de-anonymization | Vendor cost (Clearbit Reveal / 6sense / Albacross) **and** a GDPR review — an IP is personal data. A genuine build with legal surface, not a wiring job. |
+| **P3-1** LinkedIn automation | Recommended against; see the section. The human-assisted path is the recommendation and it exists. |
+| **P1-4** complaint rate as a *real* number | Shipped as ingestion (096) + Postmaster (093). Whether it reports anything depends on the FBL/Postmaster verification being done on the sending domain. |
+| **Committed production secrets** in git history | Rotation, by a human with the credentials. Flagged repeatedly and still unrotated. |
 
 **Added since, and not on this roadmap:** the outreach queue was unordered
 (`services/queue_priority.py`). It selected every active enrollment with no
