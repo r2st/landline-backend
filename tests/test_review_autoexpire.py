@@ -49,7 +49,11 @@ async def _parked(db, contact, company, *, age_hours, step_number=1):
 # ── Config defaults (F1 behaviour is pinned as defaults, not left to env) ──────
 
 def test_config_defaults_for_review_gate():
-    assert Settings.model_fields["ai_compose_all_steps"].default is False
+    # AI composition covers every step, not just the first touch. This assertion
+    # said ``is False`` and had been wrong since the default flipped: the review
+    # gate below is what makes composing all steps safe, so the two ship
+    # together. ``test_ai_compose.py::test_config_defaults`` pins the same value.
+    assert Settings.model_fields["ai_compose_all_steps"].default is True
     assert Settings.model_fields["ai_compose_review_batch_size"].default == 3
     assert Settings.model_fields["ai_compose_review_expiry_hours"].default == 24
 

@@ -26,6 +26,30 @@ NOW = datetime.now(timezone.utc)
 TODAY = NOW.date()
 
 
+def _report_today():
+    """"Today" as the *endpoints* reckon it — in ``daily_summary_timezone``.
+
+    The endpoints window a day in the configured report timezone (Asia/Kolkata,
+    UTC+5:30), so between 18:30 and 24:00 UTC the report-local date is already
+    tomorrow. Asking them for the UTC date during that window asks for a window
+    that closed at 18:30 UTC, which the events seeded at ``NOW`` fall outside —
+    the test then failed for 5.5 hours a day and passed for the other 18.5,
+    which is worse than failing, because it reads as flake rather than as the
+    date arithmetic being wrong.
+
+    Tests that call ``compute_daily_metrics``/``generate_and_store_summary``
+    directly pass ``tz_name="UTC"`` and correctly keep using ``TODAY``.
+    """
+    from app.config import get_settings
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(get_settings().daily_summary_timezone)).date()
+    except Exception:
+        return datetime.now(timezone.utc).date()
+
+
 async def _seed_day_activity(db: AsyncSession) -> None:
     """Create a company, sequence, enrollment, and a spread of today's events."""
     company = Company(id=_uuid.uuid4(), name="MoldCo", country="US", source="prospecting")
@@ -155,10 +179,11 @@ async def test_daily_summary_latest_endpoint(client: AsyncClient, db_session: As
 @pytest.mark.asyncio
 async def test_daily_summary_by_date_endpoint(client: AsyncClient, db_session: AsyncSession):
     await _seed_day_activity(db_session)
-    resp = await client.get(f"/api/v1/reports/daily-summary/{TODAY.isoformat()}")
+    target = _report_today()
+    resp = await client.get(f"/api/v1/reports/daily-summary/{target.isoformat()}")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["date"] == TODAY.isoformat()
+    assert data["date"] == target.isoformat()
     assert data["emails_sent"] == 2
 
 
