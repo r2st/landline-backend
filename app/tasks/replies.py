@@ -113,9 +113,24 @@ async def suppress_contact(db: AsyncSession, contact: Contact, reason: str) -> i
     ``unsubscribed`` flag), writes a revoked consent record for the audit trail,
     and marks every actionable enrollment ``unsubscribed`` so the queue stops
     dispatching immediately. Returns the number of enrollments stopped.
+
+    Also puts the *address* on the org suppression list. The flags live on a
+    contact row, and rows are created by the scraper: someone who replied
+    "unsubscribe" today and is rediscovered next month through another source
+    arrives as a fresh row with ``suppressed=False``, and the sequence engine
+    mails a person who has already told us to stop. The list is keyed by address
+    and outlives every row, so it is the half that actually holds.
     """
     contact.suppressed = True
     contact.unsubscribed = True
+
+    from app.services import suppression as _suppression
+
+    # Flushes, doesn't commit — it joins this caller's transaction, so the list
+    # entry and the stopped enrollments land together or not at all.
+    await _suppression.add_entry(
+        db, contact.email, reason="unsubscribe", source="auto"
+    )
 
     now = datetime.now(timezone.utc)
     db.add(

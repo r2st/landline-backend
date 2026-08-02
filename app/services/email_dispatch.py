@@ -22,7 +22,6 @@ from typing import Optional
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from itsdangerous import URLSafeTimedSerializer
 
 from app.config import get_settings
 from app.models.gmail_account import GmailAccount
@@ -323,11 +322,19 @@ async def resolve_sender_info(
 
 
 def _make_unsubscribe_url(contact_email: str) -> str:
-    """Generate the signed unsubscribe URL for a contact."""
-    settings = get_settings()
-    serializer = URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
-    token = serializer.dumps(contact_email, salt="unsubscribe")
-    return f"https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe?token={token}"
+    """Generate the signed unsubscribe URL for a contact.
+
+    The token comes from :mod:`app.services.opt_out`, which owns both minting and
+    verification. This used to sign with ``secret_key or
+    "landline-unsubscribe-secret"`` while the endpoint verified with
+    ``secret_key`` or a *random per-process* key — so on any box without a
+    configured ``secret_key``, every unsubscribe link we sent was signed with a
+    key the endpoint would reject. It also carries the sending org now, so the
+    opt-out is scoped to the sender the recipient is actually replying to.
+    """
+    from app.services.opt_out import make_unsubscribe_url
+
+    return make_unsubscribe_url(contact_email)
 
 
 def _unsubscribe_footer_text(contact_email: str) -> str:

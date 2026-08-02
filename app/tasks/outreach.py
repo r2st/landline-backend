@@ -365,15 +365,26 @@ def send_sequence_step(self, enrollment_id: str):
                     return {"status": "paused", "reason": "no_contact_email"}
 
                 # Hard suppression (Feature 1): never send to a suppressed contact.
-                # Two sources: the per-contact ``suppressed`` flag, and the org
-                # do-not-contact suppression LIST keyed by email (Feature 2 — a
-                # bulk compliance import that may name an address which isn't even
-                # a contact). Either one stops the enrollment as unsubscribed
-                # (NOT bounced — a compliance stop must not dent sender metrics).
+                # Three sources: the per-contact ``suppressed`` flag, the legacy
+                # ``unsubscribed`` flag, and the org do-not-contact suppression
+                # LIST keyed by email (Feature 2 — a bulk compliance import that
+                # may name an address which isn't even a contact). Any one of them
+                # stops the enrollment as unsubscribed (NOT bounced — a compliance
+                # stop must not dent sender metrics).
+                #
+                # ``unsubscribed`` is checked because this gate not checking it is
+                # how the footer unsubscribe link — the only opt-out a recipient
+                # can actually reach — failed to stop anything for as long as it
+                # existed. ``opt_out.record`` now sets both flags and the list, so
+                # this is redundant by design: three writers have set this column
+                # alone at various times, and the cost of reading it is an
+                # attribute access.
                 from app.services import suppression as _suppression
 
-                if getattr(contact, "suppressed", False) or await _suppression.is_suppressed(
-                    db, contact.email
+                if (
+                    getattr(contact, "suppressed", False)
+                    or getattr(contact, "unsubscribed", False)
+                    or await _suppression.is_suppressed(db, contact.email)
                 ):
                     enrollment.status = "unsubscribed"
                     enrollment.completed_at = datetime.now(timezone.utc)
@@ -1600,13 +1611,15 @@ def process_outreach_queue():
                 contact = contact_result.scalar_one_or_none()
 
                 # Hard suppression: a contact suppressed via an unsubscribe reply
-                # (Feature 1), or an address on the org do-not-contact list
-                # (Feature 2), is never emailed again. Skip before any send —
-                # send_sequence_step re-checks and stops the enrollment properly.
+                # (Feature 1), one who used the unsubscribe link, or an address on
+                # the org do-not-contact list (Feature 2), is never emailed again.
+                # Skip before any send — send_sequence_step re-checks and stops the
+                # enrollment properly. Same three-way check it makes; see there.
                 from app.services import suppression as _suppression
 
                 if contact and (
                     getattr(contact, "suppressed", False)
+                    or getattr(contact, "unsubscribed", False)
                     or await _suppression.is_suppressed(db, contact.email)
                 ):
                     logger.info("Skipping enrollment %s: contact suppressed", enrollment.id)

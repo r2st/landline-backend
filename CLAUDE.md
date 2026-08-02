@@ -189,6 +189,44 @@ later; a worker half an hour behind held six copies of every task in its
 backlog. Time-based, never explicitly cleared, floored above the sweep interval
 (a lease shorter than 5 minutes is inert).
 
+## An opt-out stops the mail, and keeps stopping it
+
+There are three ways out of Dialtone mail — a reply saying "unsubscribe", the
+bulk compliance route, and **the link in the footer of every email plus the RFC
+8058 one-click header Gmail and Yahoo require**. The first two set
+`contact.suppressed`, wrote a consent record and stopped every live enrollment.
+The third set `contact.unsubscribed` and nothing else — and no send gate has ever
+read that column. So the only opt-out a recipient can actually reach was the only
+one that let steps 2 through 5 keep arriving on schedule.
+
+**`app.services.opt_out.record(db, email, org_id=…)` is the one way to record an
+opt-out.** It sets both flags, writes the revoked `ConsentRecord`, stops every
+enrollment in `ACTIONABLE_STATUSES`, *and* adds the address to the org
+suppression list. Never write the flags directly.
+
+- **The list is the durable half.** Flags live on a contact row and the scraper
+  creates rows: someone who opts out today and is rediscovered next month arrives
+  with `suppressed=False`. `SuppressionEntry` is keyed by `(org, email)` and
+  outlives every row. `unsubscribe` was a legal `SUPPRESSION_REASONS` value that
+  nothing had ever written.
+- **Match every row, case-insensitively.** `contacts.email` has no unique
+  constraint. A `scalar_one_or_none` here raised `MultipleResultsFound` on a
+  re-scraped duplicate, which became a 400 — "That link didn't work" to the human,
+  a broken one-click affordance to the mailbox provider, and nothing recorded.
+- **One serializer, `opt_out.unsubscribe_serializer()`.** The sender used to fall
+  back to a hardcoded secret and the endpoint to a random per-process key, so on
+  a box with no `SECRET_KEY` every unsubscribe link we sent was unverifiable.
+- **Tokens carry the sending org**, so an opt-out lands on that sender's list
+  rather than every org holding the address. Bare-string tokens are the legacy
+  shape, stay valid a year, and are in real inboxes — they decode to
+  `org_id=None`, which deliberately applies the opt-out everywhere.
+- **Only promise what happened.** The confirmation page and the one-click 200 are
+  claims that the address is suppressed; return the error page when it isn't.
+
+The send path checks `suppressed` **or** `unsubscribed` **or** the list, in both
+`send_sequence_step` and the queue sweep. The `unsubscribed` read is deliberate
+redundancy: rows written by the old link handler are in the database now.
+
 ## Pre-send spam gate
 
 Every outbound path runs the deterministic content scan

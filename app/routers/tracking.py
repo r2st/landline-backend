@@ -4,6 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -17,6 +18,7 @@ from app.models.email_template import EmailSend
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.org_context import org_scope
+from app.services import opt_out
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +71,13 @@ def _get_serializer():
 
 
 def _get_unsubscribe_serializer():
-    settings = get_settings()
-    key = settings.secret_key
-    if not key:
-        logger.warning("secret_key not set — unsubscribe tokens will use a random per-process key")
-        key = _FALLBACK_KEY
-    return URLSafeTimedSerializer(key)
+    """Delegates to the one place unsubscribe tokens are minted and verified.
+
+    Kept as a thin alias because tests and older callers import it by name. The
+    body used to be a second, independently-drifting copy of the sender's key
+    resolution — see :func:`app.services.opt_out.unsubscribe_serializer`.
+    """
+    return opt_out.unsubscribe_serializer()
 
 
 def generate_tracking_pixel_url(send_id: str) -> str:
@@ -310,23 +313,58 @@ async def track_click(token: str, db: AsyncSession = Depends(get_db)):
         return RedirectResponse(url="https://apprendtechnologies.com", status_code=302)
 
 
-async def _process_unsubscribe(token: str, db: AsyncSession) -> bool:
-    """Verify an unsubscribe token and mark the contact unsubscribed.
+def _decode_unsubscribe_token(token: str) -> tuple[Optional[str], Optional[uuid.UUID]]:
+    """Verify an unsubscribe token into ``(email, org_id)``. Raises if invalid.
 
-    Returns True when the token was valid (whether or not a matching contact
-    row existed), False when the token failed to verify. Shared by the GET
-    (user clicks a link) and POST (RFC 8058 one-click) handlers so both do
-    exactly the same thing.
+    Two shapes, because tokens outlive deploys. Current tokens are a dict
+    carrying the sending org (``{"e": ..., "o": ...}``) so the opt-out lands on
+    that sender's suppression list. Tokens minted before that are a bare address
+    string and are valid for a year — they are sitting in real inboxes right now,
+    and breaking them would break the one-click unsubscribe Gmail requires of us.
+    They decode to ``org_id=None``, which the opt-out reads as "every org holding
+    this address".
     """
-    serializer = _get_unsubscribe_serializer()
-    email = serializer.loads(token, salt="unsubscribe", max_age=86400 * 365)  # 1 year
-    if email:
-        result = await db.execute(select(Contact).where(Contact.email == email))
-        contact = result.scalar_one_or_none()
-        if contact:
-            contact.unsubscribed = True
-            await db.commit()
-            logger.info("Contact %s unsubscribed", email)
+    payload = _get_unsubscribe_serializer().loads(
+        token, salt="unsubscribe", max_age=86400 * 365  # 1 year
+    )
+    if isinstance(payload, dict):
+        raw_org = payload.get("o")
+        org_id = None
+        if raw_org:
+            try:
+                org_id = uuid.UUID(str(raw_org))
+            except (ValueError, AttributeError, TypeError):
+                # A signed token we minted, so this shouldn't happen — but an
+                # unreadable org must not cost the recipient their opt-out.
+                logger.warning("Unsubscribe token carried an unreadable org id")
+        return payload.get("e"), org_id
+    return payload, None
+
+
+async def _process_unsubscribe(token: str, db: AsyncSession) -> bool:
+    """Verify an unsubscribe token and stop all mail to that address.
+
+    Raises when the token fails to verify; the callers turn that into the error
+    page / a 400. Shared by the GET (a human clicks the footer link) and POST
+    (RFC 8058 one-click) handlers so both do exactly the same thing.
+
+    Delegates to :mod:`app.services.opt_out`, which is the point of this
+    function's existence. It used to set ``contact.unsubscribed`` and stop — a
+    column no send gate reads. The sequence engine checks ``contact.suppressed``
+    and the org suppression list, so the sequence carried on to step 2, 3, 4 and
+    5 after the recipient had opted out. See that module for the rest.
+    """
+    email, org_id = _decode_unsubscribe_token(token)
+    result = await opt_out.record(
+        db, email, org_id=org_id, reason="unsubscribe", source="auto",
+        basis="unsubscribe link",
+    )
+    if result is None:
+        # The signature verified but the payload isn't an address. Nothing to
+        # suppress, and nothing the recipient can do about it — don't show them
+        # a success page for an opt-out that recorded nothing.
+        logger.warning("Unsubscribe token verified but carried no usable address")
+        return False
     return True
 
 
@@ -351,7 +389,11 @@ _UNSUB_ERR_HTML = (
 async def unsubscribe(token: str, db: AsyncSession = Depends(get_db)):
     """Handle a user-clicked unsubscribe link (renders a confirmation page)."""
     try:
-        await _process_unsubscribe(token, db)
+        if not await _process_unsubscribe(token, db):
+            # "You're unsubscribed" is a promise. Only make it when the address
+            # is genuinely on a suppression list — the page used to say it
+            # unconditionally, including when nothing had been recorded at all.
+            return HTMLResponse(_UNSUB_ERR_HTML, status_code=400)
         return HTMLResponse(_UNSUB_OK_HTML)
     except Exception as e:
         logger.warning("Unsubscribe failed: %s", str(e))
@@ -370,7 +412,8 @@ async def unsubscribe_one_click(token: str, db: AsyncSession = Depends(get_db)):
     returns a small 200 body (the provider ignores the content).
     """
     try:
-        await _process_unsubscribe(token, db)
+        if not await _process_unsubscribe(token, db):
+            return Response(status_code=400)
         return Response(status_code=200)
     except Exception as e:
         logger.warning("One-click unsubscribe failed: %s", str(e))

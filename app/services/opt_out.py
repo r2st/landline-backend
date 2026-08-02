@@ -1,0 +1,337 @@
+"""One address asked us to stop. Make that stick, everywhere, permanently.
+
+The problem this exists for
+---------------------------
+There were three ways to opt out of Dialtone mail, and they did three different
+things:
+
+* **Reply "UNSUBSCRIBE"** (``tasks.replies.suppress_contact``) — set
+  ``suppressed`` *and* ``unsubscribed``, wrote a revoked ``ConsentRecord``, and
+  marked every live enrollment ``unsubscribed``. Correct.
+* **The bulk compliance route** (``routers.contacts``) — the same. Correct.
+* **The unsubscribe link in the footer of every email we send**, and the RFC 8058
+  one-click header Gmail and Yahoo require — set ``contact.unsubscribed`` and
+  nothing else.
+
+The send path gates on ``contact.suppressed`` and on the org suppression list.
+It has never read ``unsubscribed``. So the *only* opt-out a recipient can
+actually reach — the link we put in front of them, and the one-click button the
+mailbox provider renders on our behalf — was the only one that did not stop the
+mail. Click it after step 1 of a five-step sequence and steps 2 through 5 still
+arrive, on schedule, from the sender you just told to stop.
+
+``unsubscribe`` was already a legal value in ``SUPPRESSION_REASONS`` and nothing
+in the codebase had ever written one.
+
+Two more faults in the same handler, both live:
+
+* It matched a single contact with ``scalar_one_or_none()``. ``contacts.email``
+  has no unique constraint and is not unique across orgs, so an address held by
+  two rows raised ``MultipleResultsFound``, which the caller turned into a 400.
+  The human saw "That link didn't work"; the mailbox provider treating a 400 as
+  a broken one-click affordance saw the same. Nothing was recorded either way,
+  and the duplicate rows that caused it are exactly what a re-scraped prospect
+  looks like.
+* It matched ``Contact.email == email`` exactly. Addresses are handled
+  case-insensitively everywhere else in this codebase (``normalize_email``).
+
+Why the suppression list, and not just the flags
+------------------------------------------------
+Flags live on a *row*. The scraper creates rows. Someone who opts out today and
+is rediscovered next month through a different source arrives as a new contact
+with ``suppressed=False``, and the sequence engine mails a person who has
+already told us to stop — the same violation, one import later.
+
+``SuppressionEntry`` is keyed by ``(org, email)`` and outlives every contact row,
+so it is the durable half. The flags are the fast half, read on the row the send
+path already has in hand. This module always writes both, which is why it exists
+rather than each caller assembling its own half of the operation.
+
+Which org
+---------
+An opt-out is addressed to the sender, not to the platform, so it is scoped to
+the org whose mail prompted it. New unsubscribe tokens carry that org id.
+
+Tokens already sitting in inboxes do not — they are a bare address, they stay
+valid for a year, and we cannot ask the recipient which of our customers they
+meant. For those, ``org_id=None`` applies the opt-out to every org holding that
+address. That is deliberately the broad reading: the cost of being wrong is a
+prospect one org stops mailing, against a prospect who asked to stop and kept
+receiving mail. Those are not comparable.
+"""
+
+from __future__ import annotations
+
+import logging
+import secrets
+import uuid
+from datetime import datetime, timezone
+from typing import NamedTuple, Optional
+
+from itsdangerous import URLSafeTimedSerializer
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import get_settings
+from app.models.consent import ConsentRecord
+from app.models.contact import Contact
+from app.models.outreach import OutreachEnrollment
+from app.models.suppression import SUPPRESSION_REASONS, SUPPRESSION_SOURCES, SuppressionEntry
+from app.org_context import APPREND_ORG_ID, get_current_org_id
+from app.services.suppression import normalize_email
+
+logger = logging.getLogger(__name__)
+
+# Random per-process fallback, used only when ``secret_key`` is unconfigured.
+# Tokens signed with it die at restart, which is the correct failure for a
+# missing secret — a hardcoded one is a forgeable opt-out for every address.
+_FALLBACK_KEY = secrets.token_urlsafe(32)
+
+
+def unsubscribe_serializer() -> URLSafeTimedSerializer:
+    """The one serializer for unsubscribe tokens, minting and verifying alike.
+
+    There were two, and they disagreed. The sender
+    (``email_dispatch._make_unsubscribe_url``) fell back to a hardcoded
+    ``"landline-unsubscribe-secret"`` when ``secret_key`` was unset; the verifier
+    (``routers.tracking``) fell back to a random per-process key. On a box with
+    no ``secret_key`` configured, every unsubscribe link in every email we sent
+    was therefore signed with a key the endpoint would never accept — a
+    guaranteed "That link didn't work" on the one control a recipient has, and a
+    400 to every mailbox provider trying one-click on our behalf.
+
+    One factory, so the two ends cannot drift apart again. The random fallback is
+    the surviving one: a hardcoded signing key lets anyone forge an opt-out for
+    any address, and losing tokens on restart is much the smaller failure.
+    """
+    key = get_settings().secret_key
+    if not key:
+        logger.warning(
+            "secret_key not set — unsubscribe tokens will use a random per-process key"
+        )
+        key = _FALLBACK_KEY
+    return URLSafeTimedSerializer(key)
+
+
+def make_unsubscribe_token(email: str, org_id: Optional[uuid.UUID] = None) -> str:
+    """Mint the token that goes in the footer link and the List-Unsubscribe header.
+
+    Carries the sending org so the opt-out lands on *that* sender's suppression
+    list rather than being applied across every org that happens to hold the
+    address. Falls back to the ambient org context, which is bound for the whole
+    of a send.
+    """
+    org = org_id if org_id is not None else get_current_org_id()
+    payload: dict[str, str] = {"e": email}
+    if org is not None:
+        payload["o"] = str(org)
+    return unsubscribe_serializer().dumps(payload, salt="unsubscribe")
+
+
+# The endpoint that honours these tokens. It is an API route, not a frontend
+# one: `routers.tracking.unsubscribe` renders its own confirmation page, and the
+# RFC 8058 one-click POST has to land on the same origin.
+UNSUBSCRIBE_ENDPOINT = (
+    "https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe"
+)
+
+
+def make_unsubscribe_url(email: str, org_id: Optional[uuid.UUID] = None) -> str:
+    """The full link that goes in a footer and in the List-Unsubscribe header.
+
+    One builder, for the same reason there is one serializer. The SES sender
+    (``email_sender._build_unsubscribe_footer``) pointed its own copy at
+    ``https://landline.apprendtechnologies.com/unsubscribe`` — a *frontend* path
+    that does not exist and never has, so that footer offered a 404 as the
+    recipient's only way out. Signed with the hardcoded fallback secret, too, so
+    even against the right endpoint it would not have verified.
+    """
+    return f"{UNSUBSCRIBE_ENDPOINT}?token={make_unsubscribe_token(email, org_id)}"
+
+
+# Enrollment states an opt-out has to interrupt. Everything else is already
+# finished (``completed``, ``bounced``, ``unsubscribed``) and rewriting it would
+# only destroy the record of how it ended.
+ACTIONABLE_STATUSES = ("active", "paused", "pending_review")
+
+
+class OptOutResult(NamedTuple):
+    """What the opt-out actually changed.
+
+    ``recorded`` is the honest answer to "is this address now safe from us?" and
+    is true whenever a suppression entry exists — including the case where no
+    contact row matched at all, which is precisely when the flags alone would
+    have recorded nothing and the confirmation page would have lied.
+    """
+
+    email: str
+    contacts: int
+    enrollments_stopped: int
+    orgs: tuple[uuid.UUID, ...]
+
+    @property
+    def recorded(self) -> bool:
+        return bool(self.orgs)
+
+
+async def record(
+    db: AsyncSession,
+    email: Optional[str],
+    *,
+    org_id: Optional[uuid.UUID] = None,
+    reason: str = "unsubscribe",
+    source: str = "auto",
+    basis: Optional[str] = None,
+) -> Optional[OptOutResult]:
+    """Stop all mail to ``email``. Commits. Idempotent.
+
+    ``org_id`` scopes the opt-out to one sender; ``None`` applies it to every org
+    holding the address (see the module docstring on legacy tokens).
+
+    Returns ``None`` only when ``email`` is not email-shaped — the one case where
+    there is nothing a caller could sensibly suppress. Otherwise the address ends
+    up on at least one suppression list, so a caller can tell a recipient the
+    truth without checking whether we happened to have a row for them.
+    """
+    normalized = normalize_email(email)
+    if normalized is None:
+        return None
+    if reason not in SUPPRESSION_REASONS:
+        reason = "unsubscribe"
+    if source not in SUPPRESSION_SOURCES:
+        source = "auto"
+    now = datetime.now(timezone.utc)
+
+    # ``skip_org_filter`` throughout, with the org applied explicitly instead.
+    # This runs from an unauthenticated endpoint where no org is bound, and the
+    # global filter's no-context behaviour is to *not* filter — relying on that
+    # by accident is how a scoping change turns a compliance stop into a no-op.
+    contact_q = (
+        select(Contact)
+        .where(func.lower(Contact.email) == normalized)
+        .execution_options(skip_org_filter=True)
+    )
+    if org_id is not None:
+        contact_q = contact_q.where(Contact.org_id == org_id)
+    contacts = list((await db.execute(contact_q)).scalars().all())
+
+    # Every row for this address, not the one row a `scalar_one_or_none` was
+    # willing to accept. A person the scraper found twice is one person, and the
+    # duplicate used to raise instead of unsubscribing either copy.
+    for contact in contacts:
+        contact.suppressed = True
+        contact.unsubscribed = True
+        db.add(
+            ConsentRecord(
+                # Explicit: the insert stamp reads the ambient org, which is
+                # unset here and would file every record under the first-party
+                # org regardless of whose contact it is.
+                org_id=contact.org_id,
+                contact_id=contact.id,
+                consent_type="none",
+                basis=(basis or "unsubscribe link")[:2000],
+                granted_at=None,
+                revoked_at=now,
+            )
+        )
+
+    enrollments_stopped = 0
+    if contacts:
+        enrollments = (
+            await db.execute(
+                select(OutreachEnrollment)
+                .where(
+                    OutreachEnrollment.contact_id.in_([c.id for c in contacts]),
+                    OutreachEnrollment.status.in_(ACTIONABLE_STATUSES),
+                )
+                .execution_options(skip_org_filter=True)
+            )
+        ).scalars().all()
+        for enr in enrollments:
+            # ``unsubscribed``, never ``bounced``. A compliance stop is not a
+            # delivery failure and must not move sender reputation metrics.
+            enr.status = "unsubscribed"
+            enr.completed_at = now
+            enrollments_stopped += 1
+
+    await db.commit()
+
+    # The durable half, committed separately so a lost race on the unique
+    # constraint cannot roll back the flags and the stopped enrollments above.
+    targets = {c.org_id for c in contacts}
+    if org_id is not None:
+        targets.add(org_id)
+    if not targets:
+        # Nobody holds this address — an opt-out from a legacy token whose
+        # contact has since been deleted, or a bare address. Suppress in the
+        # first-party org anyway: the point of the list is to survive the row.
+        targets.add(APPREND_ORG_ID)
+
+    written: list[uuid.UUID] = []
+    for target in sorted(targets, key=str):
+        if await _ensure_entry(db, target, normalized, reason=reason, source=source):
+            written.append(target)
+
+    result = OptOutResult(
+        email=normalized,
+        contacts=len(contacts),
+        enrollments_stopped=enrollments_stopped,
+        orgs=tuple(written),
+    )
+    logger.info(
+        "Opt-out recorded for %s: %d contact(s), %d enrollment(s) stopped, %d org list(s)",
+        normalized, result.contacts, result.enrollments_stopped, len(result.orgs),
+    )
+    return result
+
+
+async def _ensure_entry(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    normalized: str,
+    *,
+    reason: str,
+    source: str,
+) -> bool:
+    """Put ``normalized`` on ``org_id``'s suppression list. True if it is there now.
+
+    Idempotent against ``uq_suppression_org_email`` from both directions: the
+    pre-check handles the ordinary repeat, and the ``IntegrityError`` handles the
+    one that matters — a mailbox provider POSTing one-click twice in parallel, or
+    a click landing while the provider's POST is in flight. Losing that race
+    still leaves the address suppressed, which is the whole requirement, so it is
+    reported as success rather than raised.
+    """
+    existing = (
+        await db.execute(
+            select(SuppressionEntry.id)
+            .where(
+                SuppressionEntry.org_id == org_id,
+                SuppressionEntry.email == normalized,
+            )
+            .limit(1)
+            .execution_options(skip_org_filter=True)
+        )
+    ).first()
+    if existing is not None:
+        return True
+
+    db.add(
+        SuppressionEntry(org_id=org_id, email=normalized, reason=reason, source=source)
+    )
+    try:
+        await db.commit()
+        return True
+    except IntegrityError:
+        await db.rollback()
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        # The flags and the stopped enrollments are already committed, so mail
+        # has stopped; what is lost is only the protection against a future
+        # re-import. Worth a loud log, not worth failing the opt-out.
+        logger.error(
+            "Could not add %s to org %s suppression list: %s", normalized, org_id, exc
+        )
+        await db.rollback()
+        return False

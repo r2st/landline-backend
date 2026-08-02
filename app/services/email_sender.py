@@ -5,7 +5,6 @@ from typing import Optional
 
 from jinja2.sandbox import SandboxedEnvironment
 
-from itsdangerous import URLSafeTimedSerializer
 
 from app.config import get_settings
 
@@ -43,10 +42,21 @@ class EmailSender:
         return tmpl.render(**context)
 
     def _build_unsubscribe_footer(self, contact_email: str) -> str:
-        """CAN-SPAM compliant unsubscribe footer with signed token (no PII in URL)."""
-        serializer = URLSafeTimedSerializer(settings.secret_key or "landline-unsubscribe-secret")
-        token = serializer.dumps(contact_email, salt="unsubscribe")
-        unsubscribe_url = f"https://landline.apprendtechnologies.com/unsubscribe?token={token}"
+        """CAN-SPAM compliant unsubscribe footer with signed token (no PII in URL).
+
+        Both the token and the URL come from :mod:`app.services.opt_out`, which
+        owns minting and verification. This was the second copy of both and it
+        was wrong twice over: it signed with a hardcoded
+        ``"landline-unsubscribe-secret"`` fallback the endpoint would never
+        accept, and it pointed at ``landline.apprendtechnologies.com/unsubscribe``
+        — a frontend route that does not exist. A recipient following this
+        footer got a 404, and the token behind it would have failed to verify
+        anyway. Only reachable today because both callers pass
+        ``include_unsubscribe=False``; the default is ``True``.
+        """
+        from app.services.opt_out import make_unsubscribe_url
+
+        unsubscribe_url = make_unsubscribe_url(contact_email)
         return (
             "\n\n—\n"
             f"{settings.company_name}\n"

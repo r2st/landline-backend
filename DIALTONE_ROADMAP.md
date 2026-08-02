@@ -240,6 +240,43 @@ Two guards (`services/send_claim.py`, migration 109):
   duplicate task is never created rather than created and refused. Time-based,
   so a task lost with its broker is re-dispatched rather than stranded.
 
+**Added 2026-08-02 — the unsubscribe link did not stop the mail.** Three ways
+out of Dialtone mail, doing three different things. A reply saying "unsubscribe"
+and the bulk compliance route both set `contact.suppressed`, wrote a revoked
+consent record and marked every live enrollment `unsubscribed`. The link in the
+footer of every email we send — and the RFC 8058 one-click header Gmail and
+Yahoo require us to carry — set `contact.unsubscribed` and stopped there. No
+send gate has ever read that column; they read `contact.suppressed` and the org
+suppression list. So the only opt-out a recipient can actually reach was the only
+one that did nothing: click it after step 1 of a five-step sequence and steps 2
+through 5 still arrive, on schedule, from the sender you just told to stop.
+`unsubscribe` was already a legal `SUPPRESSION_REASONS` value and nothing in the
+codebase had ever written one.
+
+Three more faults in the same handler, all live:
+
+* it matched one contact with `scalar_one_or_none`, and `contacts.email` has no
+  unique constraint — a re-scraped duplicate raised `MultipleResultsFound`, which
+  became a 400. The human read "That link didn't work"; the mailbox provider read
+  a broken one-click affordance; neither row was unsubscribed;
+* it matched the address case-sensitively, alone in this codebase;
+* the sender signed tokens with `secret_key or "landline-unsubscribe-secret"`
+  while the endpoint verified with `secret_key` or a *random per-process* key, so
+  on any box without a configured `SECRET_KEY` every unsubscribe link we had ever
+  sent was signed with a key the endpoint would reject.
+
+`services/opt_out.py` is now the one way to record an opt-out: both flags, the
+consent record, every actionable enrollment stopped, and the address on the org
+suppression list. The list is the half that lasts — flags live on a contact row
+and the scraper creates rows, so someone who opts out today and is rediscovered
+next month would otherwise arrive as a fresh row with `suppressed=False`. Tokens
+now carry the sending org so an opt-out is scoped to the sender that prompted it;
+bare-string tokens are the legacy shape, are valid for a year, are sitting in
+real inboxes, and deliberately apply the opt-out to every org holding the
+address. The reply-based path writes a list entry too, for the same durability
+reason. Both send gates read `unsubscribed` as well, because rows written by the
+old handler are in the database right now.
+
 **Added earlier, and not on this roadmap:** the outreach queue was unordered
 (`services/queue_priority.py`). It selected every active enrollment with no
 `ORDER BY` and then spent a finite daily cap walking that list, so a sequential
