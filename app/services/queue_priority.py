@@ -34,8 +34,10 @@ module only chooses who reaches those gates first.
 **The score is value plus waiting, and waiting is unbounded.** Value is capped
 at :data:`MAX_VALUE_POINTS`; wait pressure grows at :data:`WAIT_POINTS_PER_DAY`
 forever. So an enrollment with nothing going for it overtakes a perfect one
-after ``MAX_VALUE_POINTS / WAIT_POINTS_PER_DAY`` days of being overdue — about
-three weeks at the current constants. That crossing point is the whole design:
+after ``MAX_VALUE_POINTS / WAIT_POINTS_PER_DAY`` days of being overdue — around
+three and a half weeks at the current constants, and
+:func:`wait_breakeven_days` is the authority on the number rather than this
+sentence. That crossing point is the whole design:
 a pure value ranking is precisely the starvation bug above, restated with better
 taste, because the same low-value rows would lose forever on purpose instead of
 by accident. Value decides who goes first; waiting guarantees everyone goes.
@@ -95,9 +97,38 @@ MAX_FIT_POINTS = 16.0
 # ``IntentSignal.combined_score`` already means.
 MAX_INTENT_POINTS = 22.0
 
+# --- Who the mail is actually addressed to -----------------------------------
+# The paradigm low-value case in this module's own docstring is "a cold step-1 to
+# a role inbox scraped off a Places listing" — and until now nothing scored it.
+# Both terms below are about the *recipient*, not the company, and both are
+# deliberately smaller than engagement: they are priors, and one open outranks
+# any prior.
+#
+# A named person versus a shared inbox. ``info@`` is a real mailbox — which is
+# why ``is_non_prospect_address`` lets it through and why it still gets sent —
+# but it lands in a queue triaged by whoever is on rota, and cold mail is the
+# first thing that queue deletes. Round 9's scraper fix deliberately keeps these
+# so SMB shops aren't stranded, which is right, and makes ordering them behind a
+# named colleague the place to express the difference.
+#
+# Both are sized so their *sum* stays under :data:`OPEN_POINTS`. A single open is
+# an observation and these are guesses about a stranger; a named, verified
+# address that has never responded must not displace a shared inbox that has.
+NAMED_CONTACT_POINTS = 8.0
+# A verified-deliverable address versus a guess. When Apollo and Hunter are out
+# of credits ``email_pattern_generator`` *derives* addresses and writes them
+# ``unknown`` on purpose; those are the sends most likely to become a hard
+# bounce, and a hard bounce is charged against the global rate the kill switch
+# reads. Spending scarce capacity on the proven address first is free insurance.
+VERIFIED_ADDRESS_POINTS = 4.0
+MAX_RECIPIENT_POINTS = NAMED_CONTACT_POINTS + VERIFIED_ADDRESS_POINTS
+
 # The ceiling of everything above. Kept as a derived constant so the docstring's
 # crossing-point claim cannot drift away from the constants it is computed from.
-MAX_VALUE_POINTS = CLICK_POINTS + MAX_STEP_POINTS + MAX_FIT_POINTS + MAX_INTENT_POINTS
+MAX_VALUE_POINTS = (
+    CLICK_POINTS + MAX_STEP_POINTS + MAX_FIT_POINTS + MAX_INTENT_POINTS
+    + MAX_RECIPIENT_POINTS
+)
 
 # Enrollment ids per ``IN`` clause. Large sweeps chunk rather than building one
 # unbounded parameter list.
@@ -141,6 +172,8 @@ class _Facts:
     company_of: dict[UUID, UUID] = field(default_factory=dict)      # contact -> company
     fit_of: dict[UUID, int] = field(default_factory=dict)           # company -> fit_score
     intent_of: dict[UUID, float] = field(default_factory=dict)      # company -> combined
+    named_contacts: set[UUID] = field(default_factory=set)          # not a role inbox
+    verified_contacts: set[UUID] = field(default_factory=set)       # proven deliverable
 
 
 def _aware(value: Optional[datetime]) -> Optional[datetime]:
@@ -189,20 +222,42 @@ async def _load_events(db: AsyncSession, facts: _Facts, enrollment_ids: list[UUI
 async def _load_company_signals(
     db: AsyncSession, facts: _Facts, contact_ids: list[UUID], now: datetime
 ) -> None:
-    """Contact → company, then the company's best fit score and live intent."""
+    """Contact → company, then the company's best fit score and live intent.
+
+    The contact pass also picks up the two recipient-level priors, out of the
+    same rows: adding a second query over the same primary keys to read two more
+    columns would be exactly the per-enrollment cost this module goes out of its
+    way to avoid.
+    """
     from app.models.contact import Contact
     from app.models.intent_signal import IntentSignal
     from app.models.lead_score import LeadScore
+    from app.services.email_validation import is_role_address
 
     for chunk in _chunks(contact_ids):
         rows = (
             await db.execute(
-                select(Contact.id, Contact.company_id).where(Contact.id.in_(chunk))
+                select(
+                    Contact.id,
+                    Contact.company_id,
+                    Contact.email,
+                    Contact.email_verification_result,
+                ).where(Contact.id.in_(chunk))
             )
         ).all()
-        for contact_id, company_id in rows:
+        for contact_id, company_id, email, verification in rows:
             if company_id is not None:
                 facts.company_of[contact_id] = company_id
+            # An address we cannot parse is not credited as a named person; the
+            # absence of a bonus is the whole penalty, and a contact with no
+            # address is stopped by a gate long before ordering matters.
+            if email and not is_role_address(email):
+                facts.named_contacts.add(contact_id)
+            # Only a positive verdict counts. ``unknown`` is the default a
+            # pattern-derived guess carries and ``risky`` is what a catch-all
+            # domain returns — neither is proof of a mailbox.
+            if verification == "deliverable":
+                facts.verified_contacts.add(contact_id)
 
     company_ids = list({c for c in facts.company_of.values()})
     if not company_ids:
@@ -282,6 +337,11 @@ def _score_one(enrollment, facts: _Facts, now: datetime) -> Score:
     sent = facts.sent_counts.get(enrollment.id, 0)
     if sent > 0:
         score.add("in_flight", min(STEP_POINTS * sent, MAX_STEP_POINTS))
+
+    if enrollment.contact_id in facts.named_contacts:
+        score.add("named_recipient", NAMED_CONTACT_POINTS)
+    if enrollment.contact_id in facts.verified_contacts:
+        score.add("verified_address", VERIFIED_ADDRESS_POINTS)
 
     company_id = facts.company_of.get(enrollment.contact_id)
     if company_id is not None:

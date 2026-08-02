@@ -137,9 +137,17 @@ def test_value_ceiling_matches_its_components():
         + queue_priority.MAX_STEP_POINTS
         + queue_priority.MAX_FIT_POINTS
         + queue_priority.MAX_INTENT_POINTS
+        + queue_priority.MAX_RECIPIENT_POINTS
+    )
+    assert queue_priority.MAX_RECIPIENT_POINTS == (
+        queue_priority.NAMED_CONTACT_POINTS + queue_priority.VERIFIED_ADDRESS_POINTS
     )
     # A click must outrank a mere open, or "strongest signal" means nothing.
     assert queue_priority.CLICK_POINTS > queue_priority.OPEN_POINTS
+    # The recipient terms are priors about who we are writing to; one observed
+    # open has to outrank the best possible guess, or a well-shaped address
+    # displaces a contact who has actually shown interest.
+    assert queue_priority.OPEN_POINTS > queue_priority.MAX_RECIPIENT_POINTS
     # And the crossing point has to be reachable — weeks, not years.
     assert 5 < queue_priority.wait_breakeven_days() < 60
 
@@ -528,3 +536,221 @@ async def test_capped_sweep_spends_its_quota_on_the_best_enrollments(
     # And the sweep reports the demand it could not serve, so a binding cap is
     # visible rather than looking like an idle queue.
     assert result[0]["skipped_daily_quota"] == 1
+
+
+# ─── Who the mail is addressed to ────────────────────────────────────────────
+#
+# The module docstring's paradigm low-value case has always been "a cold step-1
+# to a role inbox scraped off a Places listing". Until these terms existed it
+# was named and not scored, so that contact and a named decision-maker with the
+# same fit competed on row order.
+
+
+async def test_a_named_person_outranks_a_shared_inbox(db_session: AsyncSession):
+    """``info@`` is a real mailbox — it still gets sent, it just goes second.
+
+    Round 9's scraper fix deliberately keeps generic inboxes so SMB shops aren't
+    stranded, which makes "both addresses at the same company" the normal case
+    and the ordering between them the only place to express the difference.
+    """
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    # The shared inbox is given the *earlier* enrollment deliberately: ties break
+    # on ``enrolled_at`` then id, so with equal scores it would win. The score
+    # has to be what reorders them, or the assertion is a coin flip on a UUID.
+    shared = await _enrollment(
+        db_session, seq, await _contact(db_session, company, "info@acme.com"),
+        due_at=NOW - timedelta(hours=1), enrolled_at=NOW - timedelta(days=5),
+    )
+    named = await _enrollment(
+        db_session, seq, await _contact(db_session, company, "dale.chen@acme.com"),
+        due_at=NOW - timedelta(hours=1), enrolled_at=NOW - timedelta(days=1),
+    )
+    await db_session.commit()
+
+    scores = await queue_priority.score_enrollments(
+        db_session, [shared, named], now=NOW
+    )
+    assert "named_recipient" not in scores[shared.id].parts
+    assert scores[named.id].parts["named_recipient"] == (
+        queue_priority.NAMED_CONTACT_POINTS
+    )
+
+    ordered = await queue_priority.rank(db_session, [shared, named], now=NOW)
+    assert [e.id for e in ordered] == [named.id, shared.id]
+
+
+async def test_a_verified_address_outranks_a_guess(db_session: AsyncSession):
+    """When Apollo and Hunter are out of credits, ``email_pattern_generator``
+    derives addresses and writes them ``unknown`` on purpose. Those are the
+    sends most likely to become a hard bounce, and a hard bounce is charged
+    against the global rate the kill switch reads."""
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    guessed = await _contact(db_session, company, "d.chen@acme.com")
+    guessed.email_verification_result = "unknown"
+    proven = await _contact(db_session, company, "dale.chen@acme.com")
+    proven.email_verification_result = "deliverable"
+    await db_session.flush()
+
+    # As above: the guess enrolls first, so only the score can reorder them.
+    a = await _enrollment(
+        db_session, seq, guessed, due_at=NOW - timedelta(hours=1),
+        enrolled_at=NOW - timedelta(days=5),
+    )
+    b = await _enrollment(
+        db_session, seq, proven, due_at=NOW - timedelta(hours=1),
+        enrolled_at=NOW - timedelta(days=1),
+    )
+    await db_session.commit()
+
+    scores = await queue_priority.score_enrollments(db_session, [a, b], now=NOW)
+    assert "verified_address" not in scores[a.id].parts
+    assert scores[b.id].parts["verified_address"] == (
+        queue_priority.VERIFIED_ADDRESS_POINTS
+    )
+
+    ordered = await queue_priority.rank(db_session, [a, b], now=NOW)
+    assert [e.id for e in ordered] == [b.id, a.id]
+
+
+@pytest.mark.parametrize("verdict", ["unknown", "risky", "undeliverable", None])
+async def test_only_a_positive_verdict_earns_the_verification_bonus(
+    db_session: AsyncSession, verdict
+):
+    """``risky`` is what a catch-all domain returns and ``unknown`` is the
+    default a guess carries; neither is proof of a mailbox."""
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    contact = await _contact(db_session, company, "dale.chen@acme.com")
+    contact.email_verification_result = verdict
+    await db_session.flush()
+    enrollment = await _enrollment(
+        db_session, seq, contact, due_at=NOW - timedelta(hours=1)
+    )
+    other = await _enrollment(
+        db_session, seq, await _contact(db_session, company, "sam.reed@acme.com"),
+        due_at=NOW - timedelta(hours=1),
+    )
+    await db_session.commit()
+
+    scores = await queue_priority.score_enrollments(
+        db_session, [enrollment, other], now=NOW
+    )
+    assert "verified_address" not in scores[enrollment.id].parts
+
+
+async def test_engagement_still_beats_a_perfect_recipient(db_session: AsyncSession):
+    """These terms are priors. An open is an observation, and the observation
+    has to win — otherwise a well-shaped address displaces a contact who has
+    actually shown interest."""
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    perfect = await _contact(db_session, company, "dale.chen@acme.com")
+    perfect.email_verification_result = "deliverable"
+    await db_session.flush()
+    cold = await _enrollment(
+        db_session, seq, perfect, due_at=NOW - timedelta(hours=1)
+    )
+    engaged = await _enrollment(
+        db_session, seq, await _contact(db_session, company, "info@acme.com"),
+        due_at=NOW - timedelta(hours=1),
+    )
+    await _event(db_session, engaged, "opened")
+    await db_session.commit()
+
+    ordered = await queue_priority.rank(db_session, [cold, engaged], now=NOW)
+    assert [e.id for e in ordered] == [engaged.id, cold.id]
+
+
+async def test_the_shared_inbox_is_ordered_behind_not_starved(
+    db_session: AsyncSession,
+):
+    """The anti-starvation guarantee has to survive the new terms.
+
+    A role inbox with no fit, no intent and no engagement still overtakes a
+    perfect named contact once it is far enough past due — otherwise this is a
+    permanent block on every SMB whose only published address is ``info@``,
+    which is the population round 9 went out of its way to keep.
+    """
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    named = await _contact(db_session, company, "dale.chen@acme.com")
+    named.email_verification_result = "deliverable"
+    await db_session.flush()
+    best = await _enrollment(db_session, seq, named, due_at=NOW - timedelta(minutes=1))
+
+    overdue = queue_priority.wait_breakeven_days() + 2
+    shared = await _enrollment(
+        db_session, seq, await _contact(db_session, company, "info@acme.com"),
+        due_at=NOW - timedelta(days=overdue),
+        enrolled_at=NOW - timedelta(days=overdue + 1),
+    )
+    await db_session.commit()
+
+    ordered = await queue_priority.rank(db_session, [best, shared], now=NOW)
+    assert [e.id for e in ordered] == [shared.id, best.id]
+
+
+async def test_a_contact_with_no_address_scores_no_recipient_points(
+    db_session: AsyncSession,
+):
+    """The absence of the bonus is the whole penalty. A contact with no address
+    is stopped by a gate long before ordering matters, and crediting it as a
+    named person would rank it above a real shared inbox."""
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    blank = await _contact(db_session, company, "dale.chen@acme.com")
+    blank.email = None
+    await db_session.flush()
+    enrollment = await _enrollment(
+        db_session, seq, blank, due_at=NOW - timedelta(hours=1)
+    )
+    other = await _enrollment(
+        db_session, seq, await _contact(db_session, company, "sam.reed@acme.com"),
+        due_at=NOW - timedelta(hours=1),
+    )
+    await db_session.commit()
+
+    scores = await queue_priority.score_enrollments(
+        db_session, [enrollment, other], now=NOW
+    )
+    assert "named_recipient" not in scores[enrollment.id].parts
+    assert "named_recipient" in scores[other.id].parts
+
+
+async def test_the_recipient_terms_cost_no_extra_query(
+    db_session: AsyncSession, monkeypatch
+):
+    """Read out of the contact rows the ranker already fetches.
+
+    The sweep goes out of its way to avoid per-enrollment queries; a ranking
+    pass that reintroduced one to read two more columns would cost more than
+    the ordering is worth.
+    """
+    seq = await _sequence(db_session)
+    company = await _company(db_session, "Acme Stamping")
+    enrollments = []
+    for i in range(4):
+        enrollments.append(
+            await _enrollment(
+                db_session, seq,
+                await _contact(db_session, company, f"person{i}@acme.com"),
+                due_at=NOW - timedelta(hours=1),
+            )
+        )
+    await db_session.commit()
+
+    executed = 0
+    original = type(db_session).execute
+
+    async def _counting(self, *args, **kwargs):
+        nonlocal executed
+        executed += 1
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(db_session), "execute", _counting)
+    await queue_priority.score_enrollments(db_session, enrollments, now=NOW)
+
+    # events + contacts + fit + intent. The module docstring promises four.
+    assert executed == 4
