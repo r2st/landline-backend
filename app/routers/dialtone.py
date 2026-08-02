@@ -43,7 +43,14 @@ from app.models.sequence import OutreachSequence, SequenceStep
 from app.models.smtp_account import SmtpAccount
 from app.models.suppression import SuppressionEntry
 from app.schemas.booking import BookingConfig, BookingConfigUpdate
-from app.schemas.sequence_analytics import SequenceAnalytics, SequenceStepAnalytics
+from app.schemas.sequence_analytics import (
+    CampaignAnalytics,
+    CampaignAnalyticsResponse,
+    RankedLead,
+    RankedLeadsResponse,
+    SequenceAnalytics,
+    SequenceStepAnalytics,
+)
 from app.schemas.suppression import (
     SuppressionEntryCreate,
     SuppressionEntryRead,
@@ -1427,4 +1434,258 @@ async def sequence_analytics(sequence_id: uuid.UUID, db: AsyncSession = Depends(
         deals_attributed=deals_attributed,
         conversion_rate=_rate(deals_attributed, total_enrollments),
         steps=step_analytics,
+    )
+
+
+# ─── Cross-campaign analytics ────────────────────────────────────────────────
+
+
+# Sort keys the campaign table accepts, mapped to the response field they order
+# by. Whitelisted rather than passed through: this is a user-supplied string
+# reaching a sort, and "reply_rate" is the only kind of thing it should be.
+_CAMPAIGN_SORTS = {
+    "reply_rate", "open_rate", "click_rate", "bounce_rate", "conversion_rate",
+    "sent", "total_enrollments", "deals_attributed", "ai_composed_rate",
+}
+
+
+@router.get("/campaigns/analytics", response_model=CampaignAnalyticsResponse)
+async def campaign_analytics(
+    days: Optional[int] = Query(
+        None, ge=1, le=365,
+        description="Only count sends/engagement from the last N days. Omit for all time.",
+    ),
+    sort_by: str = Query("reply_rate", description=f"One of {sorted(_CAMPAIGN_SORTS)}"),
+    include_empty: bool = Query(
+        False, description="Include campaigns that have never sent anything."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every campaign side by side: open, click, reply, bounce and conversion.
+
+    ``/sequences/{id}/analytics`` answers "how is this campaign doing, step by
+    step". Nothing answered "which campaign should we be running", which is the
+    question that decides where volume goes — and with ten sequences competing
+    for a warm-up-capped daily send budget, that is the only allocation decision
+    Dialtone actually makes.
+
+    Two columns here exist to keep the others honest. ``ai_composed_rate`` says
+    what share of the sends were personalized rather than static mail-merge, and
+    ``avg_personalization_depth`` says how much the copywriter knew when it
+    wrote them. A campaign's reply rate is uninterpretable without them: the AI
+    provider chain going dark silently converts a personalized campaign into a
+    mail-merge campaign with an unchanged name, an unchanged send count, and a
+    quietly different reply rate.
+    """
+    if sort_by not in _CAMPAIGN_SORTS:
+        raise HTTPException(
+            status_code=400, detail=f"sort_by must be one of {sorted(_CAMPAIGN_SORTS)}"
+        )
+
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+
+    sequences = (
+        await db.execute(select(OutreachSequence).order_by(OutreachSequence.name))
+    ).scalars().all()
+    if not sequences:
+        return CampaignAnalyticsResponse(timeframe_days=days, campaigns=[], totals=None)
+
+    # --- Event counts per sequence, one pass ---
+    event_query = (
+        select(
+            OutreachEnrollment.sequence_id,
+            OutreachEvent.event_type,
+            func.count(OutreachEvent.id),
+        )
+        .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+        .group_by(OutreachEnrollment.sequence_id, OutreachEvent.event_type)
+    )
+    if since is not None:
+        event_query = event_query.where(OutreachEvent.occurred_at >= since)
+    counts: dict[uuid.UUID, dict[str, int]] = {}
+    for sequence_id, event_type, n in (await db.execute(event_query)).all():
+        counts.setdefault(sequence_id, {})[event_type] = n
+
+    # --- Last send + AI-composition mix, per sequence ---
+    # The composition markers live in the send event's metadata (there is no
+    # EmailSend row on this path), so this reads the rows rather than aggregating
+    # in SQL. Bounded by the timeframe and by sends actually made.
+    sent_query = (
+        select(
+            OutreachEnrollment.sequence_id,
+            OutreachEvent.occurred_at,
+            OutreachEvent.event_metadata,
+        )
+        .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+        .where(OutreachEvent.event_type == "sent")
+    )
+    if since is not None:
+        sent_query = sent_query.where(OutreachEvent.occurred_at >= since)
+
+    ai_composed: dict[uuid.UUID, int] = {}
+    depth_sum: dict[uuid.UUID, int] = {}
+    depth_n: dict[uuid.UUID, int] = {}
+    last_send: dict[uuid.UUID, datetime] = {}
+    for sequence_id, occurred_at, meta in (await db.execute(sent_query)).all():
+        meta = meta or {}
+        if meta.get("ai_generated"):
+            ai_composed[sequence_id] = ai_composed.get(sequence_id, 0) + 1
+        personalization = meta.get("personalization") or {}
+        if personalization:
+            depth_sum[sequence_id] = depth_sum.get(sequence_id, 0) + int(
+                personalization.get("depth", 0) or 0
+            )
+            depth_n[sequence_id] = depth_n.get(sequence_id, 0) + 1
+        if occurred_at is not None:
+            stamp = occurred_at if occurred_at.tzinfo else occurred_at.replace(tzinfo=timezone.utc)
+            known = last_send.get(sequence_id)
+            if known is None or stamp > known:
+                last_send[sequence_id] = stamp
+
+    # --- Enrollment counts + deal attribution, one pass each ---
+    enrollment_rows = (
+        await db.execute(
+            select(
+                OutreachEnrollment.sequence_id,
+                OutreachEnrollment.status,
+                func.count(OutreachEnrollment.id),
+            ).group_by(OutreachEnrollment.sequence_id, OutreachEnrollment.status)
+        )
+    ).all()
+    enrollments: dict[uuid.UUID, dict[str, int]] = {}
+    for sequence_id, status, n in enrollment_rows:
+        enrollments.setdefault(sequence_id, {})[status] = n
+
+    deal_rows = (
+        await db.execute(
+            select(Deal.source_sequence_id, func.count(Deal.id))
+            .where(Deal.source_sequence_id.isnot(None))
+            .group_by(Deal.source_sequence_id)
+        )
+    ).all()
+    deals = {sequence_id: n for sequence_id, n in deal_rows}
+
+    campaigns: list[CampaignAnalytics] = []
+    for sequence in sequences:
+        c = counts.get(sequence.id, {})
+        sent = c.get("sent", 0)
+        if not sent and not include_empty:
+            continue
+        by_status = enrollments.get(sequence.id, {})
+        total_enrollments = sum(by_status.values())
+        composed = ai_composed.get(sequence.id, 0)
+        depth_count = depth_n.get(sequence.id, 0)
+        campaigns.append(CampaignAnalytics(
+            sequence_id=sequence.id,
+            name=sequence.name,
+            industry=sequence.industry,
+            tone=getattr(sequence, "tone", None),
+            status=sequence.status,
+            is_active=bool(sequence.is_active),
+            total_enrollments=total_enrollments,
+            active_enrollments=by_status.get("active", 0),
+            sent=sent,
+            opened=c.get("opened", 0),
+            clicked=c.get("clicked", 0),
+            replied=c.get("replied", 0),
+            bounced=c.get("bounced", 0),
+            unsubscribed=c.get("unsubscribed", 0),
+            open_rate=_rate(c.get("opened", 0), sent),
+            click_rate=_rate(c.get("clicked", 0), sent),
+            reply_rate=_rate(c.get("replied", 0), sent),
+            bounce_rate=_rate(c.get("bounced", 0), sent),
+            unsubscribe_rate=_rate(c.get("unsubscribed", 0), sent),
+            deals_attributed=deals.get(sequence.id, 0),
+            conversion_rate=_rate(deals.get(sequence.id, 0), total_enrollments),
+            ai_composed=composed,
+            ai_composed_rate=_rate(composed, sent),
+            avg_personalization_depth=(
+                round(depth_sum.get(sequence.id, 0) / depth_count, 2) if depth_count else 0.0
+            ),
+            last_send_at=last_send.get(sequence.id),
+        ))
+
+    campaigns.sort(key=lambda c: getattr(c, sort_by, 0), reverse=True)
+
+    totals = None
+    if campaigns:
+        t_sent = sum(c.sent for c in campaigns)
+        t_enrolled = sum(c.total_enrollments for c in campaigns)
+        t_opened = sum(c.opened for c in campaigns)
+        t_clicked = sum(c.clicked for c in campaigns)
+        t_replied = sum(c.replied for c in campaigns)
+        t_bounced = sum(c.bounced for c in campaigns)
+        t_unsub = sum(c.unsubscribed for c in campaigns)
+        t_deals = sum(c.deals_attributed for c in campaigns)
+        t_ai = sum(c.ai_composed for c in campaigns)
+        # Depth is averaged over the campaigns that reported one, weighted by
+        # their sends — an unweighted mean would let a 3-send campaign outvote a
+        # 300-send one on the headline number.
+        weighted = sum(c.avg_personalization_depth * c.sent for c in campaigns)
+        totals = CampaignAnalytics(
+            sequence_id=uuid.UUID(int=0),
+            name="All campaigns",
+            industry=None,
+            tone=None,
+            status="aggregate",
+            is_active=True,
+            total_enrollments=t_enrolled,
+            active_enrollments=sum(c.active_enrollments for c in campaigns),
+            sent=t_sent,
+            opened=t_opened,
+            clicked=t_clicked,
+            replied=t_replied,
+            bounced=t_bounced,
+            unsubscribed=t_unsub,
+            open_rate=_rate(t_opened, t_sent),
+            click_rate=_rate(t_clicked, t_sent),
+            reply_rate=_rate(t_replied, t_sent),
+            bounce_rate=_rate(t_bounced, t_sent),
+            unsubscribe_rate=_rate(t_unsub, t_sent),
+            deals_attributed=t_deals,
+            conversion_rate=_rate(t_deals, t_enrolled),
+            ai_composed=t_ai,
+            ai_composed_rate=_rate(t_ai, t_sent),
+            avg_personalization_depth=round(weighted / t_sent, 2) if t_sent else 0.0,
+            last_send_at=max((c.last_send_at for c in campaigns if c.last_send_at), default=None),
+        )
+
+    return CampaignAnalyticsResponse(
+        timeframe_days=days, campaigns=campaigns, totals=totals
+    )
+
+
+# ─── Engagement-ranked leads ─────────────────────────────────────────────────
+
+
+@router.get("/leads/ranked", response_model=RankedLeadsResponse)
+async def ranked_leads(
+    limit: int = Query(50, ge=1, le=500),
+    min_score: float = Query(0.0, ge=0.0, le=100.0),
+    include_suppressed: bool = Query(
+        False, description="Include unsubscribed/suppressed contacts (compliance view)."
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Prospects ranked by what they did with our email, hottest first.
+
+    Fit scoring says who *should* be a good lead; this says who is *behaving*
+    like one right now. A reply outweighs a click outweighs an open, each decayed
+    by how long ago it happened, summed across both send tables — so a contact
+    who clicked the demo link on Tuesday outranks one who opened five emails in
+    April, which is the ordering a rep working a call list actually wants.
+
+    Suppressed and unsubscribed contacts are excluded by default and score zero
+    when included: someone who asked to be left alone has no place in a
+    prioritisation list regardless of what they clicked first.
+    """
+    from app.services import engagement_scoring
+
+    ranked = await engagement_scoring.rank_contacts(
+        db, limit=limit, min_score=min_score, include_suppressed=include_suppressed
+    )
+    return RankedLeadsResponse(
+        leads=[RankedLead(**row) for row in ranked],
+        tier_counts=engagement_scoring.summarize(ranked),
+        total_ranked=len(ranked),
     )
