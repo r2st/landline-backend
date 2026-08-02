@@ -70,6 +70,11 @@ class AiEmailDraft(Base, OrgScopedMixin):
     # Whether a CompanyResearch brief actually grounded the copy. Without one the
     # AI is only reworded mail-merge, which is the thing worth knowing at review.
     research_used: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Which prospect data points fed the copy: ``{"points": [...], "depth": n}``
+    # from ``app.services.personalization``. A reviewer reading "did the model
+    # invent this?" needs to see what it was actually given, and the depth is the
+    # only column that lets analytics ask whether personalization moves replies.
+    personalization: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
 
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", server_default="pending", index=True

@@ -120,6 +120,7 @@ class ComposeResult:
         research_used: bool = False,
         draft_id=None,
         reason: str = "",
+        personalization: Optional[dict] = None,
     ) -> None:
         self.action = action
         self.subject = subject
@@ -128,6 +129,12 @@ class ComposeResult:
         self.research_used = research_used
         self.draft_id = draft_id
         self.reason = reason
+        # Which prospect data points fed the copy — see
+        # ``app.services.personalization``. ``None`` for a static render, where
+        # the question doesn't apply; an empty ``points`` list means AI wrote it
+        # with nothing but the five merge fields, which is worth being able to
+        # tell apart from "we never asked".
+        self.personalization = personalization
 
     def because(self, reason: str) -> "ComposeResult":
         """Same result, annotated with why. Used by the static fallback paths."""
@@ -301,6 +308,11 @@ async def compose_step(
                 "send", existing.subject, existing.body,
                 ai_generated=True, research_used=bool(existing.research_used),
                 draft_id=existing.id, reason="approved by reviewer",
+                # The draft's own record, not a fresh assembly: this copy was
+                # written from the facts as they stood when it was drafted, and
+                # re-deriving them now would attribute the email to news that
+                # broke after it was written.
+                personalization=existing.personalization or None,
             )
         if existing.status == "rejected":
             return static.because("AI copy rejected by reviewer — sending static template")
@@ -316,6 +328,23 @@ async def compose_step(
         research_context = format_research_for_prompt(research) or ""
     except Exception as exc:
         logger.debug("Research brief unavailable for %s: %s", company.name, exc)
+
+    # Everything else we know about them: news, buying signals, what they did
+    # with the earlier steps, what we already said. The brief is one source of
+    # specificity; these are the other eight (see ``personalization``). Appended
+    # to the brief rather than replacing it — the brief is prose about the
+    # company, this is a fact list about the moment.
+    from app.services import personalization as _personalization
+
+    pctx = await _personalization.build_context(
+        db,
+        contact=contact,
+        company=company,
+        enrollment=enrollment,
+        current_step=step.step_number,
+    )
+    prompt_context = research_context + pctx.as_prompt_block()
+    personalization_meta = pctx.as_metadata()
 
     lead_data = {
         # "there", not "", so ``ai_email_generator``'s greeting default actually
@@ -338,7 +367,7 @@ async def compose_step(
         from app.services.ai_email_generator import generate_email
 
         generated = await generate_email(
-            lead_data, template_type=template_type, research_context=research_context,
+            lead_data, template_type=template_type, research_context=prompt_context,
             tone=tone,
         )
     except Exception as exc:
@@ -391,6 +420,7 @@ async def compose_step(
             static_body=static_body,
             ai_generated=True,
             research_used=bool(research_context),
+            personalization=personalization_meta,
             status="pending",
         )
         db.add(draft)
@@ -403,11 +433,16 @@ async def compose_step(
             "review", subject, body,
             ai_generated=True, research_used=bool(research_context),
             draft_id=draft.id,
+            personalization=personalization_meta,
             reason=f"review batch {already + 1}/{settings.ai_compose_review_batch_size}",
         )
 
     return ComposeResult(
         "send", subject, body,
         ai_generated=True, research_used=bool(research_context),
-        reason=f"AI-composed as {template_type} (step past its review quota)",
+        personalization=personalization_meta,
+        reason=(
+            f"AI-composed as {template_type} from {pctx.depth} data point(s) "
+            "(step past its review quota)"
+        ),
     )
