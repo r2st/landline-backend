@@ -524,6 +524,51 @@ The sequence path scans **before** `apply_tracking` and passes
 count our own rewrapped links as "too many links". Any new send path either
 scans its own pre-tracking copy or lets `send_outreach_email` do it.
 
+## An alarm on a platform-wide sum asks "is *everyone* dead?"
+
+`check_lead_gen_health` is the one beat task that deliberately does not use
+`for_each_org` — it reads platform-wide so its totals match what a
+platform_admin sees on `/leads/stats`. That part is fine. What was wrong is that
+both of its alert conditions were evaluated against those totals:
+`sends_today == 0` and `ai_composed == 0`. Each therefore asked whether *every*
+tenant was dead, and answered "no" the moment one healthy tenant existed.
+
+On a single-tenant install that is the same question. From migration 078 onward
+it is not, and the alarm silently stopped covering anyone but the last org
+standing — with no failure anywhere to notice, because **the reading was correct
+and the aggregation was the bug**. A green health check does not tell you which
+question it answered.
+
+Both failure modes are per-tenant to begin with: a stalled queue, a mailbox with
+`sending_enabled=False`, a spent daily cap, an engaged kill switch. AI
+composition most of all — per-org LLM keys (084) mean one tenant's key running
+out kills composition *for that tenant only*, which a platform-wide rate cannot
+represent at any threshold.
+
+The totals stay, and the per-org checks run underneath them:
+
+- **A platform-level alert subsumes the per-org ones of the same kind.** An
+  outage that took out every tenant is one line, not one per customer.
+- **The per-org zero-send alert is gated on an `active` enrollment.** An org
+  with nothing enrolled sent nothing because there was nothing to send; a daily
+  ERROR per idle tenant is how the whole channel gets muted. `paused` doesn't
+  count — that is the system doing what it was told. Same reasoning as
+  `DangerMonitor`'s one-alert-per-account rule.
+- **The per-org AI check needs no gate**, being already conditioned on that org
+  having sent sequence mail.
+
+Worth noting where this *didn't* happen, because it bounds the class: `/leads/
+stats` and `/dialtone/status` call the same `tally_by_org` and both keep the
+per-org breakdown next to the total. They are display surfaces, and a reader can
+see which org is which. The monitor was the only place a *decision* was taken on
+the sum, and the only one that discarded the breakdown to take it — the
+per-tenant numbers were in hand and summed away.
+
+The tests are the other half. Every case in `tests/test_lead_monitor.py` ran one
+org, so the suite was green throughout and was measuring a sum of one. **A
+single-tenant fixture cannot distinguish an aggregate from a per-tenant value**,
+so anything asserting on an aggregate needs two orgs or it is pinning nothing.
+
 ## Auto-pause: match the response to the scope
 
 - **Global-scope** danger breach → the system-wide kill switch. An aggregate
