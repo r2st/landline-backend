@@ -83,8 +83,19 @@ class TopLead(BaseModel):
 
 
 class EmailTrendPoint(BaseModel):
+    """One day of email volume and what came back from it.
+
+    ``sent`` unions both send tables (see the endpoint docstring). The four
+    engagement counts default to 0 so an older client that only reads ``sent``
+    is unaffected.
+    """
+
     date: str
     sent: int
+    opened: int = 0
+    clicked: int = 0
+    replied: int = 0
+    bounced: int = 0
 
 
 class DashboardKPIs(BaseModel):

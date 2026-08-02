@@ -530,21 +530,117 @@ async def get_recent_activity(
     return activity[:limit]
 
 
+def _day_key(value) -> str:
+    """Normalise whatever the driver returned for ``date(col)`` to ``YYYY-MM-DD``.
+
+    Postgres hands back a ``date``, SQLite the string it stored — and SQLite's
+    string carries the time for a ``TIMESTAMP`` column unless ``date()`` sees
+    it, so the first ten characters are taken rather than trusted whole.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)[:10]
+
+
 @router.get("/email-trends", response_model=list[EmailTrendPoint])
 async def get_email_trends(
     days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the number of emails sent per day over the last `days` days."""
+    """Email volume per day, and what came back from it.
+
+    This used to return ``sent`` and nothing else, from ``email_sends`` alone.
+    Both halves of that were wrong for the thing consuming it.
+
+    **It counted a fraction of the mail.** Sent mail lives in two tables (see
+    CLAUDE.md): the sequence engine writes ``outreach_events`` and no
+    ``EmailSend`` row at all, and the sequence engine is where the bulk of
+    outreach volume goes. A dashboard trend built on ``email_sends`` alone plots
+    manual and template sends and calls it the org's email volume.
+
+    **It reported engagement it never returned.** The Analytics page's compare
+    mode reads ``opened`` / ``replied`` off these points to show a
+    period-over-period change; the fields did not exist, so every comparison
+    resolved to 0 and the panel reported "no change" whatever had happened.
+    Click rate was at least honest about it — a hardcoded 0 with a comment.
+
+    Engagement is bucketed by **when it happened**, not by the send it belongs
+    to, matching ``services.outreach_trends``. It is the conventional weekly
+    open rate: slightly lagged against a send cohort, and the same convention on
+    every surface here rather than two that disagree.
+    """
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    day = func.date(EmailSend.sent_at)
-    result = await db.execute(
-        select(day.label("day"), func.count(EmailSend.id))
-        .where(EmailSend.sent_at >= since, EmailSend.status.in_(SENT_STATUSES))
-        .group_by(day)
-        .order_by(day)
-    )
-    return [EmailTrendPoint(date=str(r[0]), sent=r[1]) for r in result.all()]
+
+    # Half one: manual / template / reply sends, plus their engagement stamps.
+    send_day = func.date(EmailSend.sent_at)
+    manual = (
+        await db.execute(
+            select(
+                send_day.label("day"),
+                func.count(EmailSend.id),
+                func.count(EmailSend.replied_at),
+            )
+            .where(EmailSend.sent_at >= since, EmailSend.status.in_(SENT_STATUSES))
+            .group_by(send_day)
+        )
+    ).all()
+
+    # ``opened_at`` / ``clicked_at`` are timestamps of the event, so they bucket
+    # on their own date and need their own passes — a row sent on Monday and
+    # opened on Wednesday belongs to both days, in different columns.
+    async def _stamped(column):
+        col_day = func.date(column)
+        return (
+            await db.execute(
+                select(col_day.label("day"), func.count(EmailSend.id))
+                .where(column.isnot(None), column >= since)
+                .group_by(col_day)
+            )
+        ).all()
+
+    opened_rows = await _stamped(EmailSend.opened_at)
+    clicked_rows = await _stamped(EmailSend.clicked_at)
+
+    # Half two: the sequence engine, where the outreach volume actually is.
+    event_day = func.date(OutreachEvent.occurred_at)
+    events = (
+        await db.execute(
+            select(event_day.label("day"), OutreachEvent.event_type, func.count(OutreachEvent.id))
+            .where(
+                OutreachEvent.occurred_at >= since,
+                OutreachEvent.event_type.in_(("sent", "opened", "clicked", "replied", "bounced")),
+            )
+            .group_by(event_day, OutreachEvent.event_type)
+        )
+    ).all()
+
+    buckets: dict[str, dict[str, int]] = {}
+
+    def _bucket(raw_day) -> dict[str, int]:
+        key = _day_key(raw_day)
+        return buckets.setdefault(
+            key, {"sent": 0, "opened": 0, "clicked": 0, "replied": 0, "bounced": 0}
+        )
+
+    for raw_day, sent, replied in manual:
+        b = _bucket(raw_day)
+        b["sent"] += sent
+        b["replied"] += replied
+    for raw_day, count in opened_rows:
+        _bucket(raw_day)["opened"] += count
+    for raw_day, count in clicked_rows:
+        _bucket(raw_day)["clicked"] += count
+    for raw_day, event_type, count in events:
+        _bucket(raw_day)[event_type] += count
+
+    return [
+        EmailTrendPoint(date=day, **buckets[day])
+        for day in sorted(k for k in buckets if k)
+    ]
 
 
 @router.get("/contact-growth")
