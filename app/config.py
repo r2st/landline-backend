@@ -577,6 +577,12 @@ class Settings(BaseSettings):
     # Only news scored at least this relevant (1-10) counts as an outreach
     # trigger, so routine PR noise doesn't surface prospects.
     signal_enrollment_min_relevance: int = 5
+    # The same sweep also reacts to scored buyer-intent signals (a Quality
+    # Engineer role posted, a raise, a new plant). Separate threshold because the
+    # scales are different: intent blends relevance and urgency 0-100 each, so
+    # reusing ``min_relevance`` above would admit every signal ever recorded.
+    signal_enrollment_include_intent: bool = True
+    signal_enrollment_min_intent_score: float = 45.0
 
     # --- Phase 3 AI features ---
     # 3.1 Autonomous Prospecting Agent.

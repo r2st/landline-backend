@@ -47,7 +47,8 @@ def enroll_on_company_signals():
 
     Runs shortly after the news sweep. On a fresh funding/hire/expansion signal
     it finds the company's un-enrolled emailable contacts and flags them for
-    priority outreach (or auto-enrolls them when the org opted in). See
+    priority outreach (or auto-enrolls them when the org opted in). Reads both
+    ``CompanyNews`` and the scored ``IntentSignal`` table. See
     :func:`app.services.signal_enrollment.surface_prospects_on_signals`.
     """
     from app.config import get_settings
@@ -69,6 +70,8 @@ def enroll_on_company_signals():
                 fresh_hours=settings.signal_enrollment_fresh_hours,
                 min_relevance=settings.signal_enrollment_min_relevance,
                 auto_enroll=settings.signal_enrollment_auto_enroll,
+                include_intent=settings.signal_enrollment_include_intent,
+                min_intent_score=settings.signal_enrollment_min_intent_score,
             )
 
         return await for_each_org(_body, label="enroll_on_company_signals")

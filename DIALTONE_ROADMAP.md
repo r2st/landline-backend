@@ -140,6 +140,36 @@ This is why I rank it P0 alongside a broken safety rail: without it, every item 
 
 ---
 
+## Status check, 2026-08-02
+
+This document is from 2026-07-17 and several sections below now describe code
+that exists. Re-verified against `main` before writing this block, because a
+session that trusts the P1 list as written spends its first hour rediscovering
+finished work — which is what happened on 2026-08-02.
+
+| Item | Status on `main` |
+|---|---|
+| **P1-1** boost fit on a live signal | ✅ `scoring._intent_signal_bonus` — active signals add to `fit_score`, capped. |
+| **P1-1** inject the signal into copy | ✅ `services/personalization.py::_add_intent` — signal *and* its `outreach_angle` reach the prompt, recorded on the draft/send. |
+| **P1-1** trigger outreach on signal arrival | ✅ `services/signal_enrollment.py` now reads **both** `CompanyNews` and `IntentSignal`. Open question 3 below is answered: a hot signal does **not** bypass human review — it is evidence about timing, and skipping review is a claim about the copy. |
+| **P1-4** complaint ingestion | ✅ `services/complaint_ingestion.py` + `complaint_handler.py`, migration 096. |
+| **P2-3** engagement-driven delays | ✅ `services/adaptive_delay.py`, applied through `services/step_delay.py`. |
+| **P0-2** attribution | ✅ campaign analytics + `services/campaign_dashboard.py`. |
+| **P1-3** `cadence_pattern` dead config | ❌ Still read by nothing. |
+| **P2-1** competitor context at compose time | ❌ Still not joined at outreach time. |
+| **P2-2** CRM pull | ❌ Still push-only, contacts-only. Still blocked on "is a CRM actually in play". |
+
+**Added since, and not on this roadmap:** the outreach queue was unordered
+(`services/queue_priority.py`). It selected every active enrollment with no
+`ORDER BY` and then spent a finite daily cap walking that list, so a sequential
+scan's stable row order decided who got sent — the same enrollments losing every
+day rather than taking turns. Ranking is value (engagement, invested touches,
+fit, live intent) plus an *unbounded* wait term, so nothing starves. The
+portfolio-level `capacity` alert on the dashboard reports the shortfall that
+causes it, which otherwise surfaced as every campaign looking stalled at once.
+
+---
+
 ## P1 — Connect what is already built
 
 ### P1-1. Intent signals are detected and then ignored
