@@ -35,6 +35,74 @@ def require_secret_key() -> None:
             "(or JWT_SECRET_KEY / TOKEN_ENCRYPTION_KEY) in the environment."
         )
 
+
+def is_valid_origin(value: str) -> bool:
+    """Whether ``value`` is a bare ``scheme://host[:port]`` — what CORS compares.
+
+    The middleware matches this list by exact string against the browser's
+    ``Origin`` header, which is always exactly that shape. ``apprend.tech``,
+    ``https://app.apprend.tech/`` and ``*.apprend.tech`` are all things people
+    write in this variable, and all three match nothing at all.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(value)
+    return (
+        parsed.scheme in ("http", "https")
+        and bool(parsed.netloc)
+        and "*" not in parsed.netloc
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def resolve_cors_origins(origins: list[str], *, is_prod: bool) -> list[str]:
+    """The CORS list actually installed, with the two invisible faults handled.
+
+    Neither of these can be seen from the server side once it is running, which
+    is why they are resolved at boot rather than left to a review.
+
+    **The wildcard is a security fault and is fatal in production.**
+    ``allow_credentials=True`` is set below because the frontend authenticates
+    with a header. Combined with ``"*"``, Starlette stops replying
+    ``Access-Control-Allow-Origin: *`` and starts echoing back whatever
+    ``Origin`` the request carried — every origin, individually approved. It
+    reads like the loosest available setting and is looser than that. A dev box
+    legitimately wants it, so outside production it is a warning.
+
+    **A malformed entry is a config fault and is dropped, loudly.** It is
+    tempting to make this fatal too — it is the one that hides, since the
+    frontend fails every request and only the browser console says why. But the
+    entry grants nothing, so refusing to boot over a trailing slash would take
+    the whole API down on deploy to fix an origin that was already inert. Drop
+    it and log at ERROR: same information, and the endpoints that don't need a
+    browser keep serving.
+    """
+    if "*" in origins:
+        message = (
+            "CORS_ORIGINS contains '*' while credentials are allowed. Starlette "
+            "answers that by echoing the caller's Origin, so every site becomes "
+            "an approved one. List the frontend origins explicitly."
+        )
+        if is_prod:
+            raise RuntimeError(f"Refusing to start: {message}")
+        logger.warning(message)
+
+    resolved = []
+    for origin in origins:
+        if origin != "*" and not is_valid_origin(origin):
+            logger.error(
+                "Ignoring CORS origin %r — not a bare scheme://host[:port], so it "
+                "could never match a browser Origin header. Any frontend served "
+                "from it will be blocked, with the error visible only in the "
+                "browser console.",
+                origin,
+            )
+            continue
+        resolved.append(origin)
+    return resolved
+
 # Configure logging — every line is tagged with the current org (multi-tenant
 # observability), so a stray cross-tenant read/write is traceable to a request.
 logging.basicConfig(
@@ -53,6 +121,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
     # Fail fast on a missing signing secret rather than booting insecurely.
+    # (The CORS list is resolved at import, below — the middleware stack has to
+    # be built before the first request, which is before this runs.)
     require_secret_key()
     logger.info("Starting Landline API (%s)", settings.app_env)
     yield
@@ -83,10 +153,11 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS
+# CORS. ``allow_credentials=True`` is what makes the list worth checking — see
+# resolve_cors_origins for what a "*" turns into once credentials are allowed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=resolve_cors_origins(settings.cors_origins, is_prod=_is_prod),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
