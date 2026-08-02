@@ -1661,13 +1661,16 @@ async def ranked_leads(
     """
     from app.services import engagement_scoring
 
-    ranked = await engagement_scoring.rank_contacts(
+    page, tier_counts, total_ranked = await engagement_scoring.rank_contacts_with_totals(
         db, limit=limit, min_score=min_score, include_suppressed=include_suppressed
     )
     return RankedLeadsResponse(
-        leads=[RankedLead(**row) for row in ranked],
-        tier_counts=engagement_scoring.summarize(ranked),
-        total_ranked=len(ranked),
+        leads=[RankedLead(**row) for row in page],
+        # Both describe everyone who qualified, not the page. Reporting the
+        # page's own length as ``total_ranked`` made every org with more
+        # prospects than ``limit`` look like it had exactly ``limit``.
+        tier_counts=tier_counts,
+        total_ranked=total_ranked,
     )
 
 

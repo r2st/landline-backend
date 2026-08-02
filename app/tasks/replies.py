@@ -147,6 +147,17 @@ async def suppress_contact(db: AsyncSession, contact: Contact, reason: str) -> i
     for enr in enrollments:
         enr.status = "unsubscribed"
         enr.completed_at = now
+
+    # Book it against the campaign that prompted it, so the unsubscribe rate on
+    # every campaign surface is something other than a structural zero. See
+    # ``opt_out.attribute_to_campaign``. A reply saying "unsubscribe" and a click
+    # on the footer link are the same event to a recipient and must count the
+    # same; only the bounce and complaint paths stay out, because those have
+    # their own event types and folding them in would report a dead mailbox as a
+    # person who objected.
+    from app.services.opt_out import attribute_to_campaign
+
+    await attribute_to_campaign(db, [contact], now=now, reason="unsubscribe")
     return len(enrollments)
 
 

@@ -731,11 +731,18 @@ async def _get_outreach_metrics(db: AsyncSession) -> OutreachMetrics:
     counts = {row[0]: row[1] for row in result.all()}
 
     total_sent = counts.get("sent", 0)
-    total_delivered = counts.get("delivered", 0)
     total_opened = counts.get("opened", 0)
     total_clicked = counts.get("clicked", 0)
     total_replied = counts.get("replied", 0)
     total_bounced = counts.get("bounced", 0)
+
+    # Derived, not read. Gmail emits no delivery receipt, so nothing in this
+    # codebase has ever written a "delivered" event — reading one meant the
+    # dashboard reported 0 delivered next to thousands sent, which reads as a
+    # transport outage rather than as a metric nobody populates.
+    # ``funnel_analytics._with_rates`` already derives it this way; matching it
+    # rather than inventing a second definition of "delivered".
+    total_delivered = max(0, total_sent - total_bounced)
 
     # Rates based on sent count
     denominator = max(total_sent, 1)  # Avoid division by zero

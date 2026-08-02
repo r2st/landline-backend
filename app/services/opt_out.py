@@ -76,7 +76,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.consent import ConsentRecord
 from app.models.contact import Contact
-from app.models.outreach import OutreachEnrollment
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.suppression import SUPPRESSION_REASONS, SUPPRESSION_SOURCES, SuppressionEntry
 from app.org_context import APPREND_ORG_ID, get_current_org_id
 from app.services.suppression import normalize_email
@@ -255,6 +255,8 @@ async def record(
             enr.completed_at = now
             enrollments_stopped += 1
 
+        await attribute_to_campaign(db, contacts, now=now, reason=reason)
+
     await db.commit()
 
     # The durable half, committed separately so a lost race on the unique
@@ -284,6 +286,130 @@ async def record(
         normalized, result.contacts, result.enrollments_stopped, len(result.orgs),
     )
     return result
+
+
+# Suppression reasons that mean *this person asked us to stop*, and so belong on
+# a campaign's unsubscribe rate. The rest of ``SUPPRESSION_REASONS`` — bounce,
+# complaint, erasure, manual — do not.
+_OPT_OUT_REASONS = frozenset({"unsubscribe"})
+
+
+async def attribute_to_campaign(
+    db: AsyncSession,
+    contacts: list[Contact],
+    *,
+    now: datetime,
+    reason: str = "unsubscribe",
+) -> int:
+    """Record the opt-out against the campaign whose mail prompted it.
+
+    Flushes; the caller commits. Returns the number of events written.
+
+    Every campaign reporting surface — the campaign table, the operator
+    dashboard, the bounce/funnel summary — sources ``unsubscribed`` from
+    ``OutreachEvent``, and **nothing in the product had ever written one**. The
+    only writer was the external ``POST /outreach/events`` webhook, which almost
+    nobody calls. So the opt-out flow worked perfectly and reported itself as
+    never having happened: ``unsubscribe_rate`` was structurally 0.0% on every
+    campaign, forever.
+
+    That is the worst direction for this particular number to be wrong in. Reply
+    and bounce rates are read to judge a campaign; the unsubscribe rate is read
+    to judge whether we are *annoying people* — the leading indicator of the spam
+    complaints that put a sending domain on a blocklist. A flat zero reads as
+    "nobody minds", which is the reading that keeps a bad campaign running.
+
+    Attribution is deliberately **one event per org per opt-out**, on the
+    enrollment that most recently put mail in front of this address:
+
+    * Not one per stopped enrollment. A contact in three live campaigns would
+      book three opt-outs against one human, and the portfolio totals sum the
+      campaign rows — so the platform would report more unsubscribes than people
+      who unsubscribed.
+    * Not attributed at all when nothing was ever sent. A campaign with no sends
+      is already excluded from the table (and its rate would divide by zero);
+      an opt-out it cannot have caused is noise.
+
+    Which campaign actually prompted the click is not knowable — the RFC 8058
+    token carries an address and an org, not an enrollment, and the tokens
+    already sitting in inboxes could not carry more even if we changed it today.
+    The most recent send is the honest guess, and it is the one an operator
+    reading the row would make anyway.
+
+    Only a recipient's own opt-out is booked, hence :data:`_OPT_OUT_REASONS`.
+    A bounce and a complaint have their own event types and their own rails; a
+    ``manual`` entry is an operator's decision about an address, not a person
+    objecting. Folding any of them in here would put a dead mailbox on the chart
+    an operator reads as "how many people we annoyed".
+    """
+    if not contacts or reason not in _OPT_OUT_REASONS:
+        return 0
+
+    by_org: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for contact in contacts:
+        by_org.setdefault(contact.org_id, []).append(contact.id)
+
+    written = 0
+    for target_org, contact_ids in by_org.items():
+        last_send = (
+            await db.execute(
+                select(
+                    OutreachEvent.enrollment_id,
+                    OutreachEvent.step_number,
+                )
+                .join(
+                    OutreachEnrollment,
+                    OutreachEvent.enrollment_id == OutreachEnrollment.id,
+                )
+                .where(
+                    OutreachEnrollment.contact_id.in_(contact_ids),
+                    OutreachEvent.event_type == "sent",
+                )
+                # ``occurred_at`` alone ties for steps written in one
+                # transaction; the id breaks it so repeat runs agree.
+                .order_by(OutreachEvent.occurred_at.desc(), OutreachEvent.id.desc())
+                .limit(1)
+                .execution_options(skip_org_filter=True)
+            )
+        ).first()
+        if last_send is None:
+            continue
+        enrollment_id, step_number = last_send
+
+        # Idempotent: ``record`` is called again by every one-click retry and by
+        # a human clicking the link after their provider already POSTed it.
+        already = (
+            await db.execute(
+                select(OutreachEvent.id)
+                .where(
+                    OutreachEvent.enrollment_id == enrollment_id,
+                    OutreachEvent.event_type == "unsubscribed",
+                )
+                .limit(1)
+                .execution_options(skip_org_filter=True)
+            )
+        ).scalar_one_or_none()
+        if already is not None:
+            continue
+
+        db.add(
+            OutreachEvent(
+                # Explicit: this runs from an unauthenticated endpoint with no
+                # org bound, where the insert stamp falls back to the
+                # first-party org and would file a stranger's opt-out under ours.
+                org_id=target_org,
+                enrollment_id=enrollment_id,
+                step_number=step_number,
+                event_type="unsubscribed",
+                occurred_at=now,
+                event_metadata={"source": "opt_out", "reason": reason},
+            )
+        )
+        written += 1
+
+    if written:
+        await db.flush()
+    return written
 
 
 async def _ensure_entry(

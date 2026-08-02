@@ -248,9 +248,8 @@ async def test_summary_counts_tiers(db_session, sample_company, sample_contact):
     enr = await _enroll(db_session, sample_contact)
     await _event(db_session, enr, "replied", now - timedelta(hours=1))
 
-    ranked = await es.rank_contacts(db_session)
-    counts = es.summarize(ranked)
-    assert sum(counts.values()) == len(ranked)
+    ranked, counts, total = await es.rank_contacts_with_totals(db_session)
+    assert sum(counts.values()) == total == len(ranked)
 
 
 # ─── The endpoint ────────────────────────────────────────────────────────────
@@ -280,3 +279,32 @@ async def test_ranked_leads_endpoint_empty_ok(client):
     resp = await client.get("/api/v1/dialtone/leads/ranked")
     assert resp.status_code == 200, resp.text
     assert resp.json()["leads"] == []
+
+
+@pytest.mark.asyncio
+async def test_totals_describe_the_population_not_the_page(
+    client, db_session, sample_company
+):
+    """`total_ranked: 50` on a limit of 50 is the page measuring itself.
+
+    The header above this list is meant to say how many prospects are engaged
+    and how they break down by tier. Counting the truncated page instead made
+    an org with five hundred warm leads indistinguishable from one with
+    fifty-one — and the tier histogram a histogram of the visible rows.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    for i in range(5):
+        contact = await _contact(db_session, sample_company, f"lead{i}@example.com")
+        enrollment = await _enroll(db_session, contact)
+        await _event(db_session, enrollment, "replied", now)
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/dialtone/leads/ranked?limit=2")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert len(data["leads"]) == 2, "the page is still a page"
+    assert data["total_ranked"] == 5
+    assert sum(data["tier_counts"].values()) == 5

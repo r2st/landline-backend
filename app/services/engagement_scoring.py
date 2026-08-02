@@ -201,7 +201,34 @@ async def rank_contacts(
     include_suppressed: bool = False,
     now: Optional[datetime] = None,
 ) -> list[dict]:
+    """The top ``limit`` ranked contacts. See :func:`rank_contacts_with_totals`."""
+    page, _counts, _total = await rank_contacts_with_totals(
+        db,
+        limit=limit,
+        min_score=min_score,
+        include_suppressed=include_suppressed,
+        now=now,
+    )
+    return page
+
+
+async def rank_contacts_with_totals(
+    db: AsyncSession,
+    *,
+    limit: int = 50,
+    min_score: float = 0.0,
+    include_suppressed: bool = False,
+    now: Optional[datetime] = None,
+) -> tuple[list[dict], dict, int]:
     """Rank every emailed contact by recency-weighted engagement, best first.
+
+    Returns ``(page, tier_counts, total_ranked)``. The counts and the total
+    describe **everyone who qualified**, not the page — the caller asked for the
+    top 50 and was told there were 50, so an org with five hundred engaged
+    prospects reported the same "50 ranked, 12 hot" as one with fifty-one, and
+    the histogram above the table was a histogram of the table. The scoring pass
+    has already visited every contact by the time the list is cut, so the honest
+    numbers are free; only the page is truncated.
 
     ``min_score`` filters on the normalised 0-100 score. ``include_suppressed``
     is off by default — an unsubscribed contact scores 0 and has no business in
@@ -297,7 +324,7 @@ async def rank_contacts(
                 _apply(record, kind, aware)
 
     if not records:
-        return []
+        return [], _blank_tiers(), 0
 
     # Active enrollments, so the list can say "already in a sequence" rather than
     # sending a rep to duplicate an automated touch.
@@ -320,18 +347,21 @@ async def rank_contacts(
         reverse=True,
     )
 
+    # Counted before the cut: these describe the population, and the page is
+    # only the part of it that fits on screen.
+    counts = _blank_tiers()
+    for record in ranked:
+        if record.tier in counts:
+            counts[record.tier] += 1
+
     out = []
     for record in ranked[: max(1, limit)]:
         record.reasons = _describe(record)
         out.append(record.as_dict())
-    return out
+    return out, counts, len(ranked)
 
 
-def summarize(ranked: list[dict]) -> dict:
-    """Tier counts for a ranked list — the header line above the table."""
-    counts = {"hot": 0, "warm": 0, "cool": 0, "cold": 0}
-    for row in ranked:
-        tier = row.get("tier")
-        if tier in counts:
-            counts[tier] += 1
-    return counts
+def _blank_tiers() -> dict:
+    return {"hot": 0, "warm": 0, "cool": 0, "cold": 0}
+
+

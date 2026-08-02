@@ -105,6 +105,21 @@ FRONTEND_ROUTES = [
     ("POST", "/api/v1/client-success-agent/actions/{action_id}/dismiss"),
     ("GET", "/api/v1/client-success-agent/stats"),
     ("GET", "/api/v1/client-success-agent/health-overview"),
+    # DialtoneInbox.jsx — dispatching the operator-approved reply.
+    ("POST", "/api/v1/dialtone/inbox/{reply_id}/approve-send"),
+    # GdprControls.jsx — the right-to-access / right-to-erasure console. Both
+    # take the subject as data, not as a path segment.
+    ("GET", "/api/v1/gdpr/export"),
+    ("POST", "/api/v1/gdpr/erase"),
+    # Investors.jsx / InvestorDetail.jsx — the fundraising CRM. Documents and
+    # interactions are addressed by their own id: a document can be
+    # investor-agnostic, so the collection does not nest under one investor.
+    ("PUT", "/api/v1/investors/{investor_id}"),
+    ("POST", "/api/v1/investors/{investor_id}/outreach"),
+    ("GET", "/api/v1/investors/documents"),
+    ("POST", "/api/v1/investors/documents"),
+    ("DELETE", "/api/v1/investors/documents/{document_id}"),
+    ("DELETE", "/api/v1/investors/interactions/{interaction_id}"),
     # Platform.jsx — platform-admin promote/demote management.
     ("GET", "/api/v1/platform/admins"),
     ("POST", "/api/v1/platform/promote-admin"),

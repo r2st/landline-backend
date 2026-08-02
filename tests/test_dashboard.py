@@ -179,3 +179,40 @@ async def test_email_trends_after_compose(client, sample_contact, monkeypatch):
     assert resp.status_code == 200, resp.text
     points = resp.json()
     assert sum(p["sent"] for p in points) >= 1
+
+
+@pytest.mark.asyncio
+async def test_delivered_is_derived_not_read_from_an_event_nobody_writes(
+    client, db_session, sample_contact
+):
+    """The dashboard reported 0 delivered next to every send it had ever made.
+
+    Gmail emits no delivery receipt, so nothing in this codebase writes a
+    "delivered" event — and reading one straight off `OutreachEvent` is a metric
+    that is not merely absent but *wrong*: 0 delivered beside 4 sent reads as a
+    transport outage. Derived as sent − bounced, matching
+    ``funnel_analytics._with_rates`` rather than adding a second definition.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.models.outreach import OutreachEnrollment, OutreachEvent
+
+    enrollment = OutreachEnrollment(
+        id=uuid.uuid4(), contact_id=sample_contact.id, sequence_id=uuid.uuid4(),
+        current_step=1, status="active",
+    )
+    db_session.add(enrollment)
+    await db_session.flush()
+    for event_type in ("sent", "sent", "sent", "sent", "bounced"):
+        db_session.add(OutreachEvent(
+            id=uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+            event_type=event_type, occurred_at=datetime.now(timezone.utc),
+            event_metadata={},
+        ))
+    await db_session.commit()
+
+    data = (await client.get("/api/v1/dashboard/outreach-metrics")).json()
+    assert data["total_sent"] == 4
+    assert data["total_bounced"] == 1
+    assert data["total_delivered"] == 3

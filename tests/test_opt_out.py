@@ -584,3 +584,200 @@ async def test_reply_unsubscribe_also_lands_on_the_list(db_session):
     await db_session.refresh(enrollment)
     assert enrollment.status == "unsubscribed"
     assert await suppression.is_suppressed(db_session, "replied@example.com") is True
+
+
+# --------------------------------------------------------------------------
+# The opt-out has to be *visible*, not just effective.
+#
+# Every campaign surface — the campaign table, the operator dashboard, the
+# bounce/funnel summary — sources `unsubscribed` from `OutreachEvent`, and
+# nothing in the product wrote one. The stop worked perfectly and reported
+# itself as never having happened: `unsubscribe_rate` was a structural 0.0% on
+# every campaign, forever, which is the reading that keeps a bad campaign
+# running.
+#
+# Mutation-tested — each of these fails at least one test below: not writing the
+# event; writing it on every stopped enrollment instead of one per org; writing
+# it for a contact that was never mailed; stamping the ambient org instead of
+# the contact's; writing a second one on a repeat click; and leaving the reply
+# path out.
+# --------------------------------------------------------------------------
+
+
+async def _sent_event(db_session, enrollment, *, step=1, org_id=None):
+    from datetime import datetime, timezone
+
+    from app.models.outreach import OutreachEvent
+
+    kw = {"org_id": org_id} if org_id is not None else {}
+    db_session.add(OutreachEvent(
+        id=uuid.uuid4(), enrollment_id=enrollment.id, step_number=step,
+        event_type="sent", occurred_at=datetime.now(timezone.utc),
+        event_metadata={}, **kw,
+    ))
+    await db_session.commit()
+
+
+async def _unsub_events(db_session, enrollment_id=None):
+    from app.models.outreach import OutreachEvent
+
+    q = select(OutreachEvent).where(OutreachEvent.event_type == "unsubscribed")
+    if enrollment_id is not None:
+        q = q.where(OutreachEvent.enrollment_id == enrollment_id)
+    return list((await db_session.execute(
+        q.execution_options(skip_org_filter=True)
+    )).scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_is_booked_against_the_campaign_that_caused_it(
+    client, db_session
+):
+    """The campaign table reported nobody opting out, forever."""
+    contact, enrollment = await _make_contact(db_session, "seen@example.com")
+    await _sent_event(db_session, enrollment, step=3)
+
+    resp = await client.post(
+        f"/api/v1/track/unsubscribe?token={_legacy_token('seen@example.com')}"
+    )
+    assert resp.status_code == 200
+
+    events = await _unsub_events(db_session, enrollment.id)
+    assert len(events) == 1, "the opt-out left no trace on any campaign surface"
+    # The step the recipient was actually on — the row is read next to the
+    # funnel, where "they left at step 3" is the whole point of having it.
+    assert events[0].step_number == 3
+    assert events[0].org_id == contact.org_id
+    assert events[0].event_metadata.get("source") == "opt_out"
+
+
+@pytest.mark.asyncio
+async def test_one_optout_is_one_event_however_many_campaigns_were_mailing(
+    client, db_session
+):
+    """Three live campaigns and one human is one unsubscribe, not three.
+
+    The portfolio totals sum the campaign rows, so per-enrollment attribution
+    would report more unsubscribes than there were people.
+    """
+    contact, first = await _make_contact(db_session, "busy@example.com")
+    await _sent_event(db_session, first, step=1)
+
+    others = []
+    for step in (2, 3):
+        enr = OutreachEnrollment(
+            id=uuid.uuid4(), contact_id=contact.id, sequence_id=uuid.uuid4(),
+            status="active", current_step=1, org_id=contact.org_id,
+        )
+        db_session.add(enr)
+        await db_session.flush()
+        await _sent_event(db_session, enr, step=step)
+        others.append(enr)
+
+    resp = await client.post(
+        f"/api/v1/track/unsubscribe?token={_legacy_token('busy@example.com')}"
+    )
+    assert resp.status_code == 200
+
+    events = await _unsub_events(db_session)
+    assert len(events) == 1
+    # The campaign that most recently put mail in front of them. Which one
+    # actually prompted the click isn't knowable — the RFC 8058 token carries an
+    # address and an org, never an enrollment — so the last send is the guess,
+    # and it is the one an operator reading the row would make anyway.
+    assert events[0].enrollment_id == others[-1].id
+
+
+@pytest.mark.asyncio
+async def test_repeat_one_click_does_not_double_count(client, db_session):
+    """Providers POST one-click and the human clicks the link too."""
+    _, enrollment = await _make_contact(db_session, "twice@example.com")
+    await _sent_event(db_session, enrollment)
+
+    token = _legacy_token("twice@example.com")
+    for _ in range(3):
+        assert (await client.post(f"/api/v1/track/unsubscribe?token={token}")).status_code == 200
+
+    assert len(await _unsub_events(db_session)) == 1
+
+
+@pytest.mark.asyncio
+async def test_never_mailed_contact_books_nothing(client, db_session):
+    """A campaign with no sends is off the table and its rate divides by zero."""
+    _, _ = await _make_contact(db_session, "silent@example.com")
+
+    resp = await client.post(
+        f"/api/v1/track/unsubscribe?token={_legacy_token('silent@example.com')}"
+    )
+    assert resp.status_code == 200
+    assert await _unsub_events(db_session) == []
+
+
+@pytest.mark.asyncio
+async def test_reply_unsubscribe_counts_the_same_as_the_link(db_session):
+    """Same event to the recipient, so it has to be the same event to us."""
+    from app.tasks.replies import suppress_contact
+
+    contact, enrollment = await _make_contact(db_session, "toldyou@example.com")
+    await _sent_event(db_session, enrollment, step=2)
+
+    await suppress_contact(db_session, contact, "replied unsubscribe")
+    await db_session.commit()
+
+    events = await _unsub_events(db_session, enrollment.id)
+    assert len(events) == 1
+    assert events[0].step_number == 2
+
+
+@pytest.mark.asyncio
+async def test_optout_events_do_not_cross_tenants(client, db_session):
+    """A legacy token opts out everywhere; each org books its own row.
+
+    This runs with no org bound, where the insert stamp falls back to the
+    first-party org — so an unstamped write would file a stranger's opt-out
+    under ours and leave their own campaign reading zero.
+    """
+    from app.models.tenant import Organization
+
+    other_org = uuid.uuid4()
+    db_session.add(Organization(id=other_org, name="Other Co", slug="other-co"))
+    await db_session.flush()
+
+    mine, mine_enr = await _make_contact(db_session, "shared@example.com")
+    theirs, theirs_enr = await _make_contact(
+        db_session, "shared@example.com", org_id=other_org
+    )
+    await _sent_event(db_session, mine_enr, org_id=mine.org_id)
+    await _sent_event(db_session, theirs_enr, org_id=other_org)
+
+    resp = await client.post(
+        f"/api/v1/track/unsubscribe?token={_legacy_token('shared@example.com')}"
+    )
+    assert resp.status_code == 200
+
+    events = await _unsub_events(db_session)
+    assert {e.org_id for e in events} == {mine.org_id, other_org}
+    assert {e.enrollment_id for e in events} == {mine_enr.id, theirs_enr.id}
+
+
+@pytest.mark.asyncio
+async def test_only_a_real_opt_out_lands_on_the_unsubscribe_rate(db_session):
+    """A bounce is a dead mailbox, not a person objecting.
+
+    `record` takes a `reason` and every do-not-contact writer could route
+    through it. If it booked an `unsubscribed` event whatever the reason, the
+    column an operator reads as "how many people we annoyed" would fill up with
+    bad addresses — and it sits next to the bounce column, so the same recipient
+    would be counted twice in two different meanings.
+    """
+    contact, enrollment = await _make_contact(db_session, "bounced@example.com")
+    await _sent_event(db_session, enrollment)
+
+    await opt_out.record(
+        db_session, "bounced@example.com", org_id=contact.org_id, reason="bounce"
+    )
+
+    assert await _unsub_events(db_session) == []
+    # The stop itself still happened — this is about what gets *counted*.
+    await db_session.refresh(enrollment)
+    assert enrollment.status == "unsubscribed"
