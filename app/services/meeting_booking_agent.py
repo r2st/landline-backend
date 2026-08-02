@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_reply import EmailReply
+from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.meeting_booking import BookedMeeting, MeetingBookingAgent
 from app.services import google_calendar
@@ -539,6 +540,8 @@ async def _guarded_send(
     *,
     to_email: str,
     kind: str,
+    refusable: bool = True,
+    contact_id=None,
     **kwargs,
 ) -> tuple[bool, object]:
     """Clear the compliance floors, then send. ``(ok, transport_result)``.
@@ -564,9 +567,30 @@ async def _guarded_send(
     mail to go, the fix is to remove the entry — a decision with a record, not a
     branch in a module.
 
+    The **volume** floors are claimed here for the same reason: this agent is
+    autonomous volume out of a mailbox the sequence queue is also sending from,
+    and it consumed none of that mailbox's warm-up allowance or the org's daily
+    cap. A day-1 mailbox ramped to 5/day sent its 5 sequence steps and then a
+    meeting proposal every 15 minutes, with every warm-up check reading 5/5 —
+    the ramp enforced against a number this path never touched.
+
+    ``refusable`` splits the four sends where the compliance floors deliberately
+    do not, and the asymmetry is the point. Suppression is absolute because it
+    is about consent, and the list does not record which mail a recipient meant
+    to escape. The volume caps are *operational* — they exist to keep a cold
+    domain from burning itself — so they bind the mail that is cold volume
+    (a proposal, a re-proposal) and not the mail that is one half of a
+    conversation already underway. Refusing a confirmation would leave a
+    prospect who just picked a slot with an event on their calendar and no
+    word from us; refusing a reminder would silence a meeting starting in an
+    hour. Both still *count*, because the wire does not care what we called it.
+
     Failures are swallowed to a ``False`` exactly like the direct calls this
     replaced: the agent records the attempt in ``conversation_thread`` and a
     dead Gmail token must not take down the sweep for every other meeting.
+    **Callers must act on that ``False``** — see :func:`propose_meeting`, which
+    would otherwise persist a ``proposed`` meeting for a message nobody got and
+    leave the 15-minute sweep polling forever for a reply to it.
     """
     from app.services import email_dispatch
 
@@ -577,11 +601,98 @@ async def _guarded_send(
             kind, to_email, blocked.get("status"), blocked.get("reason"),
         )
         return False, None
+
+    slot = await email_dispatch.claim_send_volume(db, account, refusable=refusable)
+    if slot.blocked is not None:
+        logger.info(
+            "meeting agent: %s to %s held (%s): %s",
+            kind, to_email, slot.blocked.get("status"), slot.blocked.get("reason"),
+        )
+        return False, None
     try:
-        return True, sender(account, to_email=to_email, **kwargs)
+        result = sender(account, to_email=to_email, **kwargs)
     except Exception as exc:  # noqa: BLE001 — record the attempt, don't crash the sweep
+        await email_dispatch.settle_send_volume(db, slot, sent=False)
         logger.warning("meeting agent: %s send failed to %s: %s", kind, to_email, exc)
         return False, None
+
+    # ``GmailSender.send_email`` **returns** ``{"status": "error"}`` for an
+    # expired token or a 4xx from the API — it does not raise, so the
+    # ``except`` above never sees the most common way a send fails. Reporting
+    # that as ``True`` would put the ok/not-ok answer back where it was: the
+    # accounting would correctly release the slot and record nothing, and the
+    # caller would still persist a ``proposed`` meeting for a message nobody
+    # received. One outcome, one answer — ``landed`` is it.
+    #
+    # A test double returning something that isn't a dict, or a dict with no
+    # ``status``, reads as landed; that is the contract every existing spy in
+    # the suite was written against.
+    landed = not (isinstance(result, dict) and result.get("status") not in (None, "sent"))
+    await email_dispatch.settle_send_volume(db, slot, sent=landed)
+    await email_dispatch.record_account_send(db, account, sent=landed)
+    if landed:
+        _record_sent_mail(
+            db, account, to_email=to_email, contact_id=contact_id,
+            result=result, **kwargs,
+        )
+    else:
+        logger.warning(
+            "meeting agent: %s to %s returned %s: %s",
+            kind, to_email, result.get("status"), result.get("detail"),
+        )
+    return landed, result
+
+
+def _record_sent_mail(
+    db: AsyncSession,
+    account: GmailAccount,
+    *,
+    to_email: str,
+    contact_id,
+    result: object,
+    subject: str = "",
+    body_html: str = "",
+    thread_id: Optional[str] = None,
+    **_ignored,
+) -> None:
+    """Write the ``EmailSend`` row for a message this agent put on the wire.
+
+    This agent wrote to *neither* send table. Per "Sent mail lives in two
+    tables", anything answering "what did we send?" reads both — and this was a
+    third place, read by nothing:
+
+    * **The unified inbox showed the reply and not the proposal.** A prospect
+      answering "Tuesday works" appeared as a thread whose opening message does
+      not exist — the exact symptom that split caused before.
+    * **The reply might not have been ingested at all.**
+      ``_is_outreach_reply`` decides whether an inbound message is outreach or
+      inbox noise, and its three tests are a thread we started, a message id we
+      recorded, and an address we have emailed. All three read ``EmailSend`` or
+      an enrollment. A proposal on a *fresh* thread to a contact with no live
+      enrollment matched none of them, so the reply was dropped as noise — and
+      the booking sweep, which polls ``EmailReply`` by thread, waited for a
+      reply that was never recorded. The agent's own loop depended on a row it
+      wasn't writing.
+    * **The daily cap's seed didn't see it.** ``_db_sent_today`` counts rows;
+      a send with no row is one the counter forgets at the next reseed.
+
+    Synchronous and unflushed on purpose: the caller is mid-transaction and owns
+    the commit.
+    """
+    sent = result if isinstance(result, dict) else {}
+    db.add(EmailSend(
+        contact_id=contact_id,
+        to_email=to_email,
+        subject=(subject or "")[:500],
+        body_html=body_html,
+        status="sent",
+        sent_at=datetime.now(timezone.utc),
+        gmail_message_id=sent.get("gmail_message_id"),
+        gmail_thread_id=sent.get("gmail_thread_id") or thread_id,
+        from_email=account.email,
+        sender_account_id=account.id,
+        user_id=getattr(account, "user_id", None),
+    ))
 
 
 async def propose_meeting(
@@ -666,15 +777,14 @@ async def propose_meeting(
             {"role": "agent", "text": text, "at": now.isoformat()},
         ],
     )
-    db.add(meeting)
-    await db.flush()
 
     subject = f"Re: {reply.subject}" if reply and reply.subject else "Let's find a time"
     sender = send_email or _default_gmail_send
-    _, sent = await _guarded_send(
+    ok, sent = await _guarded_send(
         db, sender, account,
         to_email=to_email,
         kind="proposal",
+        contact_id=contact.id if contact else None,
         subject=subject[:255],
         body_html=html,
         body_text=text,
@@ -682,6 +792,23 @@ async def propose_meeting(
         in_reply_to=reply.gmail_message_id if reply else None,
         references=reply.gmail_message_id if reply else None,
     )
+    if not ok:
+        # The row is added only now, and only if the mail went. This is the
+        # same reasoning as the pre-check above — a ``proposed`` meeting whose
+        # proposal never arrived is a row the 15-minute sweep polls forever for
+        # a reply to a message nobody received — extended to the outcomes the
+        # pre-check cannot see: a dead Gmail token, and the volume caps, which
+        # decline *routinely* rather than exceptionally. Returning None lets the
+        # caller propose again once there is allowance to send it with.
+        logger.info(
+            "meeting agent: proposal to %s did not go out — no meeting recorded",
+            to_email,
+        )
+        return None
+
+    db.add(meeting)
+    await db.flush()
+
     if isinstance(sent, dict):
         meeting.gmail_thread_id = sent.get("gmail_thread_id") or (reply.gmail_thread_id if reply else None)
         meeting.gmail_message_id = sent.get("gmail_message_id")
@@ -749,16 +876,12 @@ async def repropose_meeting(
         return False
 
     text, html = build_proposal_text(contact, fresh, rep_name=account.display_name or "")
-    meeting.proposed_slots = fresh
-    meeting.conversation_thread = [
-        *(meeting.conversation_thread or []),
-        {"role": "agent", "text": text, "at": now.isoformat(), "kind": "reproposal"},
-    ]
     sender = send_email or _default_gmail_send
-    await _guarded_send(
+    ok, _ = await _guarded_send(
         db, sender, account,
         to_email=to_email,
         kind="re-proposal",
+        contact_id=contact.id if contact else None,
         subject=f"Re: {meeting.title}"[:255],
         body_html=html,
         body_text=text,
@@ -766,6 +889,24 @@ async def repropose_meeting(
         in_reply_to=meeting.gmail_message_id,
         references=meeting.gmail_message_id,
     )
+    if not ok:
+        # ``proposed_slots`` is what ``handle_slot_selection`` matches the next
+        # reply against. Replacing it before knowing the mail went would leave
+        # the meeting offering times the prospect was never shown — so their
+        # reply picking one of the *old* ones no longer matches anything, and
+        # the agent re-proposes at them instead of confirming. The result is
+        # written after the send, not before it.
+        logger.info(
+            "meeting agent: re-proposal for meeting %s did not go out — slots unchanged",
+            meeting.id,
+        )
+        return False
+
+    meeting.proposed_slots = fresh
+    meeting.conversation_thread = [
+        *(meeting.conversation_thread or []),
+        {"role": "agent", "text": text, "at": now.isoformat(), "kind": "reproposal"},
+    ]
     return True
 
 
@@ -837,6 +978,11 @@ async def confirm_meeting(
             db, sender, account,
             to_email=to_email,
             kind="confirmation",
+            contact_id=contact.id if contact else None,
+            # The prospect has picked a slot and the invite is on their
+            # calendar. A cap that swallows the confirmation leaves them with a
+            # meeting and no word from us — worse than the volume it saves.
+            refusable=False,
             subject=f"Confirmed: {meeting.title}"[:255],
             body_html=html,
             body_text=text,
@@ -888,6 +1034,11 @@ async def send_reminder(
         db, sender, account,
         to_email=to_email,
         kind="reminder",
+        contact_id=contact.id if contact else None,
+        # ``reminder_sent_at`` is stamped above, before the send, so a retry
+        # can't double-send — which means a refusal here is permanent silence
+        # about a meeting starting within the hour. Counted, never refused.
+        refusable=False,
         subject=f"Reminder: {meeting.title}"[:255],
         body_html=html,
         body_text=text,

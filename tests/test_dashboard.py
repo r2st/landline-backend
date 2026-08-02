@@ -150,14 +150,31 @@ async def test_company_read_has_fit_score_and_contact_count(client):
 
 
 @pytest.mark.asyncio
-async def test_email_trends_after_compose(client, sample_contact):
+async def test_email_trends_after_compose(client, sample_contact, monkeypatch):
+    """The compose has to actually send for the trend to show a send.
+
+    This used to pass with no transport configured at all: SES logged "email
+    not sent", the row was written ``skipped``, and ``skipped`` was in the
+    dashboard's sent-status set. So the test asserted that a compose which sent
+    nothing appeared on the sent trend — the definition it was measuring, not
+    the behaviour it was named for. The transport is stubbed instead.
+    """
+    from app.services import email_sender
+
+    def _sent(self, **kwargs):
+        return {"status": "sent", "message_id": "ses-1", "transport": "ses"}
+
+    monkeypatch.setattr(email_sender.EmailSender, "send_email", _sent)
+
     # First template auto-becomes default.
     await client.post("/api/v1/email-templates", json={
         "name": "T", "subject": "Hi {{first_name}}", "body": "<p>{{company}}</p>",
     })
-    await client.post("/api/v1/email-compose", json={
+    resp = await client.post("/api/v1/email-compose", json={
         "contact_ids": [str(sample_contact.id)],
     })
+    assert resp.json()["sent"] == 1, resp.text
+
     resp = await client.get("/api/v1/dashboard/email-trends?days=30")
     assert resp.status_code == 200, resp.text
     points = resp.json()

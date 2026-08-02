@@ -19,7 +19,6 @@ Routes:
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -345,6 +344,10 @@ async def test_send(
                 sender=account.email,
                 transport="smtp",
             )
+    # Same rule as the Gmail test endpoint: never refused, always counted. The
+    # message leaves the mailbox either way, and the warm-up ramp is enforced
+    # against a counter this path used not to touch.
+    slot = await email_dispatch.claim_send_volume(db, account, refusable=False)
     result = await asyncio.to_thread(
         SmtpSender(account).send_email,
         to_email=to_email,
@@ -360,10 +363,12 @@ async def test_send(
             "If you're reading this, you're good to go. Happy sending."
         ),
     )
-    if result.get("status") == "sent":
+    landed = result.get("status") == "sent"
+    await email_dispatch.settle_send_volume(db, slot, sent=landed)
+    if landed:
         account.status = "connected"
         account.last_error = None
-        account.last_used_at = datetime.now(timezone.utc)
+        await email_dispatch.record_account_send(db, account, sent=True)
     else:
         account.status = "error"
         account.last_error = result.get("detail")

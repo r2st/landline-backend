@@ -47,8 +47,13 @@ router = APIRouter(prefix="/platform", tags=["platform"])
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
 # EmailSend rows that count as an outbound email for platform metrics — mirrors
-# the dashboard's headline "emails sent" definition (composed + skipped-but-logged).
-_SENT_STATUSES = ("sent", "skipped")
+# the dashboard's headline "emails sent" definition. ``skipped`` is deliberately
+# not in here (see ``dashboard.SENT_STATUSES`` for the full reasoning): it is
+# what a no-address contact, a suppressed one, a spam-gate block, a warm-up hold
+# and a spent daily cap all record, and none of them sent anything. On this
+# surface it was worse than on the dashboard — a per-org billing-shaped number
+# that counted mail a tenant's own suppression list stopped.
+_SENT_STATUSES = ("sent",)
 
 
 # --- Schemas ---------------------------------------------------------------

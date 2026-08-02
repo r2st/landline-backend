@@ -2012,19 +2012,36 @@ class EmailHistoryService:
         if blocked is not None:
             return {"status": "error", "detail": blocked["reason"]}
 
+        # The volume floors count this send but never refuse it. A person
+        # hitting Reply to someone who wrote to them is the mail most worth
+        # sending, and holding it because the *cold outreach* cap is spent would
+        # be a worse failure than the cap prevents. It still leaves the same
+        # mailbox, so it depletes the day and the mailbox's warm-up allowance —
+        # cold volume yields to a live conversation, which is the priority the
+        # cap would want if it could express one.
+        slot = await email_dispatch.claim_send_volume(db, account, refusable=False)
+
         # Send via Gmail
         sender = GmailSender(account)
-        send_result = sender.send_email(
-            to_email=to_email,
-            subject=reply_subject,
-            body_html=body_html,
-            body_text=body_text,
-            thread_id=effective_thread_id,
-            in_reply_to=in_reply_to,
-            references=references,
-        )
+        try:
+            send_result = sender.send_email(
+                to_email=to_email,
+                subject=reply_subject,
+                body_html=body_html,
+                body_text=body_text,
+                thread_id=effective_thread_id,
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+        except Exception:
+            await email_dispatch.settle_send_volume(db, slot, sent=False)
+            raise
 
-        if send_result.get("status") != "sent":
+        landed = send_result.get("status") == "sent"
+        await email_dispatch.settle_send_volume(db, slot, sent=landed)
+        await email_dispatch.record_account_send(db, account, sent=landed)
+
+        if not landed:
             return {
                 "status": "error",
                 "detail": send_result.get("detail", "Failed to send reply"),

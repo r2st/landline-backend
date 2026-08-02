@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.user import User
+from app.services import email_dispatch
 from app.services.email_dispatch import get_active_account, _make_sender
 
 logger = logging.getLogger(__name__)
@@ -83,16 +84,28 @@ async def send_welcome_email(
             user, temp_password, login_url, settings.app_name
         )
 
+        # Counted against the mailbox, never refused. This is the one message
+        # carrying a new operator their own credentials, so no cap may swallow
+        # it — but it goes out over the same connection as the outreach, and a
+        # send the warm-up ramp cannot see is a send the ramp is not ramping.
+        slot = await email_dispatch.claim_send_volume(db, account, refusable=False)
+
         sender = _make_sender(account)
-        result = await asyncio.to_thread(
-            sender.send_email,
-            to_email=user.email,
-            subject=subject,
-            body_html=html_body,
-            body_text=text_body,
-        )
+        try:
+            result = await asyncio.to_thread(
+                sender.send_email,
+                to_email=user.email,
+                subject=subject,
+                body_html=html_body,
+                body_text=text_body,
+            )
+        except Exception:
+            await email_dispatch.settle_send_volume(db, slot, sent=False)
+            raise
 
         if result.get("status") == "sent":
+            await email_dispatch.settle_send_volume(db, slot, sent=True)
+            await email_dispatch.record_account_send(db, account, sent=True)
             logger.info(
                 "Welcome email sent to %s via %s (%s)",
                 user.email,
@@ -101,6 +114,7 @@ async def send_welcome_email(
             )
             return True
 
+        await email_dispatch.settle_send_volume(db, slot, sent=False)
         logger.warning(
             "Welcome email to %s was not sent (status=%s): %s",
             user.email,

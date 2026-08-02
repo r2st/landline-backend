@@ -570,16 +570,24 @@ async def send_test_email(
         status = send_result.get("status", "error")
         detail = send_result.get("reason") or send_result.get("detail")
 
-        if status in ("sent", "skipped"):
+        if status == "sent":
             logger.info(
                 "Test email sent to %s using template %s",
                 payload.test_email, payload.template_id,
             )
             return SendTestResponse(status="sent", subject=subject, detail=detail)
 
+        # ``skipped`` used to be reported here as ``sent``, on the same theory
+        # as the dashboard's status set: it meant SES wasn't configured, so the
+        # compose "worked". It is what the dispatcher returns for every soft
+        # decline — the spam gate, the warm-up ramp, the daily cap, and the
+        # suppression list — so the operator asking "did that reach the inbox?"
+        # was told yes for mail that was never sent, and told it most often for
+        # the reasons they most needed to know about. The reason rides along in
+        # ``detail``; report what happened.
         logger.warning(
-            "Test email failed for %s using template %s: %s",
-            payload.test_email, payload.template_id, detail,
+            "Test email to %s using template %s not sent (%s): %s",
+            payload.test_email, payload.template_id, status, detail,
         )
         return SendTestResponse(status="failed", subject=subject, detail=detail)
     except Exception as exc:
@@ -740,8 +748,16 @@ async def compose_and_send(
             # Store the rendered body for thread view
             email_send.body_html = body_html
 
-            if status in ("sent", "skipped"):
-                # "skipped" means SES creds aren't configured — still a successful compose.
+            if status == "sent":
+                # An ``Interaction`` is a claim, on the contact's own timeline,
+                # that we emailed this person. ``skipped`` was included here on
+                # the theory that it only meant "SES creds aren't configured —
+                # still a successful compose"; it is also what a suppressed
+                # recipient, a spam-gate block, a warm-up hold and a spent daily
+                # cap record. So the contact whose whole point is that we did
+                # *not* email them got a timeline entry saying we did — and a
+                # rep reading that history has no way to tell it from a real
+                # one.
                 db.add(Interaction(
                     company_id=contact.company_id,
                     contact_id=contact.id,

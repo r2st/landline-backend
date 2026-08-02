@@ -380,6 +380,34 @@ is the read-side union (inbox, thread view, lead view); mirror it rather than
 adding a second write path, because the send accounting (warm-up counters,
 deliverability, A/B attribution) is keyed on today's split.
 
+**The meeting-booking agent wrote to neither**, which is the third state and the
+easiest to miss: not a half-migrated *read*, an unrecorded *write*. Its four
+sends (propose, re-propose, confirm, remind) went out over a `GmailSender` and
+left nothing behind anywhere. The inbox showed a prospect's "Tuesday works" as a
+thread with no opening message, and the daily cap's row-count seed forgot the
+send. The one that bit hardest is circular: `_is_outreach_reply` decides whether
+an inbound message is outreach or inbox noise, and all three of its tests read
+`EmailSend` or an enrollment — so a proposal on a *fresh* thread to a contact
+with no live enrollment matched none of them, the reply was dropped as noise,
+and `check_booking_replies` polled `EmailReply` by thread for a row nothing had
+written. **The agent's own loop depended on the record it wasn't keeping.**
+`_record_sent_mail` writes the `EmailSend` row after a landed send.
+
+**`status='skipped'` is not a send.** `dashboard.SENT_STATUSES` and
+`platform._SENT_STATUSES` were `("sent", "skipped")`, on the theory that skipped
+meant "SES creds aren't configured — still a successful compose". It never meant
+only that, and it means it less every release: the template router writes
+`skipped` for a contact with no address, one who unsubscribed and one on the
+suppression list, and `send_outreach_email` returns it for a spam-gate block, a
+warm-up hold, a kill-switch halt and a spent daily cap. None of them put a
+message on the wire — the SES branch logs "email not sent" — so every one was a
+non-send counted as a send, on a metric whose *denominator* role makes it
+flattering, and it grew exactly when things went wrong: the day a cap holds a
+blast is the day the dashboard reported the biggest send. Both are `("sent",)`.
+Note how it hid: `test_email_trends_after_compose` composed with no transport
+configured and asserted the trend showed a send, so the suite pinned the wrong
+definition rather than the behaviour the test was named for.
+
 The last two surfaces reading `EmailSend` alone — `get_inbox_analytics` and the
 dashboard's `emails_sent` tiles — now union both. Note *why* that mattered on the
 dashboard, because the same shape will recur: `emails_opened` beside it already
@@ -404,6 +432,101 @@ outcome that isn't a real send (soft skip, dispatcher exception, bounce). One
 at once. The counter seeds from the DB (`SET … NX`) so a restart or an eviction
 resumes at the real number. With Redis unreachable it degrades to the row-count
 check — per-worker, never looser — and says `[degraded: …]` in the reason.
+
+## A cap that counts one of six sources is not a cap
+
+The reservation above was claimed in exactly one place — `app.tasks.outreach` —
+and the per-account warm-up ramp in exactly one other: inside
+`send_outreach_email`, which is the only thing that incremented
+`GmailAccount.daily_send_count`. Both therefore governed the sequence queue and
+nothing else, while five other paths sent from the same mailbox for free.
+
+**This is the same shape as the compliance gate above and fails differently.**
+Skipping suppression is a breach the recipient notices. Skipping the volume
+caps is invisible in both directions: a day-1 mailbox on a 5/day ramp sends its
+5 sequence steps and stops exactly as designed, and then the meeting agent
+proposes, the smart-reply answers, a human replies from the inbox and an
+operator fires two "tests" — and every warm-up check still reads `5/5`. Nothing
+errors, the ramp reports itself enforced, `daily_send_count` graphs a textbook
+curve, and the mailbox is putting four times that volume on the wire from a cold
+IP. What notices is the receiving side, weeks later, by which time the domain is
+the broken thing. Note that the *template blast* skipped the daily cap while
+going straight through `send_outreach_email` — the function whose docstring
+claims every outreach path funnels through it.
+
+Three pieces, in `app.services.email_dispatch`:
+
+- **`claim_send_volume(db, account, *, refusable=, daily_slot_held=)`** takes
+  the warm-up gate and the daily reservation together and returns a
+  `VolumeSlot`. `send_outreach_email` calls it for every caller by default;
+  `daily_slot_held=True` is the queue, which claims earlier so its slot releases
+  alongside the send claim and the pacing window.
+- **`settle_send_volume(db, slot, sent=)`** closes the claim against the *day*
+  — release if nothing landed, consume if the slot was non-refusable. Call it on
+  every outcome including an exception, or a flapping SMTP host eats the day's
+  allowance without sending.
+- **`record_account_send(db, account, sent=)`** books it against the *mailbox*.
+  Kept separate because the two disagree about an unsent attempt: the day gets
+  its slot back, and the mailbox is still stamped as the one we last tried,
+  which is what rotation reads.
+
+**`refusable` is a product decision, so it is stated per call site.** The
+compliance floors are absolute because they are about consent. The volume caps
+are *operational* — they keep a cold domain from burning itself — so they bind
+cold volume and not the second half of a conversation the recipient started:
+
+- **Refused when the day is spent:** the sequence queue, meeting proposals and
+  re-proposals, smart-reply auto-sends.
+- **Never refused, always counted** (`refusable=False`): a human hitting Reply
+  in the inbox, a meeting confirmation (they picked a slot and the invite is on
+  their calendar), a meeting reminder (`reminder_sent_at` is stamped *before*
+  the send, so a refusal is permanent silence), the per-account test send, and
+  the welcome email carrying an operator their own password.
+
+Not counting what we couldn't refuse is what makes a cap drift, so
+`consume_daily_send` increments past the limit rather than declining to record.
+
+Two consequences worth keeping in mind:
+
+- **`_db_sent_today` reads both send tables**, per "Sent mail lives in two
+  tables" above. It is what the Redis counter is *seeded* from, so an
+  undercounted seed hands back allowance the mailbox already spent — the one
+  direction a cap must never be wrong in.
+- **A caller that ignored a failed send now ignores a routine one.**
+  `_guarded_send` returned `False` only on a dead Gmail token before, so
+  `propose_meeting` discarding it was a rare bug; with the caps declining
+  routinely it became a common one. It now adds the `BookedMeeting` row *after*
+  the send, and `repropose_meeting` replaces `proposed_slots` after the send —
+  otherwise the meeting offers times the prospect was never shown, and their
+  reply picking an old one matches nothing.
+
+  Three callers were reporting a send that didn't happen as one that did, and
+  they are worth reading together because the shape recurs wherever a send
+  result is turned back into a decision:
+
+  - **`GmailSender.send_email` returns `{"status": "error"}`; it does not
+    raise.** An expired refresh token and a 4xx from the API both come back as
+    a dict, so `_guarded_send`'s `except` never saw the *most common* way a
+    send fails. It settled the volume correctly and returned `True` anyway —
+    one outcome with two answers. It returns `landed` now.
+  - **`send_meeting_reminders_async` counted attempts.** `reminder_sent_at` is
+    stamped before the send (deliberately — one missed reminder beats mailing
+    someone every 15 minutes), so nothing downstream ever corrects the report.
+    It counts the return value.
+  - **`deal_progression_agent.execute_action` marked follow-ups `executed`
+    whatever the dispatcher said**, and the hourly sweep only looks at
+    `approved` ones. So a follow-up held by a spent cap was retired as though
+    it had gone out. A decline that will clear leaves the action `approved`;
+    `suppressed` — the one that never clears — becomes `expired`, because
+    retrying it hourly is a queue that cannot drain. The `DealActivity` row is
+    written only for a real send, or one "dropped" entry, so a held blast
+    doesn't put an hourly "sent a follow-up" under a deal nobody emailed.
+
+`tests/test_send_volume_coverage.py` enforces it mechanically, mirroring
+`test_send_gate_coverage` (same AST walk, its own `REVIEWED`). Its self-test
+plants a send that is fully *compliant* and simply costs the mailbox nothing —
+the exact shape all five paths had after the compliance fix landed, which is why
+it is a second file rather than a second assertion in the first.
 
 ## A step goes on the wire at most once
 

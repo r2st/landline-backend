@@ -19,6 +19,14 @@ eviction, or a mid-day deploy resumes from the real count rather than zero.
 When Redis is unreachable the reservation degrades to the row-count check — the
 same per-worker enforcement as before, never *more* permissive — and says so in
 the returned reason so the degradation is visible rather than silent.
+
+**Not every send can be refused, and every send still counts.** For a long time
+only the outreach queue reserved, so the four paths that send from the same
+mailbox without going through it — the meeting agent, the smart-reply auto-send,
+the inbox reply composer, the per-account test send — spent a day's volume the
+cap never saw. :func:`consume_daily_send` is the other half: a send that already
+happened depletes the day without ever having been refusable. A cap that only
+counts one of five sources is not a cap; it is a number that agrees with itself.
 """
 
 import logging
@@ -327,16 +335,39 @@ class SendLimiter:
             await self._db_sent_today(db, now),
         )
 
+    async def _db_sent_since(self, db: AsyncSession, since: datetime) -> int:
+        """Sends recorded since *since*, across **both** send tables.
+
+        There is no single "sent emails" table. The sequence engine writes
+        ``OutreachEvent(event_type='sent')`` and no ``EmailSend``; every other
+        path — template blasts, manual sends, inbox replies, smart-reply
+        auto-sends — writes ``EmailSend`` and no event. Counting one table is
+        counting one half of the day's volume, and this number is what the daily
+        cap's Redis counter is *seeded* from: an undercounted seed hands back
+        allowance the mailbox already spent, which is the cap failing in the one
+        direction that matters.
+        """
+        events = (
+            await db.execute(
+                select(func.count(OutreachEvent.id))
+                .where(OutreachEvent.event_type == "sent")
+                .where(OutreachEvent.occurred_at >= since)
+            )
+        ).scalar() or 0
+        direct = (
+            await db.execute(
+                select(func.count(EmailSend.id))
+                .where(EmailSend.status == "sent")
+                .where(EmailSend.sent_at >= since)
+            )
+        ).scalar() or 0
+        return events + direct
+
     async def _db_sent_today(self, db: AsyncSession, now: Optional[datetime] = None) -> int:
         """Sends recorded in the current UTC day (the counter's seed value)."""
         now = now or datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        result = await db.execute(
-            select(func.count(OutreachEvent.id))
-            .where(OutreachEvent.event_type == "sent")
-            .where(OutreachEvent.occurred_at >= today_start)
-        )
-        return result.scalar() or 0
+        return await self._db_sent_since(db, today_start)
 
     async def reserve_daily_send(
         self, db: AsyncSession, *, now: Optional[datetime] = None
@@ -398,6 +429,46 @@ class SendLimiter:
 
         return True, f"OK (reserved {count}/{limit} today)"
 
+    async def consume_daily_send(
+        self, db: AsyncSession, *, now: Optional[datetime] = None
+    ) -> None:
+        """Count a send that has already happened, without refusing anything.
+
+        :meth:`reserve_daily_send` is a *permission* — asked before the wire,
+        refused when the day is spent. Some sends are not refusable and should
+        still deplete the day: a human hitting Reply in the inbox, and a
+        smart-reply already committed to a thread. Refusing those would be a
+        worse product than the cap is worth — the cap exists to protect a
+        sending domain from *cold volume*, and a reply to someone who wrote to
+        us first is the mail most worth sending.
+
+        Not counting them is the failure this closes. The cap then measures one
+        source and calls it the day's total, so cold outreach keeps being
+        granted allowance a mailbox has already spent — the cap reads as
+        enforced and the mailbox sends over it.
+
+        So: everything counts, only autonomous cold volume is refused. Called
+        *after* a confirmed send, which is both simpler and more accurate than a
+        pre-claim — there is no race to lose when nothing is being gated.
+        """
+        client = await _get_redis()
+        if client is None:
+            # Degraded to row counts, which read the send's own row — this
+            # send counts itself with nothing to increment.
+            return
+        now = now or datetime.now(timezone.utc)
+        key = _daily_key(now)
+        try:
+            await client.set(
+                key, await self._db_sent_today(db, now),
+                nx=True, ex=_seconds_until_utc_midnight(now),
+            )
+            await client.incr(key)
+            if await client.ttl(key) < 0:
+                await client.expire(key, _seconds_until_utc_midnight(now))
+        except Exception as exc:  # noqa: BLE001 — counting is best-effort
+            logger.warning("Could not count daily send on %s: %s", key, exc)
+
     async def release_daily_send(self, *, now: Optional[datetime] = None) -> None:
         """Return an unused reservation to today's pool.
 
@@ -454,21 +525,11 @@ class SendLimiter:
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         thirty_days_ago = now - timedelta(days=30)
 
-        # Today's sends
-        result = await db.execute(
-            select(func.count(OutreachEvent.id))
-            .where(OutreachEvent.event_type == "sent")
-            .where(OutreachEvent.occurred_at >= today_start)
-        )
-        today_count = result.scalar() or 0
-
-        # 30-day sends
-        result = await db.execute(
-            select(func.count(OutreachEvent.id))
-            .where(OutreachEvent.event_type == "sent")
-            .where(OutreachEvent.occurred_at >= thirty_days_ago)
-        )
-        monthly_count = result.scalar() or 0
+        # Both send tables, for the same reason the cap's seed reads both: the
+        # tile beside this one is the operator's picture of how much of today's
+        # allowance is gone, and half of it isn't a picture of anything.
+        today_count = await self._db_sent_since(db, today_start)
+        monthly_count = await self._db_sent_since(db, thirty_days_ago)
 
         from app.services import system_settings
 

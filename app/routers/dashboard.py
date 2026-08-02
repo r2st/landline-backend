@@ -32,8 +32,23 @@ from app.schemas.dashboard import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
-# Email sends that count as "delivered to the prospect" for the emails-sent metric.
-SENT_STATUSES = ("sent", "skipped")
+# Email sends that count as "delivered to the prospect" for the emails-sent
+# metric. ``skipped`` used to be in here on the theory that it meant "SES creds
+# aren't configured — still a successful compose". It never meant only that, and
+# it means it less every release: the template router writes ``skipped`` for a
+# contact with no address, one who unsubscribed and one on the suppression list,
+# and ``send_outreach_email`` returns it for a spam-gate block, a warm-up hold
+# and a spent daily cap. Not one of those put a message on the wire — the SES
+# branch itself logs "email not sent" — so every one of them was a non-send
+# counted as a send.
+#
+# That is the same failure this function's docstring is about, one layer down
+# and in the same direction: ``emails_opened`` comes from ``OutreachEvent``, so
+# inflating the denominator with mail that never left flatters every rate built
+# from these two tiles. It also grows exactly when things go wrong — the day a
+# cap or a kill switch holds a blast is the day the dashboard reports the
+# biggest send.
+SENT_STATUSES = ("sent",)
 
 
 async def _count_emails_sent(

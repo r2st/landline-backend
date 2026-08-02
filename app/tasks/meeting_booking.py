@@ -201,9 +201,16 @@ async def send_meeting_reminders_async(db: AsyncSession, *, now: datetime | None
     for meeting in due:
         contact = await _load_contact(db, meeting)
         # send_reminder stamps reminder_sent_at before sending, so a failed send
-        # still won't double-remind on the next sweep.
-        await agent_service.send_reminder(db, meeting=meeting, agent=agent, contact=contact, now=now)
-        reminded += 1
+        # still won't double-remind on the next sweep. That is deliberate — one
+        # missed reminder beats a retry loop mailing someone every 15 minutes —
+        # and it is exactly why the count must come from the return value. This
+        # counted the *attempt*, so the report read "reminded: 12" on a sweep
+        # where a dead Gmail token meant twelve people were told nothing, and
+        # the stamp guarantees no later sweep will correct it.
+        if await agent_service.send_reminder(
+            db, meeting=meeting, agent=agent, contact=contact, now=now
+        ):
+            reminded += 1
 
     return {"reminded": reminded, "completed": completed}
 

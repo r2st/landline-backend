@@ -1158,6 +1158,11 @@ def send_sequence_step(self, enrollment_id: str):
                         references=references,
                         # Already scanned above, on the pre-tracking body.
                         skip_spam_scan=True,
+                        # And already reserved above. The dispatcher claims the
+                        # daily slot for every other caller; this path has to
+                        # claim earlier, ahead of the send claim and the pacing
+                        # window, so all three release together.
+                        daily_slot_reserved=True,
                     )
                 except Exception:
                     # The dispatcher blew up — nothing went out, so the slot must

@@ -709,6 +709,29 @@ class SmartReplyService:
                 analysis.get("intent"), confidence,
             )
 
+        # The volume floors are claimed last, immediately before the wire,
+        # because unlike the checks above they are a *reservation* — a slot held
+        # against the day that has to be handed back if the send doesn't happen.
+        # An auto-reply is autonomous mail out of the same mailbox the sequence
+        # queue sends from, and it used to spend that mailbox's warm-up
+        # allowance without consuming any of it.
+        #
+        # The initial value is an accountless slot, which is inert in every
+        # direction — so the branches below settle unconditionally rather than
+        # carrying a None check into the one place a leaked reservation costs.
+        volume_slot = email_dispatch.VolumeSlot(account=None)
+        if should_auto_send:
+            volume_slot = await email_dispatch.claim_send_volume(db, gmail_account)
+            if volume_slot.blocked is not None:
+                should_auto_send = False
+                auto_send_decision["reason"] = str(
+                    volume_slot.blocked.get("reason") or "volume_limit"
+                )
+                logger.info(
+                    "Auto-send held for %s (%s): %s",
+                    contact_name, from_email, auto_send_decision["reason"],
+                )
+
         if should_auto_send:
             try:
                 draft = analysis["draft_reply"]
@@ -722,6 +745,8 @@ class SmartReplyService:
                 )
                 auto_sent = True
                 auto_send_decision = {"sent": True, "reason": None}
+                await email_dispatch.settle_send_volume(db, volume_slot, sent=True)
+                await email_dispatch.record_account_send(db, gmail_account, sent=True)
 
                 auto_send = EmailSend(
                     to_email=from_email,
@@ -742,6 +767,7 @@ class SmartReplyService:
                     analysis.get("intent"),
                 )
             except Exception as e:
+                await email_dispatch.settle_send_volume(db, volume_slot, sent=False)
                 logger.error("Auto-reply send failed via %s: %s", gmail_account.email, str(e))
                 auto_sent = False
                 auto_send_decision = {"sent": False, "reason": "send_failed"}

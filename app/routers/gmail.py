@@ -584,6 +584,11 @@ async def test_send(
                 sender=account.email,
                 transport="gmail",
             )
+    # A test is not refusable — verifying that a mailbox can send is exactly
+    # what an operator does when volume is already spent — but it is a real
+    # message leaving a real mailbox, so it counts. On a day-1 warm-up plan of
+    # 5/day, two "tests" are 40% of the day, and until now they were 0%.
+    slot = await email_dispatch.claim_send_volume(db, account, refusable=False)
     send_result = await asyncio.to_thread(
         GmailSender(account).send_email,
         to_email=to_email,
@@ -599,8 +604,10 @@ async def test_send(
             "If you're reading this, you're good to go. Happy sending."
         ),
     )
-    if send_result.get("status") == "sent":
-        account.last_used_at = datetime.now(timezone.utc)
+    landed = send_result.get("status") == "sent"
+    await email_dispatch.settle_send_volume(db, slot, sent=landed)
+    if landed:
+        await email_dispatch.record_account_send(db, account, sent=True)
     else:
         account.status = "error"
     await db.flush()

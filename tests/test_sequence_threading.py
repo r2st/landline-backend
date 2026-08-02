@@ -125,9 +125,13 @@ async def test_send_outreach_email_passes_threading_params():
         mock_db = AsyncMock()
         # No rows for any lookup: scalar_one_or_none (warm-up plan / signature)
         # AND first() (suppression check) must both read as "not found".
+        # scalar() is the daily-cap seed counting today's sends in both send
+        # tables — a MagicMock there is truthy, so it reads as "some sends" and
+        # then fails the comparison against the limit.
         mock_db.execute = AsyncMock(return_value=MagicMock(
             scalar_one_or_none=MagicMock(return_value=None),
             first=MagicMock(return_value=None),
+            scalar=MagicMock(return_value=0),
         ))
 
         result = await send_outreach_email(

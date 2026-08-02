@@ -453,6 +453,150 @@ async def check_send_allowed(
     return None
 
 
+async def record_account_send(db: AsyncSession, account, *, sent: bool) -> None:
+    """Book one wire attempt against the mailbox it went out from.
+
+    ``daily_send_count`` is what the per-account warm-up ramp is enforced
+    against (``warmup.check_send_allowed`` reads it through ``used_today``) and
+    what rotation uses to skip a mailbox that has had enough for today. It was
+    incremented in exactly one place — inside :func:`send_outreach_email` — so
+    the paths holding a transport directly ramped a mailbox's *reputation* while
+    contributing nothing to the number that is supposed to be governing it. A
+    day-1 mailbox on a 5/day plan sent its 5 sequence steps, then as many
+    meeting proposals, auto-replies, inbox replies and "tests" as the day
+    produced, and every warm-up check still read 5/5.
+
+    The counter rolls over at the UTC date boundary so it reflects *today*
+    rather than growing without bound, and only a send that actually landed
+    increments it — an attempt that never reached the wire cost the mailbox
+    nothing.
+    """
+    now = datetime.now(timezone.utc)
+    reset_at = account.daily_count_reset_at
+    if reset_at is not None and reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=timezone.utc)
+    if reset_at is None or reset_at.date() < now.date():
+        account.daily_send_count = 0
+        account.daily_count_reset_at = now
+    account.last_used_at = now
+    if sent:
+        account.daily_send_count = (account.daily_send_count or 0) + 1
+        # Auto-start the warm-up ramp on the first real send so the daily cap
+        # ratchets up from the true first-send date (not a stale config).
+        from app.services import system_settings
+
+        await system_settings.ensure_warmup_started(db)
+
+
+@dataclass
+class VolumeSlot:
+    """A claim on today's sending volume, settled once the send resolves.
+
+    Two shapes, and which one a path gets is a product decision rather than a
+    technical one:
+
+    * **refusable** — autonomous cold volume (the sequence queue, the meeting
+      agent, a smart-reply auto-send). The warm-up ramp and the daily cap are
+      checked *before* the wire and the send is declined when either is spent.
+    * **non-refusable** (``refusable=False``) — a human hitting Reply, an
+      operator testing a mailbox. Blocking those on a cold-outreach cap would be
+      a worse failure than the cap prevents, so they are never declined — but
+      they are counted, because the volume left the same mailbox and the next
+      cold send has to see it.
+    """
+
+    account: object
+    daily_reserved: bool = False
+    count_daily_after: bool = False
+    blocked: Optional[dict] = None
+
+
+async def claim_send_volume(
+    db: AsyncSession,
+    account,
+    *,
+    refusable: bool = True,
+    daily_slot_held: bool = False,
+) -> VolumeSlot:
+    """Claim volume for one send. ``slot.blocked`` non-None means "don't send".
+
+    ``daily_slot_held`` is for the one caller that reserves its own slot before
+    it gets here — the sequence queue, which has to claim ahead of the send
+    claim and the pacing window so it can release all three coherently. Every
+    other caller gets the reservation by default, because the alternative is the
+    arrangement this replaced: a cap enforced in one path and absent from five,
+    which reads exactly like a cap that works.
+
+    ``account`` may be ``None`` — that is the SES fallback, used when the org
+    has no mailbox connected at all. There is no per-account ramp to check
+    (there is no account), but the org's daily cap is not a property of the
+    transport and still applies: skipping it there would leave the one
+    configuration with *no* per-account limits as the one with no limits.
+    """
+    slot = VolumeSlot(account=account)
+
+    if not refusable:
+        slot.count_daily_after = True
+        return slot
+
+    transport = _transport_for(account) if account is not None else "ses"
+    sender_email = account.email if account is not None else None
+
+    if account is not None:
+        from app.services import warmup
+
+        allowed, warmup_reason = await warmup.check_send_allowed(db, account)
+        if not allowed:
+            logger.info("Send held by warm-up on %s: %s", sender_email, warmup_reason)
+            slot.blocked = {
+                "status": "skipped",
+                "reason": warmup_reason,
+                "transport": transport,
+                "sender": sender_email,
+            }
+            return slot
+
+    if not daily_slot_held:
+        from app.services.send_limiter import get_send_limiter
+
+        reserved, reason = await get_send_limiter().reserve_daily_send(db)
+        if not reserved:
+            logger.info("Send held by the daily cap on %s: %s", sender_email, reason)
+            slot.blocked = {
+                "status": "skipped",
+                "reason": reason,
+                "daily_limit_reached": True,
+                "transport": transport,
+                "sender": sender_email,
+            }
+            return slot
+        slot.daily_reserved = True
+
+    return slot
+
+
+async def settle_send_volume(db: AsyncSession, slot: VolumeSlot, *, sent: bool) -> None:
+    """Close out a claim against the day: count what landed, hand back what didn't.
+
+    Call it on every outcome including an exception out of the transport. An
+    unreleased reservation is not merely untidy — it is allowance the day never
+    gets back, so a flapping SMTP host would quietly eat a mailbox's quota
+    without sending anything.
+
+    This settles the *day's* counter only. The mailbox's own counter is
+    :func:`record_account_send`, kept separate because the two disagree about
+    what an unsent attempt means: the day gets its slot back, and the mailbox is
+    still stamped as the one we last tried, which is what rotation reads.
+    """
+    from app.services.send_limiter import get_send_limiter
+
+    if sent:
+        if slot.count_daily_after:
+            await get_send_limiter().consume_daily_send(db)
+    elif slot.daily_reserved:
+        await get_send_limiter().release_daily_send()
+
+
 async def send_outreach_email(
     db: AsyncSession,
     to_email: str,
@@ -468,6 +612,7 @@ async def send_outreach_email(
     references: Optional[str] = None,
     bypass_kill_switch: bool = False,
     skip_spam_scan: bool = False,
+    daily_slot_reserved: bool = False,
 ) -> dict:
     """Send one outreach email via the resolved sender.
 
@@ -485,6 +630,14 @@ async def send_outreach_email(
     function is not the only way mail leaves the system — the meeting-booking
     agent, the smart-reply auto-send, the inbox composer and the per-account test
     send each hold a transport directly and call that gate themselves.
+
+    The **volume** floors — the per-account warm-up ramp and the org's daily cap
+    — are claimed here too, via :func:`claim_send_volume`. The daily cap used to
+    be enforced only in the sequence queue, which made it a cap on *sequence*
+    volume wearing the name of a cap on sending: a template blast through this
+    function walked past it one contact at a time. ``daily_slot_reserved=True``
+    is for the queue, which claims its own slot earlier so it can release it
+    alongside the send claim and the pacing window.
     """
     blocked = await check_send_allowed(
         db, to_email, bypass_kill_switch=bypass_kill_switch
@@ -529,26 +682,20 @@ async def send_outreach_email(
     if account is None:
         account = await get_active_account(db)
 
-    # --- Warm-up gate (Feature 1) ---------------------------------------------
-    # A new mailbox on a warm-up ramp must not exceed today's ramped cap. This is
-    # the definitive per-account gate: it runs on the resolved account regardless
-    # of how it was chosen (explicit id, rotation, or fallback). Graduated / no
-    # plan → no constraint. Skipped for internal bypass callers.
-    if account is not None and not bypass_kill_switch:
-        from app.services import warmup
-
-        allowed, warmup_reason = await warmup.check_send_allowed(db, account)
-        if not allowed:
-            logger.info(
-                "Send to %s held by warm-up on %s: %s",
-                to_email, account.email, warmup_reason,
-            )
-            return {
-                "status": "skipped",
-                "reason": warmup_reason,
-                "transport": _transport_for(account),
-                "sender": account.email,
-            }
+    # --- Volume gates: per-account warm-up ramp, then the org's daily cap. ----
+    # Both run on the *resolved* account regardless of how it was chosen
+    # (explicit id, rotation, or fallback). Graduated / no plan → no warm-up
+    # constraint. Skipped entirely for internal bypass callers, who are not
+    # outreach and have nothing to ramp.
+    # ``account`` may be None here — the SES fallback. It has no ramp, and the
+    # org's daily cap still applies to it.
+    slot = VolumeSlot(account=account)
+    if not bypass_kill_switch:
+        slot = await claim_send_volume(
+            db, account, daily_slot_held=daily_slot_reserved
+        )
+        if slot.blocked is not None:
+            return slot.blocked
 
     # Append email signature (specific or default)
     signature = None
@@ -582,57 +729,55 @@ async def send_outreach_email(
 
     if account is not None:
         sender = _make_sender(account)
+        try:
+            result = await asyncio.to_thread(
+                sender.send_email,
+                to_email=to_email,
+                subject=subject,
+                body_html=body_html,
+                body_text=body_text,
+                reply_to=reply_to,
+                thread_id=thread_id,
+                in_reply_to=in_reply_to,
+                references=references,
+                list_unsubscribe_url=unsubscribe_url,
+            )
+        except Exception:
+            # The transport blew up, so nothing went out and the day's allowance
+            # must not stay spent — a flapping SMTP host would otherwise eat the
+            # cap without sending a single message.
+            await settle_send_volume(db, slot, sent=False)
+            raise
+        # Capture the sender email and account id for thread tracking
+        result["from_email"] = account.email
+        result["sender_account_id"] = str(account.id)
+        landed = result.get("status") == "sent"
+        await settle_send_volume(db, slot, sent=landed)
+        await record_account_send(db, account, sent=landed)
+        if result.get("status") == "error":
+            account.status = "error"
+        return result
+
+    # Fallback: Amazon SES. No account, so no ramp and nothing to book a
+    # per-mailbox count against — but the daily slot claimed above is real and
+    # has to be settled either way.
+    ses = EmailSender()
+    try:
         result = await asyncio.to_thread(
-            sender.send_email,
+            ses.send_email,
             to_email=to_email,
             subject=subject,
             body_html=body_html,
             body_text=body_text,
             reply_to=reply_to,
-            thread_id=thread_id,
-            in_reply_to=in_reply_to,
-            references=references,
-            list_unsubscribe_url=unsubscribe_url,
+            include_unsubscribe=False,
         )
-        # Capture the sender email and account id for thread tracking
-        result["from_email"] = account.email
-        result["sender_account_id"] = str(account.id)
-        # Update usage tracking. Roll the per-account daily counter over at the
-        # UTC date boundary so ``daily_send_count`` reflects *today's* sends
-        # rather than growing without bound.
-        now = datetime.now(timezone.utc)
-        reset_at = account.daily_count_reset_at
-        if reset_at is not None and reset_at.tzinfo is None:
-            reset_at = reset_at.replace(tzinfo=timezone.utc)
-        if reset_at is None or reset_at.date() < now.date():
-            account.daily_send_count = 0
-            account.daily_count_reset_at = now
-        account.last_used_at = now
-        # Only count sends that actually went out (not skipped/errored) toward
-        # the daily total.
-        if result.get("status") == "sent":
-            account.daily_send_count = (account.daily_send_count or 0) + 1
-            # Auto-start the warm-up ramp on the first real send so the daily
-            # cap ratchets up from the true first-send date (not a stale config).
-            from app.services import system_settings
-            await system_settings.ensure_warmup_started(db)
-        if result.get("status") == "error":
-            account.status = "error"
-        return result
-
-    # Fallback: Amazon SES
-    ses = EmailSender()
-    result = await asyncio.to_thread(
-        ses.send_email,
-        to_email=to_email,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        reply_to=reply_to,
-        include_unsubscribe=False,
-    )
+    except Exception:
+        await settle_send_volume(db, slot, sent=False)
+        raise
     result.setdefault("transport", "ses")
     result.setdefault("sender", ses.sender)
+    await settle_send_volume(db, slot, sent=result.get("status") == "sent")
     if result.get("status") == "sent":
         from app.services import system_settings
         await system_settings.ensure_warmup_started(db)

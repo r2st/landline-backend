@@ -285,6 +285,40 @@ async def test_send_meeting_reminders_and_completion(db_session, sample_contact,
 
 
 @pytest.mark.asyncio
+async def test_reminders_report_what_was_sent_not_what_was_attempted(
+    db_session, sample_contact, monkeypatch
+):
+    """``reminder_sent_at`` is stamped before the send, so nothing corrects this.
+
+    Stamping first is right — one missed reminder beats mailing someone every
+    15 minutes — and it is precisely why the count has to come from the return
+    value. Counting the attempt made the sweep report ``reminded: 1`` on a run
+    where a dead Gmail token meant the attendee was told nothing, and no later
+    sweep will ever revisit it.
+    """
+    from app.services import meeting_booking_agent as mba
+    from app.tasks import meeting_booking as tasks
+
+    account = await _mk_account(db_session)
+    agent = MeetingBookingAgent(is_active=True, calendar_account_id=account.id, timezone="UTC")
+    db_session.add(agent)
+    due = await _mk_meeting(
+        db_session, sample_contact.id, status="confirmed", start=NOW + timedelta(minutes=45),
+    )
+    await db_session.flush()
+
+    monkeypatch.setattr(
+        mba, "_default_gmail_send",
+        lambda account, **k: {"status": "error", "detail": "invalid_grant"},
+    )
+
+    report = await tasks.send_meeting_reminders_async(db_session, now=NOW)
+    assert report["reminded"] == 0
+    # Still stamped: the retry loop is the worse failure of the two.
+    assert due.reminder_sent_at is not None
+
+
+@pytest.mark.asyncio
 async def test_check_booking_replies_idempotent_no_new_reply(db_session, sample_contact):
     from app.tasks import meeting_booking as tasks
 

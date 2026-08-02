@@ -163,6 +163,121 @@ async def test_dashboard_emails_sent_counts_sequence_sends(
     assert body["emails_sent_today"] == 4
 
 
+async def test_a_skipped_send_is_not_an_email_sent(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """``skipped`` rows record mail that never left, and were counted as sent.
+
+    The status set was ``("sent", "skipped")`` on the theory that skipped meant
+    "SES creds aren't configured — still a successful compose". It never meant
+    only that: the template router writes it for a contact with no address, one
+    who unsubscribed and one on the suppression list, and the dispatcher returns
+    it for a spam-gate block, a warm-up hold and a spent daily cap. The SES
+    branch itself logs "email not sent".
+
+    Same direction as the union bug this file is about, and the same reason it
+    is expensive: ``emails_opened`` comes from ``OutreachEvent``, so padding the
+    denominator with mail that never went out flatters every rate built from
+    these tiles — and it pads *most* on the day a cap or a kill switch holds a
+    blast, which is the day the dashboard should look smallest.
+    """
+    now = datetime.now(timezone.utc)
+    await _make_email_send(db_session, sent_at=now - timedelta(hours=2))
+    for reason in ("no_email_address", "suppressed", "Daily limit reached (5/5)."):
+        db_session.add(EmailSend(
+            id=uuid.uuid4(), to_email="lead@prospect.com", subject="Blast",
+            status="skipped", error=reason, sent_at=now - timedelta(hours=1),
+        ))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/dashboard/overview")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["emails_sent"] == 1, "only the one that went out"
+
+
+async def test_a_held_send_does_not_claim_the_contact_was_emailed(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+):
+    """An ``Interaction`` is a claim on the contact's own timeline.
+
+    The compose loop wrote one for ``sent`` *or* ``skipped``, on the same "still
+    a successful compose" theory. So the contact whose entire point is that we
+    did not email them — suppressed, unsubscribed, or held by the daily cap —
+    got a timeline entry saying we did, indistinguishable from a real one to the
+    rep reading the history.
+    """
+    from sqlalchemy import func, select as sa_select
+
+    from app.models.interaction import Interaction
+    from app.services import email_dispatch
+
+    async def _held(db, **kwargs):
+        return {"status": "skipped", "reason": "Daily limit reached (5/5)."}
+
+    monkeypatch.setattr(email_dispatch, "send_outreach_email", _held)
+    monkeypatch.setattr(
+        "app.routers.email_templates.send_outreach_email", _held
+    )
+
+    company = Company(id=uuid.uuid4(), name="Held Co", country="US", source="test")
+    db_session.add(company)
+    await db_session.flush()
+    contact = Contact(
+        id=uuid.uuid4(), company_id=company.id, first_name="Pat",
+        email="pat@prospect.com", source="test",
+    )
+    db_session.add(contact)
+    await db_session.commit()
+
+    await client.post("/api/v1/email-templates", json={
+        "name": "T", "subject": "Hi {{first_name}}", "body": "<p>{{company}}</p>",
+    })
+    resp = await client.post("/api/v1/email-compose", json={
+        "contact_ids": [str(contact.id)],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["skipped"] == 1
+
+    count = (await db_session.execute(
+        sa_select(func.count(Interaction.id)).where(
+            Interaction.contact_id == contact.id,
+            Interaction.interaction_type == "email",
+        )
+    )).scalar()
+    assert count == 0, "no timeline entry for mail that never went out"
+
+
+async def test_a_held_template_test_is_not_reported_as_sent(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch
+):
+    """"Did that reach the inbox?" answered yes for mail that was never sent.
+
+    ``skipped`` is what the dispatcher returns for every soft decline — spam
+    gate, warm-up ramp, daily cap, suppression list — and this endpoint mapped
+    all of them to ``sent``. The operator was told yes most often for exactly
+    the reasons they most needed to hear about.
+    """
+    async def _held(db, **kwargs):
+        return {"status": "skipped", "reason": "Recipient is on the do-not-contact suppression list."}
+
+    monkeypatch.setattr(
+        "app.routers.email_templates.send_outreach_email", _held
+    )
+
+    created = await client.post("/api/v1/email-templates", json={
+        "name": "T", "subject": "Hi", "body": "<p>hello</p>",
+    })
+    template_id = created.json()["id"]
+
+    resp = await client.post("/api/v1/email-templates/send-test", json={
+        "template_id": template_id, "test_email": "gone@example.com",
+    })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert "suppression" in (body["detail"] or "")
+
+
 async def test_open_rate_denominator_can_no_longer_exceed_its_numerator(
     client: AsyncClient, db_session: AsyncSession
 ):
