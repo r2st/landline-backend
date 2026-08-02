@@ -7,6 +7,8 @@ them, and the other eight never reached the prompt:
     CompanyNews          — a funding round, a new plant, a leadership change
     IntentSignal         — job postings, expansion, the outreach angle already
                            computed for that signal
+    CompetitorMention    — a rival they told us they use, are evaluating, or are
+                           leaving, plus how we position against that rival
     DiscoveredBusiness   — the Places record that sourced them: rating, review
                            count, the search query that found them
     OutreachEvent        — what they did with the last three emails
@@ -67,6 +69,27 @@ MAX_INTENT_SIGNALS = 2
 # Prior steps summarised for the model. Three is enough to keep a four-step
 # sequence from repeating itself without spending the context window on copy.
 MAX_PRIOR_STEPS = 3
+
+# Competitor mentions worth naming in one email. One is almost always the right
+# number — an email that lists the two vendors we know they talked to reads like
+# surveillance — but a second is kept so a "they left A for B" pair can both
+# reach the model, which is a different pitch from either alone.
+MAX_COMPETITOR_MENTIONS = 2
+
+# Mention sources that are a statement about *this prospect*. ``news`` is an
+# article about the competitor, carries no ``company_id``, and says nothing
+# about the person being written to.
+COMPETITOR_MENTION_SOURCES = ("email", "call", "manual")
+
+# One line per stance ``competitive_intelligence._infer_stance`` can return.
+# Each states what a row says and nothing more: "evaluating" is not "shopping
+# around", and "using" is not "unhappy".
+_COMPETITOR_STANCE_LINES = {
+    "using": "They have told us they currently use {name} (a competitor of ours).",
+    "evaluating": "They have mentioned they are evaluating {name} (a competitor of ours).",
+    "rejected": "They have mentioned moving off or replacing {name} (a competitor of ours).",
+    "neutral": "{name} (a competitor of ours) has come up in conversation with them.",
+}
 
 # Employee-count bands. The raw number is noise to a copywriter ("47 employees"
 # invites the model to write it into the email, which is creepy); the band is
@@ -233,6 +256,75 @@ async def _add_intent(db: AsyncSession, ctx: PersonalizationContext, company_id:
             )
 
 
+async def _add_competitor(db: AsyncSession, ctx: PersonalizationContext, company_id: UUID) -> None:
+    """What this prospect has told us about the tools they already have.
+
+    ``CompetitorMention`` rows are written by ``competitive_intelligence`` when a
+    tracked rival's name turns up in a reply, a call note, or a manual entry.
+    Knowing that a shop is already running a competitor's software is the single
+    most useful thing you can know before writing to them — it changes the email
+    from "here is what we do" to "here is what you'd get that you don't have" —
+    and until now it was collected, battle-carded, and never read at compose
+    time.
+
+    Two deliberate restrictions:
+
+    * **Only mentions attached to this company, and only from sources that are
+      statements about them.** ``source="news"`` mentions are articles about the
+      competitor with no ``company_id``; they say nothing about this prospect and
+      would produce an email about someone else's press release.
+    * **Positioning, never the weaknesses list.** The battle card holds
+      attack material — weaknesses, landmine questions — written for a live
+      competitive deal where a rep can read the room. In a cold email to someone
+      who chose that vendor, running down their decision is the fastest way to
+      end the conversation, and it is the kind of claim we cannot stand behind
+      in writing to a stranger. Only ``positioning`` goes in, and the line says
+      not to disparage.
+    """
+    from app.models.competitor import Competitor, CompetitorMention
+
+    rows = (
+        await db.execute(
+            select(CompetitorMention, Competitor)
+            .join(Competitor, Competitor.id == CompetitorMention.competitor_id)
+            .where(
+                CompetitorMention.company_id == company_id,
+                CompetitorMention.source.in_(COMPETITOR_MENTION_SOURCES),
+                Competitor.is_active.is_(True),
+            )
+            .order_by(CompetitorMention.detected_at.desc())
+            .limit(MAX_COMPETITOR_MENTIONS)
+        )
+    ).all()
+
+    named: set[str] = set()
+    for mention, competitor in rows:
+        name = (competitor.name or "").strip()
+        if not name or name.lower() in named:
+            continue
+        named.add(name.lower())
+
+        stance = (mention.sentiment or "").strip().lower()
+        line = _COMPETITOR_STANCE_LINES.get(stance)
+        line = line.format(name=name) if line else (
+            f"{name} — a competitor of ours — has come up in our records for "
+            "this company."
+        )
+        ctx.add("competitor", line)
+
+        # The positioning sentence is guidance to the copywriter, not a fact
+        # about the prospect, so it is its own data point — same treatment as
+        # ``intent_angle``.
+        positioning = ((competitor.battle_card or {}).get("positioning") or "").strip()
+        if positioning:
+            ctx.add(
+                "competitor_positioning",
+                f"How we position against {name}: {positioning[:200]} — you may "
+                "use this to say what is different about us. Do not criticise "
+                f"{name} or imply they made a bad choice.",
+            )
+
+
 async def _add_engagement(
     db: AsyncSession, ctx: PersonalizationContext, enrollment_id: UUID, current_step: int
 ) -> None:
@@ -375,6 +467,7 @@ async def build_context(
         for label, coro in (
             ("news", _add_news(db, ctx, company_id, now)),
             ("intent", _add_intent(db, ctx, company_id, now)),
+            ("competitor", _add_competitor(db, ctx, company_id)),
             ("discovery", _add_discovery(db, ctx, company_id)),
         ):
             try:

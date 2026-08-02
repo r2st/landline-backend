@@ -11,7 +11,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.models.company import Company
 from app.models.company_news import CompanyNews
+from app.models.competitor import Competitor, CompetitorMention
 from app.models.intent_signal import IntentSignal
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence, SequenceStep
@@ -187,6 +189,182 @@ async def test_expired_intent_signal_is_ignored(db_session, sample_company, samp
         db_session, contact=sample_contact, company=sample_company
     )
     assert "intent_signal" not in ctx.points
+
+
+# ─── Competitor context at compose time ──────────────────────────────────────
+
+
+async def _competitor(db_session, name="RivalMES", **over):
+    comp = Competitor(
+        id=uuid.uuid4(),
+        name=f"{name}-{uuid.uuid4().hex[:6]}",
+        battle_card=over.pop("battle_card", {}),
+        **over,
+    )
+    db_session.add(comp)
+    await db_session.flush()
+    return comp
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stance,fragment",
+    [
+        ("using", "currently use"),
+        ("evaluating", "evaluating"),
+        ("rejected", "moving off or replacing"),
+        ("neutral", "come up in conversation"),
+    ],
+)
+async def test_each_stance_reaches_the_prompt_as_what_the_row_says(
+    db_session, sample_company, sample_contact, stance, fragment
+):
+    comp = await _competitor(db_session)
+    db_session.add(CompetitorMention(
+        id=uuid.uuid4(), competitor_id=comp.id, company_id=sample_company.id,
+        source="email", sentiment=stance, context="…we use them today…",
+    ))
+    await db_session.flush()
+
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    assert "competitor" in ctx.points
+    line = next(l for l in ctx.lines if comp.name in l)
+    assert fragment in line
+
+
+@pytest.mark.asyncio
+async def test_positioning_is_offered_but_the_weaknesses_are_not(
+    db_session, sample_company, sample_contact
+):
+    """The battle card holds attack material written for a live deal.
+
+    In a cold email to somebody who chose that vendor, running down their
+    decision ends the conversation. Positioning goes in; weaknesses and landmine
+    questions stay out, and the line says not to disparage.
+    """
+    comp = await _competitor(
+        db_session,
+        weaknesses=["their scheduler falls over past 40 machines"],
+        battle_card={
+            "positioning": "We ship in two weeks, not two quarters.",
+            "how_we_win": "Attack their implementation timeline.",
+            "landmine_questions": ["Ask how long their rollout really took."],
+        },
+    )
+    db_session.add(CompetitorMention(
+        id=uuid.uuid4(), competitor_id=comp.id, company_id=sample_company.id,
+        source="email", sentiment="using",
+    ))
+    await db_session.flush()
+
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    block = ctx.as_prompt_block()
+    assert "competitor_positioning" in ctx.points
+    assert "two weeks, not two quarters" in block
+    assert "Do not criticise" in block
+    assert "falls over" not in block
+    assert "Attack their implementation" not in block
+    assert "rollout really took" not in block
+
+
+@pytest.mark.asyncio
+async def test_a_news_mention_about_the_competitor_is_not_a_fact_about_this_prospect(
+    db_session, sample_company, sample_contact
+):
+    """``monitor_competitor_news`` writes company-less rows about the rival.
+
+    Reading those would produce an email about somebody else's press release.
+    """
+    comp = await _competitor(db_session)
+    db_session.add_all([
+        CompetitorMention(
+            id=uuid.uuid4(), competitor_id=comp.id, company_id=None,
+            source="news", sentiment="neutral", context="RivalMES raises Series B",
+        ),
+        # Even attached to the company, a news row is an article, not a statement.
+        CompetitorMention(
+            id=uuid.uuid4(), competitor_id=comp.id, company_id=sample_company.id,
+            source="news", sentiment="neutral", context="RivalMES opens Ohio office",
+        ),
+    ])
+    await db_session.flush()
+
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    assert "competitor" not in ctx.points
+
+
+@pytest.mark.asyncio
+async def test_another_companys_mention_does_not_leak_into_this_email(
+    db_session, sample_company, sample_contact
+):
+    comp = await _competitor(db_session)
+    other = Company(id=uuid.uuid4(), name="Someone Else Inc", source="test")
+    db_session.add(other)
+    await db_session.flush()
+    db_session.add(CompetitorMention(
+        id=uuid.uuid4(), competitor_id=comp.id, company_id=other.id,
+        source="email", sentiment="using",
+    ))
+    await db_session.flush()
+
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    assert "competitor" not in ctx.points
+
+
+@pytest.mark.asyncio
+async def test_an_inactive_competitor_is_not_named(
+    db_session, sample_company, sample_contact
+):
+    comp = await _competitor(db_session, is_active=False)
+    db_session.add(CompetitorMention(
+        id=uuid.uuid4(), competitor_id=comp.id, company_id=sample_company.id,
+        source="email", sentiment="using",
+    ))
+    await db_session.flush()
+
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    assert "competitor" not in ctx.points
+
+
+@pytest.mark.asyncio
+async def test_repeat_mentions_of_one_rival_name_it_once(
+    db_session, sample_company, sample_contact
+):
+    """Five replies naming the same vendor is one fact, not five."""
+    comp = await _competitor(db_session)
+    for _ in range(5):
+        db_session.add(CompetitorMention(
+            id=uuid.uuid4(), competitor_id=comp.id, company_id=sample_company.id,
+            source="email", sentiment="using",
+        ))
+    await db_session.flush()
+
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    assert sum(1 for l in ctx.lines if comp.name in l) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_competitor_data_costs_nothing(
+    db_session, sample_company, sample_contact
+):
+    """The common case: no rival has ever been mentioned. No line, no point."""
+    ctx = await personalization.build_context(
+        db_session, contact=sample_contact, company=sample_company
+    )
+    assert "competitor" not in ctx.points
+    assert "competitor_positioning" not in ctx.points
 
 
 @pytest.mark.asyncio
