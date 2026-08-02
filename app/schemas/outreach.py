@@ -158,9 +158,25 @@ class IndustryVerticalRead(BaseModel):
     sequence_name: str
 
 
+# Largest batch one enroll call may carry.
+#
+# Enrolling is not a set-based UPDATE: every id costs an insert and a Celery
+# dispatch, plus a research-brief dispatch per distinct company, all inline in
+# the request. An uncapped list is therefore an unbounded amount of work an
+# anonymous body can ask for — the same shape as the CSV import that could hand
+# a worker two million rows. It also runs into a hard wall well before that: the
+# `IN (...)` lookups bind one parameter per id, and PostgreSQL's wire protocol
+# tops out at 32767, so a large-enough list fails with a driver error rather
+# than a usable message.
+#
+# 1000 matches the cap already on the contact bulk-tag and bulk-suppress bodies;
+# a batch bigger than that is a campaign import, not a UI selection.
+MAX_ENROLL_BATCH = 1000
+
+
 class EnrollByIndustryRequest(BaseModel):
     industry: str = Field(..., description="Industry vertical key, e.g. 'cnc_machining'")
-    contact_ids: list[uuid.UUID] = Field(..., min_length=1)
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=MAX_ENROLL_BATCH)
 
 
 class SuggestIndustryResult(BaseModel):
@@ -177,7 +193,7 @@ class SuggestIndustryResult(BaseModel):
 # --- Batch enrollment ---
 
 class EnrollBatchRequest(BaseModel):
-    contact_ids: list[uuid.UUID] = Field(..., min_length=1)
+    contact_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=MAX_ENROLL_BATCH)
 
 
 class EnrollSkip(BaseModel):

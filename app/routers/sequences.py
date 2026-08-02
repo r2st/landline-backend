@@ -160,11 +160,24 @@ async def _enroll_into_sequence(
             skipped.append(EnrollSkip(contact_id=cid, reason="Already enrolled in this sequence"))
             continue
 
-        enrollment = OutreachEnrollment(contact_id=cid, sequence_id=sequence_id)
+        # Assign the id here rather than letting the column default supply it at
+        # INSERT time. The default is Python-side, so it only lands on flush —
+        # which is why this loop used to flush every iteration just to read
+        # ``enrollment.id`` back. That made a batch of N contacts N round-trips
+        # to the database instead of one. Generating the uuid up front is the
+        # same value from the same function, minus the round-trips.
+        enrollment = OutreachEnrollment(
+            id=uuid.uuid4(), contact_id=cid, sequence_id=sequence_id
+        )
         db.add(enrollment)
-        await db.flush()
         enrolled.append(cid)
         new_enrollment_ids.append(str(enrollment.id))
+
+    # One flush for the whole batch. This must happen before the dispatches
+    # below: the workers look the enrollment up by id, so the rows have to exist
+    # in this transaction first.
+    if enrolled:
+        await db.flush()
 
     # Best-effort: kick off the first step immediately. If the broker is
     # unreachable the periodic process_outreach_queue task will pick these up.

@@ -103,8 +103,20 @@ class CompanyPipelineStageUpdate(BaseModel):
         return v
 
 
+# Largest set of companies one bulk call may name.
+#
+# These operations are set-based, so the cost per id is small — but "small" is
+# not "none", and an uncapped list has a hard failure mode regardless of intent:
+# the `IN (...)` clause binds one parameter per id and PostgreSQL's wire protocol
+# allows 32767, past which the request dies inside the driver with an error that
+# says nothing about what the caller did wrong. 1000 is the cap already carried
+# by the equivalent contact bodies (BulkTagRequest, BulkSuppressRequest), and is
+# far above any selection a kanban board can produce.
+MAX_BULK_COMPANIES = 1000
+
+
 class BulkUpdateStageRequest(BaseModel):
-    company_ids: list[uuid.UUID] = Field(..., min_length=1)
+    company_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=MAX_BULK_COMPANIES)
     pipeline_stage: str
 
     @field_validator("pipeline_stage")
@@ -116,9 +128,9 @@ class BulkUpdateStageRequest(BaseModel):
 
 
 class BulkTagRequest(BaseModel):
-    company_ids: list[uuid.UUID] = Field(..., min_length=1)
-    add: list[str] = Field(default_factory=list)
-    remove: list[str] = Field(default_factory=list)
+    company_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=MAX_BULK_COMPANIES)
+    add: list[str] = Field(default_factory=list, max_length=50)
+    remove: list[str] = Field(default_factory=list, max_length=50)
 
 
 class BulkOpResult(BaseModel):
