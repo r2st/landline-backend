@@ -324,8 +324,12 @@ is the read-side union (inbox, thread view, lead view); mirror it rather than
 adding a second write path, because the send accounting (warm-up counters,
 deliverability, A/B attribution) is keyed on today's split.
 
-Inbox surfaces that still read `EmailSend` alone — `get_inbox_analytics`,
-the dashboard's `emails_sent` tile — therefore under-report sequence volume.
+The last two surfaces reading `EmailSend` alone — `get_inbox_analytics` and the
+dashboard's `emails_sent` tiles — now union both. Note *why* that mattered on the
+dashboard, because the same shape will recur: `emails_opened` beside it already
+came from `OutreachEvent`, so the tiles divided sequence opens by non-sequence
+sends and could show an open rate above 100%. A half-migrated read surface is
+worse than an unmigrated one — it is wrong in the direction that flatters.
 
 ## The daily send cap is a Redis reservation, not a row count
 

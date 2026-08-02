@@ -36,6 +36,46 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 SENT_STATUSES = ("sent", "skipped")
 
 
+async def _count_emails_sent(
+    db: AsyncSession,
+    *,
+    since: datetime | None = None,
+    before: datetime | None = None,
+) -> int:
+    """How many emails went out, across BOTH tables that record a send.
+
+    There is no single sent-emails table. Manual, template and reply sends write
+    ``EmailSend``; the sequence engine writes ``OutreachEvent(event_type='sent')``
+    and no ``EmailSend`` row at all — and that path carries the bulk of outreach
+    volume. Every counter here read ``EmailSend`` alone.
+
+    That was not merely a low number. The same dashboard takes ``emails_opened``
+    from ``OutreachEvent``, so the opens were counted on the sequence side while
+    the sends were not: an open rate built from the two tiles divides sequence
+    opens by non-sequence sends, and can exceed 100%. A metric that is wrong in a
+    direction that flatters the product is the expensive kind.
+
+    Both halves take the same window, so the sum is a real count and not two
+    different questions added together.
+    """
+    send_q = select(func.count(EmailSend.id)).where(
+        EmailSend.status.in_(SENT_STATUSES)
+    )
+    event_q = select(func.count(OutreachEvent.id)).where(
+        OutreachEvent.event_type == "sent"
+    )
+    if since is not None:
+        send_q = send_q.where(EmailSend.sent_at >= since)
+        event_q = event_q.where(OutreachEvent.occurred_at >= since)
+    if before is not None:
+        send_q = send_q.where(EmailSend.sent_at < before)
+        event_q = event_q.where(OutreachEvent.occurred_at < before)
+
+    sends = (await db.execute(send_q)).scalar() or 0
+    events = (await db.execute(event_q)).scalar() or 0
+    return sends + events
+
+
 @router.get("/overview", response_model=DashboardOverview)
 async def get_overview(db: AsyncSession = Depends(get_db)):
     """Get full dashboard overview with pipeline, outreach, and scoring stats.
@@ -64,11 +104,8 @@ async def _build_overview(db: AsyncSession) -> DashboardOverview:
     total_scored = row[0] or 0
     avg_fit_score = round(float(row[1]), 1) if row[1] else None
 
-    # Emails actually composed/sent (from the compose flow's send log).
-    result = await db.execute(
-        select(func.count(EmailSend.id)).where(EmailSend.status.in_(SENT_STATUSES))
-    )
-    emails_sent = result.scalar() or 0
+    # Emails actually sent, from both send tables — see _count_emails_sent.
+    emails_sent = await _count_emails_sent(db)
 
     # Leads added in the last 7 days.
     week_ago = datetime.now(timezone.utc) - timedelta(days=7)
@@ -90,14 +127,9 @@ async def _build_overview(db: AsyncSession) -> DashboardOverview:
     leads_prev_week = result.scalar() or 0
 
     # Emails sent in the previous week (7-14 days ago)
-    result = await db.execute(
-        select(func.count(EmailSend.id)).where(
-            EmailSend.status.in_(SENT_STATUSES),
-            EmailSend.sent_at >= two_weeks_ago,
-            EmailSend.sent_at < week_ago,
-        )
+    emails_sent_prev_week = await _count_emails_sent(
+        db, since=two_weeks_ago, before=week_ago
     )
-    emails_sent_prev_week = result.scalar() or 0
 
     # Contacts added in the previous week (7-14 days ago)
     result = await db.execute(
@@ -126,13 +158,7 @@ async def _build_overview(db: AsyncSession) -> DashboardOverview:
 
     # Emails sent today
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    result = await db.execute(
-        select(func.count(EmailSend.id)).where(
-            EmailSend.status.in_(SENT_STATUSES),
-            EmailSend.sent_at >= today_start,
-        )
-    )
-    emails_sent_today = result.scalar() or 0
+    emails_sent_today = await _count_emails_sent(db, since=today_start)
 
     # Emails opened (total from OutreachEvent)
     result = await db.execute(
@@ -232,13 +258,7 @@ async def _build_kpis(db: AsyncSession) -> DashboardKPIs:
     first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     # Emails sent today
-    result = await db.execute(
-        select(func.count(EmailSend.id)).where(
-            EmailSend.status.in_(SENT_STATUSES),
-            EmailSend.sent_at >= today_start,
-        )
-    )
-    emails_sent_today = result.scalar() or 0
+    emails_sent_today = await _count_emails_sent(db, since=today_start)
 
     # Open rate from OutreachEvent (opened / sent * 100)
     result = await db.execute(

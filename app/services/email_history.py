@@ -1644,6 +1644,11 @@ class EmailHistoryService:
         )
         replies_query = select(EmailReply).where(EmailReply.received_at >= since)
 
+        # The same scope, in the shape _fetch_sequence_sends takes: a list of
+        # (account_ids, from_addresses) pairs, all of which must hold. None means
+        # the unscoped admin view, matching the queries above.
+        seq_scopes: Optional[list[tuple[set, set]]] = None
+
         if user_gmail_emails is not None:
             if not user_gmail_emails:
                 return self._empty_analytics(days)
@@ -1662,9 +1667,25 @@ class EmailHistoryService:
                     func.lower(EmailReply.to_email).in_(user_gmail_emails),
                 )
             )
+            seq_scopes = [(set(user_account_ids), set(user_gmail_emails))]
 
         sends = (await db.execute(sends_query)).scalars().all()
         replies = (await db.execute(replies_query)).scalars().all()
+
+        # The other half of "what did we send?". The sequence engine records a
+        # send as OutreachEvent(event_type='sent') and writes no EmailSend row,
+        # and that path carries the bulk of Dialtone's outbound volume — so
+        # counting EmailSend alone reported a fraction of the real number and
+        # called it the total. Every other read surface in this service already
+        # unions the two; this one did not, which is why the inbox tile and the
+        # sparkline disagreed with the campaign dashboards.
+        #
+        # Same scope the send query above applies, expressed the way
+        # _fetch_sequence_sends takes it: the sending account id, or the from
+        # address, has to be one of the caller's.
+        sequence_rows = await self._fetch_sequence_sends(
+            db, scopes=seq_scopes, date_from=since, date_to=now
+        )
 
         connected_emails = user_gmail_emails or {
             e.lower() for e in account_email_map.values() if e
@@ -1675,6 +1696,12 @@ class EmailHistoryService:
         for s in sends:
             messages.append(
                 self._send_to_message(s, None, None, None, account_email_map)
+            )
+        for event, enrollment in sequence_rows:
+            messages.append(
+                self._sequence_send_to_message(
+                    event, enrollment, None, None, None, account_email_map
+                )
             )
         for r in replies:
             messages.append(
