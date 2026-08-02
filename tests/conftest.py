@@ -141,6 +141,31 @@ _patch_pg_types_for_sqlite()
 
 
 @pytest.fixture(autouse=True)
+def _send_window_open_by_default():
+    """Hold the business-hours send window open for every test that doesn't want it.
+
+    ``send_sequence_step`` now refuses to send outside the configured window, so
+    without this the entire send path is wall-clock dependent: the suite passes
+    on a Tuesday morning and fails on a Sunday, and — worse — the gates *after*
+    the window check go untested whenever CI happens to run at 3 AM. A test
+    should fail because the code is wrong, not because of when it ran.
+
+    Tests that are *about* the window re-enable it (see
+    tests/test_contact_timezone_window.py) — a later monkeypatch wins over this
+    one, so opting back in costs one line.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    original = settings.send_window_enabled
+    settings.send_window_enabled = False
+    try:
+        yield
+    finally:
+        settings.send_window_enabled = original
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_breaker():
     """Clear the process-wide LLM circuit breaker and rate limiter around every test.
 

@@ -424,6 +424,38 @@ def send_sequence_step(self, enrollment_id: str):
                 # and apply to every channel: "do not contact us" is about the
                 # contact, not about the transport.
 
+                # Timezone-aware send window. Also checked by the queue sweep,
+                # and re-checked here for the same reason suppression is: the
+                # sweep is not the only way to reach this task. ``POST
+                # /sequences/process`` calls ``send_sequence_step.delay()``
+                # directly, and its docstring calls itself "the HTTP-triggered
+                # alternative to the process_outreach_queue Celery beat task" —
+                # but the window lived only in the sweep, so triggering it at
+                # 3 AM on a Sunday sent the mail at 3 AM on a Sunday. A gate that
+                # one of two dispatch paths can route around is not a gate; the
+                # only place it holds for every caller is here, at the send.
+                #
+                # Applies to every channel, like the sweep's copy: the window is
+                # business hours in the contact's own timezone, and "don't ring
+                # them at 3 AM" is at least as true of a phone call.
+                #
+                # Deferred rather than dropped — the step is still due, just not
+                # right now — so the enrollment comes back around after the
+                # backoff instead of losing its turn.
+                _in_window, _window_reason = get_send_limiter().within_send_window(
+                    getattr(contact, "timezone", None)
+                )
+                if not _in_window:
+                    await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+                    logger.info(
+                        "Enrollment %s held: %s", enrollment_id, _window_reason
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": _window_reason,
+                        "outside_send_window": True,
+                    }
+
                 # Recipient validation — a domain with no MX can't receive mail,
                 # so sending guarantees a hard bounce. Validate once (lazily) and
                 # pause the enrollment on a definitively invalid domain.

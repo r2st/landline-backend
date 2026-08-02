@@ -25,6 +25,12 @@ _TZ_HOURS = {
 def _install_fake_clock(monkeypatch, date=_WEEKDAY, tz_hours=None):
     tz_hours = tz_hours or _TZ_HOURS
 
+    # This file is about the window, so opt back in: conftest holds it open for
+    # the rest of the suite so the send path isn't wall-clock dependent.
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "send_window_enabled", True)
+
     class _FakeDateTime:
         @staticmethod
         def now(tz=None):

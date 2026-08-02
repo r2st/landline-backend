@@ -126,6 +126,12 @@ def _stub_pipeline(monkeypatch, db_session, send_result, *, reserve=(True, "ok")
 
             return True, "OK", timedelta(0)
 
+        def within_send_window(self, tz=None):
+            # The business-hours window, also upstream of pacing. Held open for
+            # the same reason. Covered by
+            # test_send_window_enforced_at_the_send.py.
+            return True, "ok"
+
         async def reserve_daily_send(self, db):
             return reserve
 
