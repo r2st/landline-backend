@@ -2,7 +2,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.config import get_settings
@@ -34,7 +34,38 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+# Alembic creates ``alembic_version.version_num`` as VARCHAR(32) and offers no
+# option to widen it. Several revision ids in this project are longer than that
+# — ``037_add_user_id_to_email_accounts`` is 33 characters — so a database built
+# from nothing dies at 037 with "value too long for type character varying(32)",
+# *after* writing 36 revisions worth of schema. Existing databases were created
+# before the ids grew and have a wide enough column already, which is why this
+# only ever bit a fresh environment: the disaster-recovery case.
+#
+# The table is created lazily by Alembic on first use, so widening it here — an
+# idempotent ALTER, before any revision runs — fixes the fresh build without
+# touching a deployed one. Renaming 70+ revision ids would be the alternative,
+# and renaming an id that is already stamped in production is not an option.
+_VERSION_NUM_WIDTH = 128
+
+
+def _ensure_version_table_width(connection) -> None:
+    dialect = connection.dialect.name
+    if dialect != "postgresql":
+        return
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS alembic_version ("
+        f" version_num VARCHAR({_VERSION_NUM_WIDTH}) NOT NULL,"
+        " CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+    ))
+    connection.execute(text(
+        "ALTER TABLE alembic_version ALTER COLUMN version_num "
+        f"TYPE VARCHAR({_VERSION_NUM_WIDTH})"
+    ))
+
+
 def do_run_migrations(connection):
+    _ensure_version_table_width(connection)
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
