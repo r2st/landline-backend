@@ -97,6 +97,33 @@ class OutreachEnrollment(Base, OrgScopedMixin):
     last_error: Mapped[str | None] = mapped_column(Text)
     last_error_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
+    # --- At-most-once sending (``services.send_claim``) ---
+    #
+    # ``send_claim_step`` is the highest step number this enrollment has put on
+    # the wire, claimed *before* the dispatcher call in its own committed
+    # transaction — so it outlives a rollback of the send it describes. That
+    # rollback is the whole point: everything the send records (the event, the
+    # advanced step, the thread ids) commits *after* the message is already
+    # gone, and a failure in that window restored an enrollment that still read
+    # "step 1, active, due". Celery's retry then sent the same cold email to the
+    # same person a second time.
+    #
+    # Not cleared on success. Claiming step 2 is a different value, so the
+    # column can stay as the record of what shipped; it is cleared only when the
+    # attempt is known not to have reached the wire (a soft skip, a dispatcher
+    # exception raised before the transport).
+    #
+    # ``dispatched_at`` is a lease, not a claim: the queue sweep stamps it when
+    # it queues a task and skips anything stamped inside the lease window. The
+    # sweep marked nothing before, so an enrollment whose task was still in the
+    # broker was due again five minutes later — a worker half an hour behind
+    # accumulated six copies of every task in its backlog, each paying for
+    # research and an LLM composition. It expires so a task lost with its broker
+    # is re-dispatched rather than stranded.
+    send_claim_step: Mapped[int | None] = mapped_column(Integer)
+    send_claimed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
     # AI-Optimized Sequence Engine (feature 1.2): per-enrollment record of the
     # optimizer's decisions and reasoning. Each entry is one decision dict
     # ({step, action, reasoning, ...}) appended by sequence_optimizer before a

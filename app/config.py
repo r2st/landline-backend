@@ -410,6 +410,22 @@ class Settings(BaseSettings):
     # people are the same buyer. See ``SendLimiter.can_send_to_company``.
     min_hours_between_company_sends: int = 24           # Gap between touching two people at one company
     max_contacts_per_company_per_signal: int = 2        # Fan-out cap when a signal surfaces a company
+    # At-most-once sending (``services.send_claim``). Every gate above reasons
+    # about state in the database, and the window between "Gmail has the
+    # message" and "the transaction that says so committed" has not written any
+    # of it — so a retry in that window re-sends. A claim taken before the wire
+    # and committed separately is the only fact that survives it.
+    #
+    # ``grace`` is how long a claim is presumed to belong to a worker still
+    # running: longer than a research + LLM composition + SMTP round trip, or a
+    # healthy concurrent send gets reconciled out from under it. Floored in the
+    # module at 10 minutes.
+    send_claim_grace_minutes: int = 15
+    # How long a queued send task is presumed to still be coming. The sweep
+    # marked nothing when it dispatched, so a worker running behind was handed
+    # another copy of its whole backlog every five minutes. Must exceed the
+    # sweep interval (300s) to have any effect at all.
+    dispatch_lease_minutes: int = 15
     warmup_enabled: bool = True                         # Gradual ramp-up
     # Conservative warm-up ramp for a brand-new sending domain/mailbox:
     # 20/day week 1 → 50/day week 2 → 100/day week 3+ (then steady at max_emails_per_day).

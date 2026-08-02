@@ -28,6 +28,7 @@ from app.services.email_dispatch import send_outreach_email
 from app.services.sequence_optimizer import get_sequence_optimizer, record_decision
 from app.tasks.celery_app import celery_app
 from app.tasks.org_runner import for_each_org, org_scope
+from app.services import send_claim
 from app.services.send_limiter import get_send_limiter
 from app.services.send_time_optimizer import get_send_time_optimizer
 
@@ -65,6 +66,75 @@ async def _defer_enrollment(
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Could not defer enrollment %s: %s", enrollment_id, exc)
         await db.rollback()
+
+
+async def _handle_duplicate_claim(
+    db: AsyncSession, enrollment_id: str, step_number: int, claim
+) -> dict:
+    """What to do when this step is already claimed by another attempt.
+
+    The refusal itself is the safety property — no second message goes out. What
+    is left is the enrollment, which is still sitting on a step it will never be
+    allowed to send, and would otherwise be re-dispatched every five minutes for
+    the rest of its life.
+
+    Told apart by the age of the claim:
+
+    * fresh — a sibling worker is mid-send. Back off by the same interval a soft
+      skip uses and let it finish; it advances the enrollment itself. If it
+      already has, ``_defer_enrollment`` would drag a step scheduled days out
+      back to an hour from now, so the deferral is applied only while the
+      enrollment is still on the claimed step.
+    * stale — nothing came back from the attempt that took this claim. The
+      message went out and its bookkeeping is lost, so
+      :func:`send_claim.reconcile` writes the send that is missing and moves the
+      cadence on rather than leaving the enrollment wedged.
+
+    ``db`` is the send's own session, already rolled back by the caller. It is
+    reused rather than opened fresh because that rollback is what released the
+    enrollment row; a second connection here would only add another lock holder
+    to a row this task is still finishing with.
+    """
+    if claim.stale:
+        reconciled = await send_claim.reconcile(db, enrollment_id, step_number)
+        if reconciled:
+            return {
+                "status": "reconciled",
+                "reason": (
+                    "step was claimed for the wire and never recorded — "
+                    "recovered rather than re-sent"
+                ),
+                "step": step_number,
+                "enrollment_id": enrollment_id,
+            }
+        # The original attempt came back after all; nothing to fix.
+        return {
+            "status": "skipped",
+            "reason": "duplicate_send_suppressed",
+            "step": step_number,
+            "enrollment_id": enrollment_id,
+        }
+
+    still_here = (
+        await db.execute(
+            select(OutreachEnrollment.current_step)
+            .where(OutreachEnrollment.id == UUID(enrollment_id))
+            .execution_options(skip_org_filter=True)
+        )
+    ).scalar_one_or_none()
+    if still_here == step_number:
+        await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
+
+    logger.warning(
+        "Enrollment %s step %s already claimed for the wire — not sending again",
+        enrollment_id, step_number,
+    )
+    return {
+        "status": "skipped",
+        "reason": "duplicate_send_suppressed",
+        "step": step_number,
+        "enrollment_id": enrollment_id,
+    }
 
 
 def _run_async(coro):
@@ -996,6 +1066,43 @@ def send_sequence_step(self, enrollment_id: str):
                     return {"status": "skipped", "reason": _reserve_reason,
                             "daily_limit_reached": True}
 
+                # --- At-most-once: claim this step for the wire.
+                #
+                # Everything this task is about to write — the event, the
+                # advanced step, the thread ids — commits *after* Gmail already
+                # has the message. A failure anywhere in that window (a dropped
+                # COMMIT, a worker killed, bookkeeping that raises) rolls the
+                # record back and leaves the mail, and the Celery retry finds an
+                # enrollment that still reads "step N, active, due" and sends the
+                # same cold email to the same person again. Every other gate here
+                # asks the database, which in that window has not been told.
+                #
+                # The claim *commits*, which is the whole point: a committed fact
+                # outlives the rollback of the transaction that loses the send.
+                # It is also what separates two workers racing on one enrollment
+                # — the conditional UPDATE's row lock decides, not the order they
+                # reached the dispatcher.
+                #
+                # On *this* session, deliberately, not a second one.
+                # ``record_decision`` dirties ``enrollment.optimization_context``
+                # earlier in this transaction, and the next autoflush turns that
+                # into an uncommitted UPDATE holding a row lock on this very row.
+                # A claim issued from another connection would wait on that lock
+                # while this task waited on the claim — a worker wedged until the
+                # statement timeout, on every send. Committing here also lands
+                # the pre-send work (the decision log, the validated address)
+                # that was going to be committed a moment later anyway.
+                _claim_step = step.step_number
+                _claim = await send_claim.acquire(db, enrollment_id, _claim_step)
+                if not _claim.acquired:
+                    # Nothing of ours goes out, so both reservations go back.
+                    await _limiter.release_daily_send()
+                    await send_pacing.release_send_slot(send_account_id)
+                    await db.rollback()
+                    return await _handle_duplicate_claim(
+                        db, enrollment_id, _claim_step, _claim
+                    )
+
                 try:
                     send_result = await send_outreach_email(
                         db,
@@ -1015,6 +1122,14 @@ def send_sequence_step(self, enrollment_id: str):
                     # day's allowance. Same for the pacing window: a transient
                     # SMTP failure must not enforce a minute of silence on every
                     # enrollment queued behind this one.
+                    #
+                    # The send *claim* is deliberately not released here. Those
+                    # two counters are cheap to be wrong about; this is not.
+                    # ``send_outreach_email`` does real work after the transport
+                    # returns — the per-account daily counter, the warm-up start
+                    # — so an exception out of it does not prove the message
+                    # stayed home. Handing the claim back on a maybe is how one
+                    # uncertain send becomes two certain ones.
                     await _limiter.release_daily_send()
                     await send_pacing.release_send_slot(send_account_id)
                     raise
@@ -1047,6 +1162,12 @@ def send_sequence_step(self, enrollment_id: str):
                     skip_status = send_result.get("status")
                     skip_reason = send_result.get("reason")
                     await db.rollback()
+
+                    # Hand the claim back. Unlike the exception path above, this
+                    # is not a maybe: the dispatcher returned a status saying it
+                    # declined, so the step is genuinely unsent and the retry
+                    # this defers to has to be allowed to make it.
+                    await send_claim.release(db, enrollment_id, skip_step)
 
                     # Back the enrollment off so the 5-minute queue sweep stops
                     # re-dispatching a send that is going to be declined again.
@@ -1301,6 +1422,11 @@ def process_outreach_queue():
             # count is the demand signal behind the ranking — "30 sent, 84 asked"
             # is what says the cap is the constraint.
             skipped_quota = 0
+            # Enrollments whose send task from an earlier sweep is still in the
+            # broker. Reported because a number that climbs sweep after sweep is
+            # the readable form of "the worker is not keeping up" — which used to
+            # surface only as a mysteriously large LLM bill.
+            skipped_in_flight = 0
 
             # Anti-spam: don't send outside business hours / on weekends. Cold
             # mail that lands at 3 AM reads as a bot and tanks reply rates. The
@@ -1345,7 +1471,39 @@ def process_outreach_queue():
             # Latched once the org's daily email quota is found spent, so the
             # remaining email enrollments are skipped without re-asking.
             email_quota_spent: Optional[str] = None
+            # A dispatch is only useful if the task it queues will actually run
+            # before the next sweep. Nothing recorded that a task had been queued,
+            # so an enrollment whose send was still sitting in the broker was due
+            # again five minutes later and dispatched again — and again. A worker
+            # half an hour behind was handed six copies of every task in its
+            # backlog, each paying for contact research and an LLM composition
+            # before the send claim refused it. The lease expires so a task lost
+            # with its broker is re-dispatched rather than stranded forever.
+            #
+            # Time-based only, never explicitly cleared. Every path out of the
+            # send task either moves ``next_send_at`` well past the lease (a
+            # send schedules the next step days out, a soft skip defers an hour,
+            # a failure backs off) or ends the enrollment, so the lease costs
+            # nothing on the paths that matter and one expiry on the few it
+            # doesn't.
+            from app.config import get_settings as _get_settings
+
+            dispatch_lease = timedelta(
+                minutes=max(getattr(_get_settings(), "dispatch_lease_minutes", 15), 6)
+            )
             for enrollment in enrollments:
+                leased_at = enrollment.dispatched_at
+                if leased_at is not None:
+                    if leased_at.tzinfo is None:
+                        leased_at = leased_at.replace(tzinfo=timezone.utc)
+                    if now - leased_at < dispatch_lease:
+                        skipped_in_flight += 1
+                        logger.debug(
+                            "Enrollment %s already dispatched at %s — not queuing again",
+                            enrollment.id, leased_at.isoformat(),
+                        )
+                        continue
+
                 # A step with no row / no channel is an email step: that is the
                 # column's default and what every pre-multi-channel step is.
                 is_email_step = step_channels.get(
@@ -1504,6 +1662,16 @@ def process_outreach_queue():
                         )
                         continue
 
+                # Take the lease *before* the task exists, and commit it there
+                # and then. A stamp written now and committed at the end of the
+                # sweep would leave the row locked for the whole loop, against a
+                # worker whose first act is to UPDATE that same row to claim the
+                # step — and would be lost entirely if the sweep died mid-list,
+                # which is exactly when the duplicate dispatch it prevents is
+                # most likely.
+                enrollment.dispatched_at = datetime.now(timezone.utc)
+                await db.commit()
+
                 # Dispatch the send
                 send_sequence_step.delay(str(enrollment.id))
                 dispatched += 1
@@ -1515,6 +1683,7 @@ def process_outreach_queue():
                 "skipped_outside_window": skipped_window,
                 "held_for_optimal_window": scheduled_smart,
                 "skipped_daily_quota": skipped_quota,
+                "skipped_in_flight": skipped_in_flight,
             }
 
         return await for_each_org(_body, label="process_outreach_queue")

@@ -204,6 +204,42 @@ both send tables, and not a mailbox provider. `bounce_handler` suppresses the
 remaining colleagues the moment the domain crosses the line; the send path keeps
 a backstop for contacts discovered afterwards.
 
+**Added 2026-08-02 — the send path had no at-most-once guarantee.** Every gate
+in this system reasons about state in the database, and the window between
+"Gmail has the message" and "the transaction saying so committed" has not
+written any of it. `send_sequence_step` sends and *then* records the
+`OutreachEvent`, the advanced `current_step` and the thread ids; a dropped
+`COMMIT`, a statement timeout, bookkeeping that raises, or a worker killed in
+that window rolls the record back and leaves the mail. Celery retries in sixty
+seconds, finds an enrollment reading `step N, active, due` — exactly what the
+rollback restored — and sends the same cold email to the same person again.
+`can_send_to_contact` counts sends and finds none; `can_send_to_company` reads
+both send tables and finds nothing; the due check sees a step still due. All
+correct, all blind, because the send is only real on Gmail's side.
+
+The second way in needed no fault at all. The queue sweep marked nothing when it
+dispatched, so an enrollment whose task was still sitting in the broker was due
+on the next sweep too — a worker half an hour behind was handed six copies of
+every task in its backlog, each paying for research and an LLM composition.
+
+Two guards (`services/send_claim.py`, migration 109):
+
+* **The claim** is the correctness one. `(enrollment, step)` is claimed by a
+  conditional UPDATE committed on its own session immediately before the
+  dispatcher call, so it is the one fact that outlives the rollback of the send
+  it describes — and the row lock decides the concurrent case too. Deliberately
+  at-most-once: a claim says an attempt reached the dispatcher, not that Gmail
+  accepted it, and resolving that ambiguity by re-sending trades a certain
+  duplicate for a possible one. A stale claim on a step the enrollment is still
+  sitting on is *reconciled* — the missing `sent` event is recorded (flagged
+  `wire_outcome: unconfirmed`, and in the denominator, because deliverability
+  rates must count attempts) and the cadence moves on, rather than the
+  enrollment being re-dispatched and refused every five minutes forever.
+* **The dispatch lease** (`dispatched_at`) is the cheap one: the sweep stamps it
+  before the task exists and skips anything stamped inside the window, so the
+  duplicate task is never created rather than created and refused. Time-based,
+  so a task lost with its broker is re-dispatched rather than stranded.
+
 **Added earlier, and not on this roadmap:** the outreach queue was unordered
 (`services/queue_priority.py`). It selected every active enrollment with no
 `ORDER BY` and then spent a finite daily cap walking that list, so a sequential

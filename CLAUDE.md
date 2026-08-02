@@ -155,6 +155,40 @@ at once. The counter seeds from the DB (`SET … NX`) so a restart or an evictio
 resumes at the real number. With Redis unreachable it degrades to the row-count
 check — per-worker, never looser — and says `[degraded: …]` in the reason.
 
+## A step goes on the wire at most once
+
+Every send gate in this codebase asks the *database* — and the window between
+"Gmail has the message" and "the transaction saying so committed" has not
+written any of it. `send_sequence_step` sends and then records the
+`OutreachEvent`, the advanced `current_step` and the thread ids; a dropped
+`COMMIT` (or a raise, or a killed worker) in that window rolls the record back
+and leaves the mail. The Celery retry then finds `step N, active, due` and sends
+the same cold email to the same prospect again.
+
+`app.services.send_claim.acquire(db, enrollment_id, step)` is the interlock: a
+conditional UPDATE on `outreach_enrollments.send_claim_step`, **committed on its
+own session** immediately before the dispatcher call, so it survives that
+rollback. The row lock also decides the concurrent case — two workers, one
+enrollment, neither having committed.
+
+- **Never release a claim on an ambiguous outcome.** `send_outreach_email` does
+  work *after* the transport returns, so an exception out of it does not prove
+  the message stayed home. Release only on a returned soft-skip status
+  (`skipped` / `suppressed` / `halted`) — the dispatcher declined, it didn't fail.
+- **A stale claim is reconciled, never re-sent.** `send_claim.reconcile` writes
+  the missing `sent` event (flagged `reconciled` / `wire_outcome: unconfirmed`,
+  and counted, because deliverability rates divide by *attempts*) and advances
+  the cadence, so the enrollment stops being re-dispatched and refused forever.
+- **Any new send path must claim.** A path that sends without one reintroduces
+  the duplicate for itself.
+
+`OutreachEnrollment.dispatched_at` is the other half — a lease taken by the
+queue sweep before the task exists. The sweep marked nothing before, so an
+enrollment whose task was still in the broker was dispatched again five minutes
+later; a worker half an hour behind held six copies of every task in its
+backlog. Time-based, never explicitly cleared, floored above the sweep interval
+(a lease shorter than 5 minutes is inert).
+
 ## Pre-send spam gate
 
 Every outbound path runs the deterministic content scan
