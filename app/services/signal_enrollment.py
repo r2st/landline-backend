@@ -58,6 +58,7 @@ from app.models.company import Company
 from app.models.company_news import CompanyNews
 from app.models.contact import Contact
 from app.models.follow_up import FollowUp
+from app.services.email_validation import is_role_address
 from app.models.intent_signal import IntentSignal
 from app.models.outreach import OutreachEnrollment
 from app.models.sequence import OutreachSequence
@@ -209,6 +210,7 @@ async def surface_prospects_on_signals(
     auto_enroll: bool = False,
     min_intent_score: float = DEFAULT_MIN_INTENT_SCORE,
     include_intent: bool = True,
+    max_contacts_per_company: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> dict:
     """React to fresh company signals by surfacing un-enrolled prospects.
@@ -218,8 +220,18 @@ async def surface_prospects_on_signals(
     flagged, prospects auto-enrolled, and signals marked actioned, with the
     actioned count split by source so a change in either is attributable.
     Idempotent per signal via each row's ``actioned`` flag.
+
+    ``max_contacts_per_company`` caps the fan-out per company (default
+    ``settings.max_contacts_per_company_per_signal``); see the ranking note at
+    the cap itself. A value below 1 is treated as uncapped.
     """
     now = now or datetime.now(timezone.utc)
+    if max_contacts_per_company is None:
+        from app.config import get_settings
+
+        max_contacts_per_company = get_settings().max_contacts_per_company_per_signal
+    if max_contacts_per_company < 1:
+        max_contacts_per_company = None  # uncapped
     cutoff = now - timedelta(hours=fresh_hours)
 
     signals = await _collect_news(db, cutoff=cutoff, min_relevance=min_relevance)
@@ -276,6 +288,28 @@ async def surface_prospects_on_signals(
         prospects = [c for c in emailable if c.id not in enrolled_ids]
         if not prospects:
             continue
+
+        # Rank, then cap. Acting on every contact at a company turns one signal
+        # into a simultaneous multi-recipient blast — four addresses, one buyer,
+        # and a recipient mail server watching an unknown sender hit four
+        # mailboxes at once. ``send_limiter.can_send_to_company`` is the
+        # authoritative brake (it covers every enrolment path), but creating the
+        # rows here anyway would just park colleagues in a queue that drains one
+        # per day for a week; better to pick the best few and leave the rest
+        # un-enrolled, where a later signal or the prospector can still reach
+        # them.
+        #
+        # Ranking prefers the primary contact, then a named person over a shared
+        # inbox: ``info@`` is a real mailbox but a queue somebody triages, and
+        # cold mail is the first thing that queue deletes.
+        prospects.sort(
+            key=lambda c: (
+                not bool(getattr(c, "is_primary", False)),
+                is_role_address(c.email),
+                (c.email or "").lower(),
+            )
+        )
+        prospects = prospects[:max_contacts_per_company]
 
         # Strongest signal drives the headline shown to the operator. Intent
         # outranks press at equal recency regardless of the numbers: the scales

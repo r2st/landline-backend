@@ -30,9 +30,20 @@ from sqlalchemy import select, func
 from app.config import get_settings
 from app.models.outreach import OutreachEvent, OutreachEnrollment
 from app.models.contact import Contact
+from app.models.email_template import EmailSend
 from app.org_context import get_current_org_id
 
 logger = logging.getLogger(__name__)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat a naive timestamp as UTC.
+
+    Postgres hands back tz-aware values for these columns; SQLite (the test
+    engine) drops the offset. Subtracting a naive from an aware datetime raises,
+    so normalise before any arithmetic.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 # Lazily-created, cached async Redis client (mirrors app.services.api_key_auth).
 # Disabled on first failure so a persistent outage doesn't retry a dead socket
@@ -132,6 +143,111 @@ class SendLimiter:
                 return False, f"Too soon to email {contact_email} again (wait {days_remaining} more days)"
 
         return True, "OK"
+
+    async def can_send_to_company(
+        self,
+        db: AsyncSession,
+        company_id,
+        *,
+        exclude_contact_id=None,
+        now: Optional[datetime] = None,
+    ) -> tuple[bool, str, timedelta]:
+        """Whether we may mail *another* person at this company yet.
+
+        Returns ``(allowed, reason, wait)`` — ``wait`` is how long remains on the
+        gap, so the caller can defer by the real amount instead of re-checking
+        hourly.
+
+        **Why this is not covered by the per-contact caps.**
+        ``can_send_to_contact`` is keyed on an email address. ``info@acme.com``,
+        ``sales@acme.com``, ``jane@acme.com`` and ``bob@acme.com`` are four
+        different addresses and one buyer, so all four pass a per-address gate
+        while the recipient's mail server sees a burst from an unknown sender —
+        the canonical spam pattern, and the single fastest way to burn a sending
+        domain. It reads as a blast to the humans too: colleagues compare notes,
+        and near-identical cold copy arriving to four of them the same minute
+        destroys the credibility the copy was written to build.
+
+        That fan-out is reachable today. ``signal_enrollment`` enrols *every*
+        un-enrolled emailable contact at a company on one signal and dispatches
+        each immediately, and it fires on the strongest buying signals the system
+        detects — so the failure lands hardest on the accounts most worth
+        winning.
+
+        **The current contact is excluded.** A follow-up to someone we are
+        already sequencing is not fan-out; its spacing belongs to
+        ``step_delay``/``can_send_to_contact``. Only *other* people at the
+        company gate this send.
+
+        **Both send tables are read.** Sequence sends write ``OutreachEvent``
+        and nothing else; manual/template sends write ``EmailSend``. Reading one
+        would make the gate blind to whichever path sent last — the same split
+        that made the unified inbox blind to every sequence send.
+        """
+        now = now or datetime.now(timezone.utc)
+        zero = timedelta(0)
+        if company_id is None:
+            # A contact with no company cannot collide with a colleague.
+            return True, "OK", zero
+
+        min_gap = timedelta(hours=self.settings.min_hours_between_company_sends)
+        if min_gap <= zero:
+            return True, "OK", zero
+
+        window_start = now - min_gap
+
+        # Colleagues: every other contact at this company.
+        peers = select(Contact.id).where(Contact.company_id == company_id)
+        if exclude_contact_id is not None:
+            peers = peers.where(Contact.id != exclude_contact_id)
+
+        # Sequence sends — OutreachEvent → enrollment → contact.
+        seq_last = (
+            await db.execute(
+                select(func.max(OutreachEvent.occurred_at))
+                .join(
+                    OutreachEnrollment,
+                    OutreachEvent.enrollment_id == OutreachEnrollment.id,
+                )
+                .where(
+                    OutreachEnrollment.contact_id.in_(peers),
+                    OutreachEvent.event_type == "sent",
+                    OutreachEvent.occurred_at >= window_start,
+                )
+            )
+        ).scalar()
+
+        # Manual / template sends — EmailSend → contact.
+        direct_last = (
+            await db.execute(
+                select(func.max(EmailSend.sent_at)).where(
+                    EmailSend.contact_id.in_(peers),
+                    EmailSend.status == "sent",
+                    EmailSend.sent_at >= window_start,
+                )
+            )
+        ).scalar()
+
+        candidates = [t for t in (seq_last, direct_last) if t is not None]
+        if not candidates:
+            return True, "OK", zero
+
+        last = max(_as_utc(t) for t in candidates)
+        elapsed = now - last
+        if elapsed >= min_gap:
+            return True, "OK", zero
+
+        wait = min_gap - elapsed
+        hours = max(1, int(wait.total_seconds() // 3600) + 1)
+        return (
+            False,
+            (
+                f"A colleague at this company was emailed "
+                f"{int(elapsed.total_seconds() // 3600)}h ago "
+                f"(wait ~{hours}h)"
+            ),
+            wait,
+        )
 
     def within_send_window(self, tz_name: Optional[str] = None) -> tuple[bool, str]:
         """Whether the current time is inside the configured send window.

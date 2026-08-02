@@ -319,3 +319,179 @@ async def test_a_buying_signal_does_not_bypass_the_human_by_default(
     assert (await db_session.execute(
         select(func.count(OutreachEnrollment.id))
     )).scalar() == 0
+
+
+# --------------------------------------------------------------------------
+# Fan-out cap — one signal must not blast every mailbox at a company
+# --------------------------------------------------------------------------
+
+
+async def _company_with_contact_mix(db_session, company):
+    """The contact mix round 9's scraper fix now produces at an SMB shop.
+
+    Generic inboxes are deliberately kept (they are all a small shop often
+    exposes), so ``info@`` + ``sales@`` alongside named people is the normal
+    case rather than the exception.
+    """
+    made = {}
+    for addr, primary in [
+        ("info@acme.test", False),
+        ("sales@acme.test", False),
+        ("jane@acme.test", False),
+        ("bob@acme.test", False),
+    ]:
+        c = Contact(
+            id=uuid.uuid4(), company_id=company.id,
+            first_name=addr.split("@")[0], email=addr, source="test",
+            is_primary=primary,
+        )
+        db_session.add(c)
+        made[addr] = c
+    await db_session.flush()
+    return made
+
+
+@pytest.mark.asyncio
+async def test_one_signal_does_not_flag_every_contact_at_a_company(
+    db_session, sample_company, sample_contact
+):
+    """The burst: four addresses, one buyer.
+
+    Before the cap this surfaced every emailable contact, and on the auto-enroll
+    path dispatched a send for each immediately — a simultaneous
+    multi-recipient blast at the exact company a buying signal says is worth
+    winning.
+    """
+    await _company_with_contact_mix(db_session, sample_company)
+    db_session.add(_news(sample_company.id))
+    await db_session.flush()
+
+    result = await surface_prospects_on_signals(
+        db_session, fresh_hours=48, min_relevance=5, max_contacts_per_company=2
+    )
+
+    assert result["flagged"] == 2
+    followups = (await db_session.execute(select(FollowUp))).scalars().all()
+    assert len(followups) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_cap_keeps_named_people_over_shared_inboxes(
+    db_session, sample_company
+):
+    """``info@`` is a real mailbox but a queue somebody triages, and cold mail is
+    the first thing that queue deletes. When only two of four can be touched,
+    the named people are the two."""
+    await _company_with_contact_mix(db_session, sample_company)
+    db_session.add(_news(sample_company.id))
+    await db_session.flush()
+
+    await surface_prospects_on_signals(
+        db_session, fresh_hours=48, min_relevance=5, max_contacts_per_company=2
+    )
+
+    followups = (await db_session.execute(select(FollowUp))).scalars().all()
+    chosen = set()
+    for f in followups:
+        c = (await db_session.execute(
+            select(Contact).where(Contact.id == f.contact_id)
+        )).scalar_one()
+        chosen.add(c.email)
+    assert chosen == {"bob@acme.test", "jane@acme.test"}
+
+
+@pytest.mark.asyncio
+async def test_the_primary_contact_outranks_a_named_peer(
+    db_session, sample_company
+):
+    made = await _company_with_contact_mix(db_session, sample_company)
+    # The operator marked the shared inbox as primary — that is a human
+    # judgement about who to talk to, and it outranks the address shape.
+    made["info@acme.test"].is_primary = True
+    db_session.add(_news(sample_company.id))
+    await db_session.flush()
+
+    await surface_prospects_on_signals(
+        db_session, fresh_hours=48, min_relevance=5, max_contacts_per_company=1
+    )
+
+    followup = (await db_session.execute(select(FollowUp))).scalars().one()
+    contact = (await db_session.execute(
+        select(Contact).where(Contact.id == followup.contact_id)
+    )).scalar_one()
+    assert contact.email == "info@acme.test"
+
+
+@pytest.mark.asyncio
+async def test_the_cap_applies_to_the_auto_enroll_path(
+    db_session, sample_company, monkeypatch
+):
+    """The dangerous path: these rows dispatch a send immediately."""
+    from app.models.sequence import OutreachSequence, SequenceStep
+
+    sample_company.industry_segment = "CNC Machining"
+    await _company_with_contact_mix(db_session, sample_company)
+    seq = OutreachSequence(
+        id=uuid.uuid4(), name="CNC", industry="cnc_machining", is_active=True
+    )
+    db_session.add(seq)
+    await db_session.flush()
+    db_session.add(SequenceStep(
+        id=uuid.uuid4(), sequence_id=seq.id, step_number=1, delay_days=0,
+        subject_template="hi", body_template="hi",
+    ))
+    db_session.add(_news(sample_company.id))
+    await db_session.flush()
+
+    dispatched = []
+    from app.tasks import outreach as outreach_tasks
+    monkeypatch.setattr(
+        outreach_tasks.send_sequence_step, "delay", lambda eid: dispatched.append(eid)
+    )
+
+    result = await surface_prospects_on_signals(
+        db_session, fresh_hours=48, min_relevance=5, auto_enroll=True,
+        max_contacts_per_company=2,
+    )
+
+    assert result["enrolled"] == 2
+    assert len(dispatched) == 2, "one immediate send per enrollment, capped"
+    assert (await db_session.execute(
+        select(func.count(OutreachEnrollment.id))
+    )).scalar() == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cap_below_one_means_uncapped(
+    db_session, sample_company, sample_contact
+):
+    """An escape hatch for an operator who wants the old behaviour, rather than
+    a value that silently surfaces nobody."""
+    await _company_with_contact_mix(db_session, sample_company)
+    db_session.add(_news(sample_company.id))
+    await db_session.flush()
+
+    result = await surface_prospects_on_signals(
+        db_session, fresh_hours=48, min_relevance=5, max_contacts_per_company=0
+    )
+
+    # sample_contact plus the four above.
+    assert result["flagged"] == 5
+
+
+@pytest.mark.asyncio
+async def test_the_cap_defaults_to_the_configured_value(
+    db_session, sample_company, sample_contact
+):
+    """Callers that pass nothing get the setting, not "unlimited"."""
+    from app.config import get_settings
+
+    await _company_with_contact_mix(db_session, sample_company)
+    db_session.add(_news(sample_company.id))
+    await db_session.flush()
+
+    result = await surface_prospects_on_signals(
+        db_session, fresh_hours=48, min_relevance=5
+    )
+
+    assert result["flagged"] == get_settings().max_contacts_per_company_per_signal

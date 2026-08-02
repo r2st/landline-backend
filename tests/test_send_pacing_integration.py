@@ -119,6 +119,13 @@ def _stub_pipeline(monkeypatch, db_session, send_result, *, reserve=(True, "ok")
             # tests never stop short of the gate they exist to exercise.
             return True, "ok"
 
+        async def can_send_to_company(self, db, company_id, **kwargs):
+            # Account-level burst control, also upstream of pacing. Held open
+            # for the same reason. Covered by test_company_send_throttle.
+            from datetime import timedelta
+
+            return True, "OK", timedelta(0)
+
         async def reserve_daily_send(self, db):
             return reserve
 

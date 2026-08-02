@@ -394,6 +394,35 @@ def send_sequence_step(self, enrollment_id: str):
                             "daily_limit_reached": True,
                         }
 
+                # Account-level burst control. The per-contact gates are keyed on
+                # an address and cannot see that info@, sales@ and two named
+                # people are one buyer — so four cold emails can land on one
+                # company within seconds, which is both the canonical spam
+                # pattern and the fastest way to lose the account's goodwill.
+                # Deferring (rather than cancelling) staggers the colleagues
+                # instead of dropping them, and the wait comes from the gate so a
+                # 20-hour gap costs one wake-up rather than twenty.
+                if is_email_step:
+                    (
+                        _co_ok,
+                        _co_reason,
+                        _co_wait,
+                    ) = await get_send_limiter().can_send_to_company(
+                        db, contact.company_id, exclude_contact_id=contact.id
+                    )
+                    if not _co_ok:
+                        await _defer_enrollment(
+                            db, enrollment_id, max(_co_wait, SOFT_SKIP_BACKOFF)
+                        )
+                        logger.info(
+                            "Enrollment %s held: %s", enrollment_id, _co_reason
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": _co_reason,
+                            "company_throttled": True,
+                        }
+
                 from app.services.email_validation import validate_contact
 
                 if is_email_step and contact.email_status is None:

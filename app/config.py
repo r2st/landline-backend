@@ -405,6 +405,11 @@ class Settings(BaseSettings):
     max_emails_per_day: int = 100                       # Steady-state daily cap (== fully-warmed week-3 volume)
     min_days_between_followups: int = 3                 # Minimum gap between follow-ups to same contact
     max_emails_per_contact_per_month: int = 8           # Hard cap per contact per 30 days
+    # Account-level (per-company) sending discipline. The per-contact caps above
+    # are keyed on an *address* and cannot see that info@, sales@ and two named
+    # people are the same buyer. See ``SendLimiter.can_send_to_company``.
+    min_hours_between_company_sends: int = 24           # Gap between touching two people at one company
+    max_contacts_per_company_per_signal: int = 2        # Fan-out cap when a signal surfaces a company
     warmup_enabled: bool = True                         # Gradual ramp-up
     # Conservative warm-up ramp for a brand-new sending domain/mailbox:
     # 20/day week 1 → 50/day week 2 → 100/day week 3+ (then steady at max_emails_per_day).

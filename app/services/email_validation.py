@@ -171,6 +171,39 @@ def is_non_prospect_address(email: Optional[str]) -> tuple[bool, str]:
     return False, ""
 
 
+# Shared-inbox local parts. A real mailbox, read by a real person — which is why
+# ``is_non_prospect_address`` deliberately lets these through — but a *worse*
+# prospect than a named individual: it lands in a queue triaged by whoever is on
+# rota, and cold mail is the first thing that queue deletes.
+_ROLE_LOCALPART_RE = re.compile(
+    r"^(info|sales|contact|contactus|admin|administrator|support|help|helpdesk|"
+    r"service|customerservice|hello|hi|enquir(y|ies)|inquir(y|ies)|office|mail|"
+    r"email|team|general|accounts?|accounting|billing|invoices?|finance|ar|ap|"
+    r"careers?|jobs|recruiting|hr|marketing|press|media|pr|webmaster|web|"
+    r"orders?|quotes?|rfq|purchasing|procurement|shipping|reception|frontdesk)"
+    r"([-_.]?(us|team|dept|department|inbox))?$",
+    re.IGNORECASE,
+)
+
+
+def is_role_address(email: Optional[str]) -> bool:
+    """Whether ``email`` is a shared/role inbox rather than a named person.
+
+    A *ranking* signal, never a rejection — the opposite of
+    :func:`is_non_prospect_address`, which decides deliverability. ``info@`` is a
+    perfectly real inbox and worth mailing when it is all a company exposes; it
+    is simply the last address to pick when a named alternative exists, and the
+    one to drop first when capping how many people at a company get touched.
+
+    Empty or malformed input is not a role address (it is not an address at all);
+    that call belongs to the validation gate.
+    """
+    if not email or "@" not in email:
+        return False
+    local, _, _ = email.strip().lower().rpartition("@")
+    return bool(_ROLE_LOCALPART_RE.match(local))
+
+
 def validate_email(email: Optional[str]) -> str:
     """Full recipient validation: syntax, junk shape, then MX.
 
