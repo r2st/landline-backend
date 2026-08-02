@@ -11,6 +11,7 @@ returned in API responses (only a redacted list of which keys are set).
 
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,6 +23,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.integration import Integration, WebhookSubscription
 from app.models.user import User
+from app.services.crm_import import CRM_PULL_PROVIDERS, get_crm_importer
 from app.services.crypto import TokenCryptoError, decrypt, encrypt
 from app.services.integrations import get_connector, marketplace_catalog
 from app.services.webhook_dispatch import get_webhook_dispatcher
@@ -54,6 +56,9 @@ class IntegrationRead(BaseModel):
     configured_credentials: list[str]
     is_active: bool
     last_error: Optional[str] = None
+    # "When did this last actually pull anything?" is the first question asked
+    # of a sync, and the column has always been there without being reported.
+    last_synced_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -85,6 +90,7 @@ def _to_read(i: Integration) -> IntegrationRead:
         configured_credentials=sorted((i.credentials or {}).keys()),
         is_active=i.is_active,
         last_error=i.last_error,
+        last_synced_at=i.last_synced_at,
     )
 
 
@@ -259,6 +265,67 @@ async def run_action(
         body.action, body.params, integration.config, _decrypt_credentials(integration.credentials)
     )
     return {"ok": result.ok, "message": result.message, "data": result.data}
+
+
+class CrmImportRequest(BaseModel):
+    """Bounds on one CRM pull. Every field has a safe default."""
+
+    max_records: int = Field(
+        500, ge=1, le=10_000,
+        description="Stop after this many CRM rows. The response carries a "
+                    "next_cursor so a large book imports in slices.",
+    )
+    page_size: int = Field(100, ge=1, le=200)
+    cursor: Optional[str] = Field(
+        None, description="Opaque cursor from a previous import's next_cursor."
+    )
+    dry_run: bool = Field(
+        False,
+        description="Fetch and resolve against existing records, write nothing. "
+                    "Answers 'how much of this book do we already have?'",
+    )
+
+
+@router.post("/integrations/{integration_id}/import/contacts")
+async def import_crm_contacts(
+    integration_id: uuid.UUID,
+    body: CrmImportRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pull contacts from a CRM into Landline, deduplicated against what we have.
+
+    Imported records are **persisted, never enrolled** — see
+    ``app.services.crm_import``. Bringing your book in must not be the event
+    that starts emailing it.
+    """
+    integration = await _get_integration_or_404(db, integration_id, current_user.org_id)
+    if integration.provider not in CRM_PULL_PROVIDERS:
+        raise HTTPException(
+            400,
+            f"{integration.provider!r} cannot pull contacts "
+            f"(providers that can: {', '.join(CRM_PULL_PROVIDERS)})",
+        )
+    connector = get_connector(integration.provider)
+    if connector is None:
+        raise HTTPException(400, f"Unknown provider {integration.provider!r}")
+
+    summary = await get_crm_importer().import_contacts(
+        db,
+        connector,
+        integration.config,
+        _decrypt_credentials(integration.credentials),
+        provider=integration.provider,
+        max_records=body.max_records,
+        page_size=body.page_size,
+        cursor=body.cursor,
+        dry_run=body.dry_run,
+    )
+    if not body.dry_run:
+        integration.last_synced_at = datetime.now(timezone.utc)
+        integration.last_error = summary.errors[0] if summary.errors else None
+        await db.flush()
+    return summary.as_dict()
 
 
 # --- Shared helper for workflow actions ------------------------------------

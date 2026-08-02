@@ -111,7 +111,68 @@ class HubSpotConnector(BaseConnector):
     auth_type = "api_key"
     config_fields = ["sync_direction"]
     credential_fields = ["access_token"]
-    supported_actions = ["sync_contact"]
+    supported_actions = ["sync_contact", "fetch_contacts"]
+
+    # Properties asked for by name: HubSpot returns only ``createdate``,
+    # ``lastmodifieddate`` and ``hs_object_id`` unless you say otherwise, so an
+    # unqualified fetch comes back with no email on it at all.
+    _PROPERTIES = (
+        "email", "firstname", "lastname", "company", "phone", "jobtitle",
+        "website", "city", "state", "country",
+    )
+
+    async def _action_fetch_contacts(
+        self, params: dict, config: dict, credentials: dict
+    ) -> ConnectorResult:
+        """Read a page of contacts *out* of HubSpot.
+
+        Returns provider-neutral rows (see ``app.services.crm_import``) plus the
+        opaque ``cursor`` for the next page — paging is the caller's loop, not
+        this method's, so one connector call is one HTTP request and a caller
+        can stop at whatever budget it has.
+        """
+        token = credentials.get("access_token")
+        if not token:
+            return ConnectorResult.failure("Missing HubSpot access_token")
+        query: dict = {
+            "limit": max(1, min(int(params.get("limit") or 100), 100)),
+            "properties": ",".join(self._PROPERTIES),
+        }
+        if params.get("cursor"):
+            query["after"] = params["cursor"]
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.hubapi.com/crm/v3/objects/contacts",
+                headers={"Authorization": f"Bearer {token}"},
+                params=query,
+            )
+        if resp.status_code != 200:
+            return ConnectorResult.failure(
+                f"HubSpot returned {resp.status_code}", status_code=resp.status_code
+            )
+        payload = resp.json() or {}
+        records = []
+        for row in payload.get("results") or []:
+            props = row.get("properties") or {}
+            records.append({
+                "external_id": row.get("id"),
+                "email": props.get("email"),
+                "first_name": props.get("firstname"),
+                "last_name": props.get("lastname"),
+                "title": props.get("jobtitle"),
+                "phone": props.get("phone"),
+                "company": props.get("company"),
+                "website": props.get("website"),
+                "city": props.get("city"),
+                "state": props.get("state"),
+                "country": props.get("country"),
+            })
+        cursor = ((payload.get("paging") or {}).get("next") or {}).get("after")
+        return ConnectorResult.success(
+            f"Fetched {len(records)} HubSpot contacts",
+            records=records,
+            cursor=cursor,
+        )
 
     async def _action_sync_contact(
         self, params: dict, config: dict, credentials: dict
@@ -149,7 +210,69 @@ class SalesforceConnector(BaseConnector):
     auth_type = "oauth"
     config_fields = ["instance_url", "sync_direction"]
     credential_fields = ["access_token"]
-    supported_actions = ["sync_contact"]
+    supported_actions = ["sync_contact", "fetch_contacts"]
+
+    _API = "v59.0"
+    # Leads, not Contacts, to mirror the push side: ``sync_contact`` creates a
+    # Lead, so pulling Leads makes the round trip idempotent instead of writing
+    # to one object and reading from another.
+    _SOQL = (
+        "SELECT Id, FirstName, LastName, Email, Phone, Title, Company, Website, "
+        "City, State, Country, NumberOfEmployees FROM Lead"
+    )
+
+    async def _action_fetch_contacts(
+        self, params: dict, config: dict, credentials: dict
+    ) -> ConnectorResult:
+        """Read a page of Leads *out* of Salesforce.
+
+        Salesforce hands back a whole path in ``nextRecordsUrl`` rather than an
+        opaque token, so the cursor here is that path; the caller passes it back
+        untouched, same as HubSpot's ``after``.
+        """
+        token = credentials.get("access_token")
+        instance = config.get("instance_url")
+        if not token or not instance:
+            return ConnectorResult.failure("Missing Salesforce access_token / instance_url")
+        base = instance.rstrip("/")
+        headers = {"Authorization": f"Bearer {token}"}
+        cursor = params.get("cursor")
+        limit = max(1, min(int(params.get("limit") or 200), 2000))
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            if cursor:
+                resp = await client.get(f"{base}{cursor}", headers=headers)
+            else:
+                resp = await client.get(
+                    f"{base}/services/data/{self._API}/query",
+                    headers=headers,
+                    params={"q": f"{self._SOQL} LIMIT {limit}"},
+                )
+        if resp.status_code != 200:
+            return ConnectorResult.failure(
+                f"Salesforce returned {resp.status_code}", status_code=resp.status_code
+            )
+        payload = resp.json() or {}
+        records = []
+        for row in payload.get("records") or []:
+            records.append({
+                "external_id": row.get("Id"),
+                "email": row.get("Email"),
+                "first_name": row.get("FirstName"),
+                "last_name": row.get("LastName"),
+                "title": row.get("Title"),
+                "phone": row.get("Phone"),
+                "company": row.get("Company"),
+                "website": row.get("Website"),
+                "city": row.get("City"),
+                "state": row.get("State"),
+                "country": row.get("Country"),
+                "employee_count": row.get("NumberOfEmployees"),
+            })
+        return ConnectorResult.success(
+            f"Fetched {len(records)} Salesforce leads",
+            records=records,
+            cursor=payload.get("nextRecordsUrl"),
+        )
 
     async def _action_sync_contact(
         self, params: dict, config: dict, credentials: dict

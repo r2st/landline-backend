@@ -165,6 +165,81 @@ async def test_run_action_missing_creds_returns_failure(client):
     assert resp.json()["ok"] is False  # no api_key configured
 
 
+# --- CRM pull ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_import_contacts_rejects_a_provider_that_cannot_pull(client):
+    """Slack has no book of business. Say so, don't 500 on a missing action."""
+    created = await client.post(
+        "/api/v1/integrations",
+        json={"provider": "slack", "credentials": {"webhook_url": "https://h.test/x"}},
+    )
+    iid = created.json()["id"]
+    resp = await client.post(f"/api/v1/integrations/{iid}/import/contacts", json={})
+    assert resp.status_code == 400
+    assert "cannot pull contacts" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_import_contacts_reports_a_connector_failure_without_500(client):
+    """No live HubSpot in a test: the fetch fails and the summary says so."""
+    created = await client.post(
+        "/api/v1/integrations",
+        json={"provider": "hubspot", "credentials": {}},
+    )
+    iid = created.json()["id"]
+    resp = await client.post(
+        f"/api/v1/integrations/{iid}/import/contacts", json={"max_records": 5}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["provider"] == "hubspot"
+    assert body["fetched"] == 0
+    assert body["companies_created"] == 0
+    assert body["errors"] == ["Missing HubSpot access_token"]
+
+
+@pytest.mark.asyncio
+async def test_import_contacts_ingests_a_page_and_stamps_last_synced(
+    client, monkeypatch
+):
+    from app.services.integrations.base import ConnectorResult as _CR
+    from app.services.integrations import providers as _providers
+
+    async def _fake_fetch(self, params, config, credentials):
+        return _CR.success("ok", records=[{
+            "external_id": "1",
+            "email": "jane@crm-import-demo.com",
+            "first_name": "Jane",
+            "last_name": "Diaz",
+            "title": "Owner",
+            "company": "CRM Import Demo",
+        }], cursor=None)
+
+    monkeypatch.setattr(
+        _providers.HubSpotConnector, "_action_fetch_contacts", _fake_fetch
+    )
+
+    created = await client.post(
+        "/api/v1/integrations",
+        json={"provider": "hubspot", "credentials": {"access_token": "tok"}},
+    )
+    iid = created.json()["id"]
+    resp = await client.post(
+        f"/api/v1/integrations/{iid}/import/contacts", json={"max_records": 10}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["fetched"] == 1
+    assert body["companies_created"] == 1
+    assert body["contacts_created"] == 1
+    assert body["errors"] == []
+
+    fetched = await client.get(f"/api/v1/integrations/{iid}")
+    assert fetched.json()["last_synced_at"] is not None
+
+
 # --- Webhook framework -----------------------------------------------------
 
 
