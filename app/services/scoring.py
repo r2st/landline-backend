@@ -138,14 +138,39 @@ async def _engagement_velocity(
     ``(signal_count, most_recent_event)``.
 
     Events counted: email opens, clicks, and replies from any contact at
-    this company.  Each non-null timestamp within the window counts as one
-    signal.
+    this company, **across both send tables** — ``email_sends`` (manual,
+    template, inbox replies) and ``outreach_events`` (the sequence engine, which
+    writes no ``EmailSend`` row). See CLAUDE.md, "Sent mail lives in two tables".
+
+    Reading only ``EmailSend`` here meant velocity was computed over the manual
+    send path alone. Nearly all volume — every Dialtone sequence send and every
+    open, click and reply it earns — goes through ``outreach_events``, so a
+    company that opened three cold emails this morning scored a velocity of zero
+    and got the neutral 1.0 multiplier. The burst-detection this function exists
+    for could not fire on the only channel that produces bursts.
     """
     from app.models.email_template import EmailSend
+    from app.models.outreach import OutreachEnrollment, OutreachEvent
 
     if now is None:
         now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=24)
+
+    signal_count = 0
+    most_recent: Optional[datetime] = None
+
+    def _consider(ts: Optional[datetime]) -> None:
+        nonlocal signal_count, most_recent
+        if ts is None:
+            return
+        # SQLite (and any tz-naive source) hands back naive datetimes;
+        # normalise to UTC so the window comparison never raises.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts >= window_start:
+            signal_count += 1
+            if most_recent is None or ts > most_recent:
+                most_recent = ts
 
     rows = await db.execute(
         select(
@@ -163,20 +188,24 @@ async def _engagement_velocity(
             ),
         )
     )
-    signal_count = 0
-    most_recent: Optional[datetime] = None
     for opened, clicked, replied in rows.all():
         for ts in (opened, clicked, replied):
-            if ts is None:
-                continue
-            # SQLite (and any tz-naive source) hands back naive datetimes;
-            # normalise to UTC so the window comparison never raises.
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if ts >= window_start:
-                signal_count += 1
-                if most_recent is None or ts > most_recent:
-                    most_recent = ts
+            _consider(ts)
+
+    # Sequence engagement. One row per event here (rather than three nullable
+    # columns per send), so each qualifying row is exactly one signal.
+    seq_rows = await db.execute(
+        select(OutreachEvent.occurred_at)
+        .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+        .join(Contact, OutreachEnrollment.contact_id == Contact.id)
+        .where(
+            Contact.company_id == company.id,
+            OutreachEvent.event_type.in_(("opened", "clicked", "replied")),
+            OutreachEvent.occurred_at >= window_start,
+        )
+    )
+    for (occurred_at,) in seq_rows.all():
+        _consider(occurred_at)
 
     return signal_count, most_recent
 
@@ -324,11 +353,21 @@ async def _engagement_signal(
     and recent actionable news. Returns (points, breakdown). Capped so a hot
     lead can't run away with the score.
 
+    Counts engagement from **both send tables** — ``email_sends`` and
+    ``outreach_events`` (see CLAUDE.md, "Sent mail lives in two tables"). The
+    ``EmailSend``-only version of this query scored the manual send path and was
+    blind to every Dialtone sequence send, which is where essentially all cold
+    volume and all of its engagement lives. A company that opened four sequence
+    emails and clicked twice contributed exactly zero engagement points to its
+    own fit score, so the "engagement" component of lead scoring measured a
+    channel the lead-gen engine doesn't use.
+
     Imported lazily to avoid import cycles and to keep the firmographic-only
     unit tests (which never create sends/news) returning zero here.
     """
     from app.models.email_template import EmailSend
     from app.models.company_news import CompanyNews
+    from app.models.outreach import OutreachEnrollment, OutreachEvent
 
     breakdown: dict = {}
     points = 0
@@ -344,6 +383,25 @@ async def _engagement_signal(
         .where(Contact.company_id == company.id)
     )
     opened, clicked, replied = eng.one()
+
+    # Sequence engagement, added to the same counters — the weights below are
+    # per *kind* of signal (a reply is worth more than an open), not per table,
+    # so which path carried the email is irrelevant to what it says about intent.
+    seq = await db.execute(
+        select(OutreachEvent.event_type, func.count(OutreachEvent.id))
+        .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+        .join(Contact, OutreachEnrollment.contact_id == Contact.id)
+        .where(
+            Contact.company_id == company.id,
+            OutreachEvent.event_type.in_(("opened", "clicked", "replied")),
+        )
+        .group_by(OutreachEvent.event_type)
+    )
+    seq_counts = {event_type: count for event_type, count in seq.all()}
+    opened = (opened or 0) + seq_counts.get("opened", 0)
+    clicked = (clicked or 0) + seq_counts.get("clicked", 0)
+    replied = (replied or 0) + seq_counts.get("replied", 0)
+
     if replied:
         points += _ENGAGEMENT_WEIGHTS["replied"]
         breakdown["replied"] = int(replied)
