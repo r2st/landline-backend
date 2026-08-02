@@ -17,6 +17,7 @@ from app.config import Settings
 from app.services import ai_service as ai_module
 from app.services.ai_service import AIService
 from app.services import llm_providers as chain_module
+from app.services import llm_rate_limit as rate_limit_module
 from app.services.llm_providers import (
     CircuitBreaker,
     LLMChainExhausted,
@@ -35,9 +36,12 @@ from app.services.llm_providers import (
 # "OpenRouter is out of quota but Groq is fine" and mean it.
 # ---------------------------------------------------------------------------
 class _Response:
-    def __init__(self, status: int, data: dict):
+    def __init__(self, status: int, data: dict, headers: dict | None = None):
         self.status_code = status
         self._data = data
+        # Real responses carry these, and the 429 path reads ``Retry-After`` off
+        # them to decide how long to park the provider.
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -60,6 +64,11 @@ class _HostRoutedClient:
     """
 
     behaviour: dict = {}
+    # Per-model overrides, checked before ``behaviour``. Same outcome vocabulary.
+    # A provider's models can differ in ways the host cannot express — the free
+    # OpenRouter model being capped while the paid one on the same host answers
+    # is the case the fallback-model list exists for.
+    model_behaviour: dict = {}
     calls: list = []
 
     def __init__(self, *args, **kwargs):
@@ -75,16 +84,23 @@ class _HostRoutedClient:
         model = (json or {}).get("model")
         _HostRoutedClient.calls.append({"url": url, "model": model, "json": json,
                                         "headers": headers})
-        for host, outcome in _HostRoutedClient.behaviour.items():
-            if host in url:
-                if outcome == "boom":
-                    raise RuntimeError("connection reset")
-                if outcome == "empty":
-                    return _Response(200, {"choices": [{"message": {"content": ""},
-                                                        "finish_reason": "length"}]})
-                if isinstance(outcome, int):
-                    return _Response(outcome, {"error": {"code": outcome}})
-                return _Response(200, {"choices": [{"message": {"content": outcome}}]})
+        # Model overrides win over host ones, so a test can say "the free model
+        # is capped but the paid one on the same host answers".
+        matches = [o for m, o in _HostRoutedClient.model_behaviour.items() if m == model]
+        matches += [o for h, o in _HostRoutedClient.behaviour.items() if h in url]
+        for outcome in matches:
+            if outcome == "boom":
+                raise RuntimeError("connection reset")
+            if outcome == "empty":
+                return _Response(200, {"choices": [{"message": {"content": ""},
+                                                    "finish_reason": "length"}]})
+            if isinstance(outcome, tuple):
+                # (status, headers) — for the 429 path, which reads Retry-After.
+                status, hdrs = outcome
+                return _Response(status, {"error": {"code": status}}, hdrs)
+            if isinstance(outcome, int):
+                return _Response(outcome, {"error": {"code": outcome}})
+            return _Response(200, {"choices": [{"message": {"content": outcome}}]})
         return _Response(200, {"choices": [{"message": {"content": "default reply"}}]})
 
     @classmethod
@@ -100,6 +116,7 @@ class _HostRoutedClient:
 @pytest.fixture(autouse=True)
 def _reset_fake(monkeypatch):
     _HostRoutedClient.behaviour = {}
+    _HostRoutedClient.model_behaviour = {}
     _HostRoutedClient.calls = []
     monkeypatch.setattr(chain_module.httpx, "AsyncClient", _HostRoutedClient)
     reset_breaker()
@@ -692,3 +709,266 @@ def test_any_llm_available_sees_a_chain_only_deployment():
     nothing = _settings(anthropic_api_key="", openrouter_api_key="",
                         gemini_api_key="", groq_api_key="", cerebras_api_key="")
     assert any_llm_available(nothing) is False
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting: a free-tier cap must cost a hop, never a quality cliff
+# ---------------------------------------------------------------------------
+# The chain's premise is that the *next* provider has an independent quota. That
+# makes rate limiting a routing decision rather than a wait, and these assert
+# both halves of it: a throttled provider is skipped rather than failed, and the
+# chain never degrades to the caller's static template merely because a window
+# was full.
+@pytest.fixture
+def rate_limit_settings(monkeypatch):
+    """Point ``chat_completion``'s internal ``get_settings`` at a tight cap.
+
+    ``chat_completion`` reads pacing config from ``app.config`` directly, not
+    from the ``providers`` argument, so this is the seam.
+    """
+    def _apply(**overrides):
+        settings = _settings(**overrides)
+        monkeypatch.setattr("app.config.get_settings", lambda: settings)
+        return settings
+
+    return _apply
+
+
+@pytest.fixture
+def no_stall(monkeypatch):
+    """Record what the chain would have waited for, and advance a fake clock instead.
+
+    Advancing matters: the point of the wait is that the window has moved on by
+    the time we retry. A fixture that only swallowed the sleep would leave the
+    limiter in exactly the state it was in, and the retry would decline again —
+    testing the harness rather than the code.
+    """
+    import time as _time
+
+    slept: list[float] = []
+    clock = {"now": _time.monotonic()}
+    monkeypatch.setattr(_time, "monotonic", lambda: clock["now"])
+
+    async def _fake(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(rate_limit_module, "_sleep", _fake)
+    return slept
+
+
+@pytest.mark.asyncio
+async def test_a_paced_out_provider_is_skipped_for_the_next_one(
+    rate_limit_settings, no_stall
+):
+    """One request per minute, two calls: the second must land on Gemini.
+
+    Not on OpenRouter 60 seconds later. Waiting out a busy provider while an
+    idle one with an independent quota sits there is the one thing a fallback
+    chain should never do.
+    """
+    rate_limit_settings(llm_provider_rpm="openrouter:1,gemini:5", llm_default_rpm=5,
+                        llm_rate_limit_max_wait_seconds=0.0)
+    _HostRoutedClient.behaviour = {"openrouter.ai": "first", "generativelanguage": "second"}
+    chain = build_provider_chain(_settings())
+
+    _, p1, _ = await chat_completion([{"role": "user", "content": "x"}],
+                                     providers=chain, max_tokens=64,
+                                     breaker=CircuitBreaker(3, 300))
+    _, p2, _ = await chat_completion([{"role": "user", "content": "x"}],
+                                     providers=chain, max_tokens=64,
+                                     breaker=CircuitBreaker(3, 300))
+    assert (p1, p2) == ("openrouter", "gemini")
+    assert no_stall == []
+
+
+@pytest.mark.asyncio
+async def test_being_paced_is_not_a_failure_and_does_not_trip_the_breaker(
+    rate_limit_settings, no_stall
+):
+    """Three throttled requests must not blackhole a healthy provider for 5 minutes.
+
+    The breaker's whole contract is "this provider is broken". A provider we
+    chose not to call is not one that failed, and conflating the two would take
+    a working provider offline for the cooldown every time a batch got busy.
+    """
+    rate_limit_settings(llm_provider_rpm="openrouter:1", llm_default_rpm=50,
+                        llm_rate_limit_max_wait_seconds=0.0)
+    _HostRoutedClient.behaviour = {"openrouter.ai": "ok", "generativelanguage": "ok"}
+    breaker = CircuitBreaker(3, 300)
+    chain = build_provider_chain(_settings())
+
+    for _ in range(4):
+        await chat_completion([{"role": "user", "content": "x"}], providers=chain,
+                              max_tokens=64, breaker=breaker)
+
+    assert breaker.is_open("openrouter") is False
+    assert llm_status()["requests_failed"].get("openrouter", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_429_parks_the_provider_so_the_rest_of_the_batch_skips_it(
+    rate_limit_settings, no_stall
+):
+    """The second email in a batch must not re-earn the same 429.
+
+    Before parking, every send in a batch paid a full round trip to be told the
+    same thing by the same provider. Retry-After is the provider stating when it
+    will take us back; the cheapest correct response is to believe it.
+    """
+    rate_limit_settings(llm_provider_rpm="openrouter:50,gemini:50", llm_default_rpm=50)
+    _HostRoutedClient.behaviour = {
+        "openrouter.ai": (429, {"Retry-After": "60"}),
+        "generativelanguage": "gemini wrote this",
+    }
+    chain = build_provider_chain(_settings())
+
+    for _ in range(3):
+        _, provider, _ = await chat_completion([{"role": "user", "content": "x"}],
+                                               providers=chain, max_tokens=64,
+                                               breaker=CircuitBreaker(3, 300))
+        assert provider == "gemini"
+
+    # One OpenRouter round trip in total, not three.
+    assert _HostRoutedClient.hosts_tried().count("openrouter.ai") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_park_is_reported_so_throttled_is_distinguishable_from_broken(
+    rate_limit_settings, no_stall
+):
+    rate_limit_settings()
+    _HostRoutedClient.behaviour = {
+        "openrouter.ai": (429, {"Retry-After": "45"}),
+        "generativelanguage": "ok",
+    }
+    await chat_completion([{"role": "user", "content": "x"}],
+                          providers=build_provider_chain(_settings()),
+                          max_tokens=64, breaker=CircuitBreaker(3, 300))
+
+    limits = llm_status()["rate_limits"]["openrouter"]
+    assert limits["parked"] is True
+    assert 0 < limits["park_remaining_seconds"] <= 45
+    assert limits["rate_limited_responses"] == 1
+
+
+@pytest.mark.asyncio
+async def test_everything_paced_at_once_waits_rather_than_degrading_to_a_template(
+    rate_limit_settings, no_stall
+):
+    """The failure this whole subsystem exists to prevent, in miniature.
+
+    Raising here would hand the caller its static mail-merge fallback — losing
+    the personalization — because we were a few seconds early. Every provider
+    busy is a queue, not an outage.
+    """
+    rate_limit_settings(llm_provider_rpm="openrouter:1,gemini:1,groq:1,cerebras:1",
+                        llm_default_rpm=1,
+                        llm_rate_limit_max_wait_seconds=0.0,
+                        llm_rate_limit_max_stall_seconds=90.0)
+    _HostRoutedClient.behaviour = {
+        "openrouter.ai": "ok", "generativelanguage": "ok",
+        "groq.com": "ok", "cerebras.ai": "ok",
+    }
+    chain = build_provider_chain(_settings())
+
+    # Fill every provider's one-per-minute window.
+    for _ in range(4):
+        await chat_completion([{"role": "user", "content": "x"}], providers=chain,
+                              max_tokens=64, breaker=CircuitBreaker(3, 300))
+
+    content, provider, _ = await chat_completion([{"role": "user", "content": "x"}],
+                                                 providers=chain, max_tokens=64,
+                                                 breaker=CircuitBreaker(3, 300))
+    assert content == "ok"
+    assert provider == "openrouter"
+    # It waited exactly once, for the provider that frees up soonest.
+    assert len(no_stall) == 1
+    assert 0 < no_stall[0] <= 60
+
+
+@pytest.mark.asyncio
+async def test_a_stall_longer_than_the_ceiling_degrades_instead_of_blocking(
+    rate_limit_settings, no_stall
+):
+    """A worker held for a minute is worse than one template-copy email."""
+    rate_limit_settings(llm_provider_rpm="openrouter:1,gemini:1,groq:1,cerebras:1",
+                        llm_default_rpm=1,
+                        llm_rate_limit_max_wait_seconds=0.0,
+                        llm_rate_limit_max_stall_seconds=2.0)
+    _HostRoutedClient.behaviour = {
+        "openrouter.ai": "ok", "generativelanguage": "ok",
+        "groq.com": "ok", "cerebras.ai": "ok",
+    }
+    chain = build_provider_chain(_settings())
+    for _ in range(4):
+        await chat_completion([{"role": "user", "content": "x"}], providers=chain,
+                              max_tokens=64, breaker=CircuitBreaker(3, 300))
+
+    with pytest.raises(LLMChainExhausted, match="rate limited"):
+        await chat_completion([{"role": "user", "content": "x"}], providers=chain,
+                              max_tokens=64, breaker=CircuitBreaker(3, 300))
+    assert no_stall == []
+
+
+@pytest.mark.asyncio
+async def test_real_429s_from_everyone_do_not_add_a_stall_on_top(
+    rate_limit_settings, no_stall
+):
+    """Already told no by every provider, on the merits. Waiting adds nothing.
+
+    The stall exists for the case where we were throttled *before* sending a
+    byte. Once the round trips are spent and every provider answered 429, the
+    caller's template is the correct answer and it should get there promptly.
+    """
+    rate_limit_settings()
+    _HostRoutedClient.behaviour = {
+        "openrouter.ai": (429, {"Retry-After": "30"}),
+        "generativelanguage": (429, {"Retry-After": "30"}),
+        "groq.com": (429, {"Retry-After": "30"}),
+        "cerebras.ai": (429, {"Retry-After": "30"}),
+    }
+    with pytest.raises(LLMChainExhausted):
+        await chat_completion([{"role": "user", "content": "x"}],
+                              providers=build_provider_chain(_settings()),
+                              max_tokens=64, breaker=CircuitBreaker(3, 300))
+    assert no_stall == []
+
+
+@pytest.mark.asyncio
+async def test_a_park_does_not_interrupt_the_providers_own_model_list(
+    rate_limit_settings, no_stall
+):
+    """The free model 429s; the paid sibling must still be tried on this call.
+
+    ``openrouter_fallback_models`` exists precisely to reach a paid model when
+    the free tier is capped, and a paid model has its own allowance. A park is a
+    routing signal for the *next* call — re-asking it between sibling models
+    would turn that escape hatch into a dead branch.
+    """
+    rate_limit_settings()
+    # The free model is capped; the paid one, on the same provider, answers.
+    _HostRoutedClient.model_behaviour = {
+        "openai/gpt-oss-20b:free": (429, {"Retry-After": "60"}),
+        "openai/gpt-4o-mini": "paid copy",
+    }
+
+    chain = build_provider_chain(
+        _settings(),
+        openrouter_models=["openai/gpt-oss-20b:free", "openai/gpt-4o-mini"],
+    )
+    _, provider, model = await chat_completion(
+        [{"role": "user", "content": "x"}],
+        providers=chain,
+        max_tokens=64, breaker=CircuitBreaker(3, 300),
+    )
+    # The free model 429'd, the paid sibling answered — same provider, same call.
+    assert provider == "openrouter"
+    assert model == "openai/gpt-4o-mini"
+    # The 429 is still counted — it is real, and the monitoring surface should
+    # say the free tier is capped — but the provider is not left parked, because
+    # it demonstrably just served us. Parking it here would cost us the paid
+    # model on the next call for the sake of a limit that only binds the free one.
+    limits = llm_status()["rate_limits"]["openrouter"]
+    assert limits["rate_limited_responses"] == 1
+    assert limits["parked"] is False

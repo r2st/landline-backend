@@ -71,6 +71,35 @@ template. Keys: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`,
 A provider failing 3× in a row is skipped for 5 minutes
 (`LLM_BREAKER_THRESHOLD` / `LLM_BREAKER_COOLDOWN_SECONDS`).
 
+### Rate limits are a routing decision, not a wait
+
+`app/services/llm_rate_limit.py` paces each provider to its own cap
+(`LLM_PROVIDER_RPM`, `"name:rpm"` pairs) and honours `Retry-After` on a 429 by
+parking that provider. The breaker is the wrong instrument for this in both
+directions: it needs three consecutive failures, so a batch send hits the cap and
+then burns three more round trips before anything stops — and then it blackholes
+a *healthy* provider for five minutes over a limit that clears in one.
+
+Three rules hold this together:
+
+- **Throttled is not failed.** A paced or parked provider records no failure and
+  never moves the breaker. Being early is not being broken.
+- **Don't wait when another provider is idle.** `LLM_RATE_LIMIT_MAX_WAIT_SECONDS`
+  (3s) is deliberately small — the chain's whole premise is an independent quota
+  one hop away. The exception is when *every* provider is paced out before a byte
+  is sent, where returning would degrade the caller to static mail-merge copy
+  because we were two seconds early; then the chain stalls for the soonest one, up
+  to `LLM_RATE_LIMIT_MAX_STALL_SECONDS`. It does **not** stall after real 429s —
+  those round trips are already spent.
+- **A park picks providers; it doesn't interrupt one mid-call.** The slot is
+  claimed once per provider, before its model list. OpenRouter's free model 429ing
+  is exactly when the paid sibling — separate allowance — should be tried, and a
+  success clears the park, because a provider that just served us is not limited.
+
+`GET /api/v1/ai/providers` reports `rate_limits` next to `circuit_breakers`:
+"outreach went out as templates" and "outreach went out personalized but
+throttled" are otherwise indistinguishable from outside the process.
+
 Services that predate `AIService` and call `client.messages.create(...)` directly
 (sales coach, orchestrator, meeting/relationship/competitive intelligence,
 sentiment, script generator, investor outreach) use `chain_client()` from the

@@ -293,7 +293,27 @@ def llm_status() -> dict[str, Any]:
         "last_provider": last.get("provider"),
         "last_model": last.get("model"),
         "circuit_breakers": get_breaker(settings).snapshot(),
+        # Pacing state alongside breaker state, because "outreach went out as
+        # templates" and "outreach went out personalized but throttled" are
+        # indistinguishable from outside the process, and the difference is
+        # entirely here.
+        "rate_limits": get_rate_limiter().snapshot(),
+        "configured_rpm": {
+            s.name: _rate_limit_module().provider_rpm(settings, s.name) for s in chain
+        },
     }
+
+
+def _rate_limit_module():
+    """Imported lazily — ``llm_rate_limit`` reads config, which imports this."""
+    from app.services import llm_rate_limit
+
+    return llm_rate_limit
+
+
+def get_rate_limiter():
+    """The process-wide rate limiter. Re-exported so callers need one import."""
+    return _rate_limit_module().get_rate_limiter()
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +479,14 @@ async def chat_completion(
       credential and the same request, so retrying it just spends money to fail
       again — but a *different provider* shares neither.
 
-    A provider is only *skipped* outright when its breaker is open.
+    A provider is *skipped* — not failed — when its breaker is open, or when
+    ``services.llm_rate_limit`` says it is paced out or parked by a
+    ``Retry-After``. The distinction matters: a skipped provider records no
+    failure and does not move the breaker, because being early is not being
+    broken, and three paced requests must not blackhole a healthy provider for
+    five minutes. If *every* provider is paced out at once, the chain waits out
+    the soonest rather than returning — degrading to a static template because
+    we were two seconds early is the failure this module exists to prevent.
 
     An empty completion is treated as a failure, not an answer. Returning ""
     here is what made the last outage invisible: every caller's JSON parse
@@ -477,12 +504,31 @@ async def chat_completion(
     if system:
         openai_messages.insert(0, {"role": "system", "content": system})
 
+    from app.config import get_settings
+    from app.services import llm_rate_limit
+
+    settings = get_settings()
+    limiter = llm_rate_limit.get_rate_limiter()
+    pass_budget = float(getattr(settings, "llm_rate_limit_max_wait_seconds", 0.0) or 0.0)
+    max_stall = float(getattr(settings, "llm_rate_limit_max_stall_seconds", 0.0) or 0.0)
+
     needs_vision = has_image(messages)
     last_error: Exception | None = None
     attempted = False
+    # ``{provider: seconds until it frees}`` for providers skipped *only* because
+    # they were paced or parked. Not failures — they get a second pass if the
+    # whole chain declines, rather than letting a two-second wait become a
+    # static-template send.
+    deferred: dict[str, float] = {}
 
-    async with httpx.AsyncClient(timeout=timeout) as http:
-        for spec in providers:
+    async def _run_pass(
+        http: httpx.AsyncClient,
+        specs: Sequence[ProviderSpec],
+        wait_budget: float,
+    ) -> tuple[str, str, str] | None:
+        nonlocal last_error, attempted
+
+        for spec in specs:
             if needs_vision and not spec.supports_vision:
                 logger.debug(
                     "Skipping %s for an image request — model is text-only", spec.name
@@ -491,6 +537,32 @@ async def chat_completion(
             if breaker.is_open(spec.name):
                 logger.info("Skipping %s — circuit breaker open", spec.name)
                 continue
+
+            # Once per provider, before its model list — not once per request.
+            #
+            # A rate limit answers "which provider should serve this call", and
+            # that question is settled the moment we commit to one. Re-asking it
+            # between sibling models would break the case the sibling list exists
+            # for: OpenRouter's free model 429s and the *paid* fallback model,
+            # which has an entirely separate allowance, is exactly what should be
+            # tried next. Parking the provider on that first 429 and then
+            # refusing to try the paid model would turn a working escape hatch
+            # into a dead one. The cost is that a sibling retry isn't counted
+            # against the window; sibling retries only happen on 429/404/5xx, so
+            # that under-count is small and self-limiting.
+            rpm = llm_rate_limit.provider_rpm(settings, spec.name)
+            granted, wait = await limiter.acquire(spec.name, rpm, max_wait=wait_budget)
+            if not granted:
+                # Paced or parked, not broken. No failure recorded and the
+                # breaker is untouched — being early is not being down.
+                deferred[spec.name] = wait
+                logger.info(
+                    "Deferring %s — rate limited, %.1fs until a slot; "
+                    "moving to the next provider",
+                    spec.name, wait,
+                )
+                continue
+            deferred.pop(spec.name, None)
 
             for model in spec.models:
                 attempted = True
@@ -518,6 +590,21 @@ async def chat_completion(
                     last_error = exc
                     _record_failed(spec.name)
                     breaker.record_failure(spec.name)
+                    if status == 429:
+                        # Believe the provider's own statement about when it will
+                        # take us back, so the rest of a batch skips it instantly
+                        # instead of each email re-earning the same 429. This
+                        # call keeps walking the sibling models — the slot was
+                        # claimed before the loop, and the paid fallback model
+                        # the free one 429'd past has its own allowance.
+                        # ``getattr``: httpx allows a status error with no
+                        # response object, and a missing header must cost us the
+                        # default park, not the send.
+                        rl_headers = getattr(exc.response, "headers", None) or {}
+                        park = limiter.note_rate_limited(
+                            spec.name, rl_headers.get("Retry-After")
+                        )
+                        deferred[spec.name] = park
                     retry_sibling = _retryable_on_sibling_model(status)
                     logger.warning(
                         "LLM provider %s model %s returned HTTP %s — %s",
@@ -563,10 +650,47 @@ async def chat_completion(
                     continue
 
                 breaker.record_success(spec.name)
+                limiter.note_success(spec.name)
                 _record_served(spec.name, model)
                 logger.info("LLM request served by %s (model=%s)", spec.name, model)
                 return content, spec.name, model
 
+        return None
+
+    async with httpx.AsyncClient(timeout=timeout) as http:
+        served = await _run_pass(http, providers, pass_budget)
+        if served is not None:
+            return served
+
+        # Nothing was even attempted: every provider that could have answered was
+        # paced or parked before we sent a byte. Declining here would degrade the
+        # caller to static mail-merge copy because we were a few seconds early —
+        # the exact silent quality cliff this chain exists to prevent. So wait
+        # out the one that frees soonest and try it alone.
+        #
+        # Gated on ``not attempted`` deliberately. If we did reach a provider and
+        # it answered 429, the chain has already spent its round trips and been
+        # told no by the providers themselves; stalling on top of that adds
+        # latency to a request that has already failed on the merits.
+        if deferred and not attempted and max_stall > 0:
+            name, wait = llm_rate_limit.shortest_wait(deferred)
+            if name is not None and 0 < wait <= max_stall:
+                logger.info(
+                    "Every LLM provider is rate limited — waiting %.1fs for %s "
+                    "rather than degrading to a static template",
+                    wait, name,
+                )
+                await llm_rate_limit.wait(wait)
+                retry_specs = [s for s in providers if s.name == name]
+                served = await _run_pass(http, retry_specs, max_stall)
+                if served is not None:
+                    return served
+
+    if deferred and not attempted:
+        raise LLMChainExhausted(
+            "every LLM provider is rate limited; soonest available in "
+            f"{llm_rate_limit.shortest_wait(deferred)[1]:.0f}s"
+        )
     if not attempted:
         raise LLMChainExhausted(
             "every LLM provider was skipped (circuit breakers open, or no "

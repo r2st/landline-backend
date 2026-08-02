@@ -142,20 +142,29 @@ _patch_pg_types_for_sqlite()
 
 @pytest.fixture(autouse=True)
 def _reset_llm_breaker():
-    """Clear the process-wide LLM circuit breaker around every test.
+    """Clear the process-wide LLM circuit breaker and rate limiter around every test.
 
-    The breaker is deliberately long-lived in production — a provider that is
-    out of quota stays skipped for the cooldown so a batch send doesn't pay its
-    timeout on every email. Under pytest that same longevity means one test's
-    simulated provider failures trip the breaker for every test that follows,
-    which reads as a mysterious cascade of "provider skipped" failures in files
-    that never touched the breaker at all.
+    Both are deliberately long-lived in production — a provider that is out of
+    quota stays skipped for the cooldown so a batch send doesn't pay its timeout
+    on every email, and the rate-limit window has to span calls to mean anything.
+    Under pytest that same longevity means one test's simulated provider failures
+    trip the breaker for every test that follows, which reads as a mysterious
+    cascade of "provider skipped" failures in files that never touched the
+    breaker at all.
+
+    The rate limiter fails the same way but more quietly: its window is a rolling
+    minute, so a file that makes more mocked calls than the configured RPM starts
+    deferring providers partway through, and a test that simulates a 429 parks
+    that provider for every test that runs in the next 20 seconds.
     """
     from app.services.llm_providers import reset_breaker
+    from app.services.llm_rate_limit import reset_rate_limiter
 
     reset_breaker()
+    reset_rate_limiter()
     yield
     reset_breaker()
+    reset_rate_limiter()
 
 
 @pytest_asyncio.fixture(autouse=True)

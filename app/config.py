@@ -161,6 +161,27 @@ class Settings(BaseSettings):
     # optimisation, not a distributed lock.
     llm_breaker_threshold: int = 3
     llm_breaker_cooldown_seconds: int = 300
+    # Client-side pacing, per provider, so we stay under the free-tier caps
+    # rather than discovering them. The breaker is the wrong instrument for this:
+    # it needs three consecutive failures, so a batch send hits the cap and then
+    # burns three more round trips before anything stops. See
+    # app.services.llm_rate_limit.
+    #
+    # "name:rpm" pairs. The caps differ by an order of magnitude between these
+    # providers, and one global number set low enough for the tightest of them
+    # throttles the whole chain to its worst hop.
+    llm_provider_rpm: str = "openrouter:20,gemini:15,groq:30,cerebras:30"
+    llm_default_rpm: int = 20
+    # How long a single call will wait for a paced provider before moving to the
+    # next one. Small on purpose: the premise of the chain is that another
+    # provider is idle with an independent quota, so blocking a worker on the
+    # busy one trades throughput for latency and gains nothing. 0 = never wait,
+    # always move on.
+    llm_rate_limit_max_wait_seconds: float = 3.0
+    # ...unless EVERY provider is paced out at once, in which case moving on
+    # means degrading to static mail-merge copy because we were two seconds
+    # early. Then the chain waits out the soonest one, up to this long.
+    llm_rate_limit_max_stall_seconds: float = 30.0
 
     # Apollo.io
     apollo_api_key: str = ""
