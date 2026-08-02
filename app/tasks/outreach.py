@@ -137,12 +137,22 @@ async def _prior_step_engagement(
     opened = any(
         et in ("opened", "clicked") and sn == prior_step_number for et, sn, _ in rows
     )
+    # Clicks are counted across the whole enrollment, not just the prior step.
+    # An open is about one message ("did that subject land?"); a click is about
+    # the person ("are they interested enough to look?"), and interest shown at
+    # step 2 is still interest when step 4 decides how direct to be.
+    clicked = any(et == "clicked" for et, _, _ in rows)
     replied = any(et == "replied" for et, _, _ in rows)
     prior_tracked = any(
         et == "sent" and sn == prior_step_number and bool((md or {}).get("tracked"))
         for et, sn, md in rows
     )
-    return {"opened": opened, "replied": replied, "prior_tracked": prior_tracked}
+    return {
+        "opened": opened,
+        "clicked": clicked,
+        "replied": replied,
+        "prior_tracked": prior_tracked,
+    }
 
 
 async def evaluate_step_condition(
@@ -154,10 +164,20 @@ async def evaluate_step_condition(
     * ``if_not_opened`` → send only if the prior step was NOT opened.
     * ``if_opened_no_reply`` → send only if the prior step WAS opened and the
       contact has not replied.
+    * ``if_clicked_no_reply`` → send only if they clicked a link anywhere in this
+      enrollment and have not replied.
+    * ``if_not_clicked`` → send only if they have never clicked.
+
+    The click branches exist because the open signal is the weakest one we have.
+    Apple Mail Privacy Protection pre-fetches images, so a meaningful share of
+    "opens" are a proxy server, not a person; Gmail's image proxy inflates the
+    rest. A click is a deliberate act by a human. Keying the branch that decides
+    *how direct to be* on clicks rather than opens is the difference between
+    reacting to interest and reacting to a mail server.
 
     The first step (no prior touch) has nothing to branch on: ``if_not_opened``
-    sends (nothing was opened yet); ``if_opened_no_reply`` does not (nothing was
-    opened yet). Returns ``(should_send, reason)``.
+    and ``if_not_clicked`` send (nothing has happened yet); ``if_opened_no_reply``
+    and ``if_clicked_no_reply`` do not. Returns ``(should_send, reason)``.
 
     **Fails open on untracked sends.** ``if_opened_no_reply`` gates on a positive
     open signal, so if the prior step went out with no pixel there is no way for
@@ -186,6 +206,26 @@ async def evaluate_step_condition(
                 )
             return False, "prior step not opened — skipping the opened-no-reply branch"
         return True, "prior step opened, no reply yet"
+    if condition == "if_clicked_no_reply":
+        if eng["replied"]:
+            return False, "contact already replied — skipping"
+        if not eng["clicked"]:
+            # Same fail-open rule as ``if_opened_no_reply``, for the same reason:
+            # a click can only be observed on a tracked send, so gating on a
+            # positive click after an untracked one is a branch that could never
+            # fire. Untracked → unknown, and unknown sends.
+            if not eng["prior_tracked"]:
+                return True, (
+                    "prior step was sent without link tracking — click state "
+                    "unknown, sending rather than skipping a step that could "
+                    "never fire"
+                )
+            return False, "no click yet — skipping the clicked-no-reply branch"
+        return True, "contact clicked a link, no reply yet"
+    if condition == "if_not_clicked":
+        if eng["clicked"]:
+            return False, "contact already clicked — skipping the not-clicked branch"
+        return True, "no click yet"
     return True, "unknown condition — defaulting to send"
 
 
@@ -786,6 +826,41 @@ def send_sequence_step(self, enrollment_id: str):
                         "spam_scan": _spam_verdict.as_metadata(),
                     }
 
+                # --- Per-mailbox pacing: no mailbox bursts. ---
+                # The warm-up ramp says how many a mailbox may send today; this
+                # says how fast. The queue sweep dispatches every due enrollment
+                # in one loop, so without this a mailbox puts its whole backlog
+                # on the wire in seconds — the burst shape bulk-send detection
+                # looks for, at a daily volume that passes every warm-up check.
+                #
+                # Resolve the sender *first* when the step isn't pinned to one:
+                # a first touch has no ``sender_account_id`` (rotation picks at
+                # dispatch), and pacing a mailbox we can't name paces nothing —
+                # which would leave the highest-volume path in the system, cold
+                # first touches, completely unpaced. Resolving here also pins the
+                # send to the mailbox we paced, so the reservation and the send
+                # can't disagree about which inbox this went out from.
+                from app.services import send_pacing
+
+                if send_account_id is None:
+                    from app.services.email_dispatch import resolve_sender_info
+
+                    send_account_id = (await resolve_sender_info(db)).account_id
+
+                _pace = await send_pacing.claim_send_slot(send_account_id)
+                if not _pace.allowed:
+                    await db.rollback()
+                    # Wait out the mailbox's window, plus a small cushion so the
+                    # retry doesn't land in the same second the slot frees and
+                    # lose the race to another worker.
+                    await _defer_enrollment(
+                        db, enrollment_id, timedelta(seconds=_pace.wait_seconds + 15)
+                    )
+                    logger.info(
+                        "Enrollment %s paced: %s", enrollment_id, _pace.reason
+                    )
+                    return {"status": "skipped", "reason": _pace.reason, "paced": True}
+
                 # --- Daily cap: claim the slot atomically, right before the wire.
                 # The queue sweep's ``can_send_today`` is advisory — it counts
                 # rows, and every concurrent worker reads the same pre-send count,
@@ -796,6 +871,9 @@ def send_sequence_step(self, enrollment_id: str):
                 _limiter = get_send_limiter()
                 _reserved, _reserve_reason = await _limiter.reserve_daily_send(db)
                 if not _reserved:
+                    # Nothing went out, so the mailbox shouldn't sit out its
+                    # spacing window on account of a cap it never touched.
+                    await send_pacing.release_send_slot(send_account_id)
                     await db.rollback()
                     await _defer_enrollment(db, enrollment_id, SOFT_SKIP_BACKOFF)
                     logger.warning(
@@ -820,14 +898,24 @@ def send_sequence_step(self, enrollment_id: str):
                 except Exception:
                     # The dispatcher blew up — nothing went out, so the slot must
                     # not stay spent or a flapping SMTP host silently eats the
-                    # day's allowance.
+                    # day's allowance. Same for the pacing window: a transient
+                    # SMTP failure must not enforce a minute of silence on every
+                    # enrollment queued behind this one.
                     await _limiter.release_daily_send()
+                    await send_pacing.release_send_slot(send_account_id)
                     raise
 
                 # A send that didn't happen (soft skip) or bounced outright never
                 # consumed real sending volume; return its slot.
                 if send_result.get("status") != "sent":
                     await _limiter.release_daily_send()
+                    # Pacing, unlike the daily cap, is released only for a *soft
+                    # skip* — the dispatcher declined before the wire. A bounce
+                    # means we did open a connection and a server did reject us,
+                    # which is exactly the moment to keep slowing down rather
+                    # than let the next message follow immediately.
+                    if send_result.get("status") in ("skipped", "suppressed", "halted"):
+                        await send_pacing.release_send_slot(send_account_id)
 
                 # Soft-skip statuses: the dispatcher declined to send but this is
                 # NOT a bounce (warm-up cap hit, suppression, kill switch). Record
@@ -891,6 +979,17 @@ def send_sequence_step(self, enrollment_id: str):
                         "ai_generated": bool(composed.ai_generated),
                         "compose_reason": composed.reason,
                         "research_used": bool(composed.research_used),
+                        # The prospect data points the copy was built from
+                        # (``app.services.personalization``). Recorded on the
+                        # send, not just the draft, because most sends never
+                        # become a draft — the review gate is a first-N sample —
+                        # and this is what lets campaign analytics ask whether
+                        # depth of personalization moves the reply rate.
+                        **(
+                            {"personalization": composed.personalization}
+                            if composed.personalization
+                            else {}
+                        ),
                         # Which spintax variant shipped (when the copy used any),
                         # so downstream engagement can be attributed per variant.
                         **({"spintax": spintax_meta} if spintax_meta else {}),

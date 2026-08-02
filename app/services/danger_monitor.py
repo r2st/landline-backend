@@ -234,8 +234,18 @@ class DangerReport:
 
 
 class DangerMonitor:
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    # Resolved per access, not captured in ``__init__``. This object is a
+    # process-lifetime singleton (``get_danger_monitor``), so a snapshot taken at
+    # construction outlives any later change to the settings object — and
+    # ``get_settings`` is ``lru_cache``d, so anything that clears that cache
+    # leaves the monitor reading a Settings instance nobody else can see. That
+    # is not hypothetical: it silently disarmed the auto-pause *disable* switch,
+    # because ``danger_account_auto_pause_enabled = False`` landed on the live
+    # settings while the rail kept consulting the stale copy and paused anyway.
+    # A safety rail must read the config that is actually in force.
+    @property
+    def settings(self):
+        return get_settings()
 
     # ------------------------------------------------------------------
     # Thresholds

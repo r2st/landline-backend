@@ -276,3 +276,38 @@ async def test_missing_account_is_skipped_not_fatal(db_session: AsyncSession):
     )
 
     assert await get_danger_monitor().pause_accounts(db_session, report) == []
+
+
+async def test_disable_switch_survives_a_settings_cache_clear(db_session: AsyncSession):
+    """The rail must read the settings in force, not a copy from process start.
+
+    ``DangerMonitor`` is a process-lifetime singleton and ``get_settings`` is
+    ``lru_cache``d. When it captured ``self.settings`` in ``__init__``, anything
+    that called ``get_settings.cache_clear()`` — two other test modules do, and
+    any runtime config reload would — left the monitor holding a Settings object
+    that nothing else could reach. Switching auto-pause off then updated the live
+    settings while the rail went on consulting the stale one and paused anyway.
+
+    This reproduces that ordering: clear the cache first, disable second, and
+    require the monitor to honour the disable. It fails against the captured-in
+    -``__init__`` version.
+    """
+    import app.config as app_config
+
+    app_config.get_settings.cache_clear()
+    fresh = get_settings()
+    before = fresh.danger_account_auto_pause_enabled
+    fresh.danger_account_auto_pause_enabled = False
+    try:
+        company = await _company(db_session)
+        bad = await _account(db_session, "stale@apprend.tech")
+        await _sends(db_session, company, bad, total=40, bounced=6)
+
+        report = await get_danger_monitor().evaluate(db_session)
+        assert report.account_breaches, "expected a breach to have something to suppress"
+        assert await get_danger_monitor().pause_accounts(db_session, report) == []
+
+        await db_session.refresh(bad)
+        assert bad.sending_enabled is True
+    finally:
+        fresh.danger_account_auto_pause_enabled = before

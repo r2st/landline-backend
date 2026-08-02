@@ -348,6 +348,18 @@ class Settings(BaseSettings):
     # the UI) takes precedence over this static default.
     warmup_start_date: str = "2026-07-15"
 
+    # Per-mailbox send pacing (app/services/send_pacing.py). The warm-up ramp
+    # caps how MUCH a mailbox sends per day; this caps how FAST. Without it the
+    # 5-minute queue sweep dispatches every due enrollment at once and a single
+    # mailbox can put ten messages on the wire inside a second — the burst shape
+    # bulk-send detection keys on, at a daily volume that looks perfectly safe.
+    # The gap is drawn from [min_gap, min_gap + jitter] because a *fixed* gap is
+    # its own fingerprint. Defaults: 60-180s, i.e. ~20-60 sends/hour/mailbox,
+    # comfortably above the warm-up ceiling of 100/day.
+    send_pacing_enabled: bool = True
+    send_min_gap_seconds: int = 60
+    send_gap_jitter_seconds: int = 120
+
     # Pre-send spam gate (app/services/spam_guard.py). The deterministic content
     # scan runs on the final rendered copy of every outbound message.
     #  - flag  (>= flag threshold): send proceeds, score recorded on the send.

@@ -114,10 +114,16 @@ class SequenceStep(Base, OrgScopedMixin):
     channel: Mapped[str] = mapped_column(String(20), nullable=False, default="email")
     # Conditional branching gate evaluated against the PRIOR step's engagement
     # for the contact before this step sends:
-    #   "always"            — send unconditionally (default; unchanged behaviour)
-    #   "if_not_opened"     — only send if the prior step was not opened
-    #   "if_opened_no_reply"— only send if the prior step was opened but not replied
+    #   "always"             — send unconditionally (default; unchanged behaviour)
+    #   "if_not_opened"      — only send if the prior step was not opened
+    #   "if_opened_no_reply" — only send if the prior step was opened but not replied
+    #   "if_clicked_no_reply"— only send if they clicked anywhere in this
+    #                          enrollment and haven't replied
+    #   "if_not_clicked"     — only send if they have never clicked
     # When the condition isn't met the step is skipped (advanced past, no send).
+    # The click branches read a deliberate human act; the open branches read a
+    # signal that Apple MPP and Gmail's image proxy both fire on their own. See
+    # ``app.tasks.outreach.evaluate_step_condition``.
     send_condition: Mapped[str] = mapped_column(
         String(20), nullable=False, default="always", server_default="always"
     )
