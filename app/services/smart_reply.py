@@ -652,6 +652,11 @@ class SmartReplyService:
         # An auto-reply is an autonomous outbound send, so before firing we
         # require ALL of:
         #   - the global sending kill switch is on;
+        #   - the address is NOT on the do-not-contact suppression list — this
+        #     path sends via the Gmail client directly, so it does not inherit
+        #     the gate inside send_outreach_email, and an auto-reply to someone
+        #     who unsubscribed, hard-bounced or filed a spam complaint is the
+        #     single worst piece of mail this system can put on the wire;
         #   - THIS org has opted in to auto-replies (per-org, not just the global
         #     config default);
         #   - the AI itself said should_auto_send AND produced a draft;
@@ -664,9 +669,12 @@ class SmartReplyService:
         auto_sent = False
         auto_send_decision: dict = {"sent": False, "reason": None}
         settings = get_settings()
-        from app.services import system_settings
+        from app.services import email_dispatch, system_settings
 
         sending_on = await system_settings.is_sending_enabled(db)
+        blocked = await email_dispatch.check_send_allowed(
+            db, from_email, check_kill_switch=False
+        )
         org_opted_in = await system_settings.is_auto_reply_enabled(db)
         min_conf = float(getattr(settings, "auto_reply_min_confidence", 0.75) or 0.0)
         try:
@@ -677,6 +685,11 @@ class SmartReplyService:
 
         if not sending_on:
             auto_send_decision["reason"] = "kill_switch_engaged"
+        elif blocked is not None:
+            # Kept separate from the kill switch above so the ops trail says
+            # which floor stopped it: one is an operator pausing the platform,
+            # the other is a recipient who asked to never hear from us again.
+            auto_send_decision["reason"] = str(blocked.get("status") or "suppressed")
         elif not org_opted_in:
             auto_send_decision["reason"] = "org_opt_out"
         elif not (analysis.get("should_auto_send") and analysis.get("draft_reply")):

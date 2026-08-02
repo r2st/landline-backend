@@ -40,7 +40,7 @@ from app.schemas.smtp import (
     TestSendResult,
     ToggleSendingRequest,
 )
-from app.services import crypto
+from app.services import crypto, email_dispatch
 from app.services.smtp_sender import SmtpSender
 
 logger = logging.getLogger(__name__)
@@ -332,6 +332,19 @@ async def test_send(
     """Send a real test email from this account to confirm deliverability."""
     account = await _get(db, account_id, current_user)
     to_email = str(body.to_email) if body.to_email else account.email
+    # Same rule as the Gmail test endpoint: a self-test is a connectivity check,
+    # a third-party address is mail and clears the do-not-contact list first.
+    if to_email.lower() != (account.email or "").lower():
+        blocked = await email_dispatch.check_send_allowed(
+            db, to_email, check_kill_switch=False
+        )
+        if blocked is not None:
+            return TestSendResult(
+                status=blocked["status"],
+                detail=blocked["reason"],
+                sender=account.email,
+                transport="smtp",
+            )
     result = await asyncio.to_thread(
         SmtpSender(account).send_email,
         to_email=to_email,

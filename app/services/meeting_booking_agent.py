@@ -532,6 +532,58 @@ def _default_gmail_send(account: GmailAccount, **kwargs) -> dict:
     return GmailSender(account).send_email(**kwargs)
 
 
+async def _guarded_send(
+    db: AsyncSession,
+    sender: Callable,
+    account: GmailAccount,
+    *,
+    to_email: str,
+    kind: str,
+    **kwargs,
+) -> tuple[bool, object]:
+    """Clear the compliance floors, then send. ``(ok, transport_result)``.
+
+    Every send in this module goes through here, and the reason is that this
+    agent holds a ``GmailSender`` directly instead of calling
+    ``send_outreach_email``. That was the bug: the kill switch and the
+    do-not-contact list are enforced inside ``send_outreach_email``, so a path
+    that doesn't call it doesn't get them — and this one is *autonomous*, firing
+    on a beat with no human between the decision and the wire.
+
+    What that cost: an operator engaging the kill switch because their domain
+    was on fire stopped the queue, the sequences and every manual send, watched
+    the UI report the platform paused — and this agent kept proposing meetings.
+    A recipient who unsubscribed, hard-bounced or filed a spam complaint stayed
+    on the suppression list that every *other* path honours, and got mail from
+    this one anyway.
+
+    Reminders and confirmations go through the same gate as proposals rather
+    than claiming a transactional exemption. The list does not record which of
+    them a recipient meant to escape, and a meeting-reminder to an address that
+    filed a complaint is the one that lands hardest. If an operator wants that
+    mail to go, the fix is to remove the entry — a decision with a record, not a
+    branch in a module.
+
+    Failures are swallowed to a ``False`` exactly like the direct calls this
+    replaced: the agent records the attempt in ``conversation_thread`` and a
+    dead Gmail token must not take down the sweep for every other meeting.
+    """
+    from app.services import email_dispatch
+
+    blocked = await email_dispatch.check_send_allowed(db, to_email)
+    if blocked is not None:
+        logger.warning(
+            "meeting agent: %s to %s not sent (%s): %s",
+            kind, to_email, blocked.get("status"), blocked.get("reason"),
+        )
+        return False, None
+    try:
+        return True, sender(account, to_email=to_email, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — record the attempt, don't crash the sweep
+        logger.warning("meeting agent: %s send failed to %s: %s", kind, to_email, exc)
+        return False, None
+
+
 async def propose_meeting(
     db: AsyncSession,
     *,
@@ -559,6 +611,20 @@ async def propose_meeting(
     to_email = (contact.email if contact else None) or (reply.from_email if reply else None)
     if not to_email:
         logger.info("meeting agent: no recipient email — skipping proposal")
+        return None
+
+    # Checked here as well as in _guarded_send, because this is the one call
+    # that *creates* a meeting: a proposal whose mail is blocked would leave a
+    # ``proposed`` row for the 15-minute sweep to keep polling for a reply to a
+    # message nobody received. Nothing to propose, so nothing to record.
+    from app.services import email_dispatch
+
+    blocked = await email_dispatch.check_send_allowed(db, to_email)
+    if blocked is not None:
+        logger.info(
+            "meeting agent: no proposal to %s (%s): %s",
+            to_email, blocked.get("status"), blocked.get("reason"),
+        )
         return None
 
     cfg = SlotConfig.from_agent(agent)
@@ -605,22 +671,20 @@ async def propose_meeting(
 
     subject = f"Re: {reply.subject}" if reply and reply.subject else "Let's find a time"
     sender = send_email or _default_gmail_send
-    try:
-        sent = sender(
-            account,
-            to_email=to_email,
-            subject=subject[:255],
-            body_html=html,
-            body_text=text,
-            thread_id=reply.gmail_thread_id if reply else None,
-            in_reply_to=reply.gmail_message_id if reply else None,
-            references=reply.gmail_message_id if reply else None,
-        )
-        if isinstance(sent, dict):
-            meeting.gmail_thread_id = sent.get("gmail_thread_id") or (reply.gmail_thread_id if reply else None)
-            meeting.gmail_message_id = sent.get("gmail_message_id")
-    except Exception as exc:  # noqa: BLE001 — record the attempt, don't crash the caller
-        logger.warning("meeting agent: proposal send failed to %s: %s", to_email, exc)
+    _, sent = await _guarded_send(
+        db, sender, account,
+        to_email=to_email,
+        kind="proposal",
+        subject=subject[:255],
+        body_html=html,
+        body_text=text,
+        thread_id=reply.gmail_thread_id if reply else None,
+        in_reply_to=reply.gmail_message_id if reply else None,
+        references=reply.gmail_message_id if reply else None,
+    )
+    if isinstance(sent, dict):
+        meeting.gmail_thread_id = sent.get("gmail_thread_id") or (reply.gmail_thread_id if reply else None)
+        meeting.gmail_message_id = sent.get("gmail_message_id")
 
     logger.info(
         "meeting agent: proposed %d slot(s) to %s (meeting %s)", len(slots), to_email, meeting.id
@@ -691,19 +755,17 @@ async def repropose_meeting(
         {"role": "agent", "text": text, "at": now.isoformat(), "kind": "reproposal"},
     ]
     sender = send_email or _default_gmail_send
-    try:
-        sender(
-            account,
-            to_email=to_email,
-            subject=f"Re: {meeting.title}"[:255],
-            body_html=html,
-            body_text=text,
-            thread_id=meeting.gmail_thread_id,
-            in_reply_to=meeting.gmail_message_id,
-            references=meeting.gmail_message_id,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("meeting agent: re-proposal send failed: %s", exc)
+    await _guarded_send(
+        db, sender, account,
+        to_email=to_email,
+        kind="re-proposal",
+        subject=f"Re: {meeting.title}"[:255],
+        body_html=html,
+        body_text=text,
+        thread_id=meeting.gmail_thread_id,
+        in_reply_to=meeting.gmail_message_id,
+        references=meeting.gmail_message_id,
+    )
     return True
 
 
@@ -771,19 +833,17 @@ async def confirm_meeting(
     ]
     if account is not None and to_email:
         sender = send_email or _default_gmail_send
-        try:
-            sender(
-                account,
-                to_email=to_email,
-                subject=f"Confirmed: {meeting.title}"[:255],
-                body_html=html,
-                body_text=text,
-                thread_id=meeting.gmail_thread_id,
-                in_reply_to=meeting.gmail_message_id,
-                references=meeting.gmail_message_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("meeting agent: confirmation send failed: %s", exc)
+        await _guarded_send(
+            db, sender, account,
+            to_email=to_email,
+            kind="confirmation",
+            subject=f"Confirmed: {meeting.title}"[:255],
+            body_html=html,
+            body_text=text,
+            thread_id=meeting.gmail_thread_id,
+            in_reply_to=meeting.gmail_message_id,
+            references=meeting.gmail_message_id,
+        )
 
     logger.info("meeting agent: confirmed meeting %s for %s", meeting.id, meeting.start_time)
     return meeting
@@ -824,21 +884,18 @@ async def send_reminder(
     if account is None or not to_email:
         return False
     sender = send_email or _default_gmail_send
-    try:
-        sender(
-            account,
-            to_email=to_email,
-            subject=f"Reminder: {meeting.title}"[:255],
-            body_html=html,
-            body_text=text,
-            thread_id=meeting.gmail_thread_id,
-            in_reply_to=meeting.gmail_message_id,
-            references=meeting.gmail_message_id,
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("meeting agent: reminder send failed: %s", exc)
-        return False
+    ok, _ = await _guarded_send(
+        db, sender, account,
+        to_email=to_email,
+        kind="reminder",
+        subject=f"Reminder: {meeting.title}"[:255],
+        body_html=html,
+        body_text=text,
+        thread_id=meeting.gmail_thread_id,
+        in_reply_to=meeting.gmail_message_id,
+        references=meeting.gmail_message_id,
+    )
+    return ok
 
 
 async def on_interested_reply(

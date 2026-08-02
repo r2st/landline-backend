@@ -510,6 +510,60 @@ the entry, and the send gate goes on refusing with no explanation. With it
 widened, a checkbox round-trip would erase a complaint or an erasure record.
 Removing any other reason stays an explicit, per-entry action on the list itself.
 
+## "The single choke point" was a claim about the callers, not the system
+
+`send_outreach_email` holds the two compliance floors — the kill switch and the
+do-not-contact list — and its docstring called itself "the single choke point
+every outreach path funnels through". That was true of the paths that call it,
+and the set of things that put mail on this platform's wire is larger than that
+set. **Five paths held a `GmailSender`/`SmtpSender`, or the raw Gmail client,
+and sent without it:**
+
+- **The meeting-booking agent** (four sends: propose, re-propose, confirm,
+  remind) answered to *neither* floor. It is autonomous — a 15-minute beat, no
+  human between the decision and the wire — so an operator engaging the kill
+  switch because their domain was on fire stopped the queue, the sequences and
+  every manual send, watched the UI report the platform paused, and this agent
+  kept proposing meetings.
+- **The smart-reply auto-send** had the kill switch and three other floors, and
+  not suppression. A reply arriving on an old thread from an address that has
+  since unsubscribed or filed a complaint was auto-answered.
+- **The inbox reply composer** and **the per-account test send** are
+  human-driven, which is not an exemption — a person clicking Reply, or typing a
+  third-party address into a "test", is how a do-not-contact address actually
+  gets mailed.
+
+The gate is now `email_dispatch.check_send_allowed`, callable from outside the
+dispatcher, and `send_outreach_email` calls the same function rather than
+carrying its own copy.
+
+**What made this invisible is worth naming.** A send that should not have
+happened produces no error: the transport returns success, the row records a
+sent message, nothing is logged as wrong, and the only party who finds out is
+the recipient who asked to never hear from us again. Compare the send *window*
+and the *daily cap*, which are enforced in the queue and so cover only the queue
+— but a path that skips them merely sends at an odd hour. Skipping this one is a
+compliance breach. **The two floors are not the same kind of thing:** the kill
+switch is operational (`bypass_kill_switch` exists for internal callers, and a
+connectivity test to your own mailbox passes `check_kill_switch=False`), and
+suppression is a compliance gate with no flag that turns it off.
+
+Reminders and confirmations clear the same gate as proposals rather than
+claiming a transactional exemption: the list does not record which mail a
+recipient meant to escape, a complaint is the entry most likely sitting there,
+and the override is an operator removing the entry — a decision with a record —
+not a branch in a module. Two sends genuinely aren't outreach and say so in
+`REVIEWED`: the kill-switch admin notification (applying the switch to the mail
+announcing the switch is circular) and the welcome email carrying a new
+operator their own temporary password.
+
+`tests/test_send_gate_coverage.py` enforces it mechanically, **function-locally**
+— "some caller checks" is the assumption that was wrong to begin with. It found a
+send site a grep for the transport class names had missed, and it carries
+self-tests that plant each of the three send shapes, including the
+`asyncio.to_thread(sender.send_email, ...)` form where the send is an *argument*
+rather than a call. `tests/test_send_compliance_gate.py` is the behavioural half.
+
 ## Pre-send spam gate
 
 Every outbound path runs the deterministic content scan

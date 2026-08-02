@@ -389,6 +389,70 @@ def _unsubscribe_footer_html(contact_email: str) -> str:
     )
 
 
+async def check_send_allowed(
+    db: AsyncSession,
+    to_email: str,
+    *,
+    bypass_kill_switch: bool = False,
+    check_kill_switch: bool = True,
+) -> Optional[dict]:
+    """The two compliance floors, in one place. ``None`` means "allowed".
+
+    Returns the same ``{"status": ..., "reason": ...}`` shape
+    :func:`send_outreach_email` returns, so a caller that is *not* going through
+    it can hand the result straight back and report the block identically.
+
+    Two floors, and the order matters:
+
+    * the **global sending kill switch** — an operator's emergency stop, and the
+      reason it exists is to cover paths their own module doesn't know about.
+      ``bypass_kill_switch`` exists for internal callers that must still work
+      while paused; ``check_kill_switch=False`` is for mail that is not outreach
+      at all (a connectivity test to your own mailbox), where the pause has
+      nothing to say.
+    * the **do-not-contact suppression list** — a compliance gate, not an
+      operational one. An address on it must never receive *any* outbound mail,
+      which is why it is enforced even for kill-switch-bypass callers and why no
+      flag turns it off. Suppression is stricter than the operational pause.
+
+    This exists as a function rather than as a block inside
+    :func:`send_outreach_email` because ``send_outreach_email`` is *not*, in
+    fact, the only way mail leaves this system. Several paths hold a
+    ``GmailSender``/``SmtpSender`` directly — the meeting-booking agent, the
+    smart-reply auto-send, the inbox reply composer, the per-account test send.
+    Each of those is a send the recipient cannot tell apart from any other, so
+    each has to clear the same floors; giving them a shared gate to call is what
+    makes "every outbound path" a checkable claim rather than a hope. See
+    ``tests/test_send_gate_coverage.py``, which enforces it mechanically.
+    """
+    if check_kill_switch and not bypass_kill_switch:
+        from app.services import system_settings
+
+        if not await system_settings.is_sending_enabled(db):
+            logger.warning(
+                "Send to %s blocked: global sending kill switch is engaged", to_email
+            )
+            return {
+                "status": "halted",
+                "reason": "Global sending kill switch is engaged — all outbound email is paused.",
+                "transport": "none",
+                "sender": None,
+            }
+
+    from app.services import suppression
+
+    if await suppression.is_suppressed(db, to_email):
+        logger.info("Send to %s blocked: address is on the suppression list", to_email)
+        return {
+            "status": "suppressed",
+            "reason": "Recipient is on the do-not-contact suppression list.",
+            "transport": "none",
+            "sender": None,
+        }
+
+    return None
+
+
 async def send_outreach_email(
     db: AsyncSession,
     to_email: str,
@@ -410,43 +474,23 @@ async def send_outreach_email(
     Returns a dict with at least ``status`` ("sent" | "skipped" | "halted" |
     "error") plus ``transport`` and ``sender`` so callers can record how it went.
 
-    The **global sending kill switch** is checked first: when engaged, nothing is
-    put on the wire and ``{"status": "halted", ...}`` is returned. This is the
-    single choke point every outreach path funnels through, so the switch covers
-    sequence steps, the outreach queue, and manual sends alike. ``bypass_kill_switch``
-    exists only for internal callers that must still work while paused (none in
-    normal operation).
+    The two compliance floors — the **global sending kill switch** and the
+    **do-not-contact list** — are checked first, via :func:`check_send_allowed`.
+    Every *outreach* path funnels through here, so they cover sequence steps, the
+    outreach queue and manual sends alike; ``bypass_kill_switch`` exists only for
+    internal callers that must still work while paused (none in normal
+    operation), and does not lift suppression.
+
+    They live in :func:`check_send_allowed` rather than inline because this
+    function is not the only way mail leaves the system — the meeting-booking
+    agent, the smart-reply auto-send, the inbox composer and the per-account test
+    send each hold a transport directly and call that gate themselves.
     """
-    if not bypass_kill_switch:
-        from app.services import system_settings
-
-        if not await system_settings.is_sending_enabled(db):
-            logger.warning(
-                "Send to %s blocked: global sending kill switch is engaged", to_email
-            )
-            return {
-                "status": "halted",
-                "reason": "Global sending kill switch is engaged — all outbound email is paused.",
-                "transport": "none",
-                "sender": None,
-            }
-
-    # --- Suppression list (Feature 2) -----------------------------------------
-    # The do-not-contact list is a compliance gate: an address on it must never
-    # receive ANY outbound mail. Checked here, the single choke point every
-    # outreach path funnels through, so it covers sequence steps, the queue and
-    # manual sends alike — and enforced even for kill-switch-bypass callers,
-    # because suppression is stricter than the operational pause.
-    from app.services import suppression
-
-    if await suppression.is_suppressed(db, to_email):
-        logger.info("Send to %s blocked: address is on the suppression list", to_email)
-        return {
-            "status": "suppressed",
-            "reason": "Recipient is on the do-not-contact suppression list.",
-            "transport": "none",
-            "sender": None,
-        }
+    blocked = await check_send_allowed(
+        db, to_email, bypass_kill_switch=bypass_kill_switch
+    )
+    if blocked is not None:
+        return blocked
 
     # --- Pre-send spam gate ---------------------------------------------------
     # The backstop for every path that doesn't scan its own copy first (manual

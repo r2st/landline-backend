@@ -1998,6 +1998,20 @@ class EmailHistoryService:
         # Don't pass synthetic or empty thread IDs to Gmail API
         effective_thread_id = gmail_thread_id if (gmail_thread_id and not gmail_thread_id.startswith("__solo_")) else None
 
+        # The do-not-contact list applies to a human hitting Reply too. This
+        # composer holds a GmailSender directly, so it does not inherit the gate
+        # inside send_outreach_email — and "a person typed it" is not one of the
+        # exemptions, because it is precisely how a suppressed address gets
+        # mailed in practice. Reported rather than swallowed: the operator sees
+        # why, and removing the suppression entry is the way to override it.
+        from app.services import email_dispatch
+
+        blocked = await email_dispatch.check_send_allowed(
+            db, to_email, check_kill_switch=False
+        )
+        if blocked is not None:
+            return {"status": "error", "detail": blocked["reason"]}
+
         # Send via Gmail
         sender = GmailSender(account)
         send_result = sender.send_email(

@@ -47,7 +47,7 @@ from app.schemas.gmail import (
     ToggleSendingRequest,
 )
 from app.schemas.smtp import TestSendRequest, TestSendResult
-from app.services import crypto, google_oauth
+from app.services import crypto, email_dispatch, google_oauth
 from app.services.gmail_sender import GmailSender
 
 logger = logging.getLogger(__name__)
@@ -567,6 +567,23 @@ async def test_send(
             detail="This account isn't connected — reconnect it before testing.",
         )
     to_email = str(body.to_email) if body.to_email else account.email
+    # A "test" send is still mail arriving in someone's inbox. Sending to your
+    # own mailbox is a connectivity check and skips the list; an operator-typed
+    # third-party address does not, or the test endpoint is a way to reach a
+    # suppressed recipient with two clicks. The kill switch is deliberately not
+    # applied either way — verifying that a mailbox can send is exactly what an
+    # operator does *while* the platform is paused.
+    if to_email.lower() != (account.email or "").lower():
+        blocked = await email_dispatch.check_send_allowed(
+            db, to_email, check_kill_switch=False
+        )
+        if blocked is not None:
+            return TestSendResult(
+                status=blocked["status"],
+                detail=blocked["reason"],
+                sender=account.email,
+                transport="gmail",
+            )
     send_result = await asyncio.to_thread(
         GmailSender(account).send_email,
         to_email=to_email,
