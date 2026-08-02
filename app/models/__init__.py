@@ -1,7 +1,21 @@
-"""SQLAlchemy models package."""
+"""SQLAlchemy models package.
+
+Importing this module must register **every** mapped class on
+``Base.metadata``. That is not a tidiness rule. ``company_group`` was missing
+from the list below and from ``alembic/env.py``, so its table was absent from
+the metadata that migration 078 diffed when it added ``org_id`` to 71 tables —
+which is the whole reason ``company_groups`` spent two years as a namespace
+shared by every tenant on the platform (see
+``app.models.company_group`` and migration 111).
+
+``tests/test_org_scoping_coverage.py`` now imports the package's modules
+directly and fails if any mapped class is missing from here, so the blind spot
+cannot silently reopen.
+"""
 
 from app.models.user import User
 from app.models.company import Company
+from app.models.company_group import CompanyGroup
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
 from app.models.consent import ConsentRecord
@@ -41,7 +55,7 @@ from app.models.prospecting import IcpProfile, ProspectingRun, ProspectCandidate
 from app.models.api_credit import ApiCreditLedger
 from app.models.discovery_search import DiscoverySearch
 from app.models.discovered_business import DiscoveredBusiness
-from app.models.sender_health import SenderHealth
+from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.models.sender_warmup import SenderWarmupPlan
 from app.models.suppression import SuppressionEntry
 from app.models.danger_signal import DangerSignalEvent
@@ -75,6 +89,7 @@ __all__ = [
     "SystemSetting",
     "User",
     "Company",
+    "CompanyGroup",
     "Contact",
     "LeadScore",
     "ConsentRecord",
@@ -130,6 +145,7 @@ __all__ = [
     "DiscoverySearch",
     "DiscoveredBusiness",
     "SenderHealth",
+    "SenderHealthSnapshot",
     "SenderWarmupPlan",
     "SuppressionEntry",
     "DangerSignalEvent",
@@ -149,6 +165,12 @@ __all__ = [
     "StakeholderMap",
     "OrgRelationship",
     "MeetingBrief",
+    "MeetingBookingAgent",
+    "BookedMeeting",
+    "IntentSignal",
+    "RepPerformance",
+    "Competitor",
+    "CompetitorMention",
     "AgentDailySummary",
     "ReferralAgent",
     "Referral",

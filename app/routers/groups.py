@@ -1,4 +1,17 @@
-"""Company group management endpoints."""
+"""Company group management endpoints.
+
+Every handler here resolves its group with a plain ``select(CompanyGroup)``, and
+that is now load-bearing rather than incidental: :class:`CompanyGroup` is
+org-scoped (migration 111), so the global read filter turns each of those into a
+lookup within the caller's org and a foreign group id 404s. Before the mixin the
+same code was an IDOR on every write — see the model docstring.
+
+The one handler that had no lookup to scope was ``remove_members``, which
+deleted straight out of the association table on ``(group_id, company_id)``. It
+is given one below. ``company_group_members`` is a bare table with no ``org_id``
+and no mapped class, so nothing filters it implicitly; reaching it through its
+group is what scopes it.
+"""
 
 import uuid
 from typing import Optional
@@ -25,6 +38,45 @@ def _parse_uuids(raw_ids: list[str]) -> list[uuid.UUID]:
         except (ValueError, AttributeError, TypeError):
             continue
     return parsed
+
+
+async def _find_or_create_group(
+    db: AsyncSession, name: str, *, description: str, color: str
+) -> tuple[CompanyGroup, bool]:
+    """The group called *name* in the caller's org, creating it if absent.
+
+    Returns ``(group, created)``.
+
+    The lookup takes the **first** match rather than asserting there is exactly
+    one, because nothing in the schema promises that. ``company_groups.name`` has
+    no unique constraint and ``POST /groups`` accepts any name, so two groups
+    called "Aerospace" is an ordinary thing for a tenant to have — and a
+    ``scalar_one_or_none`` here turned that into ``MultipleResultsFound``, i.e. a
+    500 on all three auto-group endpoints, for a tenant whose only mistake was
+    creating a group twice. (Same failure the opt-out handler had on duplicate
+    contact rows; see the unsubscribe notes in CLAUDE.md.)
+
+    Ordering by ``created_at`` makes the choice deterministic: repeated runs keep
+    filing into the same group instead of alternating between the duplicates.
+    The org filter scopes the lookup, so "already exists" now means "exists *for
+    this tenant*" — before :class:`CompanyGroup` was org-scoped this found
+    another customer's group and filed this customer's companies into it.
+    """
+    existing = (
+        await db.execute(
+            select(CompanyGroup)
+            .where(CompanyGroup.name == name)
+            .order_by(CompanyGroup.created_at.asc(), CompanyGroup.id.asc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if existing is not None:
+        return existing, False
+
+    group = CompanyGroup(name=name, description=description, color=color)
+    db.add(group)
+    await db.flush()
+    return group, True
 
 
 async def _insert_new_members(db: AsyncSession, group_id, company_ids) -> int:
@@ -167,6 +219,16 @@ async def add_members(group_id: uuid.UUID, payload: GroupMembersUpdate, db: Asyn
 @router.delete("/{group_id}/members")
 async def remove_members(group_id: uuid.UUID, payload: GroupMembersUpdate, db: AsyncSession = Depends(get_db)):
     """Remove companies from a group."""
+    # Establish that the caller owns the group before touching its membership.
+    # The association table carries no org of its own, so this lookup — which the
+    # org filter scopes — is the only thing standing between a group id and a
+    # DELETE against another tenant's rows.
+    owns = (
+        await db.execute(select(CompanyGroup.id).where(CompanyGroup.id == group_id))
+    ).scalar_one_or_none()
+    if owns is None:
+        raise HTTPException(status_code=404, detail="Group not found")
+
     company_ids = _parse_uuids(payload.company_ids)
     removed = 0
     for cid in company_ids:
@@ -199,18 +261,10 @@ async def auto_group_by_industry(db: AsyncSession = Depends(get_db)):
     
     created = 0
     for industry, company_ids in industry_map.items():
-        # Check if group already exists
-        existing = await db.execute(
-            select(CompanyGroup).where(CompanyGroup.name == industry)
+        group, was_created = await _find_or_create_group(
+            db, industry, description=f"Auto-grouped: {industry}", color="#3b82f6"
         )
-        group = existing.scalar_one_or_none()
-        
-        if not group:
-            group = CompanyGroup(name=industry, description=f"Auto-grouped: {industry}", color="#3b82f6")
-            db.add(group)
-            await db.flush()
-            created += 1
-        
+        created += was_created
         # Add companies (skipping any already in the group)
         await _insert_new_members(db, group.id, company_ids)
 
@@ -237,21 +291,13 @@ async def auto_group_by_country(db: AsyncSession = Depends(get_db)):
     created = 0
     for country_code, company_ids in country_map.items():
         group_name = country_names.get(country_code, country_code)
-        existing = await db.execute(
-            select(CompanyGroup).where(CompanyGroup.name == group_name)
+        group, was_created = await _find_or_create_group(
+            db,
+            group_name,
+            description=f"Companies in {group_name}",
+            color="#059669" if country_code == "CA" else "#2563eb",
         )
-        group = existing.scalar_one_or_none()
-
-        if not group:
-            group = CompanyGroup(
-                name=group_name,
-                description=f"Companies in {group_name}",
-                color="#059669" if country_code == "CA" else "#2563eb",
-            )
-            db.add(group)
-            await db.flush()
-            created += 1
-
+        created += was_created
         await _insert_new_members(db, group.id, company_ids)
 
     await db.commit()
@@ -298,21 +344,13 @@ async def auto_group_by_stage(db: AsyncSession = Depends(get_db)):
     created = 0
     for stage, company_ids in stage_map.items():
         group_name = stage_labels.get(stage, stage.title())
-        existing = await db.execute(
-            select(CompanyGroup).where(CompanyGroup.name == group_name)
+        group, was_created = await _find_or_create_group(
+            db,
+            group_name,
+            description=f"Companies in '{stage}' pipeline stage",
+            color=stage_colors.get(stage, "#3b82f6"),
         )
-        group = existing.scalar_one_or_none()
-
-        if not group:
-            group = CompanyGroup(
-                name=group_name,
-                description=f"Companies in '{stage}' pipeline stage",
-                color=stage_colors.get(stage, "#3b82f6"),
-            )
-            db.add(group)
-            await db.flush()
-            created += 1
-
+        created += was_created
         await _insert_new_members(db, group.id, company_ids)
 
     await db.commit()
