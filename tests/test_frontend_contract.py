@@ -42,6 +42,9 @@ FRONTEND_ROUTES = [
     # DialtoneConsole.jsx
     ("GET", "/api/v1/dialtone/console"),
     ("GET", "/api/v1/dialtone/activity"),
+    # DialtoneCampaigns.jsx — cross-campaign comparison + the warm-lead list.
+    ("GET", "/api/v1/dialtone/campaigns/analytics"),
+    ("GET", "/api/v1/dialtone/leads/ranked"),
     # DialtoneInbox.jsx — the intent-classified reply queue.
     ("GET", "/api/v1/dialtone/inbox"),
     ("GET", "/api/v1/dialtone/inbox/stats"),
