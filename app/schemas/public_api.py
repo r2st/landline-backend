@@ -24,7 +24,11 @@ class SequenceRead(BaseModel):
     industry: Optional[str] = None
     status: str
     tone: str
-    cadence_pattern: Optional[str] = None
+    # Replaces ``cadence_pattern``, which was dropped in migration 108: it always
+    # read "single_channel" because nothing ever set it, including for cadences
+    # that were nothing of the sort. This is read off the steps, so it cannot
+    # disagree with what the sequence actually does.
+    channels: list[str] = []
     created_at: datetime
 
 

@@ -43,7 +43,7 @@ from app.schemas.call import (
     CallTaskUpdateEnhanced,
     CustomScriptRequest,
 )
-from app.models.sequence import STEP_CHANNELS, CADENCE_PATTERNS
+from app.models.sequence import STEP_CHANNELS, channel_mix
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -543,6 +543,14 @@ class TestCustomScriptRequestFramework:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+class _Step:
+    """The two attributes ``channel_mix`` reads, without a DB round-trip."""
+
+    def __init__(self, step_number: int, channel: str | None):
+        self.step_number = step_number
+        self.channel = channel
+
+
 class TestMultiChannelCadence:
     """Verify multi-channel cadence constants from the Combo Prospecting model."""
 
@@ -553,20 +561,34 @@ class TestMultiChannelCadence:
         for ch in ("email", "call", "linkedin", "video", "direct_mail"):
             assert ch in STEP_CHANNELS
 
-    def test_cadence_patterns_count(self):
-        assert len(CADENCE_PATTERNS) == 4
+    # ``cadence_pattern`` was dropped in migration 108 — it was a stored label
+    # nothing wrote and nothing read. The channel mix is now derived from the
+    # steps, which is the only place it can be true. These replace the four
+    # tests that asserted the vocabulary of the dead column.
 
-    def test_cadence_patterns_include_expected(self):
-        for p in ("single_channel", "triple", "quad", "quint"):
-            assert p in CADENCE_PATTERNS
+    def test_channel_mix_is_empty_without_steps(self):
+        assert channel_mix([]) == []
+        assert channel_mix(None) == []
 
-    def test_triple_pattern_means_3_channels(self):
-        """Triple = call + voicemail + email — 3 channels."""
-        assert "triple" in CADENCE_PATTERNS
+    def test_channel_mix_single_channel(self):
+        steps = [_Step(1, "email"), _Step(2, "email"), _Step(3, "email")]
+        assert channel_mix(steps) == ["email"]
 
-    def test_quint_pattern_means_5_channels(self):
-        """Quint = call + vm + email + LinkedIn + social — 5 channels."""
-        assert "quint" in CADENCE_PATTERNS
+    def test_channel_mix_follows_cadence_order_not_step_list_order(self):
+        """An email-then-call cadence reads differently from call-then-email.
+
+        The mix is ordered by ``step_number``, not by however the caller handed
+        the rows over — the first touch is the one that characterises a cadence.
+        """
+        out_of_order = [_Step(3, "email"), _Step(1, "call"), _Step(2, "email")]
+        assert channel_mix(out_of_order) == ["call", "email"]
+
+    def test_channel_mix_defaults_a_missing_channel_to_email(self):
+        assert channel_mix([_Step(1, None)]) == ["email"]
+
+    def test_channel_mix_covers_every_declared_channel(self):
+        steps = [_Step(i + 1, ch) for i, ch in enumerate(STEP_CHANNELS)]
+        assert channel_mix(steps) == list(STEP_CHANNELS)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -6,13 +6,20 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.sequence import DEFAULT_SEQUENCE_TONE, SEQUENCE_TONES
+from app.models.sequence import (
+    DEFAULT_SEQUENCE_TONE,
+    SEND_CONDITIONS,
+    SEQUENCE_TONES,
+    STEP_CHANNELS,
+)
 from app.services.step_delay import MAX_JITTER_MINUTES
 
 # Literal-ish validation without importing Literal for every tuple: the model
 # module owns the vocabulary, the schema reuses it, so they can't drift.
 _TONE_PATTERN = f"^({'|'.join(SEQUENCE_TONES)})$"
 _TONE_DESC = f"Voice the AI copywriter writes this sequence in. One of: {', '.join(SEQUENCE_TONES)}."
+_CHANNEL_PATTERN = f"^({'|'.join(STEP_CHANNELS)})$"
+_CONDITION_PATTERN = f"^({'|'.join(SEND_CONDITIONS)})$"
 
 
 # --- Sequence Steps ---
@@ -40,6 +47,29 @@ class SequenceStepCreate(BaseModel):
     )
     subject_template: str
     body_template: str
+    # The step model has carried these three since the multi-channel and
+    # conditional-branching work landed, and the send path honours all of them —
+    # but no request schema accepted them, so the only cadence this API could
+    # build was unconditional single-channel email. The capability was there and
+    # unreachable, which is indistinguishable from absent to anyone using it.
+    channel: str = Field(
+        "email", pattern=_CHANNEL_PATTERN,
+        description="How this touch is made. One of: " + ", ".join(STEP_CHANNELS) +
+                    ". Anything other than 'email' is a task for a human — the "
+                    "cadence files a FollowUp and holds until it is done or "
+                    "expires (see app.services.manual_touch).",
+    )
+    send_condition: str = Field(
+        "always", pattern=_CONDITION_PATTERN,
+        description="Gate evaluated against the prior step's engagement before "
+                    "this step sends. One of: " + ", ".join(SEND_CONDITIONS) + ".",
+    )
+    task_timeout_hours: Optional[int] = Field(
+        None, ge=1,
+        description="How long a non-email step waits for the human before the "
+                    "touch is recorded as not made and the cadence moves on. "
+                    "NULL uses the org default. Ignored for email steps.",
+    )
 
 
 class SequenceStepRead(BaseModel):
@@ -53,6 +83,9 @@ class SequenceStepRead(BaseModel):
     delay_jitter_minutes: int = 0
     subject_template: str
     body_template: str
+    channel: str = "email"
+    send_condition: str = "always"
+    task_timeout_hours: Optional[int] = None
 
 
 # --- Sequences ---
@@ -84,6 +117,9 @@ class SequenceRead(BaseModel):
     tone: str = DEFAULT_SEQUENCE_TONE
     created_at: datetime
     steps: list[SequenceStepRead] = []
+    # Derived from the steps, never stored — see the note where
+    # ``cadence_pattern`` used to live in app/models/sequence.py.
+    channels: list[str] = []
 
 
 class SequenceWithCounts(BaseModel):

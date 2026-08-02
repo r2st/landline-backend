@@ -21,8 +21,53 @@ from app.models.mixins import OrgScopedMixin
 
 # Channel types for multi-channel cadence (from combo-prospecting research)
 STEP_CHANNELS = ("email", "call", "linkedin", "video", "direct_mail")
-# Cadence patterns from Combo Prospecting (Tony Hughes)
-CADENCE_PATTERNS = ("single_channel", "triple", "quad", "quint")
+
+# Conditional branching gates a step can carry — see ``SequenceStep.send_condition``
+# for what each one means and ``app.tasks.outreach.evaluate_step_condition`` for
+# how it is evaluated. This tuple is the storage contract the API validates
+# against; the two are pinned to each other by a test.
+SEND_CONDITIONS = (
+    "always",
+    "if_not_opened",
+    "if_opened_no_reply",
+    "if_clicked_no_reply",
+    "if_not_clicked",
+)
+
+# ``cadence_pattern`` used to live here — a String(20) defaulting to
+# "single_channel", carrying the Combo Prospecting taxonomy (triple / quad /
+# quint). It was removed in migration 108, for two reasons that are worth
+# keeping written down so it doesn't come back:
+#
+# 1. **Nothing read it and nothing wrote it.** No endpoint accepted it, no
+#    service branched on it. Every row in the database held the column default,
+#    so it carried no information — while looking, to anyone reading the schema
+#    or the public API, like a switch that configured how a sequence ran.
+# 2. **Its vocabulary could not describe the data model.** The taxonomy counts
+#    call + voicemail + email + LinkedIn + social; the step model has email,
+#    call, linkedin, video, direct_mail — no voicemail, no social — and has no
+#    name at all for the two-channel cadence it can perfectly well express.
+#
+# The channel mix is a property of the steps, and the steps already know it.
+# ``channel_mix()`` below reads it from them, so it is true by construction
+# rather than by somebody remembering to update a second field.
+
+
+def channel_mix(steps) -> list[str]:
+    """The distinct channels a sequence actually touches, in step order.
+
+    Derived from the steps rather than stored: a sequence's channel mix changes
+    the moment a step is added, and a copy of it on the parent row is a claim
+    that has to be maintained. Order follows the cadence so the reader sees
+    "email, call" for an email-then-call sequence and "call, email" for the
+    reverse — which is the difference between a follow-up and a warm-up call.
+    """
+    seen: list[str] = []
+    for step in sorted(steps or [], key=lambda s: getattr(s, "step_number", 0) or 0):
+        channel = (getattr(step, "channel", None) or "email").strip().lower()
+        if channel and channel not in seen:
+            seen.append(channel)
+    return seen
 
 # Voice the AI copywriter writes this sequence in. A quality lever, not a
 # routing one: nothing branches on tone, it only shapes the prompt, so an
@@ -66,9 +111,6 @@ class OutreachSequence(Base, OrgScopedMixin):
     industry: Mapped[str | None] = mapped_column(String(80))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
-    # Multi-channel cadence pattern (from Combo Prospecting by Tony Hughes).
-    # "triple" = Call + VM + Email; "quad" = + LinkedIn; "quint" = + social DM.
-    cadence_pattern: Mapped[str | None] = mapped_column(String(20), default="single_channel")
     # Voice the AI copywriter writes this sequence in — see SEQUENCE_TONES.
     # NOT NULL with a server default: the generator reads this on every compose,
     # and a NULL would mean "no voice", which isn't a state that means anything.
@@ -88,6 +130,15 @@ class OutreachSequence(Base, OrgScopedMixin):
     enrollments: Mapped[list["OutreachEnrollment"]] = relationship(
         "OutreachEnrollment", back_populates="sequence", cascade="all, delete-orphan", lazy="selectin"
     )
+
+    @property
+    def channels(self) -> list[str]:
+        """The distinct channels this cadence touches, read off its steps.
+
+        Safe to serialize: ``steps`` is ``lazy="selectin"``, so it is populated
+        by the same query that loaded the sequence.
+        """
+        return channel_mix(self.steps)
 
     def __repr__(self) -> str:
         return f"<OutreachSequence {self.name}>"
