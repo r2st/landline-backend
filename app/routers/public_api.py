@@ -518,15 +518,21 @@ async def create_enrollment(
     if sequence is None:
         raise HTTPException(status_code=404, detail="Sequence not found")
 
+    # One row answers "already enrolled?". Nothing in the schema stops a second
+    # active enrollment for the pair, so asserting a single one would answer a
+    # duplicate with 500 instead of the 409 below — see the same check on
+    # ``POST /outreach/enrollments``.
     existing = (
         await db.execute(
-            select(OutreachEnrollment).where(
+            select(OutreachEnrollment.id)
+            .where(
                 OutreachEnrollment.contact_id == body.contact_id,
                 OutreachEnrollment.sequence_id == body.sequence_id,
                 OutreachEnrollment.status == "active",
             )
+            .limit(1)
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if existing is not None:
         raise HTTPException(
             status_code=409, detail="Contact is already actively enrolled in this sequence"

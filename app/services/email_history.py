@@ -304,14 +304,22 @@ class EmailHistoryService:
                     else:
                         received_at = datetime.now(timezone.utc)
 
-                    # Match to a contact by email
+                    # Match to a contact by email. ``contacts`` carries no
+                    # unique constraint at all and the scraper re-creates rows,
+                    # so a duplicated address is expected — the same duplicate
+                    # that used to break every unsubscribe link. Asserting a
+                    # single row here aborted the whole mailbox sync over one of
+                    # them, and on the mail path that reads as "no replies yet"
+                    # rather than as a failure. Earliest row wins, so a thread
+                    # keeps attaching to the same contact across syncs.
                     contact = (
                         await db.execute(
-                            select(Contact).where(
-                                func.lower(Contact.email) == from_email
-                            )
+                            select(Contact)
+                            .where(func.lower(Contact.email) == from_email)
+                            .order_by(Contact.created_at.asc(), Contact.id.asc())
+                            .limit(1)
                         )
-                    ).scalar_one_or_none()
+                    ).scalars().first()
 
                     contact_id = contact.id if contact else None
                     company_id = contact.company_id if contact else None
@@ -1406,14 +1414,20 @@ class EmailHistoryService:
         name = (name or "").strip()
         if not name:
             return None
+        # Existence check. Nothing constrains (user_id, name) in the schema —
+        # this function *is* the enforcement — so a duplicate that slipped past
+        # it (a race between two creates) must still be reported as a duplicate
+        # rather than raising.
         existing = (
             await db.execute(
-                select(InboxLabel).where(
+                select(InboxLabel.id)
+                .where(
                     InboxLabel.user_id == user_id,
                     func.lower(InboxLabel.name) == name.lower(),
                 )
+                .limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if existing is not None:
             return None
         label = InboxLabel(user_id=user_id, name=name, color=color or "gray")

@@ -109,11 +109,14 @@ class NewsMonitor:
 
             # Check if we already have this article
             existing = await db.execute(
-                select(CompanyNews)
+                select(CompanyNews.id)
                 .where(CompanyNews.company_id == company.id)
                 .where(CompanyNews.title == title)
+                .limit(1)
             )
-            if existing.scalar_one_or_none():
+            # Nothing constrains (company, title) — two copies of an article
+            # already stored would otherwise abort the whole news sweep.
+            if existing.scalars().first():
                 continue
 
             # Analyze relevance with AI

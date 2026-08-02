@@ -108,9 +108,16 @@ async def create_competitor(
     payload: CompetitorCreate,
     db: AsyncSession = Depends(get_db),
 ):
+    # Existence check. This function is the only thing enforcing name
+    # uniqueness — the schema has no constraint — so a duplicate that got past
+    # it must still produce the 409, not a 500.
     existing = (
-        await db.execute(select(Competitor).where(func.lower(Competitor.name) == payload.name.lower()))
-    ).scalar_one_or_none()
+        await db.execute(
+            select(Competitor.id)
+            .where(func.lower(Competitor.name) == payload.name.lower())
+            .limit(1)
+        )
+    ).scalars().first()
     if existing is not None:
         raise HTTPException(status_code=409, detail="A competitor with that name already exists")
 

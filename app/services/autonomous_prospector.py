@@ -738,14 +738,23 @@ class AutonomousProspector:
                 break
         if contact is None:
             return False
+        # "Has this contact ever been in this sequence?" — one matching row is
+        # the whole answer. Unlike the enrol endpoint this does not filter on
+        # status, so it sees historical enrollments too, and a contact who
+        # completed a sequence and was later re-enrolled has two. The endpoint
+        # permits exactly that: it only blocks a second *active* one. Asserting
+        # a single row here turned an ordinary history into an exception that
+        # aborts the prospecting run.
         existing = (
             await db.execute(
-                select(OutreachEnrollment).where(
+                select(OutreachEnrollment.id)
+                .where(
                     OutreachEnrollment.contact_id == contact.id,
                     OutreachEnrollment.sequence_id == sequence.id,
                 )
+                .limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if existing is not None:
             return False
         db.add(OutreachEnrollment(

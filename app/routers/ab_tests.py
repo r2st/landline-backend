@@ -245,9 +245,15 @@ async def create_ab_test(payload: AbTestCreate, db: AsyncSession = Depends(get_d
     if step is None:
         raise HTTPException(status_code=404, detail="sequence step not found")
 
+    # Existence check: one row is the answer. ``ab_tests`` has no unique
+    # constraint on ``sequence_step_id``, so two tests on one step is reachable
+    # (a race on this endpoint is enough) and asserting a single row would
+    # answer the duplicate with 500 rather than the 409 below.
     existing = (
-        await db.execute(select(AbTest).where(AbTest.sequence_step_id == step_id))
-    ).scalar_one_or_none()
+        await db.execute(
+            select(AbTest.id).where(AbTest.sequence_step_id == step_id).limit(1)
+        )
+    ).scalars().first()
     if existing is not None:
         raise HTTPException(status_code=409, detail="an A/B test already exists for this step")
 

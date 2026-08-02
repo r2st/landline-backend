@@ -261,15 +261,21 @@ async def enroll_contact(
     if not sequence.is_active:
         raise HTTPException(status_code=400, detail="Sequence is not active")
 
-    # Check for existing active enrollment
+    # Check for existing active enrollment. An existence check needs one row,
+    # not the assertion that only one exists: nothing in the schema stops a
+    # second active enrollment for the same pair (no unique constraint), and
+    # two concurrent calls to this very endpoint are enough to create one. A
+    # ``scalar_one_or_none`` would then answer "already enrolled?" with a 500.
     result = await db.execute(
-        select(OutreachEnrollment).where(
+        select(OutreachEnrollment.id)
+        .where(
             OutreachEnrollment.contact_id == payload.contact_id,
             OutreachEnrollment.sequence_id == payload.sequence_id,
             OutreachEnrollment.status == "active",
         )
+        .limit(1)
     )
-    if result.scalar_one_or_none():
+    if result.scalars().first():
         raise HTTPException(
             status_code=409, detail="Contact already enrolled in this sequence"
         )

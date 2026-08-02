@@ -806,10 +806,21 @@ async def quick_add_contact(
 
     company = None
     if company_name:
+        # First match, not "the" match. ``companies`` is unique on ``domain``
+        # and on nothing else, so two firms sharing a name is ordinary B2B data
+        # — and the scrapers create companies from several sources. A
+        # ``scalar_one_or_none`` here asserted otherwise and returned 500 for
+        # every contact entered against a duplicated name, which is the
+        # business-card scanner's entire job. Oldest first so repeat adds keep
+        # filing into the same company instead of scattering between the
+        # duplicates.
         result = await db.execute(
-            select(Company).where(func.lower(Company.name) == company_name.lower())
+            select(Company)
+            .where(func.lower(Company.name) == company_name.lower())
+            .order_by(Company.created_at.asc(), Company.id.asc())
+            .limit(1)
         )
-        company = result.scalar_one_or_none()
+        company = result.scalars().first()
 
     if company is None:
         # Company.name is required; fall back to the person's name or email.

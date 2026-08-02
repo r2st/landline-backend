@@ -94,9 +94,21 @@ def _resolution_for(
 
 
 async def _active_test(db: AsyncSession, step_id: UUID) -> Optional[AbTest]:
+    """The test governing this step, oldest first if somehow there are two.
+
+    ``ab_tests`` carries no unique constraint on ``sequence_step_id``. The
+    create endpoint tries to enforce one, which is not the same thing — it
+    cannot stop a race, and this runs on the **send** path, where raising means
+    the step does not go out at all.
+    """
     return (
-        await db.execute(select(AbTest).where(AbTest.sequence_step_id == step_id))
-    ).scalar_one_or_none()
+        await db.execute(
+            select(AbTest)
+            .where(AbTest.sequence_step_id == step_id)
+            .order_by(AbTest.created_at.asc(), AbTest.id.asc())
+            .limit(1)
+        )
+    ).scalars().first()
 
 
 async def _variants(

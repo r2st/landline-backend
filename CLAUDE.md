@@ -187,21 +187,97 @@ Three rules:
 
 ## `scalar_one_or_none` asserts a uniqueness the schema rarely promises
 
-This has now cost twice, in unrelated code, the same way both times: the query
-reads as the careful option, and is in fact an assertion that raises
+This has now cost four times, in unrelated code, the same way every time: the
+query reads as the careful option, and is in fact an assertion that raises
 `MultipleResultsFound` — a 500 — the moment a second row exists.
 
 - `contacts.email` has no unique constraint and the scraper re-creates rows, so
   one duplicate contact broke **every unsubscribe link** (see the opt-out
-  section).
+  section). The same duplicate also aborted the **inbox sync**, where the
+  failure is worse than loud: a mailbox that stops ingesting replies looks
+  exactly like a mailbox with no replies.
 - `company_groups.name` has no unique constraint and `POST /groups` accepts any
   name, so a tenant that created "Aerospace" twice got a 500 from **all three**
   `/groups/auto-group-by-*` endpoints, with no way out that the UI explains.
+- `gmail_accounts` is unique on `email` and `google_sub` and nothing else, so
+  `get_active_account` broke on the **second connected mailbox** — while the
+  function directly below it returns a *list* of connected accounts, because
+  multi-mailbox sending is the whole design. `welcome_email` and `notifications`
+  call it with no rotation in front, so for them it was unconditional.
+- `companies` is unique on `domain`, not `name`. Two firms sharing a name is
+  ordinary B2B data, and it 500'd **quick-add** — the business-card scanner's
+  entire job.
 
 Before writing one, check for the constraint. If there isn't one, take
 `.order_by(...).limit(1)` and `.scalars().first()` — and order by something
 stable, or repeat runs pick different rows and the work scatters between
-duplicates instead of accumulating in one.
+duplicates instead of accumulating in one. For a pure existence check,
+`select(Model.id)…limit(1)` is both correct and cheaper.
+
+Two things this experience is worth:
+
+**Order by more than a timestamp.** `created_at` is a `server_default`, so rows
+written in one transaction — which is how duplicates usually arrive — share a
+reading and tie. Without a second key the database may return either, which is
+the scattering above with extra steps. `(<timestamp>, id)`.
+
+**Reviewing for this does not work, so it is checked mechanically.** The unsafe
+call is character-for-character identical to the safe one; what separates them
+lives in another file, in the model's constraints.
+`tests/test_single_row_assertions.py` walks every `scalar_one_or_none` in `app/`
+and requires each to be covered by a `.limit(1)`, by an equality filter on
+genuinely unique columns, or by a reasoned entry in its `REVIEWED` map. It
+carries self-tests that plant a violation and assert the scan catches it — a
+checker matching nothing passes forever and reads as coverage.
+
+An "existence check" is the most common false sense of safety here: code that
+asks "is there already one?" and enforces uniqueness itself. It is not a
+constraint. It cannot stop a race, it does not bind other write paths, and the
+row it fails on is the one it was written to detect.
+
+## The rate-limit key is the caller, and behind a proxy that takes saying so
+
+`request.client.host` is the peer that opened the socket, which is the caller
+only when nothing sits in front of the app. In production nginx proxies to
+`127.0.0.1:8001` — a Docker published port — so the peer every request presents
+is the bridge gateway. Uvicorn ships a `ProxyHeadersMiddleware` that would fix
+this and does not: its `forwarded_allow_ips` defaults to `127.0.0.1`, the
+gateway is not that, so it declines to rewrite anything and says nothing.
+
+That is not a loose limit, it is an inverted one. `AUTH_RATE_LIMIT` is
+10/minute, and on a single shared key that is ten logins a minute **for the
+whole platform**, spendable by any unauthenticated stranger. A control installed
+to stop credential stuffing became the cheapest denial of service the API
+offers. Note the shape: the limiter was working exactly as designed and the
+tests were green, because what was wrong was the identity it was counting.
+
+`TRUSTED_PROXY_HOPS` (set to `1` in `docker-compose.prod.yml`) is how the app is
+told what is in front of it. `X-Forwarded-For` cannot simply be trusted — it is
+attacker-controlled, and reading its leftmost entry lets anyone mint a fresh
+identity per request, removing the limit entirely rather than sharing it. What
+*is* trustworthy is position: each proxy appends the peer it saw, so with one
+hop the **last** entry is the one nginx wrote and no client can reach. Hence a
+count rather than a boolean, a default of 0, and a clamp so an over-configured
+count cannot walk left into client-supplied entries.
+
+Two related traps in slowapi, both of which 500 the endpoint:
+
+- **`headers_enabled` must stay False.** It injects `X-RateLimit-*` by reaching
+  for a `response: Response` kwarg the endpoints don't declare.
+- **`swallow_errors` is necessary and not sufficient.** When storage raises,
+  slowapi catches it and returns without setting `request.state.view_rate_limit`
+  — which its endpoint wrapper then reads unconditionally, before any
+  `headers_enabled` check. `RateLimitStateMiddleware` pre-seeds the attribute.
+  Without it a Redis blip returns a clean 401 for every *rejected* login and a
+  500 for the correct password: failures fine, success broken, and invisible to
+  any test that only checks that bad credentials are refused.
+
+`conftest` sets `limiter.enabled = False` for the whole session, which is the
+right default — it stops unrelated tests tripping a 429 — and it means a
+rate-limit test that forgets to re-enable it asserts nothing while looking
+exactly like one that works. Anything testing limiter behaviour needs the
+`live_limiter` fixture in `tests/test_rate_limit_storage_outage.py`, and needs a
+control proving the limiter was on.
 
 ## The Apprend org id is copied into every migration, so it is checked
 

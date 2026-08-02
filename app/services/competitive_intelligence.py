@@ -272,8 +272,11 @@ Return ONLY valid JSON:
                         .where(CompetitorMention.competitor_id == comp.id)
                         .where(CompetitorMention.source == "news")
                         .where(CompetitorMention.context == title)
+                        .limit(1)
                     )
-                    if exists.scalar_one_or_none():
+                    # Best-effort dedup on an unconstrained triple; two stored
+                    # copies must skip the article, not abort the sweep.
+                    if exists.scalars().first():
                         continue
                     db.add(CompetitorMention(
                         competitor_id=comp.id,

@@ -65,6 +65,18 @@ services:
       CELERY_BROKER_URL: "redis://redis:6379/0"
       CELERY_RESULT_BACKEND: "redis://redis:6379/1"
       APP_ENV: "staging"
+      # Rate-limit counters go in Redis, not process memory: the API runs
+      # `uvicorn --workers 2`, so in-memory counters enforce every limit twice
+      # over and which worker a request lands on decides when it trips.
+      RATELIMIT_STORAGE_URI: "redis://redis:6379/2"
+      # Exactly one reverse proxy (nginx) is in front, and it publishes to a
+      # loopback-bound port so nothing else can reach this container. That is
+      # what makes the last X-Forwarded-For entry — the one nginx appended —
+      # the real caller. Without this the peer address is the Docker bridge
+      # gateway for every request on the internet, and the 10/minute login
+      # limit becomes a platform-wide lockout anyone can trigger. See
+      # app/rate_limit.py:client_ip.
+      TRUSTED_PROXY_HOPS: "1"
     ports:
       - "127.0.0.1:8001:8000"  # 8001 externally, nginx will proxy to this
     logging:

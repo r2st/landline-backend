@@ -521,14 +521,20 @@ Return ONLY valid JSON:
         sequence = await self._pick_sequence(db, company)
         if sequence is None:
             return False
+        # One matching row answers "already enrolled?". No status filter, so a
+        # contact re-enrolled after completing the sequence has two rows — a
+        # state the enrol endpoint explicitly allows — and asserting a single
+        # one made an ordinary history abort the agent's run.
         existing = (
             await db.execute(
-                select(OutreachEnrollment.id).where(
+                select(OutreachEnrollment.id)
+                .where(
                     OutreachEnrollment.contact_id == contact.id,
                     OutreachEnrollment.sequence_id == sequence.id,
                 )
+                .limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if existing is not None:
             return False
         db.add(OutreachEnrollment(

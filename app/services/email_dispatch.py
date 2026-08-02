@@ -168,25 +168,48 @@ class SenderInfo:
 
 
 async def get_active_account(db: AsyncSession):
-    """The primary sender across all account types (Gmail preferred, then SMTP)."""
-    gmail = (
-        await db.execute(
-            select(GmailAccount).where(
-                GmailAccount.is_active == True,  # noqa: E712
-                GmailAccount.status == "connected",
+    """The primary sender across all account types (Gmail preferred, then SMTP).
+
+    Takes the **oldest** connected mailbox of the preferred transport, rather
+    than asserting there is only one.
+
+    Both queries used ``scalar_one_or_none``, which reads as the careful option
+    and is in fact an assertion that at most one row matches — raising
+    ``MultipleResultsFound`` the moment a second does. Nothing promises that
+    here: ``gmail_accounts`` is unique on ``email`` and ``google_sub`` and on
+    nothing else, and :func:`get_sending_accounts` directly below returns a
+    *list* of connected accounts because multi-mailbox sending is the design.
+    Rotation, per-account warm-up ramps and per-account sender health all exist
+    to spread volume over several. So the second mailbox a tenant connected
+    turned this into a 500.
+
+    It survived because the outreach path reaches this only as a fallback, after
+    :func:`get_next_rotation_account` finds nothing — which needs connected
+    accounts with ``sending_enabled=False``. ``welcome_email`` and
+    ``notifications`` have no rotation step and call this outright, so for them
+    a second mailbox was an unconditional failure.
+
+    Oldest-first (``connected_at``, then ``id`` to break a tie) because this
+    answers "who is the established primary sender", and because an arbitrary
+    winner is its own bug: the caller is choosing an outreach *identity*, and
+    alternating between mailboxes at random is exactly what the rotation and
+    warm-up machinery exists to do deliberately instead.
+    """
+    for model in (GmailAccount, SmtpAccount):
+        account = (
+            await db.execute(
+                select(model)
+                .where(
+                    model.is_active == True,  # noqa: E712
+                    model.status == "connected",
+                )
+                .order_by(model.connected_at.asc(), model.id.asc())
+                .limit(1)
             )
-        )
-    ).scalar_one_or_none()
-    if gmail is not None:
-        return gmail
-    return (
-        await db.execute(
-            select(SmtpAccount).where(
-                SmtpAccount.is_active == True,  # noqa: E712
-                SmtpAccount.status == "connected",
-            )
-        )
-    ).scalar_one_or_none()
+        ).scalars().first()
+        if account is not None:
+            return account
+    return None
 
 
 async def get_account(db: AsyncSession, account_id: uuid.UUID):

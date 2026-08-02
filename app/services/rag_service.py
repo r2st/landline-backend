@@ -102,14 +102,21 @@ class RagService:
 
         existing = None
         if source_id is not None:
+            # Upsert target. No unique constraint on (source_type, source_id),
+            # so a re-index that raced with itself leaves two rows; take the
+            # earliest and update it consistently rather than raising on every
+            # subsequent index of that source.
             existing = (
                 await db.execute(
-                    select(ContentEmbedding).where(
+                    select(ContentEmbedding)
+                    .where(
                         ContentEmbedding.source_type == source_type,
                         ContentEmbedding.source_id == source_id,
                     )
+                    .order_by(ContentEmbedding.id.asc())
+                    .limit(1)
                 )
-            ).scalar_one_or_none()
+            ).scalars().first()
 
         embedding = self._embed(content_text)
         if existing is not None:

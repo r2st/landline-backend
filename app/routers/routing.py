@@ -138,8 +138,14 @@ async def company_routing(company_id: uuid.UUID, db: AsyncSession = Depends(get_
             select(LeadScore)
             .join(latest, (LeadScore.company_id == latest.c.company_id) & (LeadScore.scored_at == latest.c.max_at))
             .where(LeadScore.company_id == company_id)
+            # The join is on ``scored_at == MAX(scored_at)``, which selects the
+            # latest score — and every score sharing that timestamp. Two rescores
+            # in the same tick tie, and a tie made this a 500 rather than a
+            # routing answer. Order for determinism, then take one.
+            .order_by(LeadScore.id.asc())
+            .limit(1)
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if ls is None:
         ls = await lead_router.score_and_route(db, company)
 

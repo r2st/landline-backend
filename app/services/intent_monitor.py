@@ -77,8 +77,12 @@ class IntentMonitor:
                     select(IntentSignal.id)
                     .where(IntentSignal.company_id == company.id)
                     .where(IntentSignal.title == title)
+                    .limit(1)
                 )
-                if exists.scalar_one_or_none():
+                # ``.first()``, not a single-row assertion: the dedup is
+                # best-effort and nothing constrains (company, title), so two
+                # existing signals would abort the whole monitor pass.
+                if exists.scalars().first():
                     continue
 
                 analysis = await self._analyze_signal(ai, article, company, signal_type)
