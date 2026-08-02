@@ -25,7 +25,14 @@ depends_on = None
 
 # The first-party Apprend org id — the server-side default for org_id on raw
 # inserts, matching OrgScopedMixin (see migration 078).
-APPREND_ORG_ID = "00000000-0000-0000-0000-000000000001"
+# The id migration 078 INSERTs into ``organizations``. This read
+# ``00000000-0000-0000-0000-000000000001`` — a plausible-looking id matching no
+# row — and both columns below carry a foreign key to that table, so the default
+# raised on any insert that omitted ``org_id``. It stayed latent because ORM
+# inserts are stamped by the ``before_flush`` hook in :mod:`app.models.mixins`;
+# a raw insert or backfill would have found it. Corrected here for databases
+# built from scratch, and by migration 112 for those already carrying it.
+APPREND_ORG_ID = "a9910000-0000-4000-8000-000000000001"
 
 
 def upgrade() -> None:
