@@ -212,6 +212,38 @@ async def erase_subject(db: AsyncSession, email: str) -> dict:
     counts: dict[str, int] = {}
     now = datetime.now(timezone.utc)
 
+    # --- Suppress the ADDRESS before anything scrubs it -----------------------
+    # Two things matter here: that it happens at all, and that what it records is
+    # the address the *request* named — never one read back off a contact row,
+    # because the loop below rewrites those. Sitting above the scrub is what
+    # keeps the second part obviously true rather than merely true today.
+    #
+    # The block below sets ``suppressed``/``unsubscribed`` and then overwrites
+    # ``c.email`` with an ``anonymized+<id>@redacted.invalid`` placeholder. The
+    # flags survive; the address they were about does not. That left nothing in
+    # the system mapping this person to "never contact", so the next time the
+    # scraper found them — from the same public source that found them
+    # originally — it created a fresh contact with ``suppressed=False`` and the
+    # sequence engine cold-emailed someone who had exercised their right to be
+    # forgotten. That is worse than the re-scrape hole a plain unsubscribe had:
+    # erasure doesn't just fail to be durable, it deletes the only link.
+    #
+    # ``SuppressionEntry`` is keyed by address and outlives every contact row.
+    # Keeping the minimum needed to *honour* an erasure is the recognised
+    # carve-out — you cannot avoid mailing someone without knowing who not to
+    # mail — and the send gate already reads this list on every path.
+    #
+    # Unconditional, not gated on ``contacts``: an erasure request for an address
+    # we hold no row for (or whose rows a previous erasure already anonymised,
+    # before this wrote anything) still has to be honoured if that address is
+    # ever rediscovered.
+    from app.services import suppression as _suppression
+
+    _, suppression_status = await _suppression.add_entry(
+        db, email, reason="erasure", source="manual"
+    )
+    counts["suppression_entry"] = 1 if suppression_status == "added" else 0
+
     # --- The contacts themselves: scrub PII, block, stamp anonymized_at --------
     erased_contacts = 0
     for c in contacts:

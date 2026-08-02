@@ -21,8 +21,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 from app.models.mixins import OrgScopedMixin
 
-# Why the address is suppressed.
-SUPPRESSION_REASONS = ("unsubscribe", "bounce", "complaint", "manual")
+# Why the address is suppressed. ``erasure`` is the one an operator must never
+# prune: a bounce can be re-verified and a manual entry can be argued about, but
+# an erasure entry is what keeps a right-to-be-forgotten subject un-mailed after
+# ``gdpr.erase_subject`` has overwritten the only contact row that named them.
+SUPPRESSION_REASONS = ("unsubscribe", "bounce", "complaint", "manual", "erasure")
 # How the entry got here.
 SUPPRESSION_SOURCES = ("import", "auto", "manual")
 
@@ -34,7 +37,7 @@ class SuppressionEntry(Base, OrgScopedMixin):
         # write so casing can't sneak a duplicate (or a missed match) past this.
         UniqueConstraint("org_id", "email", name="uq_suppression_org_email"),
         CheckConstraint(
-            "reason IN ('unsubscribe','bounce','complaint','manual')",
+            "reason IN ('unsubscribe','bounce','complaint','manual','erasure')",
             name="ck_suppression_reason",
         ),
         CheckConstraint(

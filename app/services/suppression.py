@@ -49,6 +49,43 @@ async def is_suppressed(db: AsyncSession, email: Optional[str]) -> bool:
     return hit is not None
 
 
+# Entries an operator's un-suppress may lift. A ``manual`` entry records
+# somebody's decision and can be reversed by another decision. The rest record
+# something that *happened* to the address — it bounced, its owner reported us
+# as spam, its owner asked us to stop, its owner invoked erasure — and none of
+# those become untrue because a checkbox was un-ticked on one contact row.
+REVERSIBLE_REASONS = ("manual",)
+
+
+async def remove_entry(db: AsyncSession, email: Optional[str]) -> bool:
+    """Lift an operator-placed suppression for ``email``. True if one was lifted.
+
+    Deliberately narrow. Un-suppressing a contact has to actually restore
+    mailability — otherwise the flag comes off, the list entry stays, the send
+    gate keeps refusing and the operator gets silence with no explanation. But it
+    must not become a way to erase a complaint or an erasure record by round-
+    tripping a checkbox, so only ``REVERSIBLE_REASONS`` are touched. Removing one
+    of the others stays an explicit, per-entry operator action against the
+    suppression list itself.
+    """
+    normalized = normalize_email(email)
+    if normalized is None:
+        return False
+    entry = (
+        await db.execute(
+            select(SuppressionEntry).where(
+                SuppressionEntry.email == normalized,
+                SuppressionEntry.reason.in_(REVERSIBLE_REASONS),
+            )
+        )
+    ).scalars().first()
+    if entry is None:
+        return False
+    await db.delete(entry)
+    await db.flush()
+    return True
+
+
 async def add_entry(
     db: AsyncSession,
     email: str,

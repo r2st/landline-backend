@@ -227,6 +227,39 @@ The send path checks `suppressed` **or** `unsubscribed` **or** the list, in both
 `send_sequence_step` and the queue sweep. The `unsubscribed` read is deliberate
 redundancy: rows written by the old link handler are in the database now.
 
+## Every do-not-contact writer writes the list, erasure most of all
+
+Five paths suppress an address (unsubscribe link, reply, bounce, complaint, bulk
+compliance) and a sixth erases a subject outright. **All of them write a
+`SuppressionEntry`**, because the flags live on a contact row and the scraper
+makes rows — suppress someone today, rediscover them next month through another
+source, and the new row arrives `suppressed=False`.
+
+**`gdpr.erase_subject` is the one to understand.** It sets the flags and then
+overwrites `contact.email` with `anonymized+<id>@redacted.invalid`. The flags
+survive; the address they were about does not. Before the list write, erasure
+did not merely fail to be durable — it *deleted the only link* between the
+address and the decision, for the one class of subject where re-contact is a
+regulatory violation rather than an annoyance.
+
+- **Record the address the request named**, never one read back off a contact
+  row. The write sits above the scrub loop to keep that obviously true rather
+  than merely true today.
+- **Unconditional, not gated on a contact existing.** An erasure request for an
+  address we hold no row for — or whose rows a previous erasure already
+  anonymised — still has to stick if that address is ever rediscovered.
+- **`reason="erasure"` is its own value** (migration 110 widened
+  `ck_suppression_reason`). An operator can re-verify a `bounce` and argue about
+  a `manual`; an erasure entry is the one whose removal re-opens legal exposure.
+  `DELETE /dialtone/suppression/{id}` refuses it with a 409.
+
+**Un-suppressing must lift something, but only its own.**
+`suppression.remove_entry` deletes entries in `REVERSIBLE_REASONS` — `manual`
+alone. Without it, `bulk-suppress {suppressed: false}` takes the flag off, leaves
+the entry, and the send gate goes on refusing with no explanation. With it
+widened, a checkbox round-trip would erase a complaint or an erasure record.
+Removing any other reason stays an explicit, per-entry action on the list itself.
+
 ## Pre-send spam gate
 
 Every outbound path runs the deterministic content scan

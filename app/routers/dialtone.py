@@ -1337,7 +1337,14 @@ async def import_suppression(
 
 @router.delete("/suppression/{entry_id}", status_code=204)
 async def delete_suppression(entry_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    """Remove an address from the suppression list (re-allows contacting it)."""
+    """Remove an address from the suppression list (re-allows contacting it).
+
+    Refuses ``erasure`` entries. Those are written by ``gdpr.erase_subject``,
+    which anonymises the contact row that named the subject — so this entry is
+    the *only* remaining record that they must not be mailed, and deleting it
+    silently re-allows cold outreach to someone who invoked their right to be
+    forgotten. Every other reason is an operator's call to reverse.
+    """
     entry = (
         await db.execute(
             select(SuppressionEntry).where(SuppressionEntry.id == entry_id)
@@ -1345,6 +1352,15 @@ async def delete_suppression(entry_id: uuid.UUID, db: AsyncSession = Depends(get
     ).scalar_one_or_none()
     if entry is None:
         raise HTTPException(status_code=404, detail="Suppression entry not found")
+    if entry.reason == "erasure":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This address is suppressed under a right-to-erasure request and "
+                "cannot be removed. The contact record naming it has been "
+                "anonymised, so this entry is the only thing preventing re-contact."
+            ),
+        )
     await db.delete(entry)
     await db.commit()
 

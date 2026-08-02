@@ -421,6 +421,7 @@ async def bulk_suppress(
 
     from app.models.consent import ConsentRecord
     from app.models.outreach import OutreachEnrollment
+    from app.services import suppression as _suppression
 
     contacts = (
         await db.execute(select(Contact).where(Contact.id.in_(payload.contact_ids)))
@@ -435,6 +436,14 @@ async def bulk_suppress(
         if not payload.suppressed:
             # Only clear the legacy flag when it was suppression that set it —
             # a genuine link-based unsubscribe must survive.
+            #
+            # Lift this route's own list entry too, or un-suppressing does
+            # nothing observable: the flag comes off, the entry stays, the send
+            # gate goes on refusing and the operator gets silence. Narrow by
+            # design — ``remove_entry`` only touches ``manual`` entries, so a
+            # bounce, a complaint, an unsubscribe or an erasure is not
+            # reversible by un-ticking a checkbox on one contact row.
+            await _suppression.remove_entry(db, contact.email)
             continue
 
         contact.unsubscribed = True
@@ -445,6 +454,16 @@ async def bulk_suppress(
             granted_at=None,
             revoked_at=now,
         ))
+        # The durable half. Everything above lives on a contact *row*, and the
+        # scraper makes rows: suppress someone today, rediscover them next month
+        # through another source, and the new row arrives with
+        # ``suppressed=False``. The list is keyed by address and outlives the
+        # row. This is the route named "compliance" and it was, until now, the
+        # only one of the three opt-out paths that recorded nothing durable —
+        # the reply path and the unsubscribe link both write here.
+        await _suppression.add_entry(
+            db, contact.email, reason="manual", source="manual"
+        )
         enrollments = (
             await db.execute(
                 select(OutreachEnrollment).where(

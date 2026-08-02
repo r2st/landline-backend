@@ -277,6 +277,40 @@ address. The reply-based path writes a list entry too, for the same durability
 reason. Both send gates read `unsubscribed` as well, because rows written by the
 old handler are in the database right now.
 
+**Added 2026-08-02 — erasure deleted the only record that it had happened.**
+The fix above made the unsubscribe link and the reply path write a
+`SuppressionEntry` as well as the per-contact flags, on the argument that flags
+live on a row and the scraper makes rows. Two writers were left setting flags
+alone, and one of them fails harder than a re-scrape hole.
+
+`gdpr.erase_subject` honours a right-to-erasure request by setting
+`suppressed`/`unsubscribed` and then overwriting `contact.email` with
+`anonymized+<id>@redacted.invalid`. The flags survive. The address they were
+about does not. Nothing else in the system mapped that person to "never
+contact", so the next time the scraper found them — from the public source that
+found them the first time — a fresh contact appeared with `suppressed=False` and
+the sequence engine cold-emailed someone who had exercised their right to be
+forgotten. An ordinary unsubscribe at least leaves a row that *names* the
+address; erasure destroys the link by design, for the one class of subject where
+re-contact is a regulatory violation rather than an annoyance.
+
+The other was `POST /contacts/bulk-suppress` — the route actually named
+compliance, and the last of the three opt-out paths recording nothing durable.
+
+Both now write the list. Erasure records the address the *request* named, above
+the scrub loop so it cannot come from a row the loop rewrites, and unconditional
+on a contact existing (an erasure for an address we hold no row for still has to
+stick). It gets `reason="erasure"` — migration 110 widens
+`ck_suppression_reason` — because an operator can re-verify a `bounce` and argue
+about a `manual`, while an erasure entry is the one whose removal re-opens legal
+exposure; `DELETE /dialtone/suppression/{id}` now refuses it with a 409.
+
+Adding a list entry to the bulk route made un-suppressing inert, so
+`suppression.remove_entry` lifts entries in `REVERSIBLE_REASONS` (`manual`
+alone). Un-ticking a checkbox on one contact row must restore mailability
+without becoming a way to erase a complaint, a bounce, an unsubscribe or an
+erasure record.
+
 **Added earlier, and not on this roadmap:** the outreach queue was unordered
 (`services/queue_priority.py`). It selected every active enrollment with no
 `ORDER BY` and then spent a finite daily cap walking that list, so a sequential
