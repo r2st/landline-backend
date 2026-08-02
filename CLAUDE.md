@@ -185,6 +185,62 @@ Three rules:
   an association table like `company_group_members` has no `org_id` of its own,
   so what scopes it is the owning row you looked up to reach it.
 
+## The read filter is a *read* filter
+
+`do_orm_execute` checks `execute_state.is_select`. A Core `update()` or
+`delete()` is not a select, so it gets no `org_id` predicate and runs across
+every tenant on the platform.
+
+What makes this the hardest of the tenancy bugs to see is that the unsafe
+statement is written exactly like the safe ones around it. Everywhere else in
+this codebase, **not writing an org predicate is the correct shape** — the
+filter supplies it. So an unscoped bulk write has nothing to notice, in a file
+full of queries that also have no visible scoping and are fine.
+
+`app.org_context.scope_write_to_current_org(stmt, Model)` is the write-side
+counterpart. Its semantics match the read filter deliberately: no org bound
+(platform admin, or a background job outside `for_each_org`) means no filter.
+
+Most bulk writes don't need it — they pin a row by a primary key read back
+through a scoped SELECT, which already proved ownership. Two shapes do:
+
+- **a broad predicate.** `where(is_default == True)` in the template and
+  signature routers cleared *every tenant's* default when one org promoted its
+  own — and the default is what unattended send paths resolve when no template
+  is named, so it decided which copy a stranger's next mail went out as.
+- **client-supplied ids.** `POST /companies/bulk-update-stage` took
+  `where(Company.id.in_(payload.company_ids))` straight off the request body: a
+  write IDOR against any company on the platform. Ids are not secrets; they come
+  back in exports, webhooks and error text. Note that `bulk_tag` directly below
+  it takes the same ids and was never exposed, because it routes through
+  `select(Company)` and mutates the objects it gets back. The SELECT is scoped,
+  so foreign ids never come back. That is the entire difference between the two
+  endpoints, and it is invisible.
+
+The kill switch was the worst instance and is worth keeping in mind, because
+being *half* scoped was what made it dangerous. `system_settings` is per-tenant
+(migration 080 made `(org_id, key)` unique precisely so each org could hold its
+own switch), and only the enrollment cascade was global. So the control reads as
+scoped in the model, in the database and in the UI — and halted the platform.
+The resume side did not merely restart strangers' outreach, it **defeated their
+kill switch**: org B pauses because its domain is on fire, org A releases its own
+switch, B starts sending again with B's UI still showing it engaged.
+
+`clear_expired_snoozes` shows the quiet version. It runs inside `for_each_org`,
+so the first org's pass cleared every tenant's expired snoozes and was credited
+with the platform's count. The end state was correct — clearing an elapsed
+snooze is idempotent and every org's rows were due — which is exactly why it
+would have sat there: the loop has been touching every tenant's rows on pass one
+all along, and the first per-org side effect anyone adds inherits that. Same
+shape as `generate_weekly_coaching`, which *did* have one.
+
+`tests/test_bulk_write_scoping.py` enforces this mechanically, for the same
+reason the `scalar_one_or_none` scan does — there is nothing to see at the call
+site. It carries self-tests that plant violations, including an `id.in_(...)`,
+so a checker that merely asked "is the primary key mentioned?" fails its own
+suite. It does **not** catch an `id ==` whose id came from an unscoped source,
+association-table writes, or raw `text()` SQL.
+
 ## `scalar_one_or_none` asserts a uniqueness the schema rarely promises
 
 This has now cost four times, in unrelated code, the same way every time: the

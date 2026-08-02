@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from sqlalchemy import update
 
 from app.models.inbox_thread_state import InboxThreadState
+from app.org_context import scope_write_to_current_org
 from app.tasks.celery_app import celery_app
 from app.tasks.org_runner import for_each_org
 
@@ -31,15 +32,32 @@ def _run_async(coro):
 
 
 async def clear_expired_snoozes_async(db, now: datetime | None = None) -> int:
-    """Null out snoozes whose time has passed. Returns rows cleared."""
+    """Null out this org's snoozes whose time has passed. Returns rows cleared.
+
+    Scoped to the bound org, because the caller below runs inside
+    ``for_each_org`` — which binds each tenant in turn precisely so that scoped
+    work comes out right — while a Core ``update()`` receives no ``org_id`` from
+    the global read filter. The first org's pass therefore cleared every
+    tenant's expired snoozes and was credited with the whole platform's count;
+    the remaining passes found nothing left to do.
+
+    The end state happened to be correct, since clearing an elapsed snooze is
+    idempotent and every org's rows were due anyway. That is what makes it worth
+    fixing rather than shrugging at: the per-org number this returns is already
+    wrong, and the first per-org side effect anyone adds here — a notification,
+    an audit row, a metric — inherits a loop that has been touching every
+    tenant's rows on pass one all along. It is the same shape as
+    ``generate_weekly_coaching`` in CLAUDE.md, which did have such a side effect.
+    """
     now = now or datetime.now(timezone.utc)
     result = await db.execute(
-        update(InboxThreadState)
-        .where(
-            InboxThreadState.snoozed_until.isnot(None),
-            InboxThreadState.snoozed_until <= now,
-        )
-        .values(snoozed_until=None)
+        scope_write_to_current_org(
+            update(InboxThreadState).where(
+                InboxThreadState.snoozed_until.isnot(None),
+                InboxThreadState.snoozed_until <= now,
+            ),
+            InboxThreadState,
+        ).values(snoozed_until=None)
     )
     return result.rowcount or 0
 

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.email_signature import EmailSignature
+from app.org_context import scope_write_to_current_org
 from app.schemas.email_signature import (
     EmailSignatureCreate,
     EmailSignatureRead,
@@ -42,8 +43,16 @@ async def _get_default_signature(db: AsyncSession) -> Optional[EmailSignature]:
 
 
 async def _clear_default(db: AsyncSession, except_id: Optional[uuid.UUID] = None) -> None:
-    """Unset is_default on all signatures (optionally except one), to keep a single default."""
-    stmt = update(EmailSignature).where(EmailSignature.is_default == True).values(is_default=False)  # noqa: E712
+    """Unset is_default on this org's signatures (optionally except one).
+
+    Scoped explicitly, for the reason spelled out in
+    ``email_templates._clear_default``: a Core ``update()`` is not a SELECT, so
+    the global org filter never touched it and this cleared every tenant's
+    default sign-off.
+    """
+    stmt = scope_write_to_current_org(
+        update(EmailSignature).where(EmailSignature.is_default == True), EmailSignature  # noqa: E712
+    ).values(is_default=False)
     if except_id is not None:
         stmt = stmt.where(EmailSignature.id != except_id)
     await db.execute(stmt)

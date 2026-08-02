@@ -31,6 +31,7 @@ from app.dependencies import UserScope, get_current_user_optional, get_scope
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.models.user import User
+from app.org_context import scope_write_to_current_org
 from app.schemas.smtp import (
     SmtpAccountCreate,
     SmtpAccountRead,
@@ -53,8 +54,15 @@ async def _clear_primary_sender(db: AsyncSession, user: Optional[User] = None) -
     so promoting one must demote all others regardless of type. When *user* is
     given (authenticated), only that user's own senders are demoted.
     """
-    demote_gmail = update(GmailAccount).values(is_active=False)
-    demote_smtp = update(SmtpAccount).values(is_active=False)
+    # Org-scoped unconditionally: a Core update() gets no org_id from the global
+    # read filter, so with no user in hand this demoted every mailbox on the
+    # platform. Same fix as gmail.set_active.
+    demote_gmail = scope_write_to_current_org(
+        update(GmailAccount), GmailAccount
+    ).values(is_active=False)
+    demote_smtp = scope_write_to_current_org(
+        update(SmtpAccount), SmtpAccount
+    ).values(is_active=False)
     if user is not None:
         demote_gmail = demote_gmail.where(GmailAccount.user_id == user.id)
         demote_smtp = demote_smtp.where(SmtpAccount.user_id == user.id)

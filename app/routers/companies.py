@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.lead_score import LeadScore
+from app.org_context import scope_write_to_current_org
 from app.schemas.company import (
     BulkExportRequest,
     BulkOpResult,
@@ -300,11 +301,22 @@ async def bulk_update_stage(
     payload: BulkUpdateStageRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Move a set of companies to a new kanban pipeline stage in one call."""
+    """Move a set of companies to a new kanban pipeline stage in one call.
+
+    The ids come straight off the request body, and a Core ``update()`` gets no
+    ``org_id`` predicate from the global read filter — so this moved any company
+    on the platform to any stage, for any authenticated caller. Ids are not
+    secrets; they come back in exports, webhooks and error text.
+
+    ``bulk_tag`` directly below takes the same client-supplied ids and was never
+    exposed, because it routes through ``select(Company)`` and mutates the ORM
+    objects it gets back — the SELECT is scoped, so foreign ids simply don't come
+    back. That is the whole difference between the two endpoints.
+    """
     result = await db.execute(
-        update(Company)
-        .where(Company.id.in_(payload.company_ids))
-        .values(pipeline_stage=payload.pipeline_stage)
+        scope_write_to_current_org(
+            update(Company).where(Company.id.in_(payload.company_ids)), Company
+        ).values(pipeline_stage=payload.pipeline_stage)
     )
     # Report how many of the requested ids actually exist vs were updated.
     matched_result = await db.execute(

@@ -24,6 +24,7 @@ from app.models.contact import Contact
 from app.models.email_template import EmailSend, EmailTemplate
 from app.models.interaction import Interaction
 from app.models.user import User
+from app.org_context import scope_write_to_current_org
 from app.schemas.email_template import (
     ABStats,
     ABStatsResponse,
@@ -92,8 +93,16 @@ def _reject_invalid(subject: Optional[str], body: Optional[str]) -> None:
 
 
 async def _clear_default(db: AsyncSession, except_id: Optional[uuid.UUID] = None) -> None:
-    """Unset is_default on all templates (optionally except one), to keep a single default."""
-    stmt = update(EmailTemplate).where(EmailTemplate.is_default == True).values(is_default=False)  # noqa: E712
+    """Unset is_default on this org's templates (optionally except one).
+
+    Scoped explicitly: a Core ``update()`` gets no ``org_id`` predicate from the
+    global read filter, so "all templates where is_default" meant every tenant's.
+    The default is what unattended send paths resolve when no template is named,
+    so clearing another org's decided which copy their next mail went out as.
+    """
+    stmt = scope_write_to_current_org(
+        update(EmailTemplate).where(EmailTemplate.is_default == True), EmailTemplate  # noqa: E712
+    ).values(is_default=False)
     if except_id is not None:
         stmt = stmt.where(EmailTemplate.id != except_id)
     await db.execute(stmt)

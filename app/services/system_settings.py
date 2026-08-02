@@ -29,6 +29,7 @@ from app.config import get_settings
 from app.models.contact import Contact  # noqa: F401 — ensure model import side effects
 from app.models.outreach import OutreachEnrollment
 from app.models.system_setting import SystemSetting
+from app.org_context import scope_write_to_current_org
 
 logger = logging.getLogger(__name__)
 
@@ -125,13 +126,27 @@ async def set_sending_enabled(
     updated_by: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> dict:
-    """Flip the global kill switch and cascade to active enrollments.
+    """Flip this org's kill switch and cascade to its active enrollments.
 
     Disabling pauses every ``active`` enrollment (marking ``kill_switch_paused``)
     so the outreach queue immediately stops dispatching. Enabling resumes only
     the enrollments the kill switch paused — enrollments paused for other reasons
     (no email, consent, bounce) are left as-is. Returns the new status plus the
     number of enrollments affected.
+
+    **The cascade is scoped to the caller's org**, and the setting always was:
+    ``system_settings`` is per-tenant (migration 080 made ``(org_id, key)``
+    unique precisely so two orgs could hold a kill switch independently). Only
+    the two UPDATEs below were platform-wide, because a Core ``update()``
+    receives no ``org_id`` predicate from the global read filter.
+
+    That combination was the worst of the two. The switch reads as scoped —
+    in the model, in the database, in the UI — and halted the platform. The
+    resume side was worse still: it did not merely resume strangers' outreach,
+    it *defeated their kill switch*. Org B pauses because its sending domain is
+    on fire; org A, who has never heard of org B, releases its own switch and B
+    starts sending again with B's UI still reporting the switch as engaged. A
+    safety control another tenant can silently release is not a safety control.
     """
     await set_value(
         db,
@@ -142,9 +157,12 @@ async def set_sending_enabled(
 
     if not enabled:
         result = await db.execute(
-            update(OutreachEnrollment)
-            .where(OutreachEnrollment.status == "active")
-            .values(status="paused", kill_switch_paused=True)
+            scope_write_to_current_org(
+                update(OutreachEnrollment).where(
+                    OutreachEnrollment.status == "active"
+                ),
+                OutreachEnrollment,
+            ).values(status="paused", kill_switch_paused=True)
         )
         affected = result.rowcount or 0
         logger.warning(
@@ -154,9 +172,12 @@ async def set_sending_enabled(
         await _notify_admin_killswitch(engaged=True, actor=updated_by, reason=reason, count=affected)
     else:
         result = await db.execute(
-            update(OutreachEnrollment)
-            .where(OutreachEnrollment.kill_switch_paused == True)  # noqa: E712
-            .values(status="active", kill_switch_paused=False)
+            scope_write_to_current_org(
+                update(OutreachEnrollment).where(
+                    OutreachEnrollment.kill_switch_paused == True  # noqa: E712
+                ),
+                OutreachEnrollment,
+            ).values(status="active", kill_switch_paused=False)
         )
         affected = result.rowcount or 0
         logger.warning(

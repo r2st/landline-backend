@@ -93,3 +93,33 @@ def org_id_for_insert() -> uuid.UUID:
     column is never left null by an ORM insert.
     """
     return _current_org_id.get() or APPREND_ORG_ID
+
+
+def scope_write_to_current_org(stmt, model):
+    """Restrict a bulk ``update()`` / ``delete()`` to the current context's org.
+
+    The write-side counterpart to the ``do_orm_execute`` filter in
+    :mod:`app.models.mixins`, and necessary because that filter checks
+    ``execute_state.is_select``. A Core ``update()`` or ``delete()`` is not a
+    select, so it receives no ``org_id`` predicate — while sitting in the same
+    file, in the same style, with the same absence of a visible org filter as
+    the scoped reads around it. Nothing about an unscoped bulk write looks
+    wrong, because in this codebase *not writing the predicate is the correct
+    shape* everywhere else.
+
+    Most bulk writes are safe without this: they key on a primary key that was
+    read back through a scoped SELECT, so the row was already proven to belong
+    to the caller. What needs scoping is a **broad predicate**
+    (``where(is_default == True)``) or **client-supplied ids**
+    (``where(id.in_(payload.ids))``) — neither of which the caller has been
+    shown to own.
+
+    Semantics deliberately match the read filter and
+    :func:`app.dependencies.scope_users_to_current_org`: no org bound (platform
+    admin, or a background job outside :func:`app.tasks.org_runner.for_each_org`)
+    means no filter, exactly as it does for every scoped read.
+    """
+    org_id = _current_org_id.get()
+    if org_id is None:
+        return stmt
+    return stmt.where(model.org_id == org_id)

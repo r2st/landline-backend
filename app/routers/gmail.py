@@ -39,7 +39,7 @@ from app.models.email_template import EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.models.user import User
-from app.org_context import APPREND_ORG_ID
+from app.org_context import APPREND_ORG_ID, scope_write_to_current_org
 from app.schemas.gmail import (
     AuthorizeResponse,
     GmailAccountRead,
@@ -313,8 +313,17 @@ async def set_active(
         )
     # The primary sender spans Gmail + SMTP, so demote every other sender. When
     # authenticated, only demote the current user's own senders.
-    demote_gmail = update(GmailAccount).values(is_active=False)
-    demote_smtp = update(SmtpAccount).values(is_active=False)
+    #
+    # Org-scoped unconditionally, because a Core update() gets no org_id from
+    # the global read filter: with no authenticated user the user_id narrowing
+    # below does not apply either, and this demoted every mailbox on the
+    # platform — quietly leaving other tenants with no primary sender at all.
+    demote_gmail = scope_write_to_current_org(
+        update(GmailAccount), GmailAccount
+    ).values(is_active=False)
+    demote_smtp = scope_write_to_current_org(
+        update(SmtpAccount), SmtpAccount
+    ).values(is_active=False)
     if current_user is not None:
         demote_gmail = demote_gmail.where(GmailAccount.user_id == current_user.id)
         demote_smtp = demote_smtp.where(SmtpAccount.user_id == current_user.id)
@@ -426,18 +435,30 @@ async def purge_account(
     await db.execute(
         delete(EmailReply).where(EmailReply.gmail_account_id == account_id)
     )
-    # Delete unlinked replies from this email address
+    # Delete unlinked replies from this email address.
+    #
+    # These two match on an *address* rather than on the account id, so unlike
+    # the delete above them nothing ties the rows to this tenant — and a Core
+    # delete() gets no org_id from the global read filter. Purging a mailbox
+    # therefore deleted any other org's mail history carrying the same address,
+    # with nothing in the counts above to show it. Scoped explicitly.
     if extra_replies:
         await db.execute(
-            delete(EmailReply).where(
-                EmailReply.from_email == email_address,
-                EmailReply.gmail_account_id.is_(None),
+            scope_write_to_current_org(
+                delete(EmailReply).where(
+                    EmailReply.from_email == email_address,
+                    EmailReply.gmail_account_id.is_(None),
+                ),
+                EmailReply,
             )
         )
     # Delete incoming emails where this account is the recipient
     if incoming_replies:
         await db.execute(
-            delete(EmailReply).where(EmailReply.to_email == email_address)
+            scope_write_to_current_org(
+                delete(EmailReply).where(EmailReply.to_email == email_address),
+                EmailReply,
+            )
         )
 
     # Null out sender_account_id on email_sends before deleting
