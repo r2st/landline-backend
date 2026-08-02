@@ -57,6 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.bounce_record import BounceRecord
+from app.models.complaint_record import ComplaintRecord
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
 from app.models.email_template import EmailSend
@@ -302,8 +303,12 @@ class DangerMonitor:
           where *most* real bounces land: Gmail accepts the message and reports
           the failure minutes later, so a hard bounce almost never appears as a
           synchronous send failure.
+        * ``ComplaintRecord`` — ingested ARF/FBL reports, and the *only* place a
+          complaint has ever been recorded. ``_COMPLAINT_STATUSES`` names
+          ``EmailSend.status`` values nothing writes, so ``complaint_rate`` was
+          a constant 0.0 long after the reports themselves started arriving.
 
-        The three are unioned rather than one replacing another: a bounce hurts
+        The four are unioned rather than one replacing another: a bounce hurts
         the sending domain's reputation identically whoever queued it, and
         watching only Dialtone would re-blind the rail to manual campaigns.
 
@@ -331,7 +336,7 @@ class DangerMonitor:
 
         es_sent = (await db.execute(es_base.where(EmailSend.status != "skipped"))).scalar() or 0
         es_bounces = (await db.execute(es_base.where(EmailSend.status == "bounced"))).scalar() or 0
-        complaints = (
+        es_complaints = (
             await db.execute(es_base.where(EmailSend.status.in_(_COMPLAINT_STATUSES)))
         ).scalar() or 0
 
@@ -398,8 +403,34 @@ class DangerMonitor:
             await db.execute(br_base.where(BounceRecord.bounce_kind == "hard"))
         ).scalar() or 0
 
+        # --- Population 4: ComplaintRecord (ingested ARF/FBL reports) ---
+        # `complaint_rate` was the last of the three metrics still structurally
+        # zero. `_COMPLAINT_STATUSES` describes `EmailSend.status` values that
+        # **nothing writes** — verified by exhaustive grep, as with `"bounced"`
+        # before it — so the numerator was a constant 0 and the metric passed
+        # unconditionally.
+        #
+        # Since `complaint_ingestion` shipped, the real reports are ledgered in
+        # `complaint_records` on a 15-minute sweep. Nothing read that table. So
+        # the rail was not merely blind: it was blind *next to* the data, which
+        # is the state that survives longest, because the feature looks present
+        # from both ends — reports arrive, the dashboard has a complaint row —
+        # and only the number joining them is fake.
+        #
+        # This is the threshold that matters most. It trips at 0.1% where bounce
+        # trips at 5%, because a complaint rate is what a mailbox provider
+        # blocklists a sending domain over, and a blocklisting is not something
+        # you back out of by pausing afterwards.
+        cr_filters = [ComplaintRecord.processed_at >= cutoff]
+        if account is not None:
+            cr_filters.append(ComplaintRecord.gmail_account_id == account.id)
+        cr_complaints = (
+            await db.execute(select(func.count(ComplaintRecord.id)).where(and_(*cr_filters)))
+        ).scalar() or 0
+
         sent = es_sent + oe_attempts
         bounces = es_bounces + oe_bounces + br_bounces
+        complaints = es_complaints + cr_complaints
         hard_bounces = es_hard + oe_hard + br_hard
 
         bounce_rate = round(bounces / sent, 6) if sent else 0.0
@@ -420,6 +451,8 @@ class DangerMonitor:
                 "bounces_sequence": oe_bounces,
                 "bounces_email": es_bounces,
                 "bounces_dsn": br_bounces,
+                "complaints_email": es_complaints,
+                "complaints_fbl": cr_complaints,
             },
         }
 

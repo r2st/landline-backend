@@ -224,6 +224,7 @@ async def test_both_populations_are_unioned(db_session: AsyncSession):
     assert m["sources"] == {
         "sent_sequence": 30, "sent_email": 20,
         "bounces_sequence": 0, "bounces_email": 0, "bounces_dsn": 0,
+        "complaints_email": 0, "complaints_fbl": 0,
     }
 
 
@@ -351,3 +352,129 @@ async def test_a_small_sample_still_never_trips_on_rate(db_session: AsyncSession
     # 100% bounce rate, but on 3 sends — too noisy to act on.
     assert by_metric["bounce_rate"].observed_value == 1.0
     assert by_metric["bounce_rate"].status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# The complaint half of the rail.
+#
+# `bounce_rate` and `hard_bounce_count` were fixed when the populations were
+# unioned. `complaint_rate` was left structurally 0.0 — `_COMPLAINT_STATUSES`
+# names `EmailSend.status` values nothing writes, so the numerator was a
+# constant and the metric passed unconditionally.
+#
+# What makes it worth a test rather than a note: the ARF/FBL sweep has been
+# ingesting the real reports into `complaint_records` on a schedule since, and
+# nothing read that table. The rail was blind *next to the data*, which is the
+# failure that survives longest — reports arrive at one end, the dashboard has a
+# complaint row at the other, and only the number joining them is fake.
+#
+# It is also the threshold that matters most: 0.1%, where bounce trips at 5%,
+# because a complaint rate is what gets a sending domain blocklisted, and a
+# blocklisting is not something pausing afterwards undoes.
+# ---------------------------------------------------------------------------
+
+
+async def _complaint(db: AsyncSession, i: int, *, account=None, when=None):
+    from app.models.complaint_record import ComplaintRecord
+
+    row = ComplaintRecord(
+        gmail_message_id=f"fbl-{uuid.uuid4()}",
+        gmail_account_id=account.id if account else None,
+        recipient_email=f"angry{i}@acme.com",
+        feedback_type="abuse",
+    )
+    if when is not None:
+        row.processed_at = when
+    db.add(row)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_ingested_complaints_trip_the_rail(db_session: AsyncSession):
+    """100 clean sends and 3 people reporting us as spam is a 3% complaint rate.
+
+    Thirty times the breach threshold. Before this, the same scenario reported
+    `complaint_rate 0.0 — pass`, because the only numerator the rail knew about
+    was a column with no writer.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    for i in range(100):
+        contact = await _contact(db_session, company, f"c{i}@acme.com")
+        await _sequence_send(db_session, seq, contact, bounced=False)
+    for i in range(3):
+        await _complaint(db_session, i)
+    await db_session.commit()
+
+    m = await get_danger_monitor()._window_metrics(db_session)
+    assert m["complaints"] == 3
+    assert m["complaint_rate"] == 0.03
+    assert m["sources"]["complaints_fbl"] == 3
+
+    report = await get_danger_monitor().evaluate(db_session)
+    by_metric = {x.metric: x for x in report.metrics if x.scope == "global"}
+    assert by_metric["complaint_rate"].status == "breach"
+    assert report.breach is True
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sender_still_reads_clean(db_session: AsyncSession):
+    """The other half: no complaints must still mean no complaints.
+
+    A numerator that finally moves is only an improvement if it can also stay
+    still — otherwise the rail has swapped a metric that never fires for one
+    that always does, and an operator learns to ignore it either way.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    for i in range(100):
+        contact = await _contact(db_session, company, f"ok{i}@acme.com")
+        await _sequence_send(db_session, seq, contact, bounced=False)
+    await db_session.commit()
+
+    report = await get_danger_monitor().evaluate(db_session)
+    by_metric = {x.metric: x for x in report.metrics if x.scope == "global"}
+    assert by_metric["complaint_rate"].observed_value == 0.0
+    assert by_metric["complaint_rate"].status == "pass"
+    assert report.breach is False
+
+
+@pytest.mark.asyncio
+async def test_complaints_scope_to_their_account(db_session: AsyncSession):
+    """A per-account pause must land on the account that earned it.
+
+    Pausing the wrong sender leaves the complaining one running and takes a
+    healthy one offline — strictly worse than not pausing at all.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    good = await _account(db_session, "clean@apprend.tech")
+    bad = await _account(db_session, "reported@apprend.tech")
+    for label, account in (("g", good), ("b", bad)):
+        for i in range(50):
+            contact = await _contact(db_session, company, f"{label}c{i}@acme.com")
+            await _sequence_send(db_session, seq, contact, bounced=False, account=account)
+    for i in range(5):
+        await _complaint(db_session, i, account=bad)
+    await db_session.commit()
+
+    monitor = get_danger_monitor()
+    assert (await monitor._window_metrics(db_session, account=good))["complaints"] == 0
+    assert (await monitor._window_metrics(db_session, account=bad))["complaints"] == 5
+
+
+@pytest.mark.asyncio
+async def test_complaints_outside_the_window_are_not_counted(db_session: AsyncSession):
+    """The rail is a 24h view; last month's complaints are not today's rate."""
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    now = datetime.now(timezone.utc)
+    for i in range(100):
+        contact = await _contact(db_session, company, f"w{i}@acme.com")
+        await _sequence_send(db_session, seq, contact, bounced=False)
+    for i in range(9):
+        await _complaint(db_session, i, when=now - timedelta(days=30))
+    await db_session.commit()
+
+    m = await get_danger_monitor()._window_metrics(db_session)
+    assert m["complaints"] == 0

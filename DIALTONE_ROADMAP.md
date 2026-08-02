@@ -18,7 +18,7 @@ Every claim below was checked against `origin/main` with file:line evidence. Tha
 
 The best-value work here is mostly *connecting things that already exist*, not building new ones. I would resist the instinct to add LinkedIn until P0/P1 are done, for reasons in **P3-1**.
 
-**P0-1 was the live finding and is now fixed** (`bb60fd6`, deployed): the safety system this product's launch readiness was argued on had never worked. Its complaint half is still blind — see **P1-4**.
+**P0-1 was the live finding and is now fixed** (bounces in `bb60fd6`, complaints on 2026-08-02): the safety system this product's launch readiness was argued on had never worked. All three of its metrics can now fire.
 
 ---
 
@@ -32,7 +32,9 @@ The best-value work here is mostly *connecting things that already exist*, not b
 >
 > **Root cause was deeper than this section said.** It is not only that nothing writes `EmailSend.status = "bounced"` — the sequence path writes **no `EmailSend` row at all** (`tasks/outreach.py:562`). The numerator *and the denominator* were zero for autonomous sends.
 >
-> **Still open:** `complaint_rate` remains structurally 0. Nothing writes a complaint status anywhere and Gmail gives no complaint signal without a feedback loop — that needs ingestion, not a query change. Tracked in **P1-4** below. The section is kept intact as the record of the finding.
+> **The complaint half is now closed too — 2026-08-02.** The reading above was right when written and then quietly stopped being right. Ingestion shipped (096: ARF/FBL sweep → `complaint_records`, on a 15-minute beat), and **nothing read the table**, so `complaint_rate` stayed a constant 0.0 for months *with the data sitting one join away*. That is the state that survives longest: reports arrive at one end, the dashboard has a complaint row at the other, and only the number joining them is fake — so the feature looks present from both directions.
+>
+> `_window_metrics` now unions a fourth population, `ComplaintRecord`, alongside the three send/bounce ones. All three rail metrics can now fire. The lesson worth carrying: **"we have no signal" and "nothing reads the signal" are indistinguishable from the dashboard**, and the second one is created by fixing the first without following it through to the consumer.
 
 **Severity: critical. Dialtone's only automatic brake is decorative — every metric it evaluates reads a column nothing ever writes.**
 
@@ -172,7 +174,7 @@ before code helps:
 |---|---|
 | **P3-2** website visitor de-anonymization | Vendor cost (Clearbit Reveal / 6sense / Albacross) **and** a GDPR review — an IP is personal data. A genuine build with legal surface, not a wiring job. |
 | **P3-1** LinkedIn automation | Recommended against; see the section. The human-assisted path is the recommendation and it exists. |
-| **P1-4** complaint rate as a *real* number | Shipped as ingestion (096) + Postmaster (093). Whether it reports anything depends on the FBL/Postmaster verification being done on the sending domain. |
+| ~~**P1-4** complaint rate as a *real* number~~ | ✅ **Done 2026-08-02.** Ingestion (096) + Postmaster (093) shipped the *data*; the rail and sender health now read it. Coverage still depends on FBL/Postmaster verification for the sending domain — Gmail runs no feedback loop, so Gmail-delivered complaints remain aggregate-only. |
 | **Committed production secrets** in git history | Rotation, by a human with the credentials. Flagged repeatedly and still unrotated. |
 
 **Added 2026-08-02 — two gaps this roadmap never had a section for, both the
@@ -311,6 +313,37 @@ alone). Un-ticking a checkbox on one contact row must restore mailability
 without becoming a way to erase a complaint, a bounce, an unsubscribe or an
 erasure record.
 
+**Added 2026-08-02 — sender reputation was throttling the sender in proportion
+to how much it sent.** The counterpart to P0-1, found by asking which *other*
+surfaces divide bounces by a denominator that does not contain sequence sends.
+`deliverability_optimizer._account_metrics` folded the ingested DSN ledger into
+the numerator when that was fixed, and left the denominator on `EmailSend`
+alone. An account used purely by the agent — the normal configuration —
+therefore reported `sent_7d = 0` however much mail it had put on the wire, while
+every DSN it produced counted against it.
+
+It did not surface as a wrong rate, because it never reached a rate. `_score`
+reads `sent < 10` as "too little volume to divide by" and falls back to scoring
+**absolute** bad-event counts at −20 a bounce, so four bounces in a week — a 4%
+rate on the hundred sends the denominator could not see, unremarkable to any
+deliverability team — scored 20, landed under `sender_min_reputation`, and set
+`throttle_factor = 0.4`. That multiplies straight into the daily cap in
+`send_limiter.account_capacity`. The more the agent sent, the more bounces it
+accrued, and the harder its own cap was cut.
+
+Two things about the shape are worth keeping. **It failed in the safe-looking
+direction**: a blind rail reads healthy and lets damage through, so it is
+alarming on sight; this one read *unhealthy* and suppressed volume, which reads
+as the system being careful. And **the symptom lands nowhere near the cause** —
+what an operator sees is "why is Dialtone barely sending?", which points at the
+queue, the cap, the warm-up ramp, anything but a reputation score that is
+working exactly as designed on a number that is wrong.
+
+All four counts now union both send tables, and complaints read
+`complaint_records` for the same reason the rail does.
+`tests/test_sender_reputation_populations.py` covers it; seven of its nine cases
+fail against the old denominator.
+
 **Added earlier, and not on this roadmap:** the outreach queue was unordered
 (`services/queue_priority.py`). It selected every active enrollment with no
 `ORDER BY` and then spent a finite daily cap walking that list, so a sequential
@@ -362,6 +395,8 @@ Similarly `sequence_optimizer.decide` can recommend `switch_channel` (`sequence_
 **Effort:** small. **Value:** medium-high — it stops the cadence lying about what happened.
 
 ### P1-4. Complaint ingestion — the rail's last dead metric
+
+> **✅ CLOSED 2026-08-02.** Ingestion shipped (096) and the rail now reads it. The diagnosis below was correct — there was no signal — but the fix had two halves and only the first was done: once `complaint_records` started filling, `complaint_rate` went on reporting 0.0 because `danger_monitor` and `deliverability_optimizer` still read `EmailSend.status` values nothing writes. Kept as the record, including the part that turned out to be the easy half.
 
 With P0-1 fixed the rail trips on bounces, but `complaint_rate` is still always 0: no code path anywhere writes a complaint status, so there is nothing to count. This is not a query bug — **we have no complaint signal at all.**
 
@@ -465,7 +500,7 @@ Real intent from a visit ("someone at Acme read your pricing page twice") requir
 
 | Phase | Work | Why first |
 |---|---|---|
-| ~~1~~ | ~~**P0-1** danger metrics~~ | ✅ **Done** (`bb60fd6`) — rail now trips on bounces. Complaints still blind → **P1-4**. |
+| ~~1~~ | ~~**P0-1** danger metrics~~ | ✅ **Done** — bounces in `bb60fd6`, complaints 2026-08-02. All three rail metrics can now fire. |
 | 2 | **P0-2** attribution | Until this exists, every item below is ranked on vibes — including by the ICP learner. |
 | 3 | **P1-1** intent → action | Highest value per hour: the capability is built and idle. |
 | 4 | **P1-2** honest channel steps | Stops the funnel counting touches nobody made. Small. |

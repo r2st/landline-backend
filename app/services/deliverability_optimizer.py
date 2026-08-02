@@ -27,11 +27,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.bounce_record import BounceRecord
+from app.models.complaint_record import ComplaintRecord
 from app.models.email_template import EmailSend
+from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.services.email_dispatch import get_sending_accounts, _transport_for
 
 logger = logging.getLogger(__name__)
+
+# EmailSend.status values that represent a spam complaint. Kept in step with
+# danger_monitor so the 24h rail and this 7d rollup agree on the vocabulary —
+# and, as that module records, no code path writes any of them today. They are
+# retained rather than deleted because a future transport may set them; the
+# complaint numerator no longer depends on it.
+_COMPLAINT_STATUSES = ("complained", "complaint", "spam")
 
 # Common spam-trigger phrases (lowercased). Not exhaustive — a signal, not a verdict.
 _SPAM_PHRASES = (
@@ -51,6 +60,40 @@ class DeliverabilityOptimizer:
     # Sender reputation
     # ------------------------------------------------------------------
     async def _account_metrics(self, db: AsyncSession, account) -> dict:
+        """Seven-day sends / bounces / complaints / opens for one sending account.
+
+        **Every number here unions the two places outbound mail lives**, the same
+        way ``danger_monitor._window_metrics`` does. The bounce half already did;
+        the denominator did not, and that asymmetry was the bug.
+
+        ``EmailSend`` holds manual and template sends. Dialtone's sequence sends
+        write **no ``EmailSend`` row at all** (``tasks/outreach.py``) — they exist
+        only as ``OutreachEvent``. So an account used purely by the autonomous
+        agent, which is the normal configuration, reported ``sent_7d = 0`` no
+        matter how much mail it had sent, while ``bounces_7d`` counted every
+        ingested DSN that account had produced.
+
+        That does not fail by reporting a wrong rate. It fails by never reaching
+        the rate branch at all: ``_score`` treats ``sent < 10`` as "too little
+        volume to divide by" and falls back to scoring **absolute** bad-event
+        counts, ``-20 per bounce``. An account sending 500 sequence emails a week
+        with a 2% bounce rate — healthy by any standard — books 10 bounces
+        against a denominator that does not know the sends happened, scores 30,
+        and is throttled. ``throttle_factor`` multiplies straight into the daily
+        cap in ``send_limiter.account_capacity``, so the effect is not a wrong
+        badge on a dashboard: **the reputation system was quietly capping the
+        sender it was built to protect, in proportion to how much it sent.**
+
+        The direction matters for what to trust. A blind rail reads healthy and
+        lets damage through; this one reads *unhealthy* and suppresses volume, so
+        it looks like caution rather than a defect, and the surface it degrades —
+        "why is Dialtone barely sending?" — points nowhere near the cause.
+
+        Attribution mirrors the rail: sequence sends carry the account on the
+        enrollment (``OutreachEnrollment.sender_account_id``), and the two ledger
+        tables key on ``gmail_account_id``, so SMTP accounts fall back to send
+        status alone for those.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(days=7)
         match = or_(
             EmailSend.sender_account_id == account.id,
@@ -58,13 +101,36 @@ class DeliverabilityOptimizer:
         )
         base = select(func.count(EmailSend.id)).where(EmailSend.sent_at >= cutoff, match)
 
-        sent = (await db.execute(base.where(EmailSend.status != "skipped"))).scalar() or 0
+        send_sent = (await db.execute(base.where(EmailSend.status != "skipped"))).scalar() or 0
         send_bounces = (await db.execute(base.where(EmailSend.status == "bounced"))).scalar() or 0
-        complaints = (
-            await db.execute(base.where(EmailSend.status.in_(("complained", "complaint", "spam"))))
+        send_complaints = (
+            await db.execute(base.where(EmailSend.status.in_(_COMPLAINT_STATUSES)))
         ).scalar() or 0
-        opens = (
+        send_opens = (
             await db.execute(base.where(EmailSend.opened_at.isnot(None)))
+        ).scalar() or 0
+
+        # --- Dialtone's sequence sends, scoped through the enrollment ---
+        # The denominator counts ATTEMPTS ('sent' + 'bounced'), not successes,
+        # for the reason the rail spells out: one event is written per attempt,
+        # and counting only 'sent' leaves the worst case — every attempt failing
+        # synchronously — dividing by zero and reading clean.
+        oe_base = (
+            select(func.count(OutreachEvent.id))
+            .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+            .where(
+                OutreachEvent.occurred_at >= cutoff,
+                OutreachEnrollment.sender_account_id == account.id,
+            )
+        )
+        seq_sent = (
+            await db.execute(oe_base.where(OutreachEvent.event_type.in_(("sent", "bounced"))))
+        ).scalar() or 0
+        seq_bounces = (
+            await db.execute(oe_base.where(OutreachEvent.event_type == "bounced"))
+        ).scalar() or 0
+        seq_opens = (
+            await db.execute(oe_base.where(OutreachEvent.event_type == "opened"))
         ).scalar() or 0
 
         # Real bounces mostly arrive as mailer-daemon DSNs and are ledgered in
@@ -74,7 +140,13 @@ class DeliverabilityOptimizer:
         # so fold in the ingested bounce ledger. Gmail DSNs land in the sending
         # mailbox, so they attribute cleanly by ``gmail_account_id``; SMTP DSNs
         # carry no account link, so those accounts fall back to send status only.
+        #
+        # Complaints are the same story one step further along: ``_COMPLAINT_
+        # STATUSES`` are values nothing writes, so ``complaint_rate_7d`` was a
+        # constant 0.0 while the ARF/FBL sweep filed the real reports in
+        # ``complaint_records``, which nothing read.
         ingested_bounces = 0
+        ingested_complaints = 0
         if _transport_for(account) == "gmail":
             ingested_bounces = (
                 await db.execute(
@@ -84,7 +156,19 @@ class DeliverabilityOptimizer:
                     )
                 )
             ).scalar() or 0
-        bounces = send_bounces + ingested_bounces
+            ingested_complaints = (
+                await db.execute(
+                    select(func.count(ComplaintRecord.id)).where(
+                        ComplaintRecord.gmail_account_id == account.id,
+                        ComplaintRecord.processed_at >= cutoff,
+                    )
+                )
+            ).scalar() or 0
+
+        sent = send_sent + seq_sent
+        bounces = send_bounces + seq_bounces + ingested_bounces
+        complaints = send_complaints + ingested_complaints
+        opens = send_opens + seq_opens
 
         bounce_rate = round(bounces / sent, 4) if sent else 0.0
         complaint_rate = round(complaints / sent, 4) if sent else 0.0
@@ -97,6 +181,22 @@ class DeliverabilityOptimizer:
             "bounce_rate_7d": bounce_rate,
             "complaint_rate_7d": complaint_rate,
             "open_rate_7d": open_rate,
+            # Which population each number came from. This lands in
+            # ``SenderHealth.details``, where it answers the question an
+            # operator actually has when an account is throttled: is this the
+            # agent's traffic or a manual campaign's? They call for opposite
+            # responses, and the aggregate cannot tell them apart.
+            "sources": {
+                "sent_email": send_sent,
+                "sent_sequence": seq_sent,
+                "bounces_email": send_bounces,
+                "bounces_sequence": seq_bounces,
+                "bounces_dsn": ingested_bounces,
+                "complaints_email": send_complaints,
+                "complaints_fbl": ingested_complaints,
+                "opens_email": send_opens,
+                "opens_sequence": seq_opens,
+            },
         }
 
     def _score(self, m: dict) -> tuple[Optional[int], float, str]:
