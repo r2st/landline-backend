@@ -65,7 +65,18 @@ def _ensure_version_table_width(connection) -> None:
 
 
 def do_run_migrations(connection):
+    # The widening above autobegins a transaction (SQLAlchemy 2.0 commit-as-you-go),
+    # and `MigrationContext.configure` snapshots `connection.in_transaction()` into
+    # `_in_external_transaction`. Left uncommitted, Alembic concludes the caller owns
+    # the transaction, `begin_transaction()` degrades to a nullcontext, and nothing
+    # ever commits: `connect()` rolls the whole upgrade back on close. `upgrade head`
+    # then exits 0, logs every revision, and writes nothing — which is how a deploy
+    # reports success against an unmigrated database.
+    #
+    # Commit here, *before* configure, so Alembic sees a clean connection and owns
+    # the migration transaction itself.
     _ensure_version_table_width(connection)
+    connection.commit()
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
