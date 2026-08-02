@@ -153,9 +153,22 @@ async def test_previously_open_routers_require_auth(unauth_client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_outreach_webhook_stays_public(unauth_client: AsyncClient):
-    """The SES event webhook must remain reachable without a JWT (it is guarded
-    by the enrollment FK, not auth). A missing enrollment → 404, NOT 401."""
+async def test_outreach_webhook_rejects_unsigned_anonymous_post(unauth_client: AsyncClient):
+    """The event webhook takes a credential — a signature or a JWT, not neither.
+
+    This test used to assert the opposite (``!= 401``), on the reasoning that the
+    enrollment foreign key was guard enough for an anonymous SES callback. The FK
+    proves the enrollment exists, which is not the same as proving the caller may
+    write to the send ledger: ``event_type='sent'`` rows are what
+    ``SendLimiter._db_sent_today`` counts against the daily cap, and ``bounced``
+    rows are what the kill switch reads. Full reasoning on
+    ``require_signed_webhook_or_user``; the signed and JWT paths are covered in
+    ``test_outreach_webhook_auth.py``.
+
+    Note the 401 must arrive *before* the 404 for the missing enrollment — an
+    unauthenticated caller should not be able to use this endpoint to test
+    whether an enrollment id is real.
+    """
     resp = await unauth_client.post(
         "/api/v1/outreach/events",
         json={
@@ -164,7 +177,7 @@ async def test_outreach_webhook_stays_public(unauth_client: AsyncClient):
             "step_number": 1,
         },
     )
-    assert resp.status_code != 401
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio

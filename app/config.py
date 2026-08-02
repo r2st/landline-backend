@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     ses_sender_email: str = "landline@apprendtechnologies.com"
 
+    # Shared secret an external ESP signs its event webhook with. Empty means no
+    # ESP is wired up, and the public event endpoint accepts nothing anonymous —
+    # not "accepts everything", which is what it did before this existed. See
+    # ``app.routers.outreach.require_signed_webhook_or_user`` for why an
+    # unauthenticated write there is a send-accounting problem, not a data one.
+    outreach_webhook_secret: str = ""
+
     # The canonical primary sender for outreach. Real sending goes through the
     # connected Gmail OAuth account whose address matches this (Google Workspace
     # signs DKIM for the domain automatically), so this is both the operator's

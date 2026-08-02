@@ -31,11 +31,34 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(10.0)
 
+# The header carrying the HMAC. Named here rather than inlined because it is now
+# read on the way *in* as well as written on the way out — an inbound webhook we
+# accept has to be verified with the same scheme we ask our own subscribers to
+# verify with (see ``app.routers.outreach.require_signed_webhook_or_user``).
+SIGNATURE_HEADER = "X-Landline-Signature"
+
 
 def sign_payload(secret: str, body: bytes) -> str:
     """HMAC-SHA256 signature header value for a raw JSON body."""
     digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+def verify_payload(secret: str, body: bytes, header_value: Optional[str]) -> bool:
+    """Whether ``header_value`` is the signature this ``secret`` produces for ``body``.
+
+    The inverse of :func:`sign_payload`, and deliberately the *only* way to check
+    one: the comparison is constant-time (``hmac.compare_digest``), so a caller
+    cannot recover a signature byte-by-byte from response timing.
+
+    Returns ``False`` rather than raising for every failure mode — no secret
+    configured, no header, a malformed header, a wrong digest. A verifier that
+    raises on some rejections and returns on others invites a caller to treat one
+    of those paths as "not really a rejection".
+    """
+    if not secret or not header_value:
+        return False
+    return hmac.compare_digest(sign_payload(secret, body), header_value.strip())
 
 
 class WebhookDispatcher:

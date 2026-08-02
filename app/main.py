@@ -109,10 +109,13 @@ app.include_router(companies.router, prefix=settings.api_prefix, dependencies=_a
 # caller's org is bound on every request.
 app.include_router(contacts.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(leads.router, prefix=settings.api_prefix, dependencies=_auth)
-# The public SES webhook lives on outreach.public_router (stays unauthenticated);
-# the main outreach.router (sequences, enrollments, events, stats) is org-scoped
-# data and none of its endpoints take a user dependency, so it MUST require auth
-# to bind org context — otherwise it ran unscoped across all tenants.
+# outreach.public_router carries the ESP event webhook. "Public" is now only
+# about *which* credential it takes, not whether it takes one: it is mounted
+# without the router-level JWT dependency so a signed ESP callback can reach it,
+# and its own route dependency requires either that signature or a JWT.
+# The main outreach.router (sequences, enrollments, stats) is org-scoped data and
+# none of its endpoints take a user dependency, so it MUST require auth to bind
+# org context — otherwise it ran unscoped across all tenants.
 app.include_router(outreach.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(outreach.public_router, prefix=settings.api_prefix)
 app.include_router(dashboard.router, prefix=settings.api_prefix, dependencies=_auth)

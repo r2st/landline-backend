@@ -4,10 +4,12 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.contact import Contact
@@ -25,6 +27,7 @@ from app.schemas.outreach import (
     SequenceStepCreate,
     SequenceUpdate,
 )
+from app.services.webhook_dispatch import SIGNATURE_HEADER, verify_payload
 from app.tasks.outreach import send_sequence_step
 
 logger = logging.getLogger(__name__)
@@ -34,8 +37,82 @@ router = APIRouter(
     tags=["outreach"],
     dependencies=[Depends(get_current_user)],
 )
-# Public router — the SES event webhook must stay reachable without a JWT.
+# Router for the event endpoint, which is reachable *either* with a JWT (an
+# operator recording a touch by hand) or with an HMAC signature (an ESP posting
+# delivery events). It is mounted without the router-level auth dependency so
+# the second caller can exist at all; the per-route dependency below is what
+# actually admits a request. See ``require_signed_webhook_or_user``.
 public_router = APIRouter(prefix="/outreach", tags=["outreach"])
+
+
+_webhook_bearer = HTTPBearer(auto_error=False)
+
+
+async def require_signed_webhook_or_user(
+    request: Request,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_webhook_bearer),
+    db: AsyncSession = Depends(get_db),
+) -> str:
+    """Admit an ESP webhook (HMAC-signed body) or a logged-in user. Nothing else.
+
+    ``POST /outreach/events`` was fully anonymous, on the stated grounds that an
+    SES webhook must reach it without a JWT and that the ``enrollment_id``
+    foreign key was guard enough. Both halves were wrong.
+
+    **The FK is not a guard, because of what the rows it gates are used for.**
+    An ``OutreachEvent`` is not an annotation on a campaign; it is the send
+    ledger. ``SendLimiter._db_sent_today`` counts ``event_type='sent'`` rows to
+    decide how much of the daily cap is spent — and the Redis reservation
+    counter *seeds itself from that count* — so posting ``sent`` events spends
+    the day's outreach without sending anything. ``DangerMonitor`` reads
+    ``bounced`` rows for the bounce rate that trips the system-wide kill switch.
+    And ``replied``/``bounced``/``unsubscribed`` are written straight onto
+    ``enrollment.status`` a few lines below, ending the cadence. An anonymous
+    caller holding one enrollment id could stop one campaign, and — because the
+    cap and the kill switch are global — stop all of them.
+
+    **And no SES webhook was ever posting here.** SES notifies over SNS, whose
+    envelope is ``{"Type": "Notification", "Message": "<json string>", ...}``
+    with its own certificate-based signature. Nothing in this codebase parses
+    that shape; this endpoint takes ``{enrollment_id, step_number, event_type}``
+    and would reject a genuine SNS delivery as a 422. The exemption was held
+    open for a caller that could not have used it.
+
+    So: an ESP proves itself with an HMAC over the raw body, using the same
+    scheme and header we ask *our* webhook subscribers to verify
+    (:func:`app.services.webhook_dispatch.sign_payload`); an operator proves
+    itself with a JWT, which is how the manual-tracking half of this endpoint's
+    docstring was always supposed to work. Returns the actor kind for logging.
+
+    A present-but-wrong signature is rejected outright rather than falling
+    through to the JWT check — a caller that signed and got it wrong is not an
+    anonymous caller, and letting it retry unsigned would make the header
+    optional in practice.
+
+    The JWT is resolved through :func:`get_current_user` directly rather than
+    ``get_current_user_optional``: "optional" carries a second meaning here (a
+    legacy unscoped API-key caller resolves to ``None``), and the question this
+    dependency asks is only whether the bearer token is a valid one.
+    """
+    signature = request.headers.get(SIGNATURE_HEADER)
+    if signature:
+        secret = get_settings().outreach_webhook_secret
+        if verify_payload(secret, await request.body(), signature):
+            return "webhook"
+        # Covers both a bad digest and a signature offered when no secret is
+        # configured; the caller learns which only from its own records.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook signature",
+        )
+    if creds is not None:
+        await get_current_user(creds, db)  # raises 401 if invalid / deactivated
+        return "user"
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # --- Sequences ---
@@ -268,12 +345,15 @@ async def update_enrollment(
 async def record_event(
     payload: OutreachEventCreate,
     db: AsyncSession = Depends(get_db),
+    actor: str = Depends(require_signed_webhook_or_user),
 ):
-    """Record an outreach event (webhook from SES, manual tracking).
+    """Record an outreach event (signed ESP webhook, or manual tracking).
 
-    Public by design: external ESP webhooks (SES bounce/complaint/open) post
-    here without a JWT. Guarded by the ``enrollment_id`` foreign key — an event
-    can only attach to an enrollment that already exists.
+    Reachable without a JWT only by an ESP that signs the body with
+    ``OUTREACH_WEBHOOK_SECRET``; a logged-in operator may post here directly.
+    The ``enrollment_id`` foreign key still scopes the write to an enrollment
+    that exists — it is just not, on its own, an authorization check. See
+    :func:`require_signed_webhook_or_user`.
     """
     result = await db.execute(
         select(OutreachEnrollment).where(OutreachEnrollment.id == payload.enrollment_id)
@@ -287,6 +367,11 @@ async def record_event(
 
     # Auto-update enrollment status based on event type
     if payload.event_type in ("replied", "bounced", "unsubscribed"):
+        # Worth a line: this is the one path where an *external* caller ends a
+        # cadence, so "who stopped this enrollment" should be answerable later.
+        logger.info(
+            "Enrollment %s → %s (actor=%s)", enrollment.id, payload.event_type, actor,
+        )
         enrollment.status = payload.event_type
 
     await db.flush()
