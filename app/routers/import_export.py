@@ -17,6 +17,7 @@ from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
 from app.schemas.dashboard import CSVImportResult
+from app.services import uploads
 from app.services.ingestion import (
     CandidateRecord,
     ContactRecord,
@@ -26,6 +27,25 @@ from app.services.ingestion import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/import-export", tags=["import/export"])
+
+# Largest CSV body accepted, enforced during the read (see app.services.uploads).
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+
+# Largest number of data rows one import may carry.
+#
+# The byte cap alone does not bound this endpoint's *work*. A well-formed 10 MB
+# CSV of the minimum viable row ("Acme\n") is two million rows, and the loop
+# below awaits ``ingest_one`` — several queries and possible inserts — for each
+# one, inline in the request. Nothing stops it early: the ``len(errors) > 100``
+# break only trips on rows that *fail*, so the flawless file is precisely the one
+# that runs longest. The result is a request that holds a worker and a database
+# connection for many minutes, which is a self-inflicted outage from a single
+# upload that passed every check.
+#
+# 50k rows is far above any real hand-assembled prospect list and still finishes
+# in a time a request can survive. Anything larger is a bulk job, and should
+# arrive as several files rather than one that silently wedges the API.
+MAX_IMPORT_ROWS = 50_000
 
 # Characters that spreadsheet apps (Excel, Sheets, LibreOffice) interpret as the
 # start of a formula. A cell beginning with one of these can execute when the
@@ -92,14 +112,25 @@ async def import_csv(
     if not file.filename or not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a .csv")
 
-    MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="File too large. Maximum 10MB allowed.")
+    content = await uploads.read_capped(file, MAX_UPLOAD_SIZE)
     try:
         text = content.decode("utf-8-sig")  # Handle BOM
     except UnicodeDecodeError:
         text = content.decode("latin-1")
+
+    # Count before importing anything, so an oversized file is refused whole
+    # rather than half-applied. ``csv.reader`` over a generator keeps this a
+    # streaming count — materializing the rows to call ``len`` would reintroduce
+    # the memory blow-up on the exact input this guard exists for.
+    data_rows = max(0, sum(1 for _ in csv.reader(io.StringIO(text))) - 1)
+    if data_rows > MAX_IMPORT_ROWS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Too many rows ({data_rows:,}). Maximum {MAX_IMPORT_ROWS:,} per "
+                f"import — split the file and upload it in parts."
+            ),
+        )
 
     reader = csv.DictReader(io.StringIO(text))
 

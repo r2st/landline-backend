@@ -13,9 +13,16 @@ from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
 from app.rate_limit import AI_RATE_LIMIT, limiter
+from app.services import uploads
 from app.services.ai_service import get_ai_service
 
 router = APIRouter(prefix="/ai", tags=["ai"])
+
+# Largest business-card image accepted, enforced during the read (see
+# app.services.uploads). Comfortably above a phone photo; the image is
+# base64-encoded and shipped to the vision model, so it costs roughly 4/3 this
+# much again in request body to the provider.
+MAX_CARD_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 def _uuid_or_400(raw: str, field: str = "id") -> UUID:
@@ -336,10 +343,9 @@ async def scan_business_card(request: Request, file: UploadFile = File(...)):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
-    # Read and encode
-    contents = await file.read()
-    if len(contents) > 10 * 1024 * 1024:  # 10MB limit
-        raise HTTPException(status_code=413, detail="Image too large (max 10MB)")
+    # Read and encode, bounded — see app.services.uploads for why the cap has to
+    # be enforced during the read rather than on its result.
+    contents = await uploads.read_capped(file, MAX_CARD_IMAGE_SIZE, what="Image")
 
     image_base64 = base64.b64encode(contents).decode("utf-8")
 

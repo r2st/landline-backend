@@ -100,6 +100,7 @@ from app.services import (
     step_delay,
     suppression,
     system_settings,
+    uploads,
     warmup,
 )
 from app.services.booking import validate_booking_url
@@ -1266,7 +1267,9 @@ async def create_warmup_plan(
 # ─── Suppression list (Feature 2) ────────────────────────────────────────────
 
 # Cap an uploaded file at 5 MB so a runaway upload can't exhaust memory. A CSV
-# of email addresses is tiny; 5 MB is ~150k addresses.
+# of email addresses is tiny; 5 MB is ~150k addresses. Enforced by
+# ``uploads.read_capped``, which stops reading at the cap — see that module for
+# why the read-then-measure version of this check enforced nothing.
 _MAX_SUPPRESSION_UPLOAD = 5 * 1024 * 1024
 
 
@@ -1323,9 +1326,7 @@ async def import_suppression(
     Accepts a header row naming ``email``/``reason`` columns, a headerless CSV
     (email first), or one address per line. Returns per-outcome counts.
     """
-    raw = await file.read()
-    if len(raw) > _MAX_SUPPRESSION_UPLOAD:
-        raise HTTPException(status_code=413, detail="File too large (max 5 MB).")
+    raw = await uploads.read_capped(file, _MAX_SUPPRESSION_UPLOAD)
     try:
         content = raw.decode("utf-8-sig")  # tolerate a UTF-8 BOM from Excel
     except UnicodeDecodeError:
