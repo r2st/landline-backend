@@ -60,6 +60,7 @@ from app.schemas.bounce_analytics import (
     RecipientDomainReport,
 )
 from app.schemas.outreach_trends import OutreachTrends
+from app.schemas.sender_performance import SenderPerformance, SenderPerformanceReport
 from app.schemas.send_failures import (
     FailingEnrollment,
     FailingEnrollmentsResponse,
@@ -1843,6 +1844,104 @@ async def outreach_trend_analytics(
         db, days=days, interval=interval, sequence_id=sequence_id
     )
     return OutreachTrends(**result)
+
+
+@router.get("/analytics/senders", response_model=SenderPerformanceReport)
+async def sender_performance(
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """Outreach funnel per sending mailbox: which sender is producing replies.
+
+    `/deliverability/senders` already compares mailboxes on bounce rate,
+    complaint rate, open rate and reputation — that answers *is this mailbox in
+    trouble*. Nothing answered *is this mailbox working*. A sender can deliver
+    perfectly and never get a reply, and while it does it is spending warm-up
+    capacity the rest of the fleet could use. Reply rate is deliberately not
+    added to `SenderHealth`: conflating "trusted" with "effective" is how a
+    green deliverability dashboard ends up describing a mailbox nobody answers.
+
+    **Attribution is the enrollment's pinned mailbox.** The sequence engine
+    picks a sender by rotation on the first touch and then pins it
+    (`OutreachEnrollment.sender_account_id`) so every later step threads from
+    the same inbox — it cannot rotate away mid-sequence, which is what makes the
+    join accurate rather than approximate. Events from before the pin was set
+    (a first touch, in the same transaction) attribute to it too, which is
+    correct: that touch is what chose it.
+
+    **Scope is the sequence engine**, matching `/analytics/trends`.
+    `email_sends` holds manual, template and reply mail — real, but not cold
+    outreach, and folding replies to conversations we were already having into a
+    per-sender cold reply rate would flatter whichever mailbox a human uses most.
+
+    Sends whose enrollment has no pinned mailbox are reported as one
+    `unattributed` row rather than dropped: they are real volume, and a table
+    whose rows don't sum to the total is a table people stop trusting.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    rows = (
+        await db.execute(
+            select(
+                OutreachEnrollment.sender_account_id,
+                OutreachEvent.event_type,
+                func.count(OutreachEvent.id),
+            )
+            .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
+            .where(
+                OutreachEvent.occurred_at >= since,
+                OutreachEvent.event_type.in_(
+                    ("sent", "opened", "clicked", "replied", "bounced")
+                ),
+            )
+            .group_by(OutreachEnrollment.sender_account_id, OutreachEvent.event_type)
+        )
+    ).all()
+
+    counts: dict[Optional[uuid.UUID], dict[str, int]] = {}
+    for account_id, event_type, count in rows:
+        counts.setdefault(account_id, {})[event_type] = count
+
+    emails: dict[uuid.UUID, Optional[str]] = {}
+    known = [a for a in counts if a is not None]
+    if known:
+        emails = {
+            a.id: a.email
+            for a in (
+                await db.execute(select(GmailAccount).where(GmailAccount.id.in_(known)))
+            ).scalars().all()
+        }
+
+    senders: list[SenderPerformance] = []
+    for account_id, c in counts.items():
+        sent = c.get("sent", 0)
+        opened = c.get("opened", 0)
+        clicked = c.get("clicked", 0)
+        replied = c.get("replied", 0)
+        bounced = c.get("bounced", 0)
+        senders.append(SenderPerformance(
+            account_id=account_id,
+            # A deleted mailbox nulls the FK, so an id with no row is possible;
+            # showing the bare id beats dropping the volume it sent.
+            account_email=emails.get(account_id) if account_id else None,
+            unattributed=account_id is None,
+            sent=sent, opened=opened, clicked=clicked,
+            replied=replied, bounced=bounced,
+            open_rate=_rate(opened, sent),
+            click_rate=_rate(clicked, sent),
+            reply_rate=_rate(replied, sent),
+            bounce_rate=_rate(bounced, sent),
+        ))
+
+    # Best reply rate first — the question this endpoint exists for. Volume
+    # breaks ties so a mailbox with one send and one reply doesn't outrank a
+    # mailbox with a hundred of each.
+    senders.sort(key=lambda s: (s.reply_rate, s.sent), reverse=True)
+    return SenderPerformanceReport(
+        days=days,
+        total_sent=sum(s.sent for s in senders),
+        senders=senders,
+    )
 
 
 # ─── Bounce forensics + per-domain deliverability ────────────────────────────
