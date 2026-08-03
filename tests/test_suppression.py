@@ -162,3 +162,51 @@ async def test_send_outreach_email_blocks_suppressed(db_session: AsyncSession, m
     )
     assert result["status"] == "suppressed"
     assert sent["count"] == 0
+
+
+# ─── Address length ──────────────────────────────────────────────────────────
+
+
+def test_normalize_email_rejects_over_length_addresses():
+    """An address longer than the column is invalid *here*, not at the INSERT.
+
+    ``suppression_entries.email`` is ``VARCHAR(320)`` and the shape regex matches
+    an address of any length, so without a cap a 400-character line in an upload
+    is accepted all the way to the flush, where Postgres raises
+    ``StringDataRightTruncation``. ``import_csv`` batches the whole file into one
+    transaction and commits once, so that error does not cost the operator the
+    bad row — it costs them every row, and returns a 500 instead of the per-row
+    ``invalid`` count the endpoint exists to produce.
+    """
+    limit = suppression.MAX_EMAIL_LENGTH
+    at_limit = "a" * (limit - len("@example.com")) + "@example.com"
+    assert len(at_limit) == limit
+    assert suppression.normalize_email(at_limit) == at_limit
+
+    over = "a" * (limit - len("@example.com") + 1) + "@example.com"
+    assert len(over) == limit + 1
+    assert suppression.normalize_email(over) is None
+
+    # Whitespace is trimmed before the length is judged, so an address that only
+    # exceeds the column because of padding is still accepted.
+    assert suppression.normalize_email("  " + at_limit + "  ") == at_limit
+
+
+@pytest.mark.asyncio
+async def test_add_entry_reports_over_length_as_invalid(db_session: AsyncSession):
+    over = "b" * suppression.MAX_EMAIL_LENGTH + "@example.com"
+    entry, status = await suppression.add_entry(db_session, over)
+    assert (entry, status) == (None, "invalid")
+
+
+@pytest.mark.asyncio
+async def test_import_csv_survives_an_over_length_row(db_session: AsyncSession):
+    """One junk line must not take the rest of a compliance upload with it."""
+    over = "c" * suppression.MAX_EMAIL_LENGTH + "@example.com"
+    content = "\n".join(["good1@example.com", over, "good2@example.com"])
+
+    result = await suppression.import_csv(db_session, content)
+
+    assert result == {"added": 2, "duplicates": 0, "invalid": 1, "total": 3}
+    assert await suppression.is_suppressed(db_session, "good1@example.com") is True
+    assert await suppression.is_suppressed(db_session, "good2@example.com") is True

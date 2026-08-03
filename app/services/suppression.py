@@ -28,12 +28,37 @@ logger = logging.getLogger(__name__)
 # unusual addresses from a compliance upload.
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# The width of ``suppression_entries.email`` (and of every other address column
+# in the schema). The regex above matches an address of any length, so without
+# this a 400-character line in an upload is "valid" right up until the INSERT,
+# where Postgres raises ``StringDataRightTruncation``.
+#
+# That is the wrong place for this to fail. ``import_csv`` batches the whole
+# upload into one transaction and commits once, so the error does not cost the
+# operator the bad row — it costs them **every** row: 150k addresses parsed,
+# inserted and rolled back, and a 500 in place of the per-row ``invalid`` count
+# the endpoint exists to return. A do-not-contact list silently not applying is
+# the one outcome this module must not have, and a single junk line in a
+# third-party compliance export is an ordinary way to get one.
+#
+# 320 rather than the RFC 5321 maximum of 254: the column is what actually
+# constrains the write, and narrowing the rule here would start rejecting
+# addresses the database would happily have stored.
+MAX_EMAIL_LENGTH = 320
+
 
 def normalize_email(email: Optional[str]) -> Optional[str]:
-    """Trim + lower-case an address, or ``None`` if it isn't email-shaped."""
+    """Trim + lower-case an address, or ``None`` if it isn't email-shaped.
+
+    "Email-shaped" includes fitting in the column: an address longer than
+    :data:`MAX_EMAIL_LENGTH` is rejected here, as a row-level ``invalid``,
+    rather than at flush time as a failed transaction.
+    """
     if not email:
         return None
     cleaned = email.strip().lower()
+    if len(cleaned) > MAX_EMAIL_LENGTH:
+        return None
     return cleaned if _EMAIL_RE.match(cleaned) else None
 
 
