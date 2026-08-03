@@ -164,7 +164,8 @@ async def _build_overview(db: AsyncSession) -> DashboardOverview:
     )
     contacts_prev_week = result.scalar() or 0
 
-    # Deals won this month
+    # Deals won this month — windowed on the close date, not the create date.
+    # See ``_build_kpis`` for why.
     now = datetime.now(timezone.utc)
     first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     result = await db.execute(
@@ -173,7 +174,8 @@ async def _build_overview(db: AsyncSession) -> DashboardOverview:
             func.coalesce(func.sum(Deal.value), 0),
         ).where(
             Deal.status == "won",
-            Deal.created_at >= first_of_month,
+            Deal.close_date.isnot(None),
+            Deal.close_date >= first_of_month,
         )
     )
     won_row = result.one()
@@ -298,24 +300,38 @@ async def _build_kpis(db: AsyncSession) -> DashboardKPIs:
     total_opened_events = event_counts.get("opened", 0)
     open_rate = round(total_opened_events / max(total_sent_events, 1) * 100, 2)
 
-    # Replies this week
+    # Replies this week.
+    #
+    # This was an unwindowed count wearing a windowed name. The comment that
+    # justified it — "OutreachEvent may not have a created_at" — was wrong:
+    # the model has always had ``occurred_at``, non-null with a server default,
+    # and it is the column the whole activity feed sorts on. So the "Replies
+    # This Week" KPI was the all-time reply total: it only ever went up, it
+    # never dropped on a quiet Monday, and it disagreed with every other
+    # weekly figure on the same dashboard.
     result = await db.execute(
         select(func.count(OutreachEvent.id)).where(
             OutreachEvent.event_type == "replied",
+            OutreachEvent.occurred_at >= week_ago,
         )
     )
-    # Filter by week if the model has a timestamp; since OutreachEvent may not
-    # have a created_at, count all replies as a fallback.
     replies_this_week = result.scalar() or 0
 
-    # Deals won this month
+    # Deals won this month — by when they were *won*, not when the record was
+    # opened. Windowing on ``created_at`` asks "which deals created this month
+    # are now won", which is a different and much smaller question: any deal
+    # with a sales cycle longer than the calendar month is invisible in the
+    # month its revenue actually landed, and it inflates the month it was
+    # opened in — retroactively, so a closed month's reported number changes
+    # after the fact. ``close_date`` is stamped on the won/lost transition.
     result = await db.execute(
         select(
             func.count(Deal.id),
             func.coalesce(func.sum(Deal.value), 0),
         ).where(
             Deal.status == "won",
-            Deal.created_at >= first_of_month,
+            Deal.close_date.isnot(None),
+            Deal.close_date >= first_of_month,
         )
     )
     won_row = result.one()
