@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.dependencies import scope_users_to_current_org
 from app.models.company import Company
 from app.models.lead_score import LeadScore
 from app.models.rep_profile import RepProfile
@@ -173,7 +174,11 @@ async def company_routing(company_id: uuid.UUID, db: AsyncSession = Depends(get_
 
 async def _serialize_profile(db: AsyncSession, p: RepProfile, name: Optional[str] = None) -> dict:
     if name is None:
-        name = (await db.execute(select(User.name).where(User.id == p.user_id))).scalar_one_or_none()
+        name = (
+            await db.execute(
+                scope_users_to_current_org(select(User.name).where(User.id == p.user_id))
+            )
+        ).scalar_one_or_none()
     out = RepProfileRead.model_validate(p).model_dump()
     out["user_name"] = name
     return out
@@ -182,7 +187,16 @@ async def _serialize_profile(db: AsyncSession, p: RepProfile, name: Optional[str
 @router.get("/reps", response_model=list[RepProfileRead])
 async def list_rep_profiles(db: AsyncSession = Depends(get_db)):
     """List all rep profiles with their expertise, win rates, and capacity."""
-    rows = (await db.execute(select(RepProfile, User.name).join(User, User.id == RepProfile.user_id))).all()
+    # `RepProfile` is org-scoped by the global read filter; `User` is not (see
+    # `dependencies.scope_users_to_org`), so the join needs its own predicate or
+    # a profile pointing at another tenant's user returns that user's name.
+    rows = (
+        await db.execute(
+            scope_users_to_current_org(
+                select(RepProfile, User.name).join(User, User.id == RepProfile.user_id)
+            )
+        )
+    ).all()
     return [await _serialize_profile(db, p, name) for p, name in rows]
 
 
@@ -191,7 +205,19 @@ async def upsert_rep_profile(
     user_id: uuid.UUID, payload: RepProfileUpsert, db: AsyncSession = Depends(get_db)
 ):
     """Create or update a rep's profile (industries, capacity). Recomputes win rates."""
-    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    # Scoped, because `User` is outside the global org filter and `user_id`
+    # arrives from the path. Unscoped, this accepted any user id on the platform:
+    # the 404 became an existence oracle, `GET /routing/reps` then returned that
+    # stranger's *name* through the join above, and — because `rep_profiles.user_id`
+    # is unique platform-wide rather than per-org — the row it wrote also took the
+    # only slot that user's own org could ever insert, leaving their
+    # `PUT /routing/reps/{their own id}` failing on a unique violation with nothing
+    # visible in their tenant to explain it.
+    user = (
+        await db.execute(
+            scope_users_to_current_org(select(User).where(User.id == user_id))
+        )
+    ).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 

@@ -12,6 +12,7 @@ from typing import Optional
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.dependencies import scope_users_to_current_org
 from app.models.call import CallTask
 from app.models.company import Company
 from app.models.contact import Contact
@@ -25,11 +26,22 @@ from app.models.user import User
 async def _load_user_map(
     db: AsyncSession, user_ids: set[uuid.UUID]
 ) -> dict[uuid.UUID, User]:
-    """Load User rows for the given ids into an {id: User} map."""
+    """Load User rows for the given ids into an {id: User} map.
+
+    Scoped, because ``User`` is one of the three models outside the global org
+    filter (see :func:`app.dependencies.scope_users_to_org`). The ids here come
+    off org-scoped rows, so today nothing foreign reaches it — but that is a
+    property of the tables it happens to read, not of this query, and what it
+    resolves into the response is a name and an email address.
+    """
     ids = {u for u in user_ids if u is not None}
     if not ids:
         return {}
-    rows = (await db.execute(select(User).where(User.id.in_(ids)))).scalars().all()
+    rows = (
+        await db.execute(
+            scope_users_to_current_org(select(User).where(User.id.in_(ids)))
+        )
+    ).scalars().all()
     return {u.id: u for u in rows}
 
 
