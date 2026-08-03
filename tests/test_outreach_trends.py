@@ -128,7 +128,13 @@ async def test_buckets_are_contiguous_and_oldest_first(
     for earlier, later in zip(buckets, buckets[1:]):
         assert earlier["period_start"] < later["period_start"]
         assert later["period_start"] == earlier["period_end"] + timedelta(days=1)
-    assert buckets[-1]["period_end"] == date.today()
+    # UTC, not ``date.today()``. ``timeline`` builds its buckets from
+    # ``datetime.now(timezone.utc)``, and a bare ``date.today()`` is the *local*
+    # calendar day — so on any machine west of UTC this assertion is off by one
+    # for the last hours of the local day (and east of UTC, the first hours).
+    # The suite passes for most of the day and fails for the rest of it, which
+    # is the shape that gets a red build ignored rather than fixed.
+    assert buckets[-1]["period_end"] == datetime.now(timezone.utc).date()
 
 
 async def test_a_day_interval_gives_a_bucket_per_day(

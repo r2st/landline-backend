@@ -143,6 +143,21 @@ async def _make_sequence_sends(
     return events
 
 
+def _earlier_today(now: datetime, *, hours: int) -> datetime:
+    """``hours`` ago, but never earlier than today's UTC midnight.
+
+    ``emails_sent_today`` counts from the start of the **UTC** day. A bare
+    ``now - timedelta(hours=2)`` therefore lands on *yesterday* whenever the
+    suite runs within two hours of UTC midnight — the row is written, the
+    endpoint is right to exclude it, and the assertion fails for a reason that
+    has nothing to do with the union this file is about. Clamped rather than
+    frozen, because what these tests exercise is the endpoint's own reading of
+    "now"; pinning that would stop testing the boundary at all.
+    """
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(now - timedelta(hours=hours), day_start + timedelta(seconds=1))
+
+
 # --- Dashboard ---------------------------------------------------------------
 
 
@@ -151,8 +166,8 @@ async def test_dashboard_emails_sent_counts_sequence_sends(
 ):
     """One manual send + three sequence sends is four, not one."""
     now = datetime.now(timezone.utc)
-    await _make_email_send(db_session, sent_at=now - timedelta(hours=2))
-    await _make_sequence_sends(db_session, 3, occurred_at=now - timedelta(hours=1))
+    await _make_email_send(db_session, sent_at=_earlier_today(now, hours=2))
+    await _make_sequence_sends(db_session, 3, occurred_at=_earlier_today(now, hours=1))
     await db_session.commit()
 
     resp = await client.get("/api/v1/dashboard/overview")

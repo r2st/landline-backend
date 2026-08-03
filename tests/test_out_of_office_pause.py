@@ -226,12 +226,19 @@ async def test_pause_then_resume_round_trip(db_session: AsyncSession):
 async def test_ooo_reply_routes_into_a_pause(db_session: AsyncSession):
     contact = await _contact(db_session)
     enr = await _enrollment(db_session, contact)
+    # Derived from the real clock, not a literal. ``route_auto_action`` does not
+    # take a ``now``, so ``resolve_resume_at`` compares this against
+    # ``datetime.now``. A hardcoded date is therefore a fuse: it reads as a
+    # future return date until the wall clock passes it, and then
+    # ``parsed <= now`` sends every run down the default-hold branch and this
+    # assertion fails forever, on a calendar rollover rather than a code change.
+    back_on = (datetime.now(timezone.utc) + timedelta(days=5)).date().isoformat()
     reply = EmailReply(
         id=uuid.uuid4(),
         contact_id=contact.id,
         from_email="dana@acme.com",
         subject="Automatic reply: out of the office",
-        body_text="I am out of the office until August 3 with limited access to email.",
+        body_text=f"I am out of the office until {back_on} with limited access to email.",
         received_at=NOW,
     )
     db_session.add(reply)
@@ -239,7 +246,7 @@ async def test_ooo_reply_routes_into_a_pause(db_session: AsyncSession):
 
     action = await route_auto_action(
         db_session, reply, contact, None, "out_of_office",
-        {"return_date": "2026-08-03"},
+        {"return_date": back_on},
     )
     await db_session.flush()
     await db_session.refresh(enr)
@@ -248,4 +255,5 @@ async def test_ooo_reply_routes_into_a_pause(db_session: AsyncSession):
     assert enr.status == "paused"
     assert enr.pause_reason == "out_of_office"
     assert reply.classification_meta["ooo_paused"] == 1
-    assert reply.classification_meta["requeued_until"].startswith("2026-08-03")
+    # The parsed date is honoured, i.e. it is *not* the 7-day default hold.
+    assert reply.classification_meta["requeued_until"].startswith(back_on)
