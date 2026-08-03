@@ -44,6 +44,38 @@ limiter.enabled = False
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 
+# ---------------------------------------------------------------------------
+# ``CAST(ts AS DATE)`` means something different in SQLite, and it fails loudly
+# ---------------------------------------------------------------------------
+# SQLite has no DATE type. ``CAST('2026-08-02 09:00:00+00:00' AS DATE)`` falls
+# through to NUMERIC affinity, which reads the leading digits and yields the
+# integer ``2026``; SQLAlchemy's Date result processor then raises
+# ``TypeError: fromisoformat: argument must be str``.
+#
+# The cost isn't a confusing error, it's the coverage hole it creates. Any
+# endpoint grouping by day — a shape every "daily sends" chart in this codebase
+# uses — cannot be called at all under the test harness, so it doesn't get
+# tested, so its *other* logic doesn't get tested either. ``get_campaign_
+# analytics`` had zero tests for exactly this reason, and shipped four
+# percentages divided by a denominator that counted mail the kill switch had
+# stopped.
+#
+# ``date(x)`` is valid in both dialects (Postgres accepts function-style casts
+# for type names) and returns an ISO string SQLite's own processor parses, so
+# rewriting the cast here makes the harness agree with production rather than
+# papering over a difference.
+from sqlalchemy import Date as _SADate  # noqa: E402
+from sqlalchemy.ext.compiler import compiles as _compiles  # noqa: E402
+from sqlalchemy.sql.elements import Cast as _Cast  # noqa: E402
+
+
+@_compiles(_Cast, "sqlite")
+def _sqlite_cast_to_date(element, compiler, **kw):
+    if isinstance(element.type, _SADate):
+        return "date(%s)" % compiler.process(element.clause, **kw)
+    return compiler.visit_cast(element, **kw)
+
+
 class SQLiteUUID(TypeDecorator):
     """Store UUID as a plain string in SQLite."""
     impl = String(36)

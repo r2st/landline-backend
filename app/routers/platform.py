@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import OrgScope, get_org_scope
-from app.models.email_template import EmailSend
+from app.models.email_template import EmailSend, WIRE_STATUSES
 from app.models.outreach import OutreachEvent
 from app.models.tenant import BILLING_PLANS, Organization, TenantUsage
 from app.models.user import User, UserRole, normalize_role
@@ -53,7 +53,13 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 # and a spent daily cap all record, and none of them sent anything. On this
 # surface it was worse than on the dashboard — a per-org billing-shaped number
 # that counted mail a tenant's own suppression list stopped.
-_SENT_STATUSES = ("sent",)
+#
+# It then spent a while wrong in the other direction, and on a billing-shaped
+# number that is the direction that gets noticed from outside: ``status`` is a
+# lifecycle column the tracking endpoints advance (``sent → opened → clicked →
+# replied``), so a bare ``("sent",)`` billed a tenant for the mail nobody
+# engaged with and wrote off the rest. See ``WIRE_STATUSES``.
+_SENT_STATUSES = WIRE_STATUSES
 
 
 # --- Schemas ---------------------------------------------------------------

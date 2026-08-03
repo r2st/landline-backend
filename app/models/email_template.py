@@ -10,6 +10,53 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 from app.models.mixins import OrgScopedMixin
 
+# ---------------------------------------------------------------------------
+# ``EmailSend.status`` is a LIFECYCLE column, not a terminal one
+# ---------------------------------------------------------------------------
+# This is the part that keeps being missed, so it is stated where the column is
+# declared rather than in each of the six places that filter on it.
+#
+# A row starts ``pending``, becomes ``sent`` when the transport accepts it — and
+# then **keeps moving**. ``app.routers.tracking`` advances it on every
+# engagement signal, guarded by a rank ladder that only ever climbs:
+# ``sent → opened → clicked → replied``. So the moment a recipient opens the
+# message, that send's status is no longer ``"sent"``.
+#
+# Every counter written as ``status == "sent"`` therefore answers "how many
+# emails did we send that nobody engaged with?" while reading as "how many
+# emails did we send". The two agree exactly when the product isn't working,
+# which is why the mistake survives review and why no test caught it: a fixture
+# that sends and never opens cannot tell the two questions apart.
+#
+# The direction is the dangerous part. It is a metric that *shrinks* as
+# engagement rises, and the counter it corrupts most is not a dashboard tile:
+# ``send_limiter._db_sent_since`` is what the daily cap's Redis counter is
+# seeded from. An undercounted seed hands back allowance the mailbox already
+# spent — the one direction a cap must never be wrong in — and it hands back
+# more of it the better the campaign is doing.
+
+#: Statuses meaning the message reached the wire, so it consumed the mailbox's
+#: sending allowance. ``bounced`` belongs here: a bounce is mail that went out
+#: and was rejected afterwards, not mail that stayed home. Use this for send
+#: counts, volume caps and per-company pacing.
+WIRE_STATUSES = ("sent", "delivered", "opened", "clicked", "replied", "bounced")
+
+#: Statuses meaning the message was also *delivered* — the denominator for an
+#: engagement rate. ``bounced`` is excluded here and only here: counting a
+#: bounce against an open rate reports a copy problem for what is a list
+#: problem.
+DELIVERED_STATUSES = tuple(s for s in WIRE_STATUSES if s != "bounced")
+
+#: Statuses meaning nothing left the building. The complement of
+#: ``WIRE_STATUSES``, kept explicit so a new status has to be classified by
+#: whoever adds it rather than defaulting into whichever list is checked first.
+#: ``skipped`` covers a missing address, a suppressed or unsubscribed recipient,
+#: a spam-gate block, a warm-up hold, a spent daily cap and an engaged kill
+#: switch — none of which put a message on the wire.
+NON_WIRE_STATUSES = frozenset(
+    {"pending", "scheduled", "skipped", "suppressed", "halted", "error", "failed"}
+)
+
 
 class EmailTemplate(Base, OrgScopedMixin):
     """A reusable outreach email template.

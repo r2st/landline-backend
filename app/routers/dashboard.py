@@ -16,7 +16,7 @@ from app.models.lead_score import LeadScore
 from app.models.outreach import OutreachEvent
 from app.models.prospecting import ProspectCandidate
 from app.models.task import Task
-from app.models.email_template import EmailSend
+from app.models.email_template import EmailSend, WIRE_STATUSES
 from app.schemas.dashboard import (
     ActivityItem,
     DashboardKPIs,
@@ -48,7 +48,16 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 # from these two tiles. It also grows exactly when things go wrong — the day a
 # cap or a kill switch holds a blast is the day the dashboard reports the
 # biggest send.
-SENT_STATUSES = ("sent",)
+#
+# Removing ``skipped`` was right and the replacement — a bare ``("sent",)`` —
+# was wrong in the opposite direction, for a reason that lives in the model:
+# ``EmailSend.status`` is a *lifecycle* column, and ``app.routers.tracking``
+# advances it ``sent → opened → clicked → replied``. So this tile stopped
+# counting a send the moment its recipient opened it, and the tile beside it
+# counts exactly those opens. An open rate built from the two could once again
+# exceed 100% — the same defect the docstring below describes, arrived at from
+# the other side. See ``WIRE_STATUSES`` for the full vocabulary.
+SENT_STATUSES = WIRE_STATUSES
 
 
 async def _count_emails_sent(

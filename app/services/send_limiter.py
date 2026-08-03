@@ -38,7 +38,7 @@ from sqlalchemy import select, func
 from app.config import get_settings
 from app.models.outreach import OutreachEvent, OutreachEnrollment
 from app.models.contact import Contact
-from app.models.email_template import EmailSend
+from app.models.email_template import EmailSend, WIRE_STATUSES
 from app.org_context import get_current_org_id
 
 logger = logging.getLogger(__name__)
@@ -230,7 +230,7 @@ class SendLimiter:
             await db.execute(
                 select(func.max(EmailSend.sent_at)).where(
                     EmailSend.contact_id.in_(peers),
-                    EmailSend.status == "sent",
+                    EmailSend.status.in_(WIRE_STATUSES),
                     EmailSend.sent_at >= window_start,
                 )
             )
@@ -346,6 +346,18 @@ class SendLimiter:
         cap's Redis counter is *seeded* from: an undercounted seed hands back
         allowance the mailbox already spent, which is the cap failing in the one
         direction that matters.
+
+        The ``EmailSend`` half read ``status == "sent"``, which undercounted it
+        exactly that way. ``status`` is a lifecycle column and the tracking
+        endpoints advance it — ``sent → opened → clicked → replied`` — so a send
+        stopped being counted the moment its recipient opened it. The seed
+        therefore shed allowance *in proportion to how well the campaign was
+        landing*, and shed it on the paths where being wrong costs most: a Redis
+        restart or eviction mid-day re-seeds from this number, and a cold domain
+        on a warm-up ramp is precisely where over-sending does the damage.
+        ``WIRE_STATUSES`` is the whole ladder, plus ``bounced`` — a bounce is
+        mail that went out and was rejected afterwards, and it spent the
+        mailbox's allowance to do it.
         """
         events = (
             await db.execute(
@@ -357,7 +369,7 @@ class SendLimiter:
         direct = (
             await db.execute(
                 select(func.count(EmailSend.id))
-                .where(EmailSend.status == "sent")
+                .where(EmailSend.status.in_(WIRE_STATUSES))
                 .where(EmailSend.sent_at >= since)
             )
         ).scalar() or 0

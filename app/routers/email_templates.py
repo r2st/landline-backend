@@ -21,7 +21,12 @@ from app.database import get_db
 from app.dependencies import get_current_user_optional
 from app.models.company import Company
 from app.models.contact import Contact
-from app.models.email_template import EmailSend, EmailTemplate
+from app.models.email_template import (
+    DELIVERED_STATUSES,
+    EmailSend,
+    EmailTemplate,
+    WIRE_STATUSES,
+)
 from app.models.interaction import Interaction
 from app.models.user import User
 from app.org_context import scope_write_to_current_org
@@ -939,6 +944,20 @@ async def get_ab_stats(
     """Get A/B test results for a template."""
     from sqlalchemy import func as sa_func
 
+    # The denominator is *delivered* mail, not every row carrying a variant.
+    #
+    # The variant is assigned before the send is attempted, so a recipient who
+    # turned out to be suppressed, held by the warm-up ramp, stopped by the
+    # spam gate or refused by a spent daily cap still gets a row stamped "A" or
+    # "B" — with `status` recording that nothing left. Counting those inflated
+    # whichever arm happened to draw more of them, and the assignment is
+    # `i % 2` over an arbitrary contact list, so which arm that is has nothing
+    # to do with the copy under test. A subject line could win or lose on how
+    # many of its recipients had unsubscribed.
+    #
+    # `bounced` is excluded for the reason `FAILURE_STATUSES` gives: a bounce
+    # is a list problem, and putting it in the denominator of an open rate
+    # reports it as a copy problem.
     result = await db.execute(
         select(
             EmailSend.ab_variant,
@@ -949,6 +968,7 @@ async def get_ab_stats(
         .where(
             EmailSend.template_id == template_id,
             EmailSend.ab_variant.isnot(None),
+            EmailSend.status.in_(DELIVERED_STATUSES),
         )
         .group_by(EmailSend.ab_variant)
     )
@@ -969,23 +989,42 @@ async def get_ab_stats(
 
 @router.get("/email-sends/analytics", response_model=CampaignAnalytics)
 async def get_campaign_analytics(db: AsyncSession = Depends(get_db)):
-    """Get campaign analytics summary."""
+    """Campaign analytics summary — counts and rates over real sends only.
+
+    Every count here filtered on ``status != "scheduled"``, which is the widest
+    possible reading of "a send": it admits ``skipped`` (no address, suppressed,
+    unsubscribed, spam-gate block, warm-up hold, spent cap, engaged kill
+    switch), ``suppressed``, ``halted``, ``error``, ``failed`` and the
+    transient ``pending`` row the compose loop writes before it tries. None of
+    those put a message on the wire, and they are the denominator four
+    percentages are divided by — so every rate on this page dropped whenever
+    sending was being *prevented*, which is precisely when someone reads it.
+
+    ``WIRE_STATUSES`` is used for the volume tiles (a bounce was mail that went
+    out) and ``DELIVERED_STATUSES`` for the rate denominators (a bounce was
+    never delivered, so it is a list problem, not a copy problem).
+    """
     from datetime import timedelta
     from sqlalchemy import cast, Date
 
     # Total counts by time period
     all_sends = await db.execute(
-        select(func.count(EmailSend.id)).where(EmailSend.status != "scheduled")
+        select(func.count(EmailSend.id)).where(EmailSend.status.in_(WIRE_STATUSES))
     )
     total_all = all_sends.scalar() or 0
 
-    seven_days_ago = datetime.utcnow() - timedelta(days=7)
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    # tz-aware: ``sent_at`` is TIMESTAMP(timezone=True), and a naive
+    # ``utcnow()`` bound against it is interpreted in the session's timezone
+    # rather than UTC — a silent whole-hours window shift on any box not set to
+    # UTC.
+    now = datetime.now(timezone.utc)
+    seven_days_ago = now - timedelta(days=7)
+    thirty_days_ago = now - timedelta(days=30)
 
     sends_7d = await db.execute(
         select(func.count(EmailSend.id)).where(
             EmailSend.sent_at >= seven_days_ago,
-            EmailSend.status != "scheduled",
+            EmailSend.status.in_(WIRE_STATUSES),
         )
     )
     total_7d = sends_7d.scalar() or 0
@@ -993,12 +1032,22 @@ async def get_campaign_analytics(db: AsyncSession = Depends(get_db)):
     sends_30d = await db.execute(
         select(func.count(EmailSend.id)).where(
             EmailSend.sent_at >= thirty_days_ago,
-            EmailSend.status != "scheduled",
+            EmailSend.status.in_(WIRE_STATUSES),
         )
     )
     total_30d = sends_30d.scalar() or 0
 
-    # Rates
+    # Rates. Engagement divides by *delivered* mail; the bounce rate divides by
+    # everything that reached the wire, because a bounce is in its own
+    # numerator and excluding it from its own denominator understates it.
+    delivered_total = (
+        await db.execute(
+            select(func.count(EmailSend.id)).where(
+                EmailSend.status.in_(DELIVERED_STATUSES)
+            )
+        )
+    ).scalar() or 0
+
     if total_all > 0:
         opened = await db.execute(
             select(func.count(EmailSend.id)).where(EmailSend.opened_at.isnot(None))
@@ -1012,9 +1061,10 @@ async def get_campaign_analytics(db: AsyncSession = Depends(get_db)):
         bounced = await db.execute(
             select(func.count(EmailSend.id)).where(EmailSend.status == "bounced")
         )
-        open_rate = round((opened.scalar() or 0) / total_all * 100, 1)
-        click_rate = round((clicked.scalar() or 0) / total_all * 100, 1)
-        reply_rate = round((replied.scalar() or 0) / total_all * 100, 1)
+        _d = delivered_total or 1
+        open_rate = round((opened.scalar() or 0) / _d * 100, 1)
+        click_rate = round((clicked.scalar() or 0) / _d * 100, 1)
+        reply_rate = round((replied.scalar() or 0) / _d * 100, 1)
         bounce_rate = round((bounced.scalar() or 0) / total_all * 100, 1)
     else:
         open_rate = click_rate = reply_rate = bounce_rate = 0.0
@@ -1027,7 +1077,7 @@ async def get_campaign_analytics(db: AsyncSession = Depends(get_db)):
         )
         .where(
             EmailSend.sent_at >= thirty_days_ago,
-            EmailSend.status != "scheduled",
+            EmailSend.status.in_(WIRE_STATUSES),
         )
         .group_by(cast(EmailSend.sent_at, Date))
         .order_by(cast(EmailSend.sent_at, Date))
