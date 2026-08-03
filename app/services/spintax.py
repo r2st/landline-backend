@@ -29,6 +29,28 @@ Rules the parser honours:
 The parser is deliberately lenient — an unbalanced ``{`` is treated as a literal
 character rather than raising, because malformed copy must never blow up a send.
 
+Leniency is not the same as cheapness
+-------------------------------------
+That fallback used to cost exponential time. ``_parse_group`` discovered an
+unterminated ``{`` by scanning to the end of the string, returned ``None``, and
+the caller then advanced one character and parsed the remainder again — including
+every nested ``{`` inside it, each of which repeated the same doomed scan. So
+``k`` unmatched braces cost ``2**k``: 20 of them took 0.6s, 24 took 10s, and 30
+would have wedged a Celery worker for the better part of an hour.
+
+Nothing exotic is needed to reach that. This runs on the send path, on copy that
+has *already been through Jinja*, so the braces are a mix of what an author typed
+and what merge fields interpolated — a company name, a research snippet, an
+LLM-drafted line that opened a JSON-ish brace and never closed it.
+:func:`_brace_matches` now answers "does this ``{`` close?" once, in a single
+linear scan, so an unmatched brace is literal text at no cost.
+
+The other half is depth. Both parsing and rendering recurse per nesting level, so
+a few hundred *balanced* nested groups raised ``RecursionError`` — which is an
+exception, so "malformed copy never blows up a send" was untrue in that direction
+too. :data:`MAX_NESTING_DEPTH` bounds it: past that depth a ``{`` is literal, the
+same answer the parser already gives for a brace it cannot use.
+
 :func:`resolve_tracked` returns both the rendered string and the sequence of
 choices made, so a send path can persist *which* variant went out and attribute
 downstream engagement to it.
@@ -42,6 +64,41 @@ from typing import Optional, Union
 
 # Characters that carry meaning and can be backslash-escaped to a literal.
 _ESCAPABLE = "{}|\\"
+
+# How deep ``{`` blocks may nest before a ``{`` is read as a literal character.
+# Parsing and rendering both recurse once per level, so this is what keeps a
+# pathological template from raising ``RecursionError`` out of a send. Real
+# spintax nests two or three deep; ``{a|{b|c}|d}`` in the module docstring is the
+# realistic maximum, and 32 leaves an order of magnitude of headroom over it.
+MAX_NESTING_DEPTH = 32
+
+
+def _brace_matches(s: str) -> set[int]:
+    """Indices of every ``{`` in *s* that has a matching unescaped ``}``.
+
+    One linear pass with a stack, honouring the same backslash escapes the parser
+    does, so ``\\{`` opens nothing and ``\\}`` closes nothing.
+
+    This exists to make the unterminated-brace case free. The parser's fallback
+    for a ``{`` that never closes is to treat it as literal text, and it used to
+    *discover* that by parsing the rest of the string — recursively, once per
+    nested brace, so the cost doubled with every extra unmatched ``{``. Asking
+    the question once, up front, turns that into a lookup.
+    """
+    stack: list[int] = []
+    matched: set[int] = set()
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n and s[i + 1] in _ESCAPABLE:
+            i += 2
+            continue
+        if c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            matched.add(stack.pop())
+        i += 1
+    return matched
 
 
 class _Group:
@@ -63,11 +120,18 @@ class _Group:
 _Segment = Union[str, _Group]
 
 
-def _parse_sequence(s: str, i: int, stops: str) -> tuple[list[_Segment], int]:
+def _parse_sequence(
+    s: str, i: int, stops: str, matches: set[int], depth: int = 0
+) -> tuple[list[_Segment], int]:
     """Parse text into segments until an unescaped char in *stops* (or EOS).
 
     Returns ``(segments, index)`` where *index* points at the stop char (or the
     string end). Nested groups are parsed recursively.
+
+    *matches* is :func:`_brace_matches` for the whole of *s*; *depth* is the
+    current nesting level. Together they are what bound the work: a ``{`` that is
+    unmatched, or already :data:`MAX_NESTING_DEPTH` levels down, becomes a
+    literal without recursing.
     """
     segments: list[_Segment] = []
     buf: list[str] = []
@@ -81,7 +145,13 @@ def _parse_sequence(s: str, i: int, stops: str) -> tuple[list[_Segment], int]:
         if c in stops:
             break
         if c == "{":
-            group, ni = _parse_group(s, i)
+            group, ni = (
+                _parse_group(s, i, matches, depth)
+                if i in matches and depth < MAX_NESTING_DEPTH
+                # Unbalanced, or nested past what we're willing to recurse
+                # through. Either way there is no group here.
+                else (None, i)
+            )
             if group is None:
                 # Unbalanced brace — treat it as a literal character.
                 buf.append("{")
@@ -100,17 +170,23 @@ def _parse_sequence(s: str, i: int, stops: str) -> tuple[list[_Segment], int]:
     return segments, i
 
 
-def _parse_group(s: str, i: int) -> tuple[Optional[_Group], int]:
+def _parse_group(
+    s: str, i: int, matches: set[int], depth: int = 0
+) -> tuple[Optional[_Group], int]:
     """Parse a ``{...}`` block starting at ``s[i] == '{'``.
 
     Returns ``(group, next_index)``, or ``(None, i)`` when the brace is never
     closed (so the caller can fall back to treating ``{`` as literal text).
+
+    Only called for an ``i`` known to be in *matches*, so the unterminated return
+    is now unreachable in practice; it is kept because it is the contract the
+    caller's fallback is written against, not an assertion about the caller.
     """
     j = i + 1
     alternatives: list[list[_Segment]] = []
     n = len(s)
     while True:
-        seg, j = _parse_sequence(s, j, "|}")
+        seg, j = _parse_sequence(s, j, "|}", matches, depth + 1)
         alternatives.append(seg)
         if j >= n:
             return None, i  # unterminated group
@@ -119,6 +195,12 @@ def _parse_group(s: str, i: int) -> tuple[Optional[_Group], int]:
             continue
         # s[j] == '}'
         return _Group(alternatives), j + 1
+
+
+def _parse(template: str) -> list[_Segment]:
+    """Parse a whole template into segments. The one entry point to the parser."""
+    segments, _ = _parse_sequence(template, 0, "", _brace_matches(template))
+    return segments
 
 
 def _render_segments(segments: list[_Segment], rng, choices: list[dict]) -> str:
@@ -189,7 +271,7 @@ def resolve_tracked(template: Optional[str], *, rng: Optional[random.Random] = N
     if not template:
         return SpintaxResult(text=template or "", choices=[])
     generator = rng if rng is not None else random
-    segments, _ = _parse_sequence(template, 0, "")
+    segments = _parse(template)
     choices: list[dict] = []
     text = _render_segments(segments, generator, choices)
     return SpintaxResult(text=text, choices=choices)
@@ -204,7 +286,7 @@ def has_spintax(template: Optional[str]) -> bool:
     """True if *template* contains at least one resolvable spintax group."""
     if not template:
         return False
-    segments, _ = _parse_sequence(template, 0, "")
+    segments = _parse(template)
     return _has_spintax_segments(segments)
 
 
@@ -226,5 +308,5 @@ def count_variations(template: Optional[str]) -> int:
     """
     if not template:
         return 1
-    segments, _ = _parse_sequence(template, 0, "")
+    segments = _parse(template)
     return _count_segments(segments)
