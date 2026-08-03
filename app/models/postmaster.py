@@ -29,9 +29,21 @@ POSTMASTER_REPUTATIONS = ("HIGH", "MEDIUM", "LOW", "BAD", "REPUTATION_CATEGORY_U
 
 
 class PostmasterAccount(Base, OrgScopedMixin):
-    """OAuth connection to Google Postmaster Tools for one Google account."""
+    """OAuth connection to Google Postmaster Tools for one Google account.
+
+    The ``email`` / ``google_sub`` uniques are **per organization**. Migration
+    093 wrote them platform-wide, which made a Google identity connectable by
+    exactly one tenant on the whole deployment — see migration 115 for what that
+    did to the second tenant who tried.
+    """
 
     __tablename__ = "postmaster_accounts"
+    __table_args__ = (
+        UniqueConstraint("org_id", "email", name="uq_postmaster_accounts_org_email"),
+        UniqueConstraint(
+            "org_id", "google_sub", name="uq_postmaster_accounts_org_google_sub"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -39,8 +51,8 @@ class PostmasterAccount(Base, OrgScopedMixin):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True)
-    google_sub: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    google_sub: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     display_name: Mapped[str | None] = mapped_column(String(255))
 
     # OAuth tokens — encrypted at rest with Fernet (see app.services.crypto).
@@ -71,7 +83,12 @@ class PostmasterMetric(Base, OrgScopedMixin):
 
     __tablename__ = "postmaster_metrics"
     __table_args__ = (
-        UniqueConstraint("domain", "metric_date", name="uq_postmaster_domain_date"),
+        # Per organization. Two tenants monitoring the same domain each keep
+        # their own daily row; platform-wide, the second one to pull collided
+        # with a row it could not see. See migration 115.
+        UniqueConstraint(
+            "org_id", "domain", "metric_date", name="uq_postmaster_org_domain_date"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

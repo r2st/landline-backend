@@ -159,10 +159,26 @@ async def oauth_callback(
         logger.exception("Unexpected Postmaster OAuth callback failure")
         return HTMLResponse(_callback_html(False, "Unexpected error connecting Postmaster."))
 
+    # Scoped to the connecting org. The callback is a public route — no org is
+    # bound by a dependency, so the filter takes its documented no-op branch and
+    # the predicate has to be written by hand.
+    #
+    # This lookup used to be global. It had to be, because migration 093 made
+    # ``google_sub`` unique platform-wide, and a global lookup finds *other
+    # tenants'* rows: org B reconnecting a Google account org A already held
+    # took the update branch on org A's row, overwriting org A's tokens with org
+    # B's and reassigning ``user_id`` across the boundary, while ``org_id``
+    # stayed put. Org B was told "Connected" and their own status page — which
+    # is org-scoped — showed nothing. Migration 115 scopes the constraint, so
+    # each org keeps its own connection to the same Google identity.
+    owning_org_id = connecting_org_id or APPREND_ORG_ID
     account = (
         await db.execute(
             select(PostmasterAccount)
-            .where(PostmasterAccount.google_sub == connected.google_sub)
+            .where(
+                PostmasterAccount.google_sub == connected.google_sub,
+                PostmasterAccount.org_id == owning_org_id,
+            )
             .execution_options(skip_org_filter=True)
         )
     ).scalar_one_or_none()
@@ -178,7 +194,7 @@ async def oauth_callback(
                 "in your Google Account and try connecting again.",
             ))
         account = PostmasterAccount(
-            org_id=connecting_org_id or APPREND_ORG_ID,
+            org_id=owning_org_id,
             user_id=connecting_user_id,
             email=connected.email,
             google_sub=connected.google_sub,
