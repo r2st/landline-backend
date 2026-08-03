@@ -3,7 +3,16 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -63,16 +72,46 @@ class EmailTemplate(Base, OrgScopedMixin):
 
     The body is HTML and may contain merge fields rendered at send/preview time:
     {{first_name}}, {{company}}, {{industry_segment}}, {{city}}, {{contact_title}}.
-    At most one template is marked ``is_default``; this is enforced in production
-    by a partial unique index (see migration 002) and in application logic.
+    At most one template **per organization** is marked ``is_default``, and names
+    are unique **within** an organization. Both were platform-wide until
+    migration 114 — see the ``__table_args__`` note below.
     """
 
     __tablename__ = "email_templates"
 
+    # Migration 002 predates multi-tenancy and wrote both of these with no org:
+    # ``UNIQUE (name)`` and ``UNIQUE (is_default) WHERE is_default``. Migration
+    # 078 added ``org_id`` here and widened neither, because autogenerate diffs
+    # models against the schema and the model declared exactly what the database
+    # already had.
+    #
+    # A platform-wide ``UNIQUE (is_default) WHERE is_default`` allows **one
+    # default template across every tenant on the deployment**. The first-party
+    # org holds it, so no other organization can mark one: their org-scoped read
+    # correctly reports no default, the write then collides with a row in a
+    # tenant they cannot see, and the handler answers "a template with that name
+    # already exists" — the wrong cause, for every tenant, on their first
+    # template.
+    #
+    # See ``app.models.email_signature`` for the same pair on the signatures
+    # table, and why the quiet failure (mail sent with no default applied) is
+    # worse than the loud one.
+    __table_args__ = (
+        UniqueConstraint("org_id", "name", name="uq_email_templates_org_name"),
+        Index(
+            "uq_email_templates_org_one_default",
+            "org_id",
+            "is_default",
+            unique=True,
+            postgresql_where=text("is_default"),
+            sqlite_where=text("is_default"),
+        ),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     subject: Mapped[str] = mapped_column(String(500), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

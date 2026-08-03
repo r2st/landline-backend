@@ -52,6 +52,24 @@ REVIEWED: dict[str, str] = {
 }
 
 
+def _is_partial(index) -> bool:
+    """True when a unique index carries a ``WHERE`` clause on any dialect.
+
+    A partial unique index constrains nothing outside its own predicate, so it
+    cannot justify a single-row assertion. ``UNIQUE (org_id, is_default) WHERE
+    is_default`` promises one default per org and says nothing whatever about
+    the ``is_default = false`` rows, which are most of the table.
+
+    Checked across dialect kwargs rather than one, because the predicate is
+    spelled per dialect (``postgresql_where`` in production, ``sqlite_where``
+    for the harness) and an index declaring only one of them is still partial.
+    """
+    return any(
+        key.endswith("_where") and value is not None
+        for key, value in index.dialect_kwargs.items()
+    )
+
+
 def _unique_column_sets() -> dict[str, list[set[str]]]:
     """Per model, the column sets the schema promises are unique."""
     out = collections.defaultdict(list)
@@ -66,7 +84,9 @@ def _unique_column_sets() -> dict[str, list[set[str]]]:
             if type(con).__name__ == "UniqueConstraint"
         )
         out[name].extend(
-            {c.name for c in ix.columns} for ix in table.indexes if ix.unique
+            {c.name for c in ix.columns}
+            for ix in table.indexes
+            if ix.unique and not _is_partial(ix)
         )
     return out
 

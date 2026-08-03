@@ -75,6 +75,17 @@ def _unique_column_sets() -> dict[str, list[set[str]]]:
     ``org_id`` is subtracted from composite unique constraints: it is exactly
     the column a cross-tenant write fails to supply, so counting it as part of a
     uniqueness promise would let the shapes under test pass.
+
+    **A partial unique index promises nothing and is skipped entirely.** The
+    subtraction above assumes a composite unique is ``(org_id, <naturally unique
+    key>)``, which is true of every full one here — and false of a partial one in
+    a way that quietly disarms this whole file. ``UNIQUE (org_id, is_default)
+    WHERE is_default`` reduces to ``{is_default}``, so ``where(is_default ==
+    True)`` reads as an equality on a unique column and the scan stops flagging
+    it — the exact shape the signature and template routers had, and the exact
+    shape the planted self-test below uses. The index does not even claim what
+    the subtraction infers: outside its predicate it constrains nothing, so
+    ``is_default == False`` matches every non-default row in the table.
     """
     out = collections.defaultdict(list)
     for mapper in Base.registry.mappers:
@@ -86,11 +97,25 @@ def _unique_column_sets() -> dict[str, list[set[str]]]:
             if cols and cols != {"org_id"}:
                 out[name].append(cols - {"org_id"})
         for index in table.indexes:
-            if index.unique:
+            if index.unique and not _is_partial(index):
                 cols = {c.name for c in index.columns}
                 if cols and cols != {"org_id"}:
                     out[name].append(cols - {"org_id"})
     return out
+
+
+def _is_partial(index) -> bool:
+    """True when the index carries a ``WHERE`` clause on any dialect.
+
+    Checked across dialect kwargs rather than one, because the predicate is
+    spelled per dialect (``postgresql_where`` in production, ``sqlite_where``
+    for the test harness) and a model declaring only one of them is still a
+    partial index everywhere it exists.
+    """
+    return any(
+        key.endswith("_where") and value is not None
+        for key, value in index.dialect_kwargs.items()
+    )
 
 
 def _attr_to_column() -> dict[str, dict[str, str]]:
@@ -289,6 +314,37 @@ def test_the_scan_finds_a_planted_violation(tmp_path):
         f"the scan did not flag an unmistakable violation — it is matching "
         f"nothing. Found: {found}"
     )
+
+
+def test_a_partial_unique_index_is_not_a_uniqueness_promise():
+    """``is_default`` must never read as a column that pins one row.
+
+    Migration 114 scoped the template/signature "one default" indexes to the org
+    — ``UNIQUE (org_id, is_default) WHERE is_default``. That is the right schema
+    and it very nearly disarmed this file: ``_unique_column_sets`` subtracts
+    ``org_id`` from composite uniques, which reduces this one to
+    ``{is_default}``, and from there ``where(is_default == True)`` looks like an
+    equality on a unique column. The scan would have gone quiet about the exact
+    two routers it was written for, while every assertion in this file still
+    passed.
+
+    Asserted against the live model rather than a planted one, because what has
+    to stay true is a property of the schema this codebase actually has.
+    """
+    from app.models.email_template import EmailTemplate  # noqa: F401
+    from app.models.email_signature import EmailSignature  # noqa: F401
+
+    uniques = _unique_column_sets()
+    for model in ("EmailTemplate", "EmailSignature"):
+        assert {"is_default"} not in uniques[model], (
+            f"{model}: a partial unique index on is_default is being read as a "
+            f"uniqueness promise, which silences this scan for the two routers "
+            f"it exists to cover. Got: {uniques[model]}"
+        )
+        # The org-scoped *name* constraint is a full unique and must survive the
+        # partial-index filter, or the check swings the other way and starts
+        # flagging writes that genuinely do pin one row.
+        assert {"name"} in uniques[model], uniques[model]
 
 
 @pytest.mark.parametrize(
