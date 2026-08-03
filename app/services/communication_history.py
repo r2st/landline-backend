@@ -16,7 +16,7 @@ from app.models.call import CallTask
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_reply import EmailReply
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUS_VALUES, EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.interaction import Interaction
 from app.models.user import User
@@ -76,7 +76,7 @@ async def get_contact_communications(
         await db.execute(
             select(EmailSend).where(
                 EmailSend.contact_id == contact_id,
-                EmailSend.status != "skipped",
+                EmailSend.status.notin_(NON_WIRE_STATUS_VALUES),
             )
         )
     ).scalars().all()

@@ -60,7 +60,7 @@ from app.models.bounce_record import BounceRecord
 from app.models.complaint_record import ComplaintRecord
 from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUS_VALUES, EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import system_settings
 from app.services.outreach_events import count_attempts
@@ -335,7 +335,17 @@ class DangerMonitor:
             )
         es_base = select(func.count(EmailSend.id)).where(and_(*es_filters))
 
-        es_sent = (await db.execute(es_base.where(EmailSend.status != "skipped"))).scalar() or 0
+        # ``!= "skipped"`` predates ``NON_WIRE_STATUSES`` and lets four other
+        # non-sends into the denominator of the brake. Two of them are the
+        # send gate *refusing* — ``suppressed`` (do-not-contact) and
+        # ``halted`` (the kill switch) — so a rail that had just paused
+        # sending watched its own bounce rate fall as the refusals piled up.
+        # The queued pair is quieter and no better: ``sent_at`` is a NOT NULL
+        # ``server_default``, so a blast scheduled for next Tuesday is stamped
+        # now and dilutes today's rate the moment it is composed.
+        es_sent = (
+            await db.execute(es_base.where(EmailSend.status.notin_(NON_WIRE_STATUS_VALUES)))
+        ).scalar() or 0
         es_bounces = (await db.execute(es_base.where(EmailSend.status == "bounced"))).scalar() or 0
         es_complaints = (
             await db.execute(es_base.where(EmailSend.status.in_(_COMPLAINT_STATUSES)))

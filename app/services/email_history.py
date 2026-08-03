@@ -23,7 +23,7 @@ from app.config import get_settings
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.email_reply import EmailReply
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUS_VALUES, EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.inbox_label import InboxLabel, InboxThreadLabel
 from app.models.inbox_thread_state import InboxThreadState
@@ -524,7 +524,7 @@ class EmailHistoryService:
             await db.execute(
                 select(EmailSend).where(
                     EmailSend.contact_id.in_(contact_ids),
-                    EmailSend.status != "skipped",
+                    EmailSend.status.notin_(NON_WIRE_STATUS_VALUES),
                 )
             )
         ).scalars().all()
@@ -892,7 +892,9 @@ class EmailHistoryService:
             return ids
 
         # Build sent messages query
-        sends_query = select(EmailSend).where(EmailSend.status != "skipped")
+        sends_query = select(EmailSend).where(
+            EmailSend.status.notin_(NON_WIRE_STATUS_VALUES)
+        )
         replies_query = select(EmailReply)
         # Sequence sends live on OutreachEvent, not EmailSend (see
         # ``_fetch_sequence_sends``). They are outbound, so they follow the
@@ -1640,7 +1642,7 @@ class EmailHistoryService:
                 ids_by_email.setdefault(acc_email.lower(), []).append(acc_id)
 
         sends_query = select(EmailSend).where(
-            EmailSend.status != "skipped", EmailSend.sent_at >= since
+            EmailSend.status.notin_(NON_WIRE_STATUS_VALUES), EmailSend.sent_at >= since
         )
         replies_query = select(EmailReply).where(EmailReply.received_at >= since)
 

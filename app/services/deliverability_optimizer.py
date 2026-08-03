@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.bounce_record import BounceRecord
 from app.models.complaint_record import ComplaintRecord
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUS_VALUES, EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.services.email_dispatch import get_sending_accounts, _transport_for
@@ -101,7 +101,13 @@ class DeliverabilityOptimizer:
         )
         base = select(func.count(EmailSend.id)).where(EmailSend.sent_at >= cutoff, match)
 
-        send_sent = (await db.execute(base.where(EmailSend.status != "skipped"))).scalar() or 0
+        # Same classification as everywhere else: a queued row and a row the
+        # send gate refused are not sends, and both inflated this denominator
+        # — which is the one the 7-day reputation score and the sender
+        # throttle divide by. See ``NON_WIRE_STATUSES``.
+        send_sent = (
+            await db.execute(base.where(EmailSend.status.notin_(NON_WIRE_STATUS_VALUES)))
+        ).scalar() or 0
         send_bounces = (await db.execute(base.where(EmailSend.status == "bounced"))).scalar() or 0
         send_complaints = (
             await db.execute(base.where(EmailSend.status.in_(_COMPLAINT_STATUSES)))

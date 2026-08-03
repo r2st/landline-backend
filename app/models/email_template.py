@@ -66,6 +66,11 @@ NON_WIRE_STATUSES = frozenset(
     {"pending", "scheduled", "skipped", "suppressed", "halted", "error", "failed"}
 )
 
+#: The same set as a stable, ordered tuple, for SQL ``IN`` / ``NOT IN`` clauses.
+#: A frozenset iterates in an arbitrary order, which would emit a differently
+#: ordered ``IN (...)`` list per process and defeat statement-plan caching.
+NON_WIRE_STATUS_VALUES = tuple(sorted(NON_WIRE_STATUSES))
+
 
 class EmailTemplate(Base, OrgScopedMixin):
     """A reusable outreach email template.
