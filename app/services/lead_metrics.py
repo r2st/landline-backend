@@ -15,7 +15,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.company import Company
@@ -163,6 +163,34 @@ async def leads_and_deals_by_org(
     return out
 
 
+def window_clause(
+    start: Optional[datetime], end: Optional[datetime], *columns
+):
+    """SQL predicate for "any of ``columns`` lands in the half-open window".
+
+    Mirrors :func:`app.services.timeframes.in_range` — inclusive lower bound,
+    exclusive upper, a ``None`` bound unbounded on that side, and a NULL column
+    never a match. Returns ``None`` when both bounds are open, so the caller can
+    skip the ``.where()`` entirely.
+
+    A row is kept when *any* of its timestamps qualifies because one row can
+    emit several events at different times: an ``EmailSend`` sent in March and
+    replied to in May belongs to the May window on the strength of
+    ``replied_at`` alone.
+    """
+    if start is None and end is None:
+        return None
+    legs = []
+    for col in columns:
+        bounds = [col.isnot(None)]
+        if start is not None:
+            bounds.append(col >= start)
+        if end is not None:
+            bounds.append(col < end)
+        legs.append(and_(*bounds))
+    return or_(*legs)
+
+
 async def org_names(db: AsyncSession, org_ids) -> dict[uuid.UUID, str]:
     """Resolve org ids to names (Organization is not org-scoped, so no filter applies)."""
     ids = [i for i in org_ids if i is not None]
@@ -185,9 +213,22 @@ async def recent_events(
     discovery — the read-side union behind ``GET /leads/recent``. ``cap`` bounds
     how many rows are pulled per source so a huge history can't blow up the
     response; the caller sorts/paginates the merged result.
+
+    **The window is a SQL predicate, not a post-filter.** ``cap`` truncates to
+    the newest rows, so applying the window afterwards means the window can only
+    ever see the most recent ``cap`` rows in the *table* — and a request for an
+    older window is answered from rows that are all newer than it. On a tenant
+    past ``cap`` sends the endpoint returns an empty feed for every historical
+    timeframe, with no error and a plausible-looking ``total: 0``. Filtering
+    first makes ``cap`` bound the window's rows, which is what it was for.
     """
     items: list[RecentLeadEvent] = []
 
+    send_window = window_clause(
+        start, end,
+        EmailSend.sent_at, EmailSend.opened_at,
+        EmailSend.clicked_at, EmailSend.replied_at,
+    )
     send_query = (
         select(EmailSend, Contact, Company)
         .outerjoin(Contact, EmailSend.contact_id == Contact.id)
@@ -195,6 +236,8 @@ async def recent_events(
         .order_by(EmailSend.sent_at.desc())
         .limit(cap)
     )
+    if send_window is not None:
+        send_query = send_query.where(send_window)
     for send, contact, company in (await db.execute(send_query)).all():
         if send.status == "skipped":
             continue
@@ -241,6 +284,9 @@ async def recent_events(
         .order_by(OutreachEvent.occurred_at.desc())
         .limit(cap)
     )
+    event_window = window_clause(start, end, OutreachEvent.occurred_at)
+    if event_window is not None:
+        event_query = event_query.where(event_window)
     for event, contact, company in (await db.execute(event_query)).all():
         etype = _OUTREACH_TYPE_MAP.get(event.event_type)
         if etype is None or not in_range(event.occurred_at, start, end):
@@ -259,6 +305,9 @@ async def recent_events(
         ))
 
     cand_query = select(ProspectCandidate).order_by(ProspectCandidate.created_at.desc()).limit(cap)
+    cand_window = window_clause(start, end, ProspectCandidate.created_at)
+    if cand_window is not None:
+        cand_query = cand_query.where(cand_window)
     for cand in (await db.execute(cand_query)).scalars().all():
         if not in_range(cand.created_at, start, end):
             continue

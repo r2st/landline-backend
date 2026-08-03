@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -166,6 +166,29 @@ def _in_window(
     return True
 
 
+def _window_sql(start: Optional[datetime], end: Optional[datetime], *columns):
+    """SQL counterpart to :func:`_in_window` — same closed-interval semantics.
+
+    A row is kept when *any* of ``columns`` lands in the window, because one row
+    can emit events at several different times: an ``EmailSend`` sent in March
+    and replied to in May belongs to the May window on ``replied_at`` alone.
+    NULL never matches, matching ``_in_window``'s "an un-stamped row didn't
+    happen". Returns ``None`` when both bounds are open so the caller can skip
+    the ``.where()``.
+    """
+    if start is None and end is None:
+        return None
+    legs = []
+    for col in columns:
+        bounds = [col.isnot(None)]
+        if start is not None:
+            bounds.append(col >= start)
+        if end is not None:
+            bounds.append(col <= end)
+        legs.append(and_(*bounds))
+    return or_(*legs)
+
+
 def _sev(event_type: str) -> str:
     return _SEVERITY.get(event_type, "ok")
 
@@ -206,6 +229,14 @@ async def _collect_events(
     ``sent`` + ``opened`` + ``clicked`` + ``reply`` event at different times).
     ``cap`` bounds how many rows we pull per source so a huge history can't blow
     up the response.
+
+    **The window also goes into SQL**, and has to. ``cap`` truncates to the
+    newest rows, so a window applied only to the emitted events sees nothing but
+    the newest ``cap`` rows of each *table* — and a request for an older window
+    is answered entirely from rows that postdate it. Past ``cap`` sends, every
+    historical timeframe on this feed empties out, with no error and a
+    believable ``total: 0``. The per-event pass below stays: it is what splits
+    one row's four timestamps into four events, which SQL can't do here.
     """
     items: list[DialtoneEvent] = []
     q_lower = q.lower().strip() if q else None
@@ -217,6 +248,13 @@ async def _collect_events(
         .order_by(EmailSend.sent_at.desc())
         .limit(cap)
     )
+    send_window = _window_sql(
+        start, end,
+        EmailSend.sent_at, EmailSend.opened_at,
+        EmailSend.clicked_at, EmailSend.replied_at,
+    )
+    if send_window is not None:
+        send_query = send_query.where(send_window)
     if contact_id is not None:
         send_query = send_query.where(EmailSend.contact_id == contact_id)
     for send, contact in (await db.execute(send_query)).all():
@@ -309,6 +347,9 @@ async def _collect_events(
         .order_by(OutreachEvent.occurred_at.desc())
         .limit(cap)
     )
+    event_window = _window_sql(start, end, OutreachEvent.occurred_at)
+    if event_window is not None:
+        event_query = event_query.where(event_window)
     if contact_id is not None:
         event_query = event_query.where(OutreachEnrollment.contact_id == contact_id)
     for event, contact in (await db.execute(event_query)).all():
@@ -363,6 +404,13 @@ async def _collect_events(
         .order_by(EmailReply.classified_at.desc())
         .limit(cap)
     )
+    # The emitted timestamp falls back to ``received_at`` when a reply was
+    # classified without one being stamped, so both columns are candidates.
+    reply_window = _window_sql(
+        start, end, EmailReply.classified_at, EmailReply.received_at
+    )
+    if reply_window is not None:
+        reply_query = reply_query.where(reply_window)
     if contact_id is not None:
         reply_query = reply_query.where(EmailReply.contact_id == contact_id)
     for reply, contact in (await db.execute(reply_query)).all():
@@ -405,6 +453,9 @@ async def _collect_events(
         .order_by(Contact.phone_enriched_at.desc())
         .limit(cap)
     )
+    phone_window = _window_sql(start, end, Contact.phone_enriched_at)
+    if phone_window is not None:
+        phone_query = phone_query.where(phone_window)
     if contact_id is not None:
         phone_query = phone_query.where(Contact.id == contact_id)
     for contact in (await db.execute(phone_query)).scalars().all():
@@ -440,6 +491,9 @@ async def _collect_events(
             .order_by(ProspectCandidate.created_at.desc())
             .limit(cap)
         )
+        cand_window = _window_sql(start, end, ProspectCandidate.created_at)
+        if cand_window is not None:
+            cand_query = cand_query.where(cand_window)
         candidates = [
             cand
             for cand in (await db.execute(cand_query)).scalars().all()
@@ -485,6 +539,14 @@ async def _collect_events(
             .order_by(DangerSignalEvent.triggered_at.desc())
             .limit(cap)
         )
+        # A trip emits two events — the pause and, later, the acknowledged
+        # resume — so a trip whose resume falls in the window belongs to it even
+        # when the pause itself predates the window entirely.
+        trip_window = _window_sql(
+            start, end, DangerSignalEvent.triggered_at, DangerSignalEvent.resolved_at
+        )
+        if trip_window is not None:
+            trip_query = trip_query.where(trip_window)
         for trip in (await db.execute(trip_query)).scalars().all():
             reason = (trip.details or {}).get("reason") or (
                 f"{trip.metric} breached on {trip.scope}"
@@ -536,6 +598,9 @@ async def _collect_events(
             .order_by(AbTest.declared_at.desc())
             .limit(cap)
         )
+        ab_window = _window_sql(start, end, AbTest.declared_at)
+        if ab_window is not None:
+            concluded_query = concluded_query.where(ab_window)
         for test in (await db.execute(concluded_query)).scalars().all():
             winner = (
                 await db.execute(
