@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint, Integer, String, Text, ARRAY, func
+from sqlalchemy import CheckConstraint, Index, Integer, String, Text, ARRAY, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,6 +29,9 @@ class Company(Base, OrgScopedMixin):
             "pipeline_stage IN ('new_lead','researching','outreach','engaged','negotiating','client','churned')",
             name="ck_companies_pipeline_stage",
         ),
+        # Migration 001. Declared here so the model matches the database — see
+        # ``tests/test_index_declarations.py``.
+        Index("ix_companies_naics", "naics_code"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

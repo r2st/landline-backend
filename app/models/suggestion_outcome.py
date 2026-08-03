@@ -9,7 +9,7 @@ lead to replies/meetings get boosted; ones that get dismissed get suppressed).
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,6 +24,11 @@ class SuggestionOutcome(Base, OrgScopedMixin):
             "status IN ('suggested','accepted','dismissed','completed')",
             name="ck_suggestion_outcomes_status",
         ),
+        # Migration 047. The other four columns it indexed carry ``index=True``
+        # and so were already in the metadata; these two were not. See
+        # ``tests/test_index_declarations.py``.
+        Index("ix_suggestion_outcomes_key", "suggestion_key"),
+        Index("ix_suggestion_outcomes_type", "suggestion_type"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

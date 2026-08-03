@@ -3,7 +3,16 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, func, inspect as sa_inspect
+from sqlalchemy import (
+    Boolean,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    inspect as sa_inspect,
+)
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,6 +22,15 @@ from app.models.mixins import OrgScopedMixin
 
 class Contact(Base, OrgScopedMixin):
     __tablename__ = "contacts"
+    __table_args__ = (
+        # Every company detail page, every export and the whole enrolment path
+        # loads a company's contacts by this FK; Postgres does not index a
+        # foreign key for you. Created by migration 001 and declared here so the
+        # model matches the database — see ``tests/test_index_declarations.py``
+        # for why an index the database has and the model doesn't is dangerous
+        # rather than merely untidy.
+        Index("ix_contacts_company", "company_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

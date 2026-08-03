@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, Float, ForeignKey, Integer, String, func
+from sqlalchemy import CheckConstraint, Float, ForeignKey, Index, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,6 +16,9 @@ class LeadScore(Base, OrgScopedMixin):
     __table_args__ = (
         CheckConstraint("score_type IN ('rule_based', 'ai')", name="ck_lead_scores_type"),
         CheckConstraint("fit_score BETWEEN 0 AND 100", name="ck_lead_scores_fit"),
+        # Migration 001. Declared here so the model matches the database — see
+        # ``tests/test_index_declarations.py``.
+        Index("ix_lead_scores_company", "company_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

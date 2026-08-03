@@ -35,6 +35,9 @@ class OutreachEnrollment(Base, OrgScopedMixin):
             "'unsubscribed','pending_review')",
             name="ck_enrollment_status",
         ),
+        # Migration 001. The queue sweep filters on status on every pass. See
+        # ``tests/test_index_declarations.py``.
+        Index("ix_enrollment_status", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -198,6 +201,10 @@ class OutreachEvent(Base, OrgScopedMixin):
             "event_type",
             desc("occurred_at"),
         ),
+        # Migration 001. This is the FK the enrolment's ``selectin`` event load
+        # and every per-step engagement lookup join on, and Postgres does not
+        # index a foreign key for you. See ``tests/test_index_declarations.py``.
+        Index("ix_events_enrollment", "enrollment_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,6 +18,9 @@ class ConsentRecord(Base, OrgScopedMixin):
             "consent_type IN ('express', 'implied', 'none')",
             name="ck_consent_type",
         ),
+        # Migration 001. Declared here so the model matches the database — see
+        # ``tests/test_index_declarations.py``.
+        Index("ix_consent_contact", "contact_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
