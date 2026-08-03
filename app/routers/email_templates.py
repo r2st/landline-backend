@@ -9,7 +9,7 @@ import csv
 import io
 import logging
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -816,15 +816,39 @@ def _apply_email_send_filters(
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
 ):
-    """Apply common filters to an EmailSend query."""
+    """Apply common filters to an EmailSend query.
+
+    The two date bounds are built **UTC-aware and half-open**, and both halves of
+    that matter.
+
+    *Aware*: ``sent_at`` is ``TIMESTAMP(timezone=True)``. A naive bound compared
+    against it is not rejected — Postgres coerces it using the session's
+    ``TimeZone``, which nothing in this application sets, so the window silently
+    slides by whatever ``initdb`` picked off the host. These were the last two
+    naive bounds in ``app/``; every other ``datetime.combine`` in the codebase
+    passes ``tzinfo`` explicitly. Nothing fails when this is wrong: the export
+    and the send-history list return a window shifted by a whole number of hours,
+    and a send near either midnight silently moves in or out of a report.
+
+    *Half-open*: ``datetime.max.time()`` is 23:59:59.999999, so an inclusive
+    upper bound drops the last microsecond of ``date_to``. ``< date_to + 1 day``
+    has no edge to get wrong and does not depend on the column's precision.
+    """
     if contact_id is not None:
         query = query.where(EmailSend.contact_id == contact_id)
     if status is not None:
         query = query.where(EmailSend.status == status)
     if date_from is not None:
-        query = query.where(EmailSend.sent_at >= datetime.combine(date_from, datetime.min.time()))
+        query = query.where(
+            EmailSend.sent_at
+            >= datetime.combine(date_from, dt_time.min, tzinfo=timezone.utc)
+        )
     if date_to is not None:
-        query = query.where(EmailSend.sent_at <= datetime.combine(date_to, datetime.max.time()))
+        query = query.where(
+            EmailSend.sent_at
+            < datetime.combine(date_to, dt_time.min, tzinfo=timezone.utc)
+            + timedelta(days=1)
+        )
     return query
 
 
