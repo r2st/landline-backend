@@ -235,10 +235,15 @@ async def _suppress_address(db: AsyncSession, email: str, kind: str) -> bool:
 
 async def _suppress_contact(
     db: AsyncSession, contact: Contact, *, observed: bool = True
-) -> int:
+) -> tuple[int, int]:
     """Mark a contact do-not-email and stop its active enrollments.
 
-    Returns the number of enrollments paused. Idempotent.
+    Returns ``(enrollments_paused, funnel_events_written)``. Idempotent.
+
+    The two numbers differ, and the caller needs both. ``DangerMonitor`` sums a
+    ``BounceRecord`` population *and* a funnel-event population, so a bounce
+    that wrote a funnel event here must not also be counted from its ledger
+    row — see ``BounceRecord.funnel_events``.
 
     ``observed`` says whether a message to *this* address actually came back.
     It gates the funnel event, and nothing else: a bounce rate is a measurement,
@@ -273,6 +278,7 @@ async def _suppress_contact(
         )
     )
     paused = 0
+    events = 0
     now = datetime.now(timezone.utc)
     for enr in rows.scalars().all():
         enr.status = "bounced"
@@ -324,7 +330,8 @@ async def _suppress_contact(
                 event_metadata={"email": contact.email, "source": "bounce_handler"},
             )
         )
-    return paused
+        events += 1
+    return paused, events
 
 
 async def suppress_dead_domain(db: AsyncSession, domain: str) -> dict:
@@ -352,7 +359,8 @@ async def suppress_dead_domain(db: AsyncSession, domain: str) -> dict:
     listed = 0
     for contact in contacts:
         suppressed += 1
-        enrollments_paused += await _suppress_contact(db, contact, observed=False)
+        stopped, _ = await _suppress_contact(db, contact, observed=False)
+        enrollments_paused += stopped
         if await _suppress_address(db, contact.email, "hard"):
             listed += 1
     await db.flush()
@@ -429,6 +437,7 @@ async def _record_policy_block(db: AsyncSession, email: str, now: datetime) -> d
         "matched_contacts": len(contacts),
         "suppressed": 0,
         "enrollments_paused": 0,
+        "funnel_events": 0,
         "list_entry_added": False,
         "domain_written_off": None,
     }
@@ -481,7 +490,7 @@ async def record_bounce(
         # a re-import that replaced the contact is precisely how an address ends
         # up here — a case where the domain evidence is the only thing left.
         return {"email": email, "kind": bounce_kind, "matched_contacts": 0,
-                "suppressed": 0, "enrollments_paused": 0,
+                "suppressed": 0, "enrollments_paused": 0, "funnel_events": 0,
                 "list_entry_added": listed,
                 "domain_written_off": await _maybe_write_off_domain(
                     db, email, bounce_kind
@@ -489,6 +498,7 @@ async def record_bounce(
 
     suppressed = 0
     enrollments_paused = 0
+    funnel_events = 0
     any_suppression = False
     for contact in contacts:
         contact.bounce_count = (contact.bounce_count or 0) + 1
@@ -508,7 +518,9 @@ async def record_bounce(
         # repeat DSN closes them rather than leaving them due forever.
         if not contact.suppressed:
             suppressed += 1
-        enrollments_paused += await _suppress_contact(db, contact)
+        stopped, events = await _suppress_contact(db, contact)
+        enrollments_paused += stopped
+        funnel_events += events
 
     # One list entry per address, not per matched contact row.
     list_entry_added = False
@@ -534,6 +546,10 @@ async def record_bounce(
         "matched_contacts": len(contacts),
         "suppressed": suppressed,
         "enrollments_paused": enrollments_paused,
+        # How many funnel bounces this call booked. The ingestion sweep copies
+        # it onto the ``BounceRecord`` so the danger rail can count each DSN
+        # once instead of once per population.
+        "funnel_events": funnel_events,
         "list_entry_added": list_entry_added,
         "domain_written_off": domain_result,
     }

@@ -15,7 +15,7 @@ and why.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, String, Text, func
+from sqlalchemy import ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -50,6 +50,25 @@ class BounceRecord(Base, OrgScopedMixin):
     diagnostic: Mapped[str | None] = mapped_column(Text)
     # What record_bounce did with it (matched contacts, suppressions).
     result: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    # How many ``bounced`` OutreachEvents this notification produced.
+    #
+    # Load-bearing for the danger rail, not bookkeeping. ``DangerMonitor`` sums
+    # three bounce populations, and two of them describe the *same* event: the
+    # ingestion sweep writes this row and then calls ``record_bounce``, which
+    # books a funnel event on the enrollment that sent. Counting both doubled
+    # every ingested DSN that hit a live sequence — which is the ordinary case
+    # for an autonomous outreach agent — so the effective auto-pause threshold
+    # was half the configured one, on a metric whose global breach flips the
+    # platform-wide kill switch.
+    #
+    # A count rather than a flag because one address can hold several contact
+    # rows (``contacts.email`` has no unique constraint) and stop several
+    # enrollments. Non-zero means "already counted as a funnel event"; the rail
+    # counts only the zeroes, which are the bounces no sequence recorded —
+    # manual sends, and addresses whose enrollments had already finished.
+    funnel_events: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     processed_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

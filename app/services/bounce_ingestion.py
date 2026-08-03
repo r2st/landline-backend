@@ -330,6 +330,11 @@ class BounceIngestionService:
                     kind=parsed["kind"],
                 )
                 record.result = result
+                # The rail counts a DSN once, not once per population:
+                # a notification that booked a funnel event is already
+                # in the OutreachEvent numerator. See
+                # ``BounceRecord.funnel_events``.
+                record.funnel_events = int(result.get("funnel_events", 0) or 0)
                 await db.commit()
 
                 processed.append({"gmail_message_id": msg_id, **parsed, "result": result})
@@ -400,6 +405,11 @@ class BounceIngestionService:
                     kind=parsed["kind"],
                 )
                 record.result = result
+                # The rail counts a DSN once, not once per population:
+                # a notification that booked a funnel event is already
+                # in the OutreachEvent numerator. See
+                # ``BounceRecord.funnel_events``.
+                record.funnel_events = int(result.get("funnel_events", 0) or 0)
                 await db.commit()
 
                 processed.append({"gmail_message_id": dedup_key, **parsed, "result": result})

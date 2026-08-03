@@ -388,20 +388,38 @@ class DangerMonitor:
             )
         ).scalar() or 0
 
-        # --- Population 3: BounceRecord (async DSNs — most real bounces) ---
+        # --- Population 3: BounceRecord (async DSNs that reached no sequence) ---
         # `processed_at` is when the sweep read the DSN rather than when the
         # bounce happened. The sweep runs every 15 minutes, so against a 24h
         # window the skew is immaterial; where it does bite, it counts a bounce
         # slightly late, which errs toward pausing. That is the right direction
         # for a brake.
+        #
+        # **`funnel_events == 0` is what keeps this population disjoint from
+        # population 2.** `bounce_ingestion` writes this ledger row and then
+        # calls `record_bounce`, which books a `bounced` OutreachEvent against
+        # the enrollment that sent. Both were counted, so every ingested DSN
+        # that hit a live sequence — the ordinary case for an autonomous
+        # outreach agent — was worth two bounces, and the effective auto-pause
+        # threshold was half the configured one. A global bounce breach flips
+        # the platform-wide kill switch, so that halted every tenant's outreach
+        # at 2.5% while the operator's console (correctly) showed 5%.
+        #
+        # The comment above this block used to read "most real bounces", which
+        # was true when it was written and stopped being true the day
+        # `bounce_handler` started writing funnel events. Nothing failed; the
+        # populations simply began to overlap, and a sum has no way to notice.
+        # What remains here is the genuinely un-double-counted half: bounces on
+        # manual sends, and on addresses whose enrollments had already finished.
         br_filters = [BounceRecord.processed_at >= cutoff]
         if account is not None:
             br_filters.append(BounceRecord.gmail_account_id == account.id)
         br_base = select(func.count(BounceRecord.id)).where(and_(*br_filters))
+        br_uncounted = br_base.where(BounceRecord.funnel_events == 0)
 
-        br_bounces = (await db.execute(br_base)).scalar() or 0
+        br_bounces = (await db.execute(br_uncounted)).scalar() or 0
         br_hard = (
-            await db.execute(br_base.where(BounceRecord.bounce_kind == "hard"))
+            await db.execute(br_uncounted.where(BounceRecord.bounce_kind == "hard"))
         ).scalar() or 0
 
         # --- Population 4: ComplaintRecord (ingested ARF/FBL reports) ---

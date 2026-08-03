@@ -328,6 +328,83 @@ async def test_a_redelivered_dsn_is_still_one_bounce(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_an_ingested_dsn_is_one_bounce_not_two(db_session: AsyncSession):
+    """The ledger row and the funnel event describe the same notification.
+
+    ``bounce_ingestion`` writes the ``BounceRecord`` and then calls
+    ``record_bounce``, which books a ``bounced`` OutreachEvent on the enrollment
+    that sent. Summing both populations made every ingested DSN that hit a live
+    sequence — the ordinary case for an autonomous agent — worth two bounces, so
+    the effective auto-pause threshold was half the configured one. A global
+    bounce breach flips the platform-wide kill switch, so outreach halted for
+    every tenant at 2.5% while the console and the settings page both said 5%.
+    """
+    from app.services.bounce_handler import record_bounce
+
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    bounced_contact = None
+    for i in range(20):
+        contact = await _contact(db_session, company, f"reach{i}@acme.com")
+        await _sequence_send(db_session, seq, contact, bounced=False)
+        if i == 0:
+            bounced_contact = contact
+    await db_session.commit()
+
+    # The sweep: ledger first, then the handler — exactly bounce_ingestion's order.
+    record = BounceRecord(
+        gmail_message_id="dsn-live-seq", recipient_email=bounced_contact.email,
+        bounce_kind="hard", status_code="5.1.1", diagnostic="user unknown",
+        result={},
+    )
+    db_session.add(record)
+    await db_session.flush()
+    result = await record_bounce(
+        db_session, bounced_contact.email,
+        status_code="5.1.1", diagnostic="user unknown", kind="hard",
+    )
+    record.result = result
+    record.funnel_events = int(result.get("funnel_events", 0) or 0)
+    await db_session.commit()
+
+    assert record.funnel_events == 1, "the handler booked a funnel event"
+
+    m = await get_danger_monitor()._window_metrics(db_session)
+    assert m["sent"] == 20
+    assert m["bounces"] == 1, "one notification, one bounce"
+    assert m["hard_bounces"] == 1
+    assert m["bounce_rate"] == 0.05
+
+
+@pytest.mark.asyncio
+async def test_a_dsn_that_reached_no_sequence_is_still_counted(db_session: AsyncSession):
+    """The ledger's own half: a bounce no OutreachEvent recorded.
+
+    Manual sends, and addresses whose enrollments had already finished, leave no
+    funnel event — so ``funnel_events == 0`` and the rail must count the row.
+    Deduplicating by dropping the population outright would blind the rail to
+    every bounce outside the sequence engine, which is the failure this whole
+    module was written for.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    for i in range(20):
+        contact = await _contact(db_session, company, f"seq{i}@acme.com")
+        await _sequence_send(db_session, seq, contact, bounced=False)
+    db_session.add(BounceRecord(
+        gmail_message_id="dsn-manual", recipient_email="someone@elsewhere.com",
+        bounce_kind="hard", status_code="5.1.1", diagnostic="user unknown",
+        result={}, funnel_events=0,
+    ))
+    await db_session.commit()
+
+    m = await get_danger_monitor()._window_metrics(db_session)
+    assert m["bounces"] == 1
+    assert m["sources"]["bounces_dsn"] == 1
+    assert m["sources"]["bounces_sequence"] == 0
+
+
+@pytest.mark.asyncio
 async def test_the_window_excludes_old_traffic(db_session: AsyncSession):
     company = await _company(db_session)
     seq = await _sequence(db_session)
