@@ -105,6 +105,7 @@ from app.services import (
 )
 from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
+from app.services.outreach_events import SEND_ATTEMPT_TYPES, AttemptTally
 from app.services.send_limiter import get_send_limiter
 from app.services.timeframes import (
     DEFAULT_TIMEFRAME,
@@ -841,6 +842,10 @@ async def _period_counts(
         if status in _ERROR_STATUSES:
             bump("errors", sent_at)
         elif status == "bounced":
+            # A bounce is mail that went out, so it counts as a send *and* as a
+            # bounce — the shape the sequence table already has (a ``sent``
+            # event, then a ``bounced`` one). See ``lead_metrics.funnel_rates``.
+            bump("emails_sent", sent_at)
             bump("bounces", sent_at)
         else:
             bump("emails_sent", sent_at)
@@ -849,11 +854,31 @@ async def _period_counts(
         bump("replies", replied_at)
 
     # OutreachEvent (Dialtone's sequence log) — the other half of sent mail.
-    event_cols = select(OutreachEvent.event_type, OutreachEvent.occurred_at)
-    for event_type, occurred_at in (await db.execute(event_cols)).all():
+    # ``sent``/``bounced`` go through an :class:`AttemptTally` per window: the
+    # synchronous failure path writes ``bounced`` *instead of* ``sent`` and the
+    # async DSN path writes it *in addition to* one, so counting rows makes
+    # ``emails_sent`` mean different things depending on how the mail failed.
+    # Both shapes key the attempt on ``(enrollment_id, step_number)``.
+    attempts = [AttemptTally() for _ in windows]
+    event_cols = select(
+        OutreachEvent.event_type, OutreachEvent.occurred_at,
+        OutreachEvent.enrollment_id, OutreachEvent.step_number,
+    )
+    for event_type, occurred_at, enrollment_id, step_number in (
+        await db.execute(event_cols)
+    ).all():
+        if event_type in SEND_ATTEMPT_TYPES:
+            for tally, (start, end) in zip(attempts, windows):
+                if _in_range(occurred_at, start, end):
+                    tally.add(event_type, enrollment_id, step_number)
+            continue
         metric = _OUTREACH_COUNTERS.get(event_type)
         if metric:
             bump(metric, occurred_at)
+
+    for counts, tally in zip(tallies, attempts):
+        counts["emails_sent"] += tally.attempts
+        counts["bounces"] += tally.bounces
 
     # Leads discovered.
     for created_at in (await db.execute(select(ProspectCandidate.created_at))).scalars().all():
@@ -884,14 +909,21 @@ def _deltas(current: DialtoneTodayCounts, previous: Optional[DialtoneTodayCounts
 
 
 def _funnel_rates(counts: DialtoneTodayCounts) -> DialtoneFunnelRates:
-    """Open/click/reply rates against sends, bounce rate against attempts."""
+    """Every funnel rate against sends, bounces included in that denominator.
+
+    The bounce rate used to divide by ``sent + bounces``, which double-counts:
+    a bounced sequence send is already in ``emails_sent`` (it wrote a ``sent``
+    event when it went out and a ``bounced`` one when the DSN came back). The
+    console therefore reported a bounce rate below the one ``danger_monitor``
+    and ``deliverability_optimizer`` act on — see
+    ``lead_metrics.funnel_rates`` for the full reasoning.
+    """
     sent = counts.emails_sent
-    attempted = sent + counts.bounces
     return DialtoneFunnelRates(
         open_rate=_rate(counts.opens, sent),
         click_rate=_rate(counts.clicks, sent),
         reply_rate=_rate(counts.replies, sent),
-        bounce_rate=_rate(counts.bounces, attempted),
+        bounce_rate=_rate(counts.bounces, sent),
     )
 
 

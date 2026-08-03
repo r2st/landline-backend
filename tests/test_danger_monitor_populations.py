@@ -265,6 +265,69 @@ async def test_a_dsn_bounce_is_not_double_counted_with_a_send_failure(db_session
 
 
 @pytest.mark.asyncio
+async def test_an_async_bounce_is_not_a_second_attempt(db_session: AsyncSession):
+    """The DSN adds a row to a send that already logged one; not a new attempt.
+
+    ``bounce_handler._suppress_contact`` books its ``bounced`` OutreachEvent
+    against the step that sent — the same ``(enrollment_id, step_number)`` the
+    ``sent`` event carries. Summing the two event types therefore counted the
+    same message twice, and the denominator grew by exactly the numerator: ten
+    sends with one bounce read 1/11 = 9.1%. Against a 10% threshold that is the
+    rail declining to pause a domain that has already crossed it, which is the
+    one direction a brake must not err in.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    bounced_event = None
+    for i in range(10):
+        contact = await _contact(db_session, company, f"lead{i}@acme.com")
+        ev = await _sequence_send(db_session, seq, contact, bounced=False)
+        if i == 0:
+            bounced_event = ev
+    # The DSN lands hours later, on the step that sent.
+    db_session.add(OutreachEvent(
+        enrollment_id=bounced_event.enrollment_id,
+        step_number=bounced_event.step_number,
+        event_type="bounced",
+        occurred_at=datetime.now(timezone.utc),
+        event_metadata={"source": "bounce_handler"},
+    ))
+    await db_session.commit()
+
+    m = await get_danger_monitor()._window_metrics(db_session)
+    assert m["sent"] == 10, "the bounce is the tenth send, not an eleventh"
+    assert m["bounces"] == 1
+    assert m["bounce_rate"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_dsn_is_still_one_bounce(db_session: AsyncSession):
+    """Mailer-daemons retry. Two rows about one failed send are one bounce."""
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    first = None
+    for i in range(10):
+        contact = await _contact(db_session, company, f"dup{i}@acme.com")
+        ev = await _sequence_send(db_session, seq, contact, bounced=False)
+        if i == 0:
+            first = ev
+    for _ in range(3):
+        db_session.add(OutreachEvent(
+            enrollment_id=first.enrollment_id,
+            step_number=first.step_number,
+            event_type="bounced",
+            occurred_at=datetime.now(timezone.utc),
+            event_metadata={"source": "bounce_handler"},
+        ))
+    await db_session.commit()
+
+    m = await get_danger_monitor()._window_metrics(db_session)
+    assert m["sent"] == 10
+    assert m["bounces"] == 1
+    assert m["bounce_rate"] == 0.1
+
+
+@pytest.mark.asyncio
 async def test_the_window_excludes_old_traffic(db_session: AsyncSession):
     company = await _company(db_session)
     seq = await _sequence(db_session)

@@ -63,6 +63,7 @@ from app.models.danger_signal import DangerSignalEvent
 from app.models.email_template import EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import system_settings
+from app.services.outreach_events import count_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -354,27 +355,27 @@ class DangerMonitor:
         # Scoped through the enrollment, which is where this path records the
         # sending account (`tasks/outreach.py:556`).
         oe_filters = [OutreachEvent.occurred_at >= cutoff]
-        oe_base = (
-            select(func.count(OutreachEvent.id))
-            .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
-        )
         if account is not None:
             oe_filters.append(OutreachEnrollment.sender_account_id == account.id)
 
-        # The denominator is ATTEMPTS, not successes. `tasks/outreach.py:587`
-        # writes exactly one event per attempt — 'sent' or 'bounced' — so a
-        # synchronous failure never appears as 'sent'. Counting only 'sent' would
-        # leave the worst possible case (every attempt bouncing) with a
-        # denominator of zero, and `bounce_rate` would divide to 0.0 and read
-        # healthy. That is the original bug wearing a different hat.
-        oe_attempts = (
-            await db.execute(
-                oe_base.where(and_(*oe_filters, OutreachEvent.event_type.in_(("sent", "bounced"))))
-            )
-        ).scalar() or 0
-        oe_bounces = (
-            await db.execute(oe_base.where(and_(*oe_filters, OutreachEvent.event_type == "bounced")))
-        ).scalar() or 0
+        # The denominator is ATTEMPTS, not successes, and an attempt is a
+        # *step*, not a row. `send_sequence_step` writes one event per attempt —
+        # 'sent' or 'bounced' — so counting only 'sent' would leave the worst
+        # possible case (every attempt failing synchronously) with a denominator
+        # of zero, a bounce rate of 0.0 and a rail reading healthy. But summing
+        # the two rows over-counts the *common* case in the other direction:
+        # `bounce_handler` writes a 'bounced' event when the DSN arrives hours
+        # after a send that already logged its 'sent' one, so ten sends and one
+        # async bounce counted eleven attempts and reported 9.1%. Against a 5%
+        # or 10% threshold that is a brake applied late, which is the one
+        # direction a brake must not err in.
+        #
+        # `outreach_events.count_attempts` counts distinct
+        # `(enrollment_id, step_number)` pairs, which is right under both shapes
+        # and makes a re-delivered DSN free rather than a second bounce.
+        oe_attempts, oe_bounces = await count_attempts(
+            db, where=and_(*oe_filters), join_enrollment=True
+        )
 
         oe_hard = (
             await db.execute(

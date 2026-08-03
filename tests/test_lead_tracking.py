@@ -276,3 +276,92 @@ async def test_dialtone_status_explicit_bounds_beat_timeframe(
     })
     assert resp.status_code == 200, resp.text
     assert resp.json()["counts"]["emails_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bounce_rate_denominator_is_sends_not_sends_plus_bounces(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    """A bounced sequence send is one send, not two.
+
+    ``bounce_handler._suppress_contact`` writes a ``bounced`` OutreachEvent on
+    top of the ``sent`` event the send already wrote, so ``sent + bounces``
+    counts the same message twice and the reported bounce rate lands below the
+    real one — by more, the worse the real one is. Here every one of the four
+    sends bounced: the honest answer is 100%, and the old formula said 50%.
+    """
+    now = datetime.now(timezone.utc)
+    seq = OutreachSequence(id=_uuid.uuid4(), name="Dead domain")
+    db_session.add(seq)
+    await db_session.flush()
+    for _ in range(4):
+        enrollment = OutreachEnrollment(
+            id=_uuid.uuid4(), contact_id=sample_contact.id, sequence_id=seq.id,
+        )
+        db_session.add(enrollment)
+        await db_session.flush()
+        db_session.add(OutreachEvent(
+            id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+            event_type="sent", occurred_at=now,
+        ))
+        db_session.add(OutreachEvent(
+            id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+            event_type="bounced", occurred_at=now,
+        ))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/leads/stats", params={"timeframe": "today"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["counts"]["emails_sent"] == 4
+    assert data["counts"]["bounces"] == 4
+    assert data["rates"]["bounce_rate"] == 1.0
+    assert data["by_org"][0]["rates"]["bounce_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_console_bounce_rate_agrees_with_the_auto_pause_rail(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    sample_contact: Contact,
+):
+    """The console and ``danger_monitor`` must report the same ratio.
+
+    The rail trips on ``bounces / sent``. While the console divided by
+    ``sent + bounces`` an operator watching a 10%-threshold alarm saw 9.1% and
+    had no way to tell why sending had been paused underneath them.
+    """
+    from app.services.danger_monitor import DangerMonitor
+
+    tf = resolve_timeframe("today")
+    at = tf.start + timedelta(minutes=1)
+    seq = OutreachSequence(id=_uuid.uuid4(), name="Ten percent")
+    db_session.add(seq)
+    await db_session.flush()
+    for i in range(10):
+        enrollment = OutreachEnrollment(
+            id=_uuid.uuid4(), contact_id=sample_contact.id, sequence_id=seq.id,
+        )
+        db_session.add(enrollment)
+        await db_session.flush()
+        db_session.add(OutreachEvent(
+            id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+            event_type="sent", occurred_at=at,
+        ))
+        if i == 0:
+            db_session.add(OutreachEvent(
+                id=_uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+                event_type="bounced", occurred_at=at,
+            ))
+    await db_session.commit()
+
+    resp = await client.get("/api/v1/dialtone/console", params={"timeframe": "today"})
+    assert resp.status_code == 200, resp.text
+    console_rate = resp.json()["rates"]["bounce_rate"]
+
+    rail = await DangerMonitor()._window_metrics(db_session, hours=24)
+
+    assert console_rate == 0.1
+    assert round(rail["bounce_rate"], 4) == console_rate

@@ -26,6 +26,7 @@ from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate
 from app.models.tenant import Organization
 from app.schemas.lead_tracking import RecentLeadEvent
+from app.services.outreach_events import SEND_ATTEMPT_TYPES, AttemptTally
 from app.services.timeframes import ensure_aware, in_range
 
 # EmailSend statuses that represent a delivery failure (not a bounce).
@@ -78,14 +79,36 @@ def rate(numerator: int, denominator: int) -> float:
 
 
 def funnel_rates(counts: Counter) -> tuple[float, float, float, float]:
-    """(open_rate, click_rate, reply_rate, bounce_rate) for one tally Counter."""
+    """(open_rate, click_rate, reply_rate, bounce_rate) for one tally Counter.
+
+    **A bounce is already inside ``emails_sent``, so it is not added to it.** The
+    bounce rate used to divide by ``sent + bounces`` on the theory that a bounced
+    message is an attempt the send count doesn't hold. That is true of nothing
+    this function is given. Sequence mail — the bulk of the volume — writes an
+    ``OutreachEvent(event_type='sent')`` when it goes out and a *second*
+    ``bounced`` event when the DSN arrives (``bounce_handler._suppress_contact``),
+    so the send is counted once already and adding it again inflates the
+    denominator by exactly the numerator. The other table can't rescue the
+    formula either: no code path ever writes ``EmailSend.status = 'bounced'``, so
+    that leg contributed nothing.
+
+    The error is not a rounding one, and it grows in the direction that flatters:
+    a true 10% bounce rate reports 9.1%, a true 50% reports 33%, and a domain
+    where *every* address is dead reports 50% instead of 100%. Worse, it made the
+    operator's number disagree with the machine's — ``danger_monitor`` trips the
+    auto-pause on ``bounces / sent`` and ``deliverability_optimizer`` throttles a
+    sender on the same ratio, so the console read comfortably below a threshold
+    the rail was already acting on.
+
+    ``sent`` is the denominator everywhere now, matching
+    ``funnel_analytics._with_rates``.
+    """
     sent = counts.get("emails_sent", 0)
-    attempted = sent + counts.get("bounces", 0)
     return (
         rate(counts.get("opens", 0), sent),
         rate(counts.get("clicks", 0), sent),
         rate(counts.get("replies", 0), sent),
-        rate(counts.get("bounces", 0), attempted),
+        rate(counts.get("bounces", 0), sent),
     )
 
 
@@ -118,6 +141,14 @@ async def tally_by_org(
             if status in _ERROR_STATUSES:
                 c["errors"] += 1
             elif status == "bounced":
+                # Both counters, deliberately. A bounce is mail that went out —
+                # the model says so itself (``WIRE_STATUSES``) — and the sequence
+                # table records it that way, as a ``sent`` event plus a later
+                # ``bounced`` one. Counting it here as a bounce *instead of* a
+                # send made the two tables mean different things by
+                # ``emails_sent``, so any bounce rate over the union was wrong
+                # whichever denominator it picked.
+                c["emails_sent"] += 1
                 c["bounces"] += 1
             else:
                 c["emails_sent"] += 1
@@ -128,11 +159,32 @@ async def tally_by_org(
         if in_range(replied_at, start, end):
             c["replies"] += 1
 
-    event_cols = select(OutreachEvent.org_id, OutreachEvent.event_type, OutreachEvent.occurred_at)
-    for org_id, event_type, occurred_at in (await db.execute(event_cols)).all():
+    # Sequence sends. ``sent``/``bounced`` are counted through an
+    # :class:`AttemptTally` rather than row-by-row: the two paths that write a
+    # ``bounced`` event disagree about whether it replaces the ``sent`` one (a
+    # synchronous failure) or accompanies it (an async DSN), so a row count is
+    # wrong under one shape or the other. See ``AttemptTally`` for the full
+    # reasoning. Opens/clicks/replies stay per-row — several are expected.
+    attempts: dict[Optional[uuid.UUID], AttemptTally] = defaultdict(AttemptTally)
+    event_cols = select(
+        OutreachEvent.org_id, OutreachEvent.event_type, OutreachEvent.occurred_at,
+        OutreachEvent.enrollment_id, OutreachEvent.step_number,
+    )
+    for org_id, event_type, occurred_at, enrollment_id, step_number in (
+        await db.execute(event_cols)
+    ).all():
+        if not in_range(occurred_at, start, end):
+            continue
+        if event_type in SEND_ATTEMPT_TYPES:
+            attempts[org_id].add(event_type, enrollment_id, step_number)
+            continue
         metric = _OUTREACH_COUNTERS.get(event_type)
-        if metric and in_range(occurred_at, start, end):
+        if metric:
             tallies[org_id][metric] += 1
+
+    for org_id, tally in attempts.items():
+        tallies[org_id]["emails_sent"] += tally.attempts
+        tallies[org_id]["bounces"] += tally.bounces
 
     cand_cols = select(ProspectCandidate.org_id, ProspectCandidate.created_at)
     for org_id, created_at in (await db.execute(cand_cols)).all():

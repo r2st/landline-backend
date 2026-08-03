@@ -561,7 +561,9 @@ async def test_console_funnel_rates(
             opened_at=at if i < 2 else None,
             replied_at=at if i < 1 else None,
         ))
-    # A bounce isn't a send, so it lands in the bounce-rate denominator only.
+    # A bounce is mail that went out: it counts as a send *and* as a bounce, so
+    # every rate shares one denominator. (The sequence table has always worked
+    # this way — a ``sent`` event plus a later ``bounced`` one.)
     db_session.add(EmailSend(
         id=_uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
         subject="Bounced", status="bounced", sent_at=at,
@@ -569,10 +571,13 @@ async def test_console_funnel_rates(
     await db_session.commit()
 
     resp = await client.get("/api/v1/dialtone/console", params={"timeframe": "today"})
-    rates = resp.json()["rates"]
-    assert rates["open_rate"] == 0.5       # 2 of 4 sends
-    assert rates["reply_rate"] == 0.25     # 1 of 4 sends
-    assert rates["bounce_rate"] == 0.2     # 1 of 5 attempts
+    body = resp.json()
+    assert body["stats"]["emails_sent"] == 5
+    assert body["stats"]["bounces"] == 1
+    rates = body["rates"]
+    assert rates["open_rate"] == 0.4       # 2 of 5 sends
+    assert rates["reply_rate"] == 0.2      # 1 of 5 sends
+    assert rates["bounce_rate"] == 0.2     # 1 of 5 sends
 
 
 @pytest.mark.asyncio
