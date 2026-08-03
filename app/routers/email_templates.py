@@ -725,6 +725,15 @@ async def compose_and_send(
                 email_send.status = "scheduled"
                 email_send.scheduled_at = payload.scheduled_at
                 email_send.body_html = body_html
+                # Pin the mailbox this batch was composed as. An immediate send
+                # never needed it: ``payload.sender_account_id`` reaches the
+                # dispatcher inside this same call. A scheduled row is resolved
+                # again by the sweep days later, and leaving this NULL does not
+                # mean "the default account" — ``resolve_sender_info`` runs
+                # ``get_next_rotation_account``, so it means *whichever mailbox
+                # is least recently used at send time*. The response above has
+                # already told the operator which address this batch sends as.
+                email_send.sender_account_id = sender_info.account_id
                 scheduled += 1
                 results.append(EmailComposeResult(
                     contact_id=contact_id, to_email=contact.email,

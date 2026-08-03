@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.email_template import EmailSend
+from app.models.gmail_account import GmailAccount
 from app.tasks import scheduled_sends
 from app.tasks.celery_app import celery_app
 
@@ -277,3 +278,98 @@ async def test_one_pass_is_bounded(db_session: AsyncSession, dispatched: list):
     result = await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
 
     assert result["due"] == scheduled_sends.BATCH_LIMIT
+
+
+@pytest.fixture
+def _fernet_key():
+    """A real encryption key — ``GmailAccount`` tokens are encrypted at rest."""
+    from cryptography.fernet import Fernet
+
+    from app.config import get_settings
+    from app.services import crypto
+
+    settings = get_settings()
+    prev = settings.token_encryption_key
+    settings.token_encryption_key = Fernet.generate_key().decode()
+    crypto._fernet.cache_clear()
+    yield
+    settings.token_encryption_key = prev
+    crypto._fernet.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_row_pins_the_mailbox_it_was_composed_as(
+    _fernet_key,
+    client,
+    sample_contact,
+    db_session: AsyncSession,
+):
+    """Whose mailbox a "send later" batch goes out from is decided at compose.
+
+    An immediate send never had to record this: ``payload.sender_account_id``
+    reaches the dispatcher inside the same call. A scheduled row is re-resolved
+    by the sweep days later, and it left ``sender_account_id`` NULL — which
+    ``resolve_sender_info`` does not read as "the default account". It reads as
+    "no preference", runs ``get_next_rotation_account``, and picks whichever
+    mailbox is *least recently used at send time*.
+
+    So the operator picks their mailbox in the Compose tab, the response
+    confirms that address back to them as ``sender``, and on Thursday the
+    batch goes out from a colleague's — with the warm-up ramp, the daily
+    counter and the sending reputation all landing on the wrong account.
+    """
+    from app.services import crypto, google_oauth
+
+    chosen = GmailAccount(
+        id=uuid.uuid4(), email="picked@apprend.tech", google_sub="sub-picked",
+        display_name="Picked", refresh_token_encrypted=crypto.encrypt("r"),
+        access_token_encrypted=crypto.encrypt("a"),
+        scopes=" ".join(google_oauth.SCOPES), is_active=False, status="connected",
+    )
+    # The account rotation would hand back instead: never used, so it sorts
+    # first on the least-recently-used key.
+    other = GmailAccount(
+        id=uuid.uuid4(), email="rotation@apprend.tech", google_sub="sub-rotation",
+        display_name="Rotation", refresh_token_encrypted=crypto.encrypt("r"),
+        access_token_encrypted=crypto.encrypt("a"),
+        scopes=" ".join(google_oauth.SCOPES), is_active=True, status="connected",
+    )
+    db_session.add_all([chosen, other])
+    await db_session.commit()
+
+    await client.post("/api/v1/email-templates", json={
+        "name": "Later", "subject": "Hi {{first_name}}", "body": "<p>Hello</p>",
+    })
+
+    resp = await client.post("/api/v1/email-compose", json={
+        "contact_ids": [str(sample_contact.id)],
+        "sender_account_id": str(chosen.id),
+        "scheduled_at": (NOW + timedelta(days=3)).isoformat(),
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sender"] == chosen.email
+
+    row = (
+        await db_session.execute(
+            select(EmailSend).where(EmailSend.to_email == sample_contact.email)
+        )
+    ).scalars().first()
+    assert row is not None and row.status == "scheduled"
+    # The promise the response already made, written down where the sweep reads.
+    assert row.sender_account_id == chosen.id
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_sends_from_the_pinned_mailbox(
+    db_session: AsyncSession, dispatched: list,
+):
+    """And the pin is what reaches the dispatcher, not a fresh resolution."""
+    account_id = uuid.uuid4()
+    row = _row(due=NOW - timedelta(minutes=1))
+    row.sender_account_id = account_id
+    db_session.add(row)
+    await db_session.commit()
+
+    await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
+
+    assert dispatched[0]["sender_account_id"] == account_id
