@@ -48,6 +48,9 @@ MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 # arrive as several files rather than one that silently wedges the API.
 MAX_IMPORT_ROWS = 50_000
 
+# How many failing rows are reported before the import gives up on the file.
+MAX_IMPORT_ERRORS = 100
+
 # Formula-injection defusing now lives in ``app.csv_export`` so every export in
 # the codebase shares it. It was private to this module, which is exactly why
 # the send-history export in ``routers.email_templates`` — whose ``error``
@@ -55,6 +58,33 @@ MAX_IMPORT_ROWS = 50_000
 # than replaced at the call sites because the name reads correctly here.
 _CSV_FORMULA_PREFIXES = CSV_FORMULA_PREFIXES
 _csv_safe = csv_safe
+
+
+def _normalize_row(row: dict) -> dict[str, str]:
+    """Lower-case/underscore the header names and give every cell a string.
+
+    Two shapes of a perfectly ordinary CSV reach this and neither is an error:
+
+    * **A short row.** ``csv.DictReader`` fills the columns a row doesn't reach
+      with ``restval``, which defaults to ``None`` — so ``a,b,c`` followed by
+      ``Acme,acme.com`` yields ``{"city": None}``. Excel and every CRM export
+      omit trailing empty cells, so this is the common file, not the malformed
+      one. The previous ``v.strip()`` raised ``AttributeError`` on it, which the
+      loop's blanket ``except Exception`` turned into the row error
+      ``'NoneType' object has no attribute 'strip'`` — a message that names
+      neither the column nor the file, for a row that should simply have
+      imported. Worse, the 101st such row *breaks the loop*, so a file whose
+      last column is usually blank imported its first hundred rows and stopped.
+    * **A long row.** Fields past the header land under the ``None`` key as a
+      *list*. Dropped, hence the ``if k`` — an unnamed column has no meaning to
+      map onto.
+    """
+    out: dict[str, str] = {}
+    for key, value in row.items():
+        if not key:
+            continue
+        out[key.strip().lower().replace(" ", "_")] = (value or "").strip()
+    return out
 
 
 def _trigger_verification():
@@ -139,8 +169,7 @@ async def import_csv(
 
     for row_num, row in enumerate(reader, start=2):  # Row 1 is header
         try:
-            # Normalize keys to lowercase
-            row = {k.strip().lower().replace(" ", "_"): v.strip() for k, v in row.items() if k}
+            row = _normalize_row(row)
 
             company_name = row.get("company_name", "").strip()
             if not company_name:
@@ -204,14 +233,22 @@ async def import_csv(
 
         except IngestionError as e:
             errors.append(f"Row {row_num}: {e}")
-            if len(errors) > 100:
-                errors.append("... (truncated, too many errors)")
-                break
-        except Exception as e:
-            errors.append(f"Row {row_num}: {str(e)}")
-            if len(errors) > 100:
-                errors.append("... (truncated, too many errors)")
-                break
+        except Exception as e:  # noqa: BLE001 — one bad row must not fail the file
+            logger.exception("CSV import row %d failed", row_num)
+            errors.append(f"Row {row_num}: {type(e).__name__}: {e}")
+
+        # Abandoning the file after 100 failures is right — a header mismatch
+        # produces one error per row and there is no point reading 50k of them.
+        # Saying *where* it stopped is what was missing: "too many errors" reads
+        # like a summary of a completed import, and the rows after this one were
+        # never looked at.
+        if len(errors) > MAX_IMPORT_ERRORS:
+            errors.append(
+                f"Stopped at row {row_num} after {MAX_IMPORT_ERRORS} errors — "
+                f"the rest of the file was not imported. Fix the errors above "
+                f"and re-upload."
+            )
+            break
 
     await db.flush()
 
