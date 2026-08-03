@@ -39,6 +39,7 @@ from app.models.company import Company
 from app.services import industry_verticals
 from app.services import knowledge as knowledge_service
 from app.services.outreach import ai_sales_guidelines as ai_guidelines
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -61,16 +62,20 @@ async def list_contacts(
     if industry:
         query = query.where(IndustryContact.industry == industry)
     if company:
-        query = query.where(IndustryContact.company_name.ilike(f"%{company}%"))
+        query = query.where(
+            IndustryContact.company_name.ilike(
+                contains_pattern(company), escape=LIKE_ESCAPE
+            )
+        )
     if group:
         query = query.where(IndustryContact.contact_group == group)
     if search:
-        term = f"%{search}%"
+        term = contains_pattern(search)
         query = query.where(
-            IndustryContact.contact_name.ilike(term)
-            | IndustryContact.contact_title.ilike(term)
-            | IndustryContact.contact_email.ilike(term)
-            | IndustryContact.company_name.ilike(term)
+            IndustryContact.contact_name.ilike(term, escape=LIKE_ESCAPE)
+            | IndustryContact.contact_title.ilike(term, escape=LIKE_ESCAPE)
+            | IndustryContact.contact_email.ilike(term, escape=LIKE_ESCAPE)
+            | IndustryContact.company_name.ilike(term, escape=LIKE_ESCAPE)
         )
     query = query.order_by(IndustryContact.company_name, IndustryContact.contact_name)
     query = query.offset((page - 1) * page_size).limit(page_size)

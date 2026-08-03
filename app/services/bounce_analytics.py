@@ -46,6 +46,7 @@ from app.models.contact import Contact
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.suppression import SuppressionEntry
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern, endswith_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -403,10 +404,16 @@ async def recent(
         conditions.append(BounceRecord.bounce_kind == kind)
     if domain:
         conditions.append(
-            BounceRecord.recipient_email.ilike(f"%@{domain.strip().lower()}")
+            BounceRecord.recipient_email.ilike(
+                endswith_pattern(f"@{domain.strip().lower()}"), escape=LIKE_ESCAPE
+            )
         )
     if q:
-        conditions.append(BounceRecord.recipient_email.ilike(f"%{q.strip().lower()}%"))
+        conditions.append(
+            BounceRecord.recipient_email.ilike(
+                contains_pattern(q.strip().lower()), escape=LIKE_ESCAPE
+            )
+        )
 
     total = (
         await db.execute(select(func.count(BounceRecord.id)).where(*conditions))

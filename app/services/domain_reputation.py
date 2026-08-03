@@ -70,6 +70,7 @@ from app.models.bounce_record import BounceRecord
 from app.models.contact import Contact
 from app.models.email_template import EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern, endswith_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,9 @@ def _at_domain(column, domain: str):
     Subdomains are deliberately distinct. ``mail.acme.com`` is a different mail
     host from ``acme.com`` and can be healthy while the parent is dead.
     """
-    return func.lower(column).like(f"%@{domain}")
+    return func.lower(column).like(
+        endswith_pattern(f"@{domain}"), escape=LIKE_ESCAPE
+    )
 
 
 async def hard_bounced_addresses(db: AsyncSession, domain: str) -> set[str]:

@@ -46,6 +46,7 @@ from app.services import api_credits
 from app.services.enrichment import get_enrichment_service
 from app.services.ingestion import get_ingestion_service
 from app.services.places_discovery import PROVIDER, get_places_service
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -360,7 +361,11 @@ async def list_discovery_results(
             else DiscoveredBusiness.domain.is_(None)
         )
     if q:
-        filters.append(DiscoveredBusiness.business_name.ilike(f"%{q}%"))
+        filters.append(
+            DiscoveredBusiness.business_name.ilike(
+                contains_pattern(q), escape=LIKE_ESCAPE
+            )
+        )
 
     total = (
         await db.execute(

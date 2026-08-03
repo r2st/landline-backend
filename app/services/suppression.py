@@ -19,6 +19,7 @@ from app.models.suppression import (
     SUPPRESSION_SOURCES,
     SuppressionEntry,
 )
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -248,5 +249,9 @@ async def count_entries(db: AsyncSession, q: Optional[str] = None) -> int:
     """Total suppression entries (optionally filtered by an email substring)."""
     query = select(func.count(SuppressionEntry.id))
     if q:
-        query = query.where(SuppressionEntry.email.ilike(f"%{q.strip().lower()}%"))
+        query = query.where(
+            SuppressionEntry.email.ilike(
+                contains_pattern(q.strip().lower()), escape=LIKE_ESCAPE
+            )
+        )
     return (await db.execute(query)).scalar() or 0

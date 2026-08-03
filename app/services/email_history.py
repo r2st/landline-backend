@@ -30,6 +30,7 @@ from app.models.inbox_thread_state import InboxThreadState
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import crypto, google_oauth
 from app.services.bounce_ingestion import is_bounce_message
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern, endswith_pattern
 from app.services.gmail_sender import GmailSender
 
 logger = logging.getLogger(__name__)
@@ -991,15 +992,15 @@ class EmailHistoryService:
         # grouping via the per-user thread-state set.
 
         if search:
-            search_term = f"%{search}%"
+            search_term = contains_pattern(search)
             if sends_query is not None:
                 # Sent copy lives in body_html (no separate plaintext column).
                 sends_query = sends_query.where(
                     or_(
-                        EmailSend.subject.ilike(search_term),
-                        EmailSend.to_email.ilike(search_term),
-                        EmailSend.from_email.ilike(search_term),
-                        EmailSend.body_html.ilike(search_term),
+                        EmailSend.subject.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailSend.to_email.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailSend.from_email.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailSend.body_html.ilike(search_term, escape=LIKE_ESCAPE),
                     )
                 )
             if replies_query is not None:
@@ -1007,11 +1008,11 @@ class EmailHistoryService:
                 # searching for a phrase inside an email finds the thread.
                 replies_query = replies_query.where(
                     or_(
-                        EmailReply.subject.ilike(search_term),
-                        EmailReply.from_email.ilike(search_term),
-                        EmailReply.to_email.ilike(search_term),
-                        EmailReply.body_text.ilike(search_term),
-                        EmailReply.body_html.ilike(search_term),
+                        EmailReply.subject.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailReply.from_email.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailReply.to_email.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailReply.body_text.ilike(search_term, escape=LIKE_ESCAPE),
+                        EmailReply.body_html.ilike(search_term, escape=LIKE_ESCAPE),
                     )
                 )
 

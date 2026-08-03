@@ -49,6 +49,7 @@ from app.schemas.investor import (
     InvestorUpdate,
 )
 from app.services import ai_investor_outreach
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/investors", tags=["investors"])
@@ -98,13 +99,13 @@ async def list_investors(
     if stage:
         conditions.append(Investor.investment_stage == stage)
     if search:
-        term = f"%{search}%"
+        term = contains_pattern(search)
         conditions.append(
-            Investor.name.ilike(term)
-            | Investor.firm.ilike(term)
-            | Investor.email.ilike(term)
-            | Investor.location.ilike(term)
-            | Investor.notes.ilike(term)
+            Investor.name.ilike(term, escape=LIKE_ESCAPE)
+            | Investor.firm.ilike(term, escape=LIKE_ESCAPE)
+            | Investor.email.ilike(term, escape=LIKE_ESCAPE)
+            | Investor.location.ilike(term, escape=LIKE_ESCAPE)
+            | Investor.notes.ilike(term, escape=LIKE_ESCAPE)
         )
 
     query = select(Investor).where(and_(*conditions)).order_by(

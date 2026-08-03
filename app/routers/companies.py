@@ -35,6 +35,7 @@ from app.services.company_contacts import (
     pick_primary,
     rank_contacts,
 )
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/companies", tags=["companies"])
@@ -210,13 +211,13 @@ async def list_companies(
     # Filters
     conditions = []
     if q:
-        search = f"%{q}%"
+        search = contains_pattern(q)
         conditions.append(
             or_(
-                Company.name.ilike(search),
-                Company.domain.ilike(search),
-                Company.industry_segment.ilike(search),
-                Company.naics_description.ilike(search),
+                Company.name.ilike(search, escape=LIKE_ESCAPE),
+                Company.domain.ilike(search, escape=LIKE_ESCAPE),
+                Company.industry_segment.ilike(search, escape=LIKE_ESCAPE),
+                Company.naics_description.ilike(search, escape=LIKE_ESCAPE),
             )
         )
     if country:
@@ -226,9 +227,13 @@ async def list_companies(
     if pipeline_stage:
         conditions.append(Company.pipeline_stage == pipeline_stage)
     if naics_code:
-        conditions.append(Company.naics_code.startswith(naics_code))
+        conditions.append(Company.naics_code.startswith(naics_code, autoescape=True))
     if industry_segment:
-        conditions.append(Company.industry_segment.ilike(f"%{industry_segment}%"))
+        conditions.append(
+            Company.industry_segment.ilike(
+                contains_pattern(industry_segment), escape=LIKE_ESCAPE
+            )
+        )
     if min_employees is not None:
         conditions.append(Company.employee_count >= min_employees)
     if max_employees is not None:

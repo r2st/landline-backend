@@ -49,6 +49,7 @@ from app.schemas.public_api import (
     SequenceRead,
 )
 from app.services.api_key_auth import ApiKeyContext, require_scope
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ async def list_companies(
     """List companies in your org, newest first. Optional name search via ``q``."""
     filters = []
     if q:
-        filters.append(Company.name.ilike(f"%{q}%"))
+        filters.append(Company.name.ilike(contains_pattern(q), escape=LIKE_ESCAPE))
     total = (
         await db.execute(select(func.count(Company.id)).where(*filters))
     ).scalar_one()

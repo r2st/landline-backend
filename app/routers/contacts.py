@@ -37,6 +37,7 @@ from app.schemas.contact import (
     TagUpdate,
 )
 from app.services import contact_tags as tag_service
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/contacts", tags=["contacts"])
@@ -145,7 +146,7 @@ async def list_contacts(
 
     # City filter (case-insensitive partial match)
     if city:
-        conditions.append(Contact.city.ilike(f"%{city}%"))
+        conditions.append(Contact.city.ilike(contains_pattern(city), escape=LIKE_ESCAPE))
 
     # Source filter (exact match)
     if source:
@@ -181,17 +182,19 @@ async def list_contacts(
     # Company name filter (case-insensitive partial match, requires Company join)
     if company_name:
         _ensure_company_join()
-        conditions.append(Company.name.ilike(f"%{company_name}%"))
+        conditions.append(
+            Company.name.ilike(contains_pattern(company_name), escape=LIKE_ESCAPE)
+        )
 
     if q:
-        search = f"%{q}%"
+        search = contains_pattern(q)
         _ensure_company_join()
         conditions.append(or_(
-            Contact.first_name.ilike(search),
-            Contact.last_name.ilike(search),
-            Contact.email.ilike(search),
-            Contact.title.ilike(search),
-            Company.name.ilike(search),
+            Contact.first_name.ilike(search, escape=LIKE_ESCAPE),
+            Contact.last_name.ilike(search, escape=LIKE_ESCAPE),
+            Contact.email.ilike(search, escape=LIKE_ESCAPE),
+            Contact.title.ilike(search, escape=LIKE_ESCAPE),
+            Company.name.ilike(search, escape=LIKE_ESCAPE),
         ))
 
     if conditions:
