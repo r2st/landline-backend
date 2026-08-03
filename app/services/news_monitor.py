@@ -262,11 +262,30 @@ Return ONLY valid JSON: {{"subject": "...", "body": "..."}}"""
         }
 
     async def check_all_companies(self, db: AsyncSession, limit: int = 10) -> list[dict]:
-        """Check news for companies that haven't been checked recently."""
+        """Check news for companies that haven't been checked recently.
+
+        Returns one entry per company that *had* news — companies with nothing
+        to report are dropped. Callers that want "how many did we look at?"
+        should use :meth:`check_all_companies_counted`, not ``len()`` of this;
+        the two differ by exactly the companies with no news, which is most of
+        them on a normal day.
+        """
+        _, results = await self.check_all_companies_counted(db, limit=limit)
+        return results
+
+    async def check_all_companies_counted(
+        self, db: AsyncSession, limit: int = 10
+    ) -> tuple[int, list[dict]]:
+        """As :meth:`check_all_companies`, plus how many companies were examined.
+
+        ``(checked, results)``. ``checked`` is the size of the batch actually
+        read — not ``limit``, which is only a ceiling and overstates the work on
+        an org with fewer companies than the batch size.
+        """
         # Get companies ordered by least recently checked
         # Check companies in engaged, qualified, contacted stages first
         priority_stages = ["engaged", "qualified", "contacted", "scored", "researched", "new"]
-        
+
         result = await db.execute(
             select(Company)
             .where(Company.stage.in_(priority_stages))
@@ -289,7 +308,7 @@ Return ONLY valid JSON: {{"subject": "...", "body": "..."}}"""
             except Exception as e:
                 logger.error("News check failed for %s: %s", company.name, str(e))
 
-        return all_results
+        return len(companies), all_results
 
     async def _fetch_google_news(self, query: str) -> list[dict]:
         """Fetch news from Google News RSS."""

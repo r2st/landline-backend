@@ -70,13 +70,32 @@ async def check_company_news(company_id: UUID, db: AsyncSession = Depends(get_db
 
 
 @router.post("/check-all")
-async def check_all_news(limit: int = 10, db: AsyncSession = Depends(get_db)):
-    """Check news for multiple companies (batch)."""
+async def check_all_news(
+    limit: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check news for multiple companies (batch).
+
+    ``limit`` is bounded because each company in the batch costs an outbound
+    news fetch and an LLM call, run one after another inside this request. An
+    unbounded value therefore let one caller hold a worker and a database
+    connection for as long as the company table is long, and spend the org's
+    model quota doing it — a `?limit=100000` that reads as a harmless default
+    override. It also rejects ``0``/negative rather than passing them to
+    ``LIMIT``, which Postgres refuses outright.
+    """
     monitor = get_news_monitor()
-    results = await monitor.check_all_companies(db, limit=limit)
+    checked, results = await monitor.check_all_companies_counted(db, limit=limit)
     total_articles = sum(r["news_found"] for r in results)
     return {
-        "companies_checked": len(results),
+        # ``results`` holds only the companies that *had* news — the batch drops
+        # the empty ones — so ``len(results)`` is not the number checked. It was
+        # reported as one, which meant a sweep that examined ten companies and
+        # found nothing said "companies_checked: 0": indistinguishable from a
+        # sweep that never ran, on the endpoint an operator uses to confirm it
+        # did.
+        "companies_checked": checked,
+        "companies_with_news": len(results),
         "total_articles": total_articles,
         "results": results,
     }
