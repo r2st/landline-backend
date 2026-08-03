@@ -202,6 +202,34 @@ async def last_sent_step(db: AsyncSession, enrollment: OutreachEnrollment) -> in
     return max(int(enrollment.current_step or 1) - 1, 1)
 
 
+async def sent_step_or_none(
+    db: AsyncSession, enrollment: OutreachEnrollment
+) -> Optional[int]:
+    """:func:`last_sent_step` without the fallback — ``None`` if nothing was sent.
+
+    The fallback is right for a reply, which is proof that *something* reached
+    the recipient even if the ``sent`` event predates event logging. It is wrong
+    for a bounce, where "this enrollment never sent" is a real and common state
+    (the prospector can enroll a contact into a second sequence that hasn't run
+    yet, and ``record_bounce`` stops every active enrollment for the address).
+    Booking a bounce there invents an attempt that never happened — and one with
+    no ``sent`` partner reads to :class:`AttemptTally` as a synchronous failure,
+    so it lands in the denominator as well as the numerator.
+    """
+    row = (
+        await db.execute(
+            select(OutreachEvent.step_number)
+            .where(
+                OutreachEvent.enrollment_id == enrollment.id,
+                OutreachEvent.event_type == "sent",
+            )
+            .order_by(OutreachEvent.step_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return int(row) if row is not None else None
+
+
 async def build_reply_event(
     db: AsyncSession,
     enrollment: OutreachEnrollment,

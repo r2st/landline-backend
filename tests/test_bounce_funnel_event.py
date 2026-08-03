@@ -24,7 +24,15 @@ from app.models.sequence import OutreachSequence
 from app.services.bounce_handler import record_bounce
 
 
-async def _enrolled(db, email="lead@acme.com", *, current_step=2, status="active"):
+async def _enrolled(
+    db, email="lead@acme.com", *, current_step=2, status="active", sent_steps=None
+):
+    """An enrollment that has already sent, which is the only kind that bounces.
+
+    ``sent_steps`` defaults to every step before ``current_step`` — the state
+    ``send_sequence_step`` leaves behind, since it logs its ``sent`` event and
+    *then* increments. Pass ``[]`` for an enrollment that has never sent.
+    """
     company = Company(id=uuid.uuid4(), name="Acme Mfg", source="test", country="US")
     db.add(company)
     await db.flush()
@@ -40,6 +48,14 @@ async def _enrolled(db, email="lead@acme.com", *, current_step=2, status="active
         status=status, current_step=current_step,
     )
     db.add(enr)
+    await db.flush()
+    if sent_steps is None:
+        sent_steps = list(range(1, max(1, current_step)))
+    for step in sent_steps:
+        db.add(OutreachEvent(
+            enrollment_id=enr.id, step_number=step, event_type="sent",
+            event_metadata={},
+        ))
     await db.flush()
     return contact, enr
 
@@ -77,14 +93,7 @@ async def test_event_is_booked_against_the_step_that_bounced(db_session):
     enrollment that has just sent step 2 sits at ``current_step == 3``. Booking
     the bounce at 3 files it against a step that has never sent.
     """
-    contact, enr = await _enrolled(db_session, current_step=3)
-    db_session.add(
-        OutreachEvent(
-            enrollment_id=enr.id, step_number=2, event_type="sent",
-            event_metadata={},
-        )
-    )
-    await db_session.flush()
+    contact, enr = await _enrolled(db_session, current_step=3, sent_steps=[2])
 
     await record_bounce(
         db_session, contact.email, status_code="5.1.1", diagnostic="no such user"
@@ -108,14 +117,6 @@ async def test_a_misfiled_bounce_makes_both_steps_read_clean(db_session):
     from app.services.funnel_analytics import compute_funnel
 
     contact, enr = await _enrolled(db_session, current_step=3)
-    for step in (1, 2):
-        db_session.add(
-            OutreachEvent(
-                enrollment_id=enr.id, step_number=step, event_type="sent",
-                event_metadata={},
-            )
-        )
-    await db_session.flush()
 
     await record_bounce(
         db_session, contact.email, status_code="5.1.1", diagnostic="user unknown"
@@ -144,15 +145,7 @@ async def test_the_funnel_now_reports_a_real_bounce_rate(db_session):
     """
     from app.services.funnel_analytics import compute_funnel
 
-    contact, enr = await _enrolled(db_session, current_step=1)
-    for _ in range(2):
-        db_session.add(
-            OutreachEvent(
-                enrollment_id=enr.id, step_number=1, event_type="sent",
-                event_metadata={},
-            )
-        )
-    await db_session.flush()
+    contact, enr = await _enrolled(db_session, current_step=1, sent_steps=[1, 1])
 
     await record_bounce(
         db_session, contact.email, status_code="5.1.1", diagnostic="user unknown"
@@ -203,3 +196,90 @@ async def test_soft_bounce_below_threshold_writes_no_event(db_session):
     await db_session.refresh(enr)
     assert enr.status == "active"
     assert await _bounced_events(db_session, enr.id) == []
+
+
+@pytest.mark.asyncio
+async def test_an_enrollment_that_never_sent_books_no_bounce(db_session):
+    """``record_bounce`` stops every active enrollment for the address.
+
+    The prospector can enroll a contact into a second sequence that hasn't run
+    yet. That enrollment has no send to attribute a bounce to, and a ``bounced``
+    event with no ``sent`` partner reads as a synchronous failure — so the
+    invented row would land in the denominator as well as the numerator.
+    """
+    contact, sent_enr = await _enrolled(db_session, current_step=2)
+    idle_seq = OutreachSequence(id=uuid.uuid4(), name=f"Idle {uuid.uuid4()}")
+    db_session.add(idle_seq)
+    await db_session.flush()
+    idle = OutreachEnrollment(
+        id=uuid.uuid4(), contact_id=contact.id, sequence_id=idle_seq.id,
+        status="active", current_step=1,
+    )
+    db_session.add(idle)
+    await db_session.flush()
+
+    await record_bounce(
+        db_session, contact.email, status_code="5.1.1", diagnostic="user unknown"
+    )
+    await db_session.flush()
+
+    # Both enrollments are stopped — the address is dead either way.
+    await db_session.refresh(idle)
+    assert idle.status == "bounced"
+    # Only the one that actually sent reports a bounce.
+    assert len(await _bounced_events(db_session, sent_enr.id)) == 1
+    assert await _bounced_events(db_session, idle.id) == []
+
+
+@pytest.mark.asyncio
+async def test_writing_off_a_dead_domain_manufactures_no_bounces(db_session):
+    """One DSN must not become twenty.
+
+    ``suppress_dead_domain`` takes every *remaining* colleague out of play on
+    the strength of somebody else's bounce. Their mail did not bounce — most of
+    it was never sent — so booking one each is a prediction dressed as an
+    observation, and `danger_monitor` reads it as twenty attempts that failed
+    at a 100% rate. That is enough on its own to push the global bounce rate
+    past the threshold and flip the platform-wide kill switch, halting every
+    tenant's outreach over one bad domain in one list.
+    """
+    from app.services.bounce_handler import suppress_dead_domain
+
+    company = Company(id=uuid.uuid4(), name="Dead Co", source="test", country="US")
+    db_session.add(company)
+    await db_session.flush()
+
+    colleagues = []
+    for i in range(5):
+        contact = Contact(
+            id=uuid.uuid4(), company_id=company.id, email=f"c{i}@deadco.com",
+            first_name=f"C{i}", source="test",
+        )
+        seq = OutreachSequence(id=uuid.uuid4(), name=f"Seq {uuid.uuid4()}")
+        db_session.add_all([contact, seq])
+        await db_session.flush()
+        enr = OutreachEnrollment(
+            id=uuid.uuid4(), contact_id=contact.id, sequence_id=seq.id,
+            status="active", current_step=2,
+        )
+        db_session.add(enr)
+        await db_session.flush()
+        # Even a colleague we *had* sent to: no DSN came back for them.
+        db_session.add(OutreachEvent(
+            enrollment_id=enr.id, step_number=1, event_type="sent",
+            event_metadata={},
+        ))
+        await db_session.flush()
+        colleagues.append(enr)
+
+    result = await suppress_dead_domain(db_session, "deadco.com")
+    await db_session.flush()
+
+    assert result["contacts_suppressed"] == 5
+    assert result["enrollments_paused"] == 5
+    for enr in colleagues:
+        await db_session.refresh(enr)
+        assert enr.status == "bounced"
+        assert await _bounced_events(db_session, enr.id) == [], (
+            "a write-off is an inference, not five observed bounces"
+        )

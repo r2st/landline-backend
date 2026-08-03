@@ -100,7 +100,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
-from app.services.outreach_events import last_sent_step
+from app.services.outreach_events import sent_step_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -233,10 +233,34 @@ async def _suppress_address(db: AsyncSession, email: str, kind: str) -> bool:
     return status == "added"
 
 
-async def _suppress_contact(db: AsyncSession, contact: Contact) -> int:
+async def _suppress_contact(
+    db: AsyncSession, contact: Contact, *, observed: bool = True
+) -> int:
     """Mark a contact do-not-email and stop its active enrollments.
 
     Returns the number of enrollments paused. Idempotent.
+
+    ``observed`` says whether a message to *this* address actually came back.
+    It gates the funnel event, and nothing else: a bounce rate is a measurement,
+    so only mail that was sent and did bounce belongs in it. Two callers get
+    ``observed=False`` treatment for two different reasons:
+
+    * :func:`suppress_dead_domain` passes it explicitly. Writing off a domain
+      suppresses every *remaining* colleague on the strength of somebody else's
+      DSN. Their mail did not bounce — most of it was never sent — so booking a
+      bounce for each is a prediction dressed as an observation, and an
+      expensive one: one dead 20-contact domain manufactured 20 bounced
+      "attempts" at a 100% rate, which is enough on its own to push the global
+      bounce rate past ``danger_monitor``'s threshold and flip the platform-wide
+      kill switch. A single bad domain in one tenant's list halting everyone's
+      outreach is a brake wired to the wrong signal.
+    * an enrollment with **no ``sent`` event of its own** is skipped even on a
+      real DSN. ``record_bounce`` stops every active enrollment for the address,
+      and the prospector can enroll a contact into a second sequence that has
+      not sent yet. That enrollment has nothing to attribute a bounce to, and
+      ``AttemptTally`` reads a bounce with no send as a synchronous failure —
+      an attempt in its own right — so the invented row would show up as an
+      extra attempt *and* an extra bounce.
     """
     # ``suppressed`` is the flag the send paths gate on; ``unsubscribed`` is the
     # one the enrollment gate and the contact filters read. A bounce means both.
@@ -285,10 +309,16 @@ async def _suppress_contact(db: AsyncSession, contact: Contact) -> int:
         # this for an *active* enrollment and flips it to "bounced" in the same
         # breath, so a second DSN for the same address finds nothing active and
         # writes nothing.
+        if not observed:
+            continue
+        sent_step = await sent_step_or_none(db, enr)
+        if sent_step is None:
+            # Nothing was sent on this enrollment, so nothing bounced on it.
+            continue
         db.add(
             OutreachEvent(
                 enrollment_id=enr.id,
-                step_number=await last_sent_step(db, enr),
+                step_number=sent_step,
                 event_type="bounced",
                 occurred_at=now,
                 event_metadata={"email": contact.email, "source": "bounce_handler"},
@@ -322,7 +352,7 @@ async def suppress_dead_domain(db: AsyncSession, domain: str) -> dict:
     listed = 0
     for contact in contacts:
         suppressed += 1
-        enrollments_paused += await _suppress_contact(db, contact)
+        enrollments_paused += await _suppress_contact(db, contact, observed=False)
         if await _suppress_address(db, contact.email, "hard"):
             listed += 1
     await db.flush()
