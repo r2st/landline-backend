@@ -29,6 +29,7 @@ celery_app.conf.update(
         "app.tasks.scraping.*": {"queue": "scraping"},
         "app.tasks.enrichment.*": {"queue": "enrichment"},
         "app.tasks.outreach.*": {"queue": "outreach"},
+        "app.tasks.scheduled_sends.*": {"queue": "outreach"},
         "app.tasks.news.*": {"queue": "enrichment"},
         "app.tasks.followups.*": {"queue": "enrichment"},
         "app.tasks.calls.*": {"queue": "enrichment"},
@@ -72,6 +73,15 @@ celery_app.conf.update(
         "check-email-replies": {
             "task": "app.tasks.outreach.check_email_replies",
             "schedule": 600.0,  # every 10 minutes
+        },
+        # Put "send later" batches on the wire. Nothing read
+        # ``EmailSend.status == 'scheduled'`` before this entry existed, so the
+        # compose endpoint's scheduling option queued mail that was never sent.
+        # Every 5 minutes: the UI schedules to the minute, and a send window /
+        # daily cap can defer a row past any one pass anyway.
+        "send-due-scheduled-emails": {
+            "task": "app.tasks.scheduled_sends.send_due_scheduled_emails",
+            "schedule": 300.0,  # every 5 minutes
         },
         # Release AI-compose drafts that have sat in pending_review too long so a
         # missed review can't freeze an enrollment. Hourly is fine — the expiry
@@ -430,6 +440,10 @@ celery_app.autodiscover_tasks(["app.tasks"], force=True)
 
 # Force-import all task modules to guarantee registration
 import app.tasks.outreach  # noqa: F401
+# Registers send_due_scheduled_emails — the "send-due-scheduled-emails" beat
+# entry above. Without the force-import the task is unregistered and every
+# scheduled batch stays queued forever, exactly as it did before it existed.
+import app.tasks.scheduled_sends  # noqa: F401
 import app.tasks.warmup  # noqa: F401
 import app.tasks.news  # noqa: F401
 import app.tasks.scraping  # noqa: F401

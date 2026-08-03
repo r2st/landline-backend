@@ -641,7 +641,7 @@ async def compose_and_send(
         sender_user_id = getattr(acct, "user_id", None) if acct else None
 
     results: list[EmailComposeResult] = []
-    sent = skipped = errors = 0
+    sent = skipped = errors = scheduled = 0
 
     for i, contact_id in enumerate(payload.contact_ids):
         result = await db.execute(select(Contact).where(Contact.id == contact_id))
@@ -711,20 +711,26 @@ async def compose_and_send(
             db.add(email_send)
             await db.flush()
 
-            # Handle scheduled sends
+            # Inject open tracking pixel into email body
+            tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
+            body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
+
+            # Handle scheduled sends. The rendered copy has to be **persisted**
+            # here: the merge context is built from the contact and company as
+            # they are now, and nothing reconstructs it later. Before this,
+            # ``scheduled`` rows carried a subject and no body at all, which is
+            # part of why nothing could have sent them —
+            # ``app.tasks.scheduled_sends`` is the sweep that does.
             if payload.scheduled_at:
                 email_send.status = "scheduled"
                 email_send.scheduled_at = payload.scheduled_at
-                sent += 1
+                email_send.body_html = body_html
+                scheduled += 1
                 results.append(EmailComposeResult(
                     contact_id=contact_id, to_email=contact.email,
                     status="scheduled", detail="scheduled for later",
                 ))
                 continue
-
-            # Inject open tracking pixel into email body
-            tracking_pixel_url = generate_tracking_pixel_url(str(email_send.id))
-            body_html = body_html + f'<img src="{tracking_pixel_url}" width="1" height="1" style="display:none" />'
 
             send_result = await send_outreach_email(
                 db,
@@ -794,13 +800,14 @@ async def compose_and_send(
 
     await db.flush()
     logger.info(
-        "Compose to %d contacts via '%s' as %s (%s): sent=%d skipped=%d errors=%d",
+        "Compose to %d contacts via '%s' as %s (%s): sent=%d scheduled=%d skipped=%d errors=%d",
         len(payload.contact_ids), template.name, sender_info.from_email,
-        sender_info.transport, sent, skipped, errors,
+        sender_info.transport, sent, scheduled, skipped, errors,
     )
     return EmailComposeResponse(
         template_id=template.id,
         sent=sent,
+        scheduled=scheduled,
         skipped=skipped,
         errors=errors,
         transport=sender_info.transport,

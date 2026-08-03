@@ -147,6 +147,11 @@ class EmailComposeResult(BaseModel):
 class EmailComposeResponse(BaseModel):
     template_id: uuid.UUID
     sent: int
+    # Queued for a later ``scheduled_at`` and not yet on the wire. Counted apart
+    # from ``sent`` because it isn't one: the batch is handed to
+    # ``app.tasks.scheduled_sends``, and folding it into ``sent`` told the
+    # operator their mail had gone out when nothing had left the building.
+    scheduled: int = 0
     skipped: int
     errors: int
     # How the batch was sent: "gmail" or "ses", and the visible From address.
