@@ -71,8 +71,20 @@ async def test_hard_bounce_writes_a_funnel_event(db_session):
 
 @pytest.mark.asyncio
 async def test_event_is_booked_against_the_step_that_bounced(db_session):
-    """The send that failed is the step the enrollment was on."""
+    """The step that bounced is the step last *sent*, not ``current_step``.
+
+    ``send_sequence_step`` stamps its ``sent`` event and then increments, so an
+    enrollment that has just sent step 2 sits at ``current_step == 3``. Booking
+    the bounce at 3 files it against a step that has never sent.
+    """
     contact, enr = await _enrolled(db_session, current_step=3)
+    db_session.add(
+        OutreachEvent(
+            enrollment_id=enr.id, step_number=2, event_type="sent",
+            event_metadata={},
+        )
+    )
+    await db_session.flush()
 
     await record_bounce(
         db_session, contact.email, status_code="5.1.1", diagnostic="no such user"
@@ -80,7 +92,47 @@ async def test_event_is_booked_against_the_step_that_bounced(db_session):
     await db_session.flush()
 
     events = await _bounced_events(db_session, enr.id)
-    assert events[0].step_number == 3
+    assert events[0].step_number == 2
+
+
+@pytest.mark.asyncio
+async def test_a_misfiled_bounce_makes_both_steps_read_clean(db_session):
+    """The per-step funnel is where the off-by-one actually did damage.
+
+    A bounce filed one step to the right lands on a step with no sends, where
+    ``bounce_rate`` divides by zero to 0.0 and ``delivered`` clamps at 0 — while
+    the step that really bounced reports a flawless 100% delivered. Both halves
+    of the pair say "no bounce here", which is the reading
+    ``bounce_handler._suppress_contact`` was written to make impossible.
+    """
+    from app.services.funnel_analytics import compute_funnel
+
+    contact, enr = await _enrolled(db_session, current_step=3)
+    for step in (1, 2):
+        db_session.add(
+            OutreachEvent(
+                enrollment_id=enr.id, step_number=step, event_type="sent",
+                event_metadata={},
+            )
+        )
+    await db_session.flush()
+
+    await record_bounce(
+        db_session, contact.email, status_code="5.1.1", diagnostic="user unknown"
+    )
+    await db_session.flush()
+
+    funnel = await compute_funnel(db_session, days=30)
+    steps = {s["step_number"]: s for s in funnel["sequences"][0]["steps"]}
+
+    # The bounce is on the step that sent it, and that step reports it.
+    assert steps[2]["bounced"] == 1
+    assert steps[2]["bounce_rate"] == 100.0
+    assert steps[2]["delivered"] == 0
+    # Nothing is invented on a step the sequence never reached.
+    assert 3 not in steps
+    assert steps[1]["bounced"] == 0
+    assert steps[1]["delivered_rate"] == 100.0
 
 
 @pytest.mark.asyncio

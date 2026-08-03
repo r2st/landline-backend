@@ -100,6 +100,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.services.outreach_events import last_sent_step
 
 logger = logging.getLogger(__name__)
 
@@ -261,14 +262,33 @@ async def _suppress_contact(db: AsyncSession, contact: Contact) -> int:
         # on the enrollment, ``bounce_rate: 0.0`` on the funnel.
         #
         # Recorded against the step that was last sent, which is the step whose
-        # send bounced. Deliberately not deduplicated here: ``record_bounce``
-        # only reaches this for an *active* enrollment and flips it to "bounced"
-        # in the same breath, so a second DSN for the same address finds nothing
-        # active and writes nothing.
+        # send bounced — and ``current_step`` is **not** that step.
+        # ``send_sequence_step`` stamps its ``sent`` event with the step it sent
+        # and *then* increments the counter, so ``current_step`` names the step
+        # queued **next**. Booking the bounce there put it one step to the right
+        # of the send it belongs to, and the funnel buckets per
+        # ``(sequence_id, step_number)``: the step that actually bounced read
+        # ``bounced: 0, delivered_rate: 100%``, while the step after it —
+        # frequently one that has never sent, and past the end of the sequence
+        # entirely when the bounce arrives after the last step — collected
+        # bounces against a ``sent`` of 0, where ``bounce_rate`` divides to 0.0
+        # and ``delivered`` clamps at 0. So both halves of the pair reported no
+        # bounce, which is the exact reading this write was added to fix.
+        #
+        # ``last_sent_step`` is the shared resolver for "which step is this
+        # outcome about" (``services/outreach_events``), already used for
+        # replies after the same off-by-one zeroed every A/B variant's reply
+        # count. An outcome event is attributed with it, never with
+        # ``current_step``.
+        #
+        # Deliberately not deduplicated here: ``record_bounce`` only reaches
+        # this for an *active* enrollment and flips it to "bounced" in the same
+        # breath, so a second DSN for the same address finds nothing active and
+        # writes nothing.
         db.add(
             OutreachEvent(
                 enrollment_id=enr.id,
-                step_number=enr.current_step,
+                step_number=await last_sent_step(db, enr),
                 event_type="bounced",
                 occurred_at=now,
                 event_metadata={"email": contact.email, "source": "bounce_handler"},
