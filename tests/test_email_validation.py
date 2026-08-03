@@ -45,7 +45,7 @@ def test_check_mx_caches(monkeypatch):
         calls["n"] += 1
 
     # Seed the cache and confirm a second call doesn't recompute.
-    email_validation._MX_CACHE["cached.com"] = "valid"
+    email_validation._cache_put("cached.com", "valid")
     assert email_validation.check_mx("cached.com") == "valid"
 
 

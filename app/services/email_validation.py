@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -25,9 +26,39 @@ logger = logging.getLogger(__name__)
 
 _DNS_TIMEOUT = 5.0
 
-# Domain → status cache ("valid" | "invalid" | "unknown"). Unknowns are cached
-# too but callers treat them as "check again later" via email_status=None reset.
-_MX_CACHE: dict[str, str] = {}
+# Domain → (status, expires_at) cache, where ``expires_at`` is a
+# ``time.monotonic`` reading — a wall clock that steps backwards over an NTP
+# correction would extend a verdict's life rather than end it.
+#
+# Two properties this needs that a bare ``dict[str, str]`` did not have:
+#
+# **A verdict expires, and ``unknown`` expires quickly.** ``unknown`` means "the
+# lookup did not complete" — a resolver timeout, a SERVFAIL, dnspython missing
+# for one deploy. Cached forever, one DNS blip during a batch permanently
+# disabled the pre-bounce gate for that domain in that worker, and Celery workers
+# live for days. The direction is the problem: this gate exists to stop hard
+# bounces before they cost sending reputation, so its failure mode is silent —
+# nothing errors, the domain is simply never checked again and its dead addresses
+# go out. Note the second layer, which is why the short TTL matters even though
+# ``unknown`` is fail-open: ``app.tasks.outreach`` only validates a contact when
+# ``email_status is None``, so the ``unknown`` written from a poisoned cache
+# entry also stops *that* contact ever being re-checked. Nothing anywhere resets
+# ``email_status`` to None, contrary to what this comment used to claim.
+#
+# **It is bounded.** One entry per domain, never evicted, in a long-lived worker
+# that the autonomous prospector feeds new domains all day.
+_MX_CACHE: dict[str, tuple[str, float]] = {}
+
+# How long each verdict is trusted. A settled answer (MX present, or NXDOMAIN)
+# is stable enough to hold for a day; a failed lookup is re-tried within the
+# minute, which is short enough that a resolver blip costs one batch rather than
+# the worker's lifetime, and long enough that a genuine outage doesn't turn every
+# contact at a domain into its own 5-second timeout.
+_MX_TTL_SECONDS = {"valid": 86400.0, "invalid": 86400.0, "unknown": 60.0}
+
+# Cache ceiling. Evicts the soonest-to-expire entries when full, so the memory is
+# bounded without the cache ever handing back an answer it should have dropped.
+_MX_CACHE_MAX = 10_000
 
 # Pragmatic email syntax check: one @, a dot in the domain, no spaces. Not
 # RFC-5322-exhaustive on purpose — the MX check is the real gate.
@@ -42,6 +73,32 @@ def domain_of(email: str) -> str:
     return email.strip().rsplit("@", 1)[-1].lower()
 
 
+def _cache_get(domain: str) -> Optional[str]:
+    """The cached verdict for ``domain``, or ``None`` if absent or expired."""
+    entry = _MX_CACHE.get(domain)
+    if entry is None:
+        return None
+    status, expires_at = entry
+    if expires_at <= time.monotonic():
+        _MX_CACHE.pop(domain, None)
+        return None
+    return status
+
+
+def _cache_put(domain: str, status: str) -> None:
+    """Cache ``status`` for ``domain`` for its TTL, keeping the cache bounded."""
+    if len(_MX_CACHE) >= _MX_CACHE_MAX and domain not in _MX_CACHE:
+        # Drop the tenth nearest to expiry rather than one entry per insert, so a
+        # full cache doesn't pay a sort on every miss. Expiry order is the right
+        # eviction order here: entries near it are the ``unknown`` retries, which
+        # are the cheapest to lose and the ones we *want* re-asked.
+        doomed = sorted(_MX_CACHE.items(), key=lambda kv: kv[1][1])
+        for key, _ in doomed[: max(1, _MX_CACHE_MAX // 10)]:
+            _MX_CACHE.pop(key, None)
+    ttl = _MX_TTL_SECONDS.get(status, _MX_TTL_SECONDS["unknown"])
+    _MX_CACHE[domain] = (status, time.monotonic() + ttl)
+
+
 def check_mx(domain: str) -> str:
     """Return ``"valid"`` | ``"invalid"`` | ``"unknown"`` for a domain's MX.
 
@@ -50,13 +107,15 @@ def check_mx(domain: str) -> str:
     ``invalid`` — the domain resolves but has neither MX nor A (can't receive
                   mail) or does not exist (NXDOMAIN).
     ``unknown`` — the lookup couldn't be completed (missing dep / timeout / DNS
-                  error); never treated as a reason to suppress.
+                  error); never treated as a reason to suppress, and re-tried
+                  within the minute rather than cached for the worker's life.
     """
     domain = (domain or "").strip().lower()
     if not domain or "." not in domain:
         return "invalid"
-    if domain in _MX_CACHE:
-        return _MX_CACHE[domain]
+    cached = _cache_get(domain)
+    if cached is not None:
+        return cached
 
     try:
         import dns.resolver  # noqa: PLC0415 — optional dependency
@@ -92,7 +151,7 @@ def check_mx(domain: str) -> str:
     except Exception:  # pragma: no cover - defensive
         status = "unknown"
 
-    _MX_CACHE[domain] = status
+    _cache_put(domain, status)
     return status
 
 
