@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -42,6 +43,66 @@ router = APIRouter(prefix="/deals", tags=["deals"])
 def _f(value) -> float:
     """Coerce a (possibly Decimal/None) numeric to float."""
     return float(value) if value is not None else 0.0
+
+
+#: A deal in one of these statuses has been decided — the opportunity is over.
+DECIDED_STATUSES = ("won", "lost")
+
+
+def _apply_decision_date(
+    values: dict,
+    provided: set[str],
+    *,
+    previous_status: Optional[str] = None,
+) -> dict:
+    """Stamp ``close_date`` when a deal is decided; clear it when it reopens.
+
+    ``close_date`` is the only record of *when* a deal was decided, and nothing
+    ever wrote it. It is declared optional on ``DealCreate``/``DealUpdate`` and
+    an operator flipping a deal to won in the UI has no reason to also type a
+    date, so in practice every won deal carried ``close_date = NULL``.
+
+    Everything downstream reads that column and quietly degrades to zero:
+
+    * ``/reports/client-retention`` filters decided deals through
+      ``_in_window(d.close_date, ...)``, and ``_in_window`` returns ``False``
+      for ``None``. So ``won_deals_in_period`` and ``won_revenue_in_period``
+      were a structural 0 and $0 in *every* period, on a report whose whole
+      subject is revenue.
+    * ``/reports/top-clients`` with a date window re-aggregates through the same
+      predicate, so a windowed Top Clients table was always empty.
+    * ``/deals/metrics`` averages ``close_date - created_at`` over won deals
+      ``WHERE close_date IS NOT NULL``, so ``avg_days_to_close`` was 0.0.
+    * ``/reports/pipeline-analytics`` computes ``avg_deal_cycle_days`` the same
+      way — also 0.0.
+
+    None of those failed loudly. They reported a real-looking zero, which is the
+    one wrong answer an operator won't question on a report of a month with no
+    closes.
+
+    The rules, in order:
+
+    * An explicit ``close_date`` in the payload always wins — backfilling a
+      historical deal must stay possible, including setting it to ``None``.
+    * Only a *transition* into a decided status stamps the date. Re-saving a
+      deal that is already won (an edited note, a corrected value) leaves its
+      close date alone rather than walking it forward to today.
+    * A decided deal reopening to ``pending`` has its ``close_date`` cleared —
+      otherwise it keeps a decision date for a decision that was undone, and
+      re-winning it later would keep the *first* date.
+
+    ``values`` is the payload dict and ``provided`` the caller's
+    ``model_fields_set``; ``values`` is mutated and returned.
+    """
+    if "close_date" in provided:
+        return values
+
+    new_status = values.get("status", previous_status)
+    if new_status in DECIDED_STATUSES and previous_status not in DECIDED_STATUSES:
+        values["close_date"] = datetime.now(timezone.utc)
+    elif new_status not in DECIDED_STATUSES and previous_status in DECIDED_STATUSES:
+        values["close_date"] = None
+    return values
 
 
 async def _infer_attribution(
@@ -97,6 +158,10 @@ async def create_deal(payload: DealCreate, db: AsyncSession = Depends(get_db)):
             )
         ).scalar_one_or_none()
         values["source_sequence_id"] = enr
+
+    # A deal can be created already decided (a historical import, a close logged
+    # after the fact). Stamp its decision date the same way an update would.
+    _apply_decision_date(values, payload.model_fields_set, previous_status=None)
 
     deal = Deal(**values)
     db.add(deal)
@@ -470,6 +535,8 @@ async def update_deal(
             old_value=str(deal.value) if deal.value is not None else None,
             new_value=str(changes["value"]) if changes["value"] is not None else None,
         ))
+
+    _apply_decision_date(changes, payload.model_fields_set, previous_status=deal.status)
 
     for field, value in changes.items():
         setattr(deal, field, value)
