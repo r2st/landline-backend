@@ -14,7 +14,11 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
-from app.models.email_template import EmailSend
+from app.models.email_template import (
+    DELIVERED_STATUSES,
+    EmailSend,
+    WIRE_STATUSES,
+)
 from app.models.sequence import OutreachSequence, SequenceStep
 from app.schemas.outreach import (
     EnrollmentCreate,
@@ -445,33 +449,64 @@ async def get_enrollment_events(
 
 @router.get("/reply-stats")
 async def get_reply_stats(db: AsyncSession = Depends(get_db)):
-    """Get reply tracking statistics across all outreach emails."""
+    """Reply-tracking statistics across outreach sends recorded in ``email_sends``.
 
-    # Count by status
-    result = await db.execute(
-        select(EmailSend.status, func.count(EmailSend.id)).group_by(EmailSend.status)
-    )
-    status_counts = dict(result.all())
+    Every number here used to come out of one ``GROUP BY status``, which is the
+    wrong source twice over.
 
-    # Recent replies (last 10)
+    **``status`` is a lifecycle column, not a set of tags.** It carries the
+    furthest state a send reached — the tracking endpoints upgrade it and never
+    downgrade it — so a message that was opened and then replied to is
+    ``replied`` and appears under no other key. Counting ``status == 'opened'``
+    therefore counted opens that *stopped* at an open. It was a measure of
+    disengagement flying the name of a measure of engagement, and it fell as a
+    campaign got better. The timestamp columns are the tags: ``opened_at`` is
+    set on the first open and stays set through every later state.
+
+    **``sum(status_counts.values())`` counted every row.** Nothing filtered the
+    denominator, so `pending`, `skipped`, `error`, `failed` and `scheduled` were
+    all "sent" — a suppressed recipient, a spam-gate block, a spent daily cap
+    and a batch queued for next Thursday each made the reply rate worse. That is
+    the direction it must not be wrong in: the denominator grows fastest exactly
+    when sending is being *prevented*, so the operator reads a collapsing reply
+    rate and blames the copy.
+
+    Denominators follow the same split as the campaign summary in
+    ``email_templates``: volume is ``WIRE_STATUSES`` (a bounce was mail that
+    went out), engagement rates divide by ``DELIVERED_STATUSES`` (a bounce was
+    never delivered, so it is a list problem, not a copy problem).
+    """
+
+    async def _count(*criteria) -> int:
+        return (
+            await db.execute(select(func.count(EmailSend.id)).where(*criteria))
+        ).scalar() or 0
+
+    total_sent = await _count(EmailSend.status.in_(WIRE_STATUSES))
+    delivered = await _count(EmailSend.status.in_(DELIVERED_STATUSES))
+    opened = await _count(EmailSend.opened_at.isnot(None))
+    clicked = await _count(EmailSend.clicked_at.isnot(None))
+    replied = await _count(EmailSend.replied_at.isnot(None))
+    bounced = await _count(EmailSend.status == "bounced")
+
+    # Recent replies (last 10). Keyed on ``replied_at``, not on the status: a
+    # send that replied and then bounced a later message in the same thread
+    # would drop off this list while its reply timestamp stands.
     result = await db.execute(
         select(EmailSend)
-        .where(EmailSend.status == "replied")
+        .where(EmailSend.replied_at.isnot(None))
         .order_by(EmailSend.replied_at.desc())
         .limit(10)
     )
     recent_replies = result.scalars().all()
 
-    total_sent = sum(status_counts.values())
-    replied = status_counts.get("replied", 0)
-
     return {
         "total_sent": total_sent,
         "replied": replied,
-        "opened": status_counts.get("opened", 0),
-        "clicked": status_counts.get("clicked", 0),
-        "bounced": status_counts.get("bounced", 0),
-        "reply_rate": round(replied / max(total_sent, 1) * 100, 1),
+        "opened": opened,
+        "clicked": clicked,
+        "bounced": bounced,
+        "reply_rate": round(replied / delivered * 100, 1) if delivered else 0.0,
         "recent_replies": [
             {
                 "id": str(r.id),
