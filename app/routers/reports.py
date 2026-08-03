@@ -21,7 +21,7 @@ from app.models.agent_daily_summary import AgentDailySummary
 from app.models.client_health import ClientHealthSnapshot
 from app.models.company import Company
 from app.models.deal import Deal
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUS_VALUES, EmailSend
 from app.models.ab_test import AbTestAssignment, AbTestVariant
 from app.models.interaction import Interaction
 from app.models.lead_score import LeadScore
@@ -275,18 +275,46 @@ async def activity_heatmap(
         ts = _aware(ts)
         if ts is None:
             return
-        if lo is not None and ts < lo:
-            return
-        if hi is not None and ts > hi:
-            return
         counts[ts.date().isoformat()] += 1
 
-    for s in (await db.execute(select(EmailSend.sent_at))).scalars().all():
-        _bump(s)
-    for occurred in (await db.execute(select(Interaction.occurred_at))).scalars().all():
-        _bump(occurred)
-    for created in (await db.execute(select(Task.created_at))).scalars().all():
-        _bump(created)
+    async def _timestamps(column, *extra_filters):
+        """Every value of ``column`` inside the window.
+
+        The window is applied here rather than in ``_bump`` because it used to
+        be applied *only* in ``_bump``: the endpoint selected every timestamp in
+        `email_sends`, `interactions` and `tasks` — all of history, on every
+        table, on every load — to colour in at most 120 squares.
+        """
+        q = select(column).where(column.isnot(None), *extra_filters)
+        if lo is not None:
+            q = q.where(column >= lo)
+        if hi is not None:
+            q = q.where(column <= hi)
+        return (await db.execute(q)).scalars().all()
+
+    # `status` matters: the template router writes `skipped` for a contact with
+    # no address, one who unsubscribed and one on the suppression list, and
+    # `send_outreach_email` returns it for a spam-gate block, a warm-up hold, a
+    # kill-switch halt and a spent daily cap. None of those put a message on the
+    # wire, so none of them are a day's activity — and they cluster on exactly
+    # the days when outreach was *not* happening, which is the direction that
+    # makes a heatmap lie.
+    for ts in await _timestamps(
+        EmailSend.sent_at, EmailSend.status.notin_(NON_WIRE_STATUS_VALUES)
+    ):
+        _bump(ts)
+    # Sequence sends write no EmailSend row (see "Sent mail lives in two tables"
+    # in CLAUDE.md) — they are `OutreachEvent(event_type='sent')`, and they are
+    # where the bulk of this platform's outreach volume goes. Reading only
+    # `email_sends` left the activity heatmap blank on the busiest days.
+    for ts in await _timestamps(
+        OutreachEvent.occurred_at, OutreachEvent.event_type == "sent"
+    ):
+        _bump(ts)
+    for ts in await _timestamps(Interaction.occurred_at):
+        _bump(ts)
+    for ts in await _timestamps(Task.created_at):
+        _bump(ts)
 
     return [{"date": day, "count": counts[day]} for day in sorted(counts)]
 
