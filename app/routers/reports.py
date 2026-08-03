@@ -481,8 +481,22 @@ async def pipeline_analytics(
                 cycle_days.append(delta)
     avg_deal_cycle_days = round(sum(cycle_days) / len(cycle_days), 1) if cycle_days else 0.0
 
-    # Win / loss rates
-    total_decided = len(won_deals) + len(lost_deals) + len(pending_deals)
+    # Win / loss rates.
+    #
+    # The denominator is deals that were *decided*. It used to include
+    # ``pending_deals`` under the name ``total_decided``, which is the opposite
+    # of what a win rate measures: an open opportunity has not been lost, it has
+    # not been anything yet. Counting it as a non-win meant the reported win rate
+    # fell every time a rep created a deal and rose every time one was deleted —
+    # a team filling its pipeline watched its win rate drop.
+    #
+    # It also made the two rates incoherent: ``win_rate + loss_rate`` came to
+    # 100% only when the pipeline was empty, so the Pipeline page could show
+    # 20% won / 10% lost and leave 70% unaccounted for.
+    #
+    # ``/deals/metrics`` has always divided by won + lost. This is the same
+    # definition, so the two pages finally agree.
+    total_decided = len(won_deals) + len(lost_deals)
     win_rate = round(len(won_deals) / total_decided * 100, 1) if total_decided > 0 else 0.0
     loss_rate = round(len(lost_deals) / total_decided * 100, 1) if total_decided > 0 else 0.0
 
