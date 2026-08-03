@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.csv_export import CSV_FORMULA_PREFIXES, csv_safe
 from app.database import get_db
 from app.models.company import Company
 from app.models.contact import Contact
@@ -47,18 +48,13 @@ MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 # arrive as several files rather than one that silently wedges the API.
 MAX_IMPORT_ROWS = 50_000
 
-# Characters that spreadsheet apps (Excel, Sheets, LibreOffice) interpret as the
-# start of a formula. A cell beginning with one of these can execute when the
-# exported CSV is opened, so we defuse it by prefixing a single quote.
-_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
-
-
-def _csv_safe(value) -> str:
-    """Neutralize CSV formula injection in an exported cell value."""
-    text = "" if value is None else str(value)
-    if text and text[0] in _CSV_FORMULA_PREFIXES:
-        return "'" + text
-    return text
+# Formula-injection defusing now lives in ``app.csv_export`` so every export in
+# the codebase shares it. It was private to this module, which is exactly why
+# the send-history export in ``routers.email_templates`` — whose ``error``
+# column is a string a *remote mail server* chose — never got it. Aliased rather
+# than replaced at the call sites because the name reads correctly here.
+_CSV_FORMULA_PREFIXES = CSV_FORMULA_PREFIXES
+_csv_safe = csv_safe
 
 
 def _trigger_verification():

