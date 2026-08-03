@@ -161,6 +161,12 @@ def _extract_emails(content: str) -> list[tuple[str, Optional[str]]]:
     return rows
 
 
+# Addresses per round trip during a bulk import. Big enough that a full-size
+# upload is a few hundred statements instead of a few hundred thousand; small
+# enough that the ``IN (...)`` list stays well inside any parameter limit.
+_IMPORT_BATCH = 500
+
+
 async def import_csv(
     db: AsyncSession, content: str, *, default_reason: str = "unsubscribe"
 ) -> dict:
@@ -168,6 +174,15 @@ async def import_csv(
 
     Returns a summary: ``{added, duplicates, invalid, total}``. Deduplicates
     within the file too, so a repeated address in the upload counts once.
+
+    Batched rather than row-at-a-time. The upload cap is 5 MB, which is roughly
+    150k addresses, and the per-row path was a ``SELECT`` plus a ``flush`` each —
+    300k sequential round trips inside one request, holding a worker and a
+    database connection for minutes. The failure that produces is worse than
+    slow: the proxy times the request out, the transaction that was never
+    committed rolls back, and the operator is told nothing while *none* of their
+    compliance list landed. A do-not-contact upload silently not applying is the
+    one outcome this endpoint must not have.
     """
     if default_reason not in SUPPRESSION_REASONS:
         default_reason = "unsubscribe"
@@ -175,6 +190,9 @@ async def import_csv(
     added = duplicates = invalid = 0
     seen_in_file: set[str] = set()
 
+    # Parse and validate the whole file first; the database work is uniform after
+    # this, which is what makes it batchable.
+    pending: list[tuple[str, str]] = []
     for raw_email, row_reason in _extract_emails(content):
         normalized = normalize_email(raw_email)
         if normalized is None:
@@ -184,16 +202,38 @@ async def import_csv(
             duplicates += 1
             continue
         seen_in_file.add(normalized)
+        reason = row_reason or default_reason
+        if reason not in SUPPRESSION_REASONS:
+            reason = "manual"
+        pending.append((normalized, reason))
 
-        _, status = await add_entry(
-            db, normalized, reason=row_reason or default_reason, source="import"
+    for start in range(0, len(pending), _IMPORT_BATCH):
+        batch = pending[start : start + _IMPORT_BATCH]
+        emails = [email for email, _ in batch]
+        # One read per batch. Org-scoped by the global filter, like every other
+        # read here — a foreign org's entry for the same address is not a
+        # duplicate of ours.
+        existing = set(
+            (
+                await db.execute(
+                    select(SuppressionEntry.email).where(
+                        SuppressionEntry.email.in_(emails)
+                    )
+                )
+            ).scalars().all()
         )
-        if status == "added":
-            added += 1
-        elif status == "duplicate":
-            duplicates += 1
-        else:
-            invalid += 1
+        fresh = [
+            SuppressionEntry(email=email, reason=reason, source="import")
+            for email, reason in batch
+            if email not in existing
+        ]
+        duplicates += len(batch) - len(fresh)
+        if fresh:
+            db.add_all(fresh)
+            # One flush per batch, so the ORM emits a single multi-row INSERT
+            # rather than one statement per address.
+            await db.flush()
+            added += len(fresh)
 
     await db.commit()
     total = added + duplicates + invalid
