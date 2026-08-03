@@ -21,6 +21,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.contact import Contact
 
 
+# The tie-break every ordering of contacts ends with. ``contacts.created_at`` is
+# a ``server_default`` of ``now()``, which in Postgres is *transaction* start
+# time — so every contact a single scrape or import writes for a company shares
+# one reading to the microsecond and the timestamp settles nothing. Below it the
+# database is free to return rows in any order, and a stable sort then preserves
+# whatever that was.
+#
+# That is not a cosmetic wobble. ``pick_primary`` names the contact every list
+# view attributes the company to, and ``autonomous_prospector`` separately picks
+# the contact a sequence actually mails. Both were ordering on a value that ties,
+# so the dashboard could name one person while the mail went to another — which
+# is the exact failure ``_rank``'s docstring says it exists to prevent — and two
+# discovery runs over the same company could enrol two different contacts,
+# scattering the touches instead of accumulating them on one.
+#
+# ``id`` is arbitrary but *fixed*, which is the whole requirement: repeat runs
+# and separate surfaces agree.
+def _tiebreak(contact: Contact) -> tuple:
+    """``(created_at, id)`` — a total order over contacts, with no ties."""
+    created = contact.created_at
+    # A contact added in the current transaction has no server default yet.
+    # Sorting it before persisted rows keeps the comparison total rather than
+    # raising ``TypeError`` on ``None < datetime`` halfway through a page render.
+    return (created is not None, created, str(contact.id))
+
+
 def _rank(contact: Contact) -> tuple:
     """Sort key: whoever outreach would actually email, first.
 
@@ -37,7 +63,7 @@ def _rank(contact: Contact) -> tuple:
         not (emailable and not blocked),  # False (0) sorts first
         not bool(contact.is_primary),
         not emailable,
-        contact.created_at,
+        *_tiebreak(contact),
     )
 
 

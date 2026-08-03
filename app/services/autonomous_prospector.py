@@ -718,7 +718,19 @@ class AutonomousProspector:
                     Contact.suppressed.is_(False),
                     Contact.unsubscribed.is_(False),
                 )
-                .order_by(Contact.is_primary.desc())
+                # ``is_primary`` alone leaves every unflagged contact tied, and
+                # the autonomously-discovered companies never set the flag — so
+                # for the majority of companies the order was whatever the
+                # database happened to return. Two runs over one company could
+                # then enrol two different people, and the dashboard's own
+                # ranking (``company_contacts._rank``) could name a third.
+                # ``(created_at, id)`` is the same tie-break that module uses;
+                # ``created_at`` is transaction-start time and ties on its own.
+                .order_by(
+                    Contact.is_primary.desc(),
+                    Contact.created_at.asc(),
+                    Contact.id.asc(),
+                )
             )
         ).scalars().all()
         sequence = await self._pick_sequence(db, company)
