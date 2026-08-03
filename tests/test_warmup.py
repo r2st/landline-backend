@@ -277,3 +277,62 @@ async def test_send_outreach_email_skipped_when_warmup_capped(
     assert result["status"] == "skipped"
     assert "warm-up" in result["reason"]
     assert sent["count"] == 0  # nothing was actually sent
+
+
+@pytest.mark.asyncio
+async def test_warmup_api_rejects_mismatched_account_type(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """A supplied ``account_type`` that disagrees with the account is a 400.
+
+    The runtime gate resolves a plan by the *class of the account object*
+    (``warmup._transport_for``), so a plan stored under the other transport is
+    one it can never find. The failure is silent in the direction that matters:
+    the plan is listed on the Sender Health page and its ramp advances daily
+    while the mailbox sends with no warm-up cap at all. Nothing errors, and the
+    control reports itself enforced.
+    """
+    account = GmailAccount(
+        id=uuid.uuid4(), email="mismatch@apprend.tech", google_sub="gsub-mismatch",
+        refresh_token_encrypted="enc", status="connected",
+    )
+    db_session.add(account)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/dialtone/warmup",
+        json={"account_id": str(account.id), "account_type": "smtp"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "gmail" in resp.json()["detail"]
+
+    # Nothing was written — in particular no plan the gate cannot see.
+    assert await warmup.get_plan(db_session, account.id, "smtp") is None
+    assert await warmup.get_plan(db_session, account.id, "gmail") is None
+
+
+@pytest.mark.asyncio
+async def test_warmup_api_accepts_matching_account_type(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Naming the right transport explicitly still works (it is only inferred)."""
+    account = GmailAccount(
+        id=uuid.uuid4(), email="explicit@apprend.tech", google_sub="gsub-explicit",
+        refresh_token_encrypted="enc", status="connected",
+    )
+    db_session.add(account)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/dialtone/warmup",
+        json={"account_id": str(account.id), "account_type": "gmail"},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["account_type"] == "gmail"
+
+    # And the gate — which looks the plan up by the account object's own type —
+    # finds the plan that was just created.
+    plan = await warmup.get_plan(db_session, account.id, "gmail")
+    assert plan is not None
+    allowed, reason = await warmup.check_send_allowed(db_session, account)
+    assert allowed is True, reason

@@ -107,6 +107,7 @@ from app.services.booking import validate_booking_url
 from app.services.company_contacts import display_name, resolve_primary_contacts
 from app.services.outreach_events import SEND_ATTEMPT_TYPES, AttemptTally
 from app.services.send_limiter import get_send_limiter
+from app.services.sql_search import LIKE_ESCAPE, contains_pattern
 from app.services.timeframes import (
     DEFAULT_TIMEFRAME,
     TIMEFRAMES,
@@ -1356,12 +1357,32 @@ async def create_warmup_plan(
     ``account_type`` is inferred from which table the account lives in when not
     supplied. Idempotent: a sender that already has a plan gets it back with a
     409 so the caller knows it wasn't newly created.
+
+    A *supplied* ``account_type`` that disagrees with the table the account
+    actually lives in is a 400, not a stored value. The runtime gate resolves a
+    plan by ``(account_id, type-of-the-account-object)``
+    (``warmup.check_send_allowed`` → ``_transport_for``), so a plan filed under
+    the other transport is one the gate can never find: the operator sees the
+    plan on the Sender Health page, the daily beat advances its ramp on
+    schedule, and the mailbox meanwhile sends with no warm-up cap at all. That
+    is the failure mode this codebase keeps paying for — a control that reports
+    itself enforced while nothing enforces it — and it also lets one account
+    hold two plans, since the uniqueness constraint is on
+    ``(account_type, account_id)``.
     """
     account, transport = await _load_sender(db, str(payload.account_id))
     if account is None:
         raise HTTPException(status_code=404, detail="Sender account not found")
 
     account_type = payload.account_type or transport
+    if account_type != transport:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Sender {payload.account_id} is a {transport} account, not "
+                f"{account_type!r}. Omit account_type to have it inferred."
+            ),
+        )
     existing = await warmup.get_plan(db, payload.account_id, account_type)
     if existing is not None:
         raise HTTPException(
@@ -1403,7 +1424,11 @@ async def list_suppression(
 
     query = select(SuppressionEntry).order_by(SuppressionEntry.created_at.desc())
     if q:
-        query = query.where(SuppressionEntry.email.ilike(f"%{q.strip().lower()}%"))
+        query = query.where(
+            SuppressionEntry.email.ilike(
+                contains_pattern(q.strip().lower()), escape=LIKE_ESCAPE
+            )
+        )
     query = query.offset((page - 1) * page_size).limit(page_size)
     rows = (await db.execute(query)).scalars().all()
 
