@@ -73,6 +73,25 @@ def _paginate(page: int, page_size: int) -> tuple[int, int]:
     return (page - 1) * page_size, page_size
 
 
+def _newest_first(timestamp_column, id_column):
+    """``ORDER BY <timestamp> DESC, <id> DESC`` — a *total* order.
+
+    ``OFFSET``/``LIMIT`` over a non-total order is not a paging scheme. Every
+    ``created_at`` in this schema is a ``server_default`` of ``now()``, which in
+    Postgres is transaction start time, so a CSV import or a discovery run writes
+    hundreds of rows sharing one reading to the microsecond. Below the timestamp
+    the database is free to order the tie however it likes, and it is not obliged
+    to answer page 1 and page 2 the same way — so a client walking the pages sees
+    some rows twice and never sees others, with nothing on either page to suggest
+    anything went wrong.
+
+    This is the public API, where paging through the whole collection is the
+    normal way to use it, and an org that bulk-imported its contacts is the case
+    where *every* row ties.
+    """
+    return timestamp_column.desc(), id_column.desc()
+
+
 # ============================================================================
 # Contacts
 # ============================================================================
@@ -110,7 +129,8 @@ async def list_contacts(
     rows = (
         await db.execute(
             select(Contact).where(*filters)
-            .order_by(Contact.created_at.desc()).offset(offset).limit(limit)
+            .order_by(*_newest_first(Contact.created_at, Contact.id))
+            .offset(offset).limit(limit)
         )
     ).scalars().all()
     return ContactList(items=list(rows), total=total, page=page, page_size=page_size)
@@ -214,7 +234,8 @@ async def list_companies(
     rows = (
         await db.execute(
             select(Company).where(*filters)
-            .order_by(Company.created_at.desc()).offset(offset).limit(limit)
+            .order_by(*_newest_first(Company.created_at, Company.id))
+            .offset(offset).limit(limit)
         )
     ).scalars().all()
     return CompanyList(items=list(rows), total=total, page=page, page_size=page_size)
@@ -304,7 +325,8 @@ async def list_deals(
     rows = (
         await db.execute(
             select(Deal).where(*filters)
-            .order_by(Deal.created_at.desc()).offset(offset).limit(limit)
+            .order_by(*_newest_first(Deal.created_at, Deal.id))
+            .offset(offset).limit(limit)
         )
     ).scalars().all()
     return DealList(items=list(rows), total=total, page=page, page_size=page_size)
@@ -405,7 +427,7 @@ async def list_deal_notes(
     rows = (
         await db.execute(
             select(DealNote).where(DealNote.deal_id == deal_id)
-            .order_by(DealNote.created_at.desc())
+            .order_by(*_newest_first(DealNote.created_at, DealNote.id))
         )
     ).scalars().all()
     return list(rows)
@@ -443,7 +465,7 @@ async def list_deal_activity(
     rows = (
         await db.execute(
             select(DealActivity).where(DealActivity.deal_id == deal_id)
-            .order_by(DealActivity.created_at.desc())
+            .order_by(*_newest_first(DealActivity.created_at, DealActivity.id))
         )
     ).scalars().all()
     return list(rows)
@@ -463,7 +485,10 @@ async def list_sequences(
 ):
     """List your org's outreach sequences."""
     rows = (
-        await db.execute(select(OutreachSequence).order_by(OutreachSequence.created_at.desc()))
+        await db.execute(
+            select(OutreachSequence)
+            .order_by(*_newest_first(OutreachSequence.created_at, OutreachSequence.id))
+        )
     ).scalars().all()
     return list(rows)
 
@@ -490,7 +515,8 @@ async def list_enrollments(
     rows = (
         await db.execute(
             select(OutreachEnrollment).where(*filters)
-            .order_by(OutreachEnrollment.enrolled_at.desc()).offset(offset).limit(limit)
+            .order_by(*_newest_first(OutreachEnrollment.enrolled_at, OutreachEnrollment.id))
+            .offset(offset).limit(limit)
         )
     ).scalars().all()
     return list(rows)
