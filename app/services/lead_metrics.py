@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.deal import Deal
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUSES, EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate
 from app.models.tenant import Organization
@@ -30,6 +30,12 @@ from app.services.timeframes import ensure_aware, in_range
 
 # EmailSend statuses that represent a delivery failure (not a bounce).
 _ERROR_STATUSES = {"error", "failed"}
+
+# Statuses meaning nothing left the building and that aren't reported as errors
+# either — the queued states plus the two refusals the send gate records. Taken
+# wholesale from the model's own classification so a status added later has to
+# be classified there rather than defaulting into the send count here.
+_NOT_SENT_STATUSES = NON_WIRE_STATUSES - _ERROR_STATUSES
 
 # OutreachEvent.event_type -> the counter it increments / the feed label it maps to.
 _OUTREACH_COUNTERS = {
@@ -98,7 +104,14 @@ async def tally_by_org(
     for org_id, status, sent_at, opened_at, clicked_at, replied_at in (
         await db.execute(send_cols)
     ).all():
-        if status == "skipped":
+        # Only ``skipped`` was excluded, and the `else` below swept up whatever
+        # it didn't name — so `pending`, `scheduled`, `suppressed` and `halted`
+        # all landed in `emails_sent`. Two of those are the send gate refusing
+        # (`suppressed` = a do-not-contact match, `halted` = the kill switch), so
+        # the number grew precisely when sending stopped; the other two are
+        # queued rows, which `sent_at`'s NOT NULL `server_default` stamps and
+        # therefore counts the moment they're written rather than when they go.
+        if status in _NOT_SENT_STATUSES:
             continue
         c = tallies[org_id]
         if in_range(sent_at, start, end):
@@ -239,7 +252,9 @@ async def recent_events(
     if send_window is not None:
         send_query = send_query.where(send_window)
     for send, contact, company in (await db.execute(send_query)).all():
-        if send.status == "skipped":
+        # Same classification as the tally above: a row the send gate refused,
+        # or one still queued, is not an "email sent" entry in the feed either.
+        if send.status in _NOT_SENT_STATUSES:
             continue
         who = contact.full_name if contact is not None else send.to_email
         org_id = str(send.org_id) if send.org_id else None

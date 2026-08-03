@@ -34,7 +34,7 @@ from app.models.contact import Contact
 from app.models.danger_signal import DangerSignalEvent
 from app.models.deal import Deal
 from app.models.email_reply import EmailReply
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUSES, EmailSend
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.prospecting import ProspectCandidate
@@ -122,6 +122,12 @@ router = APIRouter(prefix="/dialtone", tags=["dialtone"])
 # Statuses on an EmailSend row that represent a delivery failure (surfaced as an
 # ``error`` event, not a plain ``email_sent``).
 _ERROR_STATUSES = {"error", "failed"}
+# Statuses meaning nothing left the building and that aren't reported as errors
+# either: the queued states, and the two refusals the send gate records.
+# ``NON_WIRE_STATUSES`` is the classification the model declares — see the note
+# above it — and taking it wholesale is what stops a status added later from
+# defaulting into the send count.
+_NOT_SENT_STATUSES = NON_WIRE_STATUSES - _ERROR_STATUSES
 # OutreachEvent.event_type → Dialtone feed event type.
 _OUTREACH_TYPE_MAP = {
     "sent": "email_sent",
@@ -258,8 +264,12 @@ async def _collect_events(
     if contact_id is not None:
         send_query = send_query.where(EmailSend.contact_id == contact_id)
     for send, contact in (await db.execute(send_query)).all():
-        if send.status == "skipped":
-            continue  # never sent → not real Dialtone activity
+        # Never sent → not real Dialtone activity. ``skipped`` was the only
+        # status excluded, so a suppressed recipient, a kill-switched send and a
+        # row still queued for next week each showed up in the log as an email
+        # we sent them.
+        if send.status in _NOT_SENT_STATUSES:
+            continue
         who = contact.full_name if contact is not None else (send.to_email or "unknown")
         if q_lower and q_lower not in (send.to_email or "").lower() and q_lower not in who.lower():
             continue
@@ -815,7 +825,18 @@ async def _period_counts(
         EmailSend.clicked_at, EmailSend.replied_at,
     )
     for status, sent_at, opened_at, clicked_at, replied_at in (await db.execute(send_cols)).all():
-        if status == "skipped":
+        # Only ``skipped`` was excluded here, and the `else` below swept up
+        # everything it didn't name — so `pending`, `scheduled`, `suppressed`
+        # and `halted` were all counted as emails sent. Two of those are the
+        # send gate *refusing*: `suppressed` is a do-not-contact match and
+        # `halted` is the kill switch. So engaging the kill switch on a blast
+        # made the console report the biggest send day it had ever had, which is
+        # the same failure the `("sent", "skipped")` note in CLAUDE.md describes
+        # and the same direction — the number flatters exactly when it's wrong.
+        # `pending`/`scheduled` are quieter and no better: `sent_at` is a
+        # NOT NULL `server_default`, so a row queued for next Tuesday is stamped
+        # now and counted now.
+        if status in _NOT_SENT_STATUSES:
             continue
         if status in _ERROR_STATUSES:
             bump("errors", sent_at)
