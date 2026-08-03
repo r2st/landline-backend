@@ -39,7 +39,10 @@ class BounceRecord(Base, OrgScopedMixin):
     )
     # The address that bounced (DSN Final-Recipient), lowercased.
     recipient_email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
-    # 'hard' | 'soft', as classified by bounce_handler.classify_bounce.
+    # 'hard' | 'soft' | 'blocked', as classified by bounce_handler.classify_bounce
+    # (``BOUNCE_KINDS``). 'blocked' is a policy rejection — a spam verdict, a
+    # DMARC failure, our IP on a blocklist — and suppresses nothing, because
+    # none of it was about the recipient. Migration 113 widened the CHECK.
     bounce_kind: Mapped[str] = mapped_column(String(10), nullable=False)
     # DSN Status (e.g. "5.1.1") and Diagnostic-Code, kept for auditing a
     # classification after the fact.

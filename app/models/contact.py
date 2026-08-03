@@ -78,7 +78,10 @@ class Contact(Base, OrgScopedMixin):
     # ``soft_bounce_suppress_threshold`` soft bounces) sets ``unsubscribed`` so
     # the dead address is never emailed again.
     bounce_count: Mapped[int] = mapped_column("bounce_count", default=0, server_default="0")
-    last_bounce_type: Mapped[str | None] = mapped_column(String(10))  # 'hard' | 'soft'
+    # 'hard' | 'soft' | 'blocked' — see bounce_handler.BOUNCE_KINDS. 'blocked'
+    # means the last rejection was about our sending reputation, not this
+    # mailbox, so it stamps the type and leaves ``bounce_count`` alone.
+    last_bounce_type: Mapped[str | None] = mapped_column(String(10))
     last_bounced_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     # Email deliverability pre-check (MX record validation). NULL = never checked.
     # 'valid' — domain has MX records; 'invalid' — no MX / bad syntax (never email);

@@ -9,9 +9,54 @@ an invalid mailbox tanks sender reputation and gets the domain blocklisted.
 * A **soft** bounce (transient: mailbox full, greylisted, 4.x.x) → tracked; the
   address is only suppressed after ``soft_bounce_suppress_threshold`` of them,
   since transient failures often clear on their own.
+* A **blocked** rejection (5.7.x policy: spam verdict, DMARC/SPF failure, IP on
+  a blocklist) → recorded and surfaced, and it suppresses **nothing**. See
+  below; this is the class that used to be counted as hard.
 
-Both increment ``Contact.bounce_count`` and stamp ``last_bounce_type`` /
-``last_bounced_at`` for the deliverability report.
+Hard and soft increment ``Contact.bounce_count`` and stamp ``last_bounce_type``
+/ ``last_bounced_at`` for the deliverability report. ``blocked`` stamps the type
+and the timestamp but deliberately does not touch the counter — see below.
+
+A policy block says something about *us*, and suppressing on it burns the list
+---------------------------------------------------------------------------
+``550 5.7.1 Our system has determined this message is likely unsolicited mail``
+is a 5.x.x code, so the code-class rule read it as a permanent failure and
+``record_bounce`` did the full hard-bounce treatment: contact ``suppressed`` and
+``unsubscribed``, live enrollments closed as ``bounced``, and a
+``reason="bounce"`` entry on the org do-not-contact list.
+
+Not one word of that rejection was about the recipient. The mailbox is alive and
+reading mail; what failed is our DMARC alignment, or our sending IP's
+reputation, or a content verdict. The consequences compound in the worst
+possible order:
+
+* **Every recipient behind the same filter bounces at once.** A broken DMARC
+  record does not reject one address, it rejects the whole send. One bad
+  afternoon suppresses everyone at every Microsoft 365 and Google Workspace
+  tenant we mailed — which, for B2B outreach, is most of the list.
+* **The domain write-off then generalises it.** ``_maybe_write_off_domain``
+  fires only on ``hard``, and ``MAILBOX_PROVIDER_DOMAINS`` shields
+  ``gmail.com``-style consumer domains — but ``acme.com`` hosted on M365 is not
+  in that set. Past ``dead_domain_bounce_threshold`` distinct addresses, every
+  remaining contact at the company is suppressed too, on the strength of a
+  rejection that never mentioned any of them.
+* **The damage outlives the cause.** Fixing the DMARC record un-breaks sending
+  and un-suppresses nothing. ``bounce`` is not in
+  ``suppression.REVERSIBLE_REASONS`` (``manual`` alone is), so the entries can
+  only be lifted one at a time, by hand, by an operator who first has to work
+  out that they were never real bounces.
+
+So the classifier answers a third way, and ``blocked`` is inert on the
+suppression path. It is *not* silent: the send still records as bounced, so
+``DangerMonitor``'s ``bounce_rate`` brake sees it in full and can pause the
+mailbox — which is the correct response to a reputation problem, and the exact
+opposite of deleting the audience. ``hard_bounce_count``, which asks "how many
+dead addresses", correctly does not.
+
+``bounce_count`` is left alone for the same reason: it is the counter
+``soft_bounce_suppress_threshold`` reads, so incrementing it would reintroduce
+the whole failure on a delay — the fifth blocked send to a live contact would
+suppress them anyway.
 
 Suppression is by **address**, not only by contact row
 -----------------------------------------------------
@@ -58,6 +103,11 @@ from app.models.outreach import OutreachEnrollment, OutreachEvent
 
 logger = logging.getLogger(__name__)
 
+#: Every value :func:`classify_bounce` can return, and every value the
+#: ``ck_bounce_kind`` CHECK constraint accepts (migration 113). Suppression
+#: behaviour differs per kind — see the module docstring.
+BOUNCE_KINDS = ("hard", "soft", "blocked")
+
 # Permanent-failure phrases seen in DSN diagnostics.
 _HARD_PHRASES = (
     "user unknown", "no such user", "unknown user", "recipient not found",
@@ -73,30 +123,82 @@ _SOFT_PHRASES = (
     "timed out", "connection timed out", "rate limit", "too many", "throttl",
     "service unavailable", "temporary failure", "temporary local problem",
 )
+# Rejections that are about the *sender* — our content verdict, our
+# authentication, our IP's reputation. The recipient's mailbox is fine.
+#
+# Matched against the diagnostic *and* the status code string, because a DSN
+# often carries the enhanced code only inside the diagnostic line
+# ("550 5.7.1 …") while ``status_code`` holds the bare "550".
+_POLICY_PHRASES = (
+    "spam", "unsolicited", "bulk mail", "junk",
+    "blocked", "block list", "blocklist", "blacklist", "denylist",
+    "spamhaus", "barracuda", "spamcop", "uceprotect", "listed in",
+    "reputation", "poor reputation", "sender score",
+    "dmarc", "spf", "dkim", "not authenticated", "unauthenticated",
+    "policy", "policy violation", "content rejected", "message rejected due to",
+    "abuse", "phish",
+)
+
+# Enhanced status subclass ``x.7.y`` is "Security or Policy Status" (RFC 3463
+# §3.8). A ``5.7.y`` is the permanent form, and it is the whole class this
+# distinction exists for: Microsoft's ``5.7.509`` (DMARC), ``5.7.606`` (banned
+# sending IP) and Google's ``5.7.1`` (unsolicited) all land here.
+_ENHANCED_POLICY_RE = re.compile(r"\b5\.7\.\d+\b")
 
 
 def classify_bounce(status_code: Optional[str] = None, diagnostic: str = "") -> str:
-    """Return ``"hard"`` or ``"soft"`` for a bounce.
+    """Return ``"hard"``, ``"soft"`` or ``"blocked"`` for a bounce.
 
-    Priority: an explicit SMTP status class (5.x.x → hard, 4.x.x → soft) wins;
-    otherwise the diagnostic text is matched against known phrases. Ambiguous
-    input defaults to ``"soft"`` — we would rather retry a live address than
-    permanently suppress a contact on a vague signal.
+    The order below is the whole of the logic, and each step is placed where it
+    is because of what the step after it would otherwise decide.
+
+    1. **A ``4.x`` is transient, whatever its reason.** First, so that a
+       greylisting DSN mentioning "policy" is not escalated into a reputation
+       alarm. ``4.7.x`` — a *temporary* policy refusal — belongs here: it
+       suppresses nothing today and clears on its own.
+    2. **An enhanced ``5.7.x`` is a policy block.** RFC 3463 §3.8 reserves the
+       ``.7.`` subclass for security and policy, and this is the step the
+       revision exists for: every rejection in the class carries a 5, so a
+       code-class-first rule called it permanent and the caller suppressed a
+       live recipient for something *we* did. See the module docstring.
+    3. **An explicit dead-recipient phrase is hard.** Ahead of the looser
+       policy-phrase match, because "user unknown" is direct evidence about the
+       mailbox and a bare word like "blocked" in the same diagnostic is not.
+       Getting this backwards would leave genuinely dead addresses in rotation,
+       which is the failure the whole module was built to stop.
+    4. **A looser policy phrase is a block** — a spam verdict, DMARC/SPF/DKIM,
+       a named blocklist — for DSNs that carry no enhanced code.
+    5. The SMTP status class (5.x.x → hard, 2.x.x → soft).
+    6. Known transient phrases.
+
+    Ambiguous input defaults to ``"soft"`` — we would rather retry a live
+    address than permanently suppress a contact on a vague signal.
     """
     code = (status_code or "").strip()
+    text = (diagnostic or "").lower()
+    haystack = f"{code} {text}".lower()
+
+    if re.match(r"\s*4", code):
+        return "soft"
+
+    if _ENHANCED_POLICY_RE.search(haystack):
+        return "blocked"
+
+    if any(p in text for p in _HARD_PHRASES):
+        return "hard"
+
+    if any(p in haystack for p in _POLICY_PHRASES):
+        return "blocked"
+
     # Enhanced status code like "5.1.1" or classic "550".
     m = re.match(r"\s*([245])", code)
     if m:
         cls = m.group(1)
         if cls == "5":
             return "hard"
-        if cls in ("4", "2"):
-            # 2.x.x isn't a bounce, but if labelled as one treat as soft/transient.
-            return "soft"
+        # 2.x.x isn't a bounce, but if labelled as one treat as soft/transient.
+        return "soft"
 
-    text = (diagnostic or "").lower()
-    if any(p in text for p in _HARD_PHRASES):
-        return "hard"
     if any(p in text for p in _SOFT_PHRASES):
         return "soft"
     return "soft"
@@ -245,6 +347,43 @@ async def _maybe_write_off_domain(
     return await suppress_dead_domain(db, domain)
 
 
+async def _record_policy_block(db: AsyncSession, email: str, now: datetime) -> dict:
+    """Stamp a policy rejection on the matching contacts and change nothing else.
+
+    Deliberately not a variant of the hard/soft path with flags turned off — the
+    whole point is that none of that machinery runs. No suppression, no
+    enrollment closed, no list entry, no domain write-off, and **no
+    ``bounce_count``**: that counter is what ``soft_bounce_suppress_threshold``
+    reads, so touching it would suppress the contact after N blocks and put the
+    bug back on a timer.
+
+    What is written is the audit trail an operator needs to see that the mailbox
+    is fine and the sending domain is not: ``last_bounce_type='blocked'`` and
+    ``last_bounced_at``. The bounced send itself is already recorded by the
+    caller, so ``DangerMonitor``'s ``bounce_rate`` still counts it and can still
+    pause the mailbox.
+    """
+    contacts = await _contacts_for_email(db, email)
+    for contact in contacts:
+        contact.last_bounce_type = "blocked"
+        contact.last_bounced_at = now
+    await db.flush()
+    logger.warning(
+        "Policy block for %s — %d contact(s) stamped, nothing suppressed. "
+        "This rejection is about our sending reputation, not the recipient.",
+        email, len(contacts),
+    )
+    return {
+        "email": email,
+        "kind": "blocked",
+        "matched_contacts": len(contacts),
+        "suppressed": 0,
+        "enrollments_paused": 0,
+        "list_entry_added": False,
+        "domain_written_off": None,
+    }
+
+
 async def record_bounce(
     db: AsyncSession,
     email: str,
@@ -255,12 +394,23 @@ async def record_bounce(
 ) -> dict:
     """Record a bounce for ``email`` and suppress the contact when warranted.
 
-    ``kind`` may be passed to force ``"hard"``/``"soft"``; otherwise it's
-    classified from ``status_code`` + ``diagnostic``. Returns a summary dict.
+    ``kind`` may be passed to force ``"hard"``/``"soft"``/``"blocked"``;
+    otherwise it's classified from ``status_code`` + ``diagnostic``. Returns a
+    summary dict.
+
+    ``blocked`` — a spam verdict, a DMARC failure, our IP on a blocklist — is
+    recorded and suppresses nothing, because none of it was about the recipient.
+    See the module docstring for why treating it as a hard bounce burned the
+    list rather than protecting it.
     """
     settings = get_settings()
-    bounce_kind = kind if kind in ("hard", "soft") else classify_bounce(status_code, diagnostic)
+    bounce_kind = (
+        kind if kind in BOUNCE_KINDS else classify_bounce(status_code, diagnostic)
+    )
     now = datetime.now(timezone.utc)
+
+    if bounce_kind == "blocked":
+        return await _record_policy_block(db, email, now)
 
     contacts = await _contacts_for_email(db, email)
     if not contacts:
