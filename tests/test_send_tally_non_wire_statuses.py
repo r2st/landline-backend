@@ -114,6 +114,13 @@ async def test_statuses_that_did_reach_the_wire_are_still_counted(
     was rejected afterwards — so every one of these is a message this mailbox
     actually sent. A tally that dropped them would repeat the mistake this file
     exists for, in the other direction and on the more valuable rows.
+
+    ``bounced`` counts as **both** a send and a bounce, which is the whole point
+    of ``WIRE_STATUSES`` naming it. This assertion said ``- 1`` until the tally
+    was corrected to do that (``84f2c73``) and was not updated with it, so the
+    suite has been red since. Excluding it would put the bounce outside the
+    denominator of its own rate, and mirror the sequence table — which records a
+    ``sent`` event and *then* a ``bounced`` one for the same message — wrongly.
     """
     for status in WIRE_STATUSES:
         await _send(db_session, status)
@@ -121,8 +128,7 @@ async def test_statuses_that_did_reach_the_wire_are_still_counted(
 
     counts = (await _period_counts(db_session, [WINDOW]))[0]
 
-    # ``bounced`` is booked as a bounce rather than a plain send; the rest count.
-    assert counts.emails_sent == len(WIRE_STATUSES) - 1
+    assert counts.emails_sent == len(WIRE_STATUSES)
     assert counts.bounces == 1
 
 
