@@ -724,6 +724,22 @@ async def daily_summary_by_date(
 
 _FUNNEL_EVENTS = ("sent", "opened", "replied", "bounced")
 
+# The events that carry the rendered copy in their metadata. Only these two are
+# worth reading `event_metadata` for — and reading it is expensive, because the
+# sequence engine persists the whole `body_html` there (see "Sent mail lives in
+# two tables" in CLAUDE.md).
+_COPY_BEARING_EVENTS = ("sent", "bounced")
+
+# How many ids to put in one `IN (...)`. Large enough that a normal window is a
+# single round trip, small enough that a year-long one doesn't hand the planner
+# a list it will refuse to index-scan.
+_ID_CHUNK = 1000
+
+
+def _chunked(items: list, size: int = _ID_CHUNK):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
 
 def _funnel_counts(buckets: dict) -> FunnelCounts:
     """Turn a ``{event_type: count}`` bucket into a FunnelCounts (rates vs sent)."""
@@ -765,14 +781,49 @@ async def outreach_funnel(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid sequence_id")
 
+    # The funnel is a count of distinct (enrollment, step, outcome) triples in a
+    # window, and every filter it applies is expressible in SQL. It used to be
+    # `select(OutreachEvent)` — the whole table, as full ORM objects, windowed
+    # afterwards in Python. That is the most expensive read in the codebase by a
+    # wide margin, because `outreach_events.event_metadata` is where the sequence
+    # engine persists each message's `body_html`: one request for a 120-day
+    # report dragged every email this org has ever sent, in full, through the
+    # session. Three of the four lookup tables around it were unbounded too.
+    #
+    # So: window + event type + distinctness in the database, and the metadata
+    # read narrowed to the enrollments that actually appear in the answer.
+    ev_q = select(
+        OutreachEvent.enrollment_id,
+        OutreachEvent.step_number,
+        OutreachEvent.event_type,
+    ).where(OutreachEvent.event_type.in_(_FUNNEL_EVENTS))
+    # No `occurred_at IS NOT NULL`, which the Python `_in_window` this replaces
+    # had to carry: the column is NOT NULL with a `now()` server default, so an
+    # event without a timestamp is not a row the database can hold.
+    if start is not None:
+        ev_q = ev_q.where(OutreachEvent.occurred_at >= start)
+    if end is not None:
+        ev_q = ev_q.where(OutreachEvent.occurred_at <= end)
+    # Same semantics as the `seen` set this replaces: a contact counts once per
+    # outcome per step, so an open pixel that fires five times is one open.
+    rows = (await db.execute(ev_q.distinct())).all()
+
+    enrollment_ids = sorted({r.enrollment_id for r in rows if r.enrollment_id is not None})
+
     # enrollment_id → sequence_id (and sequence_id → name) so events can be
     # attributed to their sequence, which the event row itself doesn't carry.
-    enr_rows = (
-        await db.execute(
-            select(OutreachEnrollment.id, OutreachEnrollment.sequence_id)
+    seq_by_enrollment: dict = {}
+    for chunk in _chunked(enrollment_ids):
+        seq_by_enrollment.update(
+            (eid, sid)
+            for eid, sid in (
+                await db.execute(
+                    select(OutreachEnrollment.id, OutreachEnrollment.sequence_id).where(
+                        OutreachEnrollment.id.in_(chunk)
+                    )
+                )
+            ).all()
         )
-    ).all()
-    seq_by_enrollment = {eid: sid for eid, sid in enr_rows}
 
     seq_names = dict(
         (
@@ -783,6 +834,26 @@ async def outreach_funnel(
     # (enrollment_id, step_number) → subject, resolved from the sent/bounced
     # event metadata (the only events that carry the copy). Later events
     # (opened/replied) inherit it so every outcome attributes to a subject.
+    # Deliberately *not* windowed: an open counted this month may belong to a
+    # send from last month, and it should still name its subject line.
+    subject_by_enr_step: dict[tuple, str] = {}
+    for chunk in _chunked(enrollment_ids):
+        for enr_id, step_no, meta in (
+            await db.execute(
+                select(
+                    OutreachEvent.enrollment_id,
+                    OutreachEvent.step_number,
+                    OutreachEvent.event_metadata,
+                ).where(
+                    OutreachEvent.enrollment_id.in_(chunk),
+                    OutreachEvent.event_type.in_(_COPY_BEARING_EVENTS),
+                )
+            )
+        ).all():
+            subj = (meta or {}).get("subject")
+            if subj:
+                subject_by_enr_step.setdefault((enr_id, step_no), subj)
+
     # A/B variant labels come from the assignment tables, keyed the same way.
     step_by_stepid = dict(
         (
@@ -795,59 +866,40 @@ async def outreach_funnel(
         ).all()
     )
     variant_by_enr_step: dict[tuple, str] = {}
-    for enr_id, step_id, variant_id in (
-        await db.execute(
-            select(
-                AbTestAssignment.enrollment_id,
-                AbTestAssignment.sequence_step_id,
-                AbTestAssignment.variant_id,
+    for chunk in _chunked(enrollment_ids):
+        for enr_id, step_id, variant_id in (
+            await db.execute(
+                select(
+                    AbTestAssignment.enrollment_id,
+                    AbTestAssignment.sequence_step_id,
+                    AbTestAssignment.variant_id,
+                ).where(AbTestAssignment.enrollment_id.in_(chunk))
             )
-        )
-    ).all():
-        step_no = step_by_stepid.get(step_id)
-        label = variant_label_by_id.get(variant_id)
-        if step_no is not None and label is not None:
-            variant_by_enr_step[(enr_id, step_no)] = label
-
-    events = list((await db.execute(select(OutreachEvent))).scalars().all())
-
-    # First pass: harvest the subject per (enrollment, step) from sent/bounced.
-    subject_by_enr_step: dict[tuple, str] = {}
-    for ev in events:
-        if ev.event_type in ("sent", "bounced"):
-            subj = (ev.event_metadata or {}).get("subject")
-            if subj:
-                subject_by_enr_step.setdefault((ev.enrollment_id, ev.step_number), subj)
+        ).all():
+            step_no = step_by_stepid.get(step_id)
+            label = variant_label_by_id.get(variant_id)
+            if step_no is not None and label is not None:
+                variant_by_enr_step[(enr_id, step_no)] = label
 
     overall: dict = defaultdict(int)
     by_step: dict[int, dict] = defaultdict(lambda: defaultdict(int))
     by_sequence: dict = defaultdict(lambda: defaultdict(int))
     by_subject: dict[tuple, dict] = defaultdict(lambda: defaultdict(int))
-    seen: set = set()  # dedupe (enrollment, step, event_type): count a contact once
 
-    for ev in events:
-        if ev.event_type not in _FUNNEL_EVENTS:
-            continue
-        if not _in_window(ev.occurred_at, start, end):
-            continue
-        seq_id = seq_by_enrollment.get(ev.enrollment_id)
+    for row in rows:
+        seq_id = seq_by_enrollment.get(row.enrollment_id)
         if seq_filter is not None and seq_id != seq_filter:
             continue
 
-        key = (ev.enrollment_id, ev.step_number, ev.event_type)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        et = ev.event_type
+        et = row.event_type
         overall[et] += 1
-        by_step[ev.step_number][et] += 1
+        by_step[row.step_number][et] += 1
         by_sequence[seq_id][et] += 1
 
         subject = subject_by_enr_step.get(
-            (ev.enrollment_id, ev.step_number), "(unknown subject)"
+            (row.enrollment_id, row.step_number), "(unknown subject)"
         )
-        label = variant_by_enr_step.get((ev.enrollment_id, ev.step_number))
+        label = variant_by_enr_step.get((row.enrollment_id, row.step_number))
         by_subject[(subject, label)][et] += 1
 
     return OutreachFunnelReport(
