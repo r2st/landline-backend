@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.workflow import Workflow, WorkflowRun
@@ -155,20 +155,53 @@ async def _score_lead(db: AsyncSession, params: dict, ctx: dict) -> dict:
     return {"fit_score": score.fit_score, "intent_score": getattr(score, "intent_score", None)}
 
 
+def _one_of(value: Any, allowed: tuple[str, ...], label: str) -> None:
+    """Refuse a step param that a CHECK constraint would refuse at flush time.
+
+    The columns these actions write are enums twice over: the REST schemas run a
+    ``field_validator`` against the same tuples, and the tables carry a
+    ``CHECK … IN (…)``. A workflow step reaches neither. ``params`` is free-form
+    JSON that :func:`app.routers.workflows._validate_steps` checks only for a
+    known ``action`` name, so ``{"stage": "Closed Won"}`` — an ordinary thing for
+    an operator to type, given that is what every other CRM calls it — is stored,
+    accepted, and only refused by Postgres, in a worker, at flush.
+
+    Failing there rather than here is not a smaller version of the same failure.
+    The engine catches a step's exception and records the step as failed, but the
+    session that raised is now in a rolled-back-pending state, so the ``flush``
+    that writes ``run.step_results`` raises ``PendingRollbackError`` on the way
+    out of :meth:`WorkflowEngine.execute_workflow` — past the per-step handler,
+    which is not around it. One mistyped enum therefore loses the whole run
+    record, takes down every later step, and 500s the caller. Raising a
+    ``ValueError`` before the write keeps it a step failure, which is what it is.
+
+    Not enforced against the DB's constraint list at runtime on purpose: these
+    tuples are the schemas' own, so drifting from them shows up in
+    ``tests/test_workflow_action_validation.py`` rather than in a worker.
+    """
+    if value not in allowed:
+        raise ValueError(f"{label} must be one of {allowed}, got {value!r}")
+
+
 @action("create_task")
 async def _create_task(db: AsyncSession, params: dict, ctx: dict) -> dict:
     """Create a follow-up Task."""
     from app.models.task import Task
+    from app.schemas.task import VALID_PRIORITIES, VALID_TASK_TYPES
 
     company_id = params.get("company_id") or _resolve_field(ctx, "company.id") or _resolve_field(ctx, "company_id")
     if not company_id:
         return {"skipped": "no company_id"}
+    priority = params.get("priority", "medium")
+    task_type = params.get("task_type", "follow_up")
+    _one_of(priority, VALID_PRIORITIES, "priority")
+    _one_of(task_type, VALID_TASK_TYPES, "task_type")
     task = Task(
         company_id=_as_uuid(company_id),
         title=params.get("title", "Workflow follow-up"),
         description=params.get("description"),
-        priority=params.get("priority", "medium"),
-        task_type=params.get("task_type", "follow_up"),
+        priority=priority,
+        task_type=task_type,
     )
     db.add(task)
     await db.flush()
@@ -179,11 +212,13 @@ async def _create_task(db: AsyncSession, params: dict, ctx: dict) -> dict:
 async def _update_deal_stage(db: AsyncSession, params: dict, ctx: dict) -> dict:
     """Advance/set a deal's stage."""
     from app.models.deal import Deal
+    from app.schemas.deal import VALID_DEAL_STAGES
 
     deal_id = params.get("deal_id") or _resolve_field(ctx, "deal.id") or _resolve_field(ctx, "deal_id")
     stage = params.get("stage")
     if not deal_id or not stage:
         return {"skipped": "deal_id and stage required"}
+    _one_of(stage, VALID_DEAL_STAGES, "stage")
     deal = (
         await db.execute(select(Deal).where(Deal.id == _as_uuid(deal_id)))
     ).scalar_one_or_none()
@@ -270,14 +305,78 @@ class WorkflowEngine:
         workflows = (await db.execute(query)).scalars().all()
 
         runs = []
+        capped = []
         for wf in workflows:
             ctx = self._seed_context(payload, org_id)
             if not evaluate_conditions(wf.trigger_conditions, ctx):
                 continue
+            if await self._over_daily_cap(db, wf):
+                logger.warning(
+                    "Workflow %s (%s) held: max_runs_per_day=%s already spent",
+                    wf.id, wf.name, wf.max_runs_per_day,
+                )
+                capped.append({"workflow_id": str(wf.id), "status": "capped"})
+                continue
             run = await self.execute_workflow(db, wf, payload, org_id)
             runs.append({"workflow_id": str(wf.id), "run_id": str(run.id), "status": run.status})
 
-        return {"workflows_matched": len(runs), "runs": runs}
+        # ``workflows_matched`` counts what ran, as it always has. A held
+        # workflow is reported separately rather than folded in: the caller of
+        # ``/workflows/emit`` needs to be able to tell "your conditions didn't
+        # match" from "your conditions matched and the cap is spent", and those
+        # are the same number otherwise.
+        return {"workflows_matched": len(runs), "runs": runs, "capped": capped}
+
+    async def _over_daily_cap(self, db: AsyncSession, workflow: Workflow) -> bool:
+        """Has this workflow already run ``max_runs_per_day`` times today (UTC)?
+
+        The column has existed since 4.3, is editable through ``POST``/``PATCH
+        /workflows``, is returned by every read, and is documented on the model
+        as the guard "against runaway self-triggering loops". Nothing read it.
+        An operator setting 50 got no bound at all — and the loop it names is
+        reachable: ``emit_webhook`` and ``slack_notify`` put events back out, and
+        every run can spend ``ai_generate`` and ``generate_email`` LLM calls, so
+        the cost of an unbounded trigger is not just rows.
+
+        Counted, deliberately, from ``workflow_runs`` rather than a counter:
+        the run table is the record the cap is *about*, it survives a restart,
+        and it is what the operator is shown on ``/workflows/{id}/runs`` — a cap
+        enforced against a number nobody can see is the harder thing to debug.
+
+        Advisory, not an interlock. Two workers dispatching the same event
+        concurrently can both read a count under the cap and both run; the
+        overshoot is bounded by worker concurrency, not by the day. That is the
+        right trade here — this bounds runaway cost, it is not a compliance
+        floor — and it is the same reasoning that makes ``can_send_today`` safe
+        as a pre-check and unsafe as a gate. Anything needing exactness wants
+        the Redis reservation shape from ``SendLimiter`` instead.
+        """
+        cap = workflow.max_runs_per_day
+        if cap is None:
+            return False
+        if cap <= 0:
+            # Not the same as unset. ``0`` is an operator switching a workflow
+            # off without deactivating it, and must hold rather than divide.
+            return True
+        since = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        count = (
+            await db.execute(
+                select(func.count())
+                .select_from(WorkflowRun)
+                .where(
+                    WorkflowRun.workflow_id == workflow.id,
+                    WorkflowRun.started_at >= since,
+                    # A run held by this very cap is recorded as ``skipped`` by
+                    # nothing today, but manual runs and future statuses share
+                    # the table — count only executions, or a cap that records
+                    # its own refusals would ratchet itself shut.
+                    WorkflowRun.status != "skipped",
+                )
+            )
+        ).scalar_one()
+        return count >= cap
 
     def _seed_context(self, payload: dict, org_id: Optional[uuid.UUID]) -> dict:
         ctx = dict(payload or {})
@@ -333,7 +432,24 @@ class WorkflowEngine:
                 continue
 
             try:
-                output = await fn(db, step.get("params", {}) or {}, ctx)
+                # Each step runs inside a SAVEPOINT so that "a failing step is
+                # captured on the run, not raised" — the promise in this
+                # module's docstring — holds for the failures that come from the
+                # *database* rather than from Python.
+                #
+                # Those are the ones this engine is most exposed to, because
+                # ``params`` is free-form JSON: a ``company_id`` naming a row
+                # that has since been deleted is a foreign-key violation, and
+                # every enum column these actions write has a CHECK behind it.
+                # Catching that exception is not enough on its own. The session
+                # it came out of is in a rolled-back-pending state, so the
+                # ``flush`` at the bottom of this method — outside the per-step
+                # handler — raises ``PendingRollbackError`` and takes the run
+                # record, the remaining steps and the caller's request with it.
+                # Rolling back to the savepoint returns the session to the state
+                # the step started in, and the run continues and is recorded.
+                async with db.begin_nested():
+                    output = await fn(db, step.get("params", {}) or {}, ctx)
                 ctx.update({k: v for k, v in output.items() if not k.startswith("_")})
                 results.append(
                     {"step_id": step_id, "action": action_name, "status": "completed", "output": output}
@@ -345,6 +461,29 @@ class WorkflowEngine:
                     {"step_id": step_id, "action": action_name, "status": "failed", "error": str(exc)}
                 )
                 i = self._next_index(step, by_id, i, success=False)
+
+        if guard >= max_iter and 0 <= i < len(steps):
+            # The guard fired: `on_success`/`on_failure` point backwards and the
+            # workflow is a cycle. It was silently indistinguishable from a
+            # workflow that ran to the end — the loop exited, no result recorded
+            # why, and a run truncated mid-cycle was reported "completed" so long
+            # as every step it *did* reach succeeded. That is the one outcome an
+            # operator most needs told, because the steps have real side effects:
+            # a two-step cycle on `generate_email` ran the LLM `max_iter` times
+            # and then reported a clean run.
+            logger.error(
+                "Workflow %s stopped after %s steps: branch targets form a loop",
+                workflow.id, guard,
+            )
+            results.append(
+                {"step_id": steps[i].get("id", f"step{i}"),
+                 "action": steps[i].get("action"),
+                 "status": "failed",
+                 "error": (
+                     f"stopped after {guard} steps: branch targets form a loop "
+                     f"(limit {max_iter})"
+                 )}
+            )
 
         run.step_results = results
         run.status = "failed" if any(r["status"] == "failed" for r in results) else "completed"
