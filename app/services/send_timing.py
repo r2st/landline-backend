@@ -1,4 +1,28 @@
-"""Optimal send timing — analyzes open data to suggest best send times."""
+"""Optimal send timing — analyzes open data to suggest best send times.
+
+A rate needs a denominator before it means anything
+---------------------------------------------------
+``get_optimal_times`` ranks days, hours and (day, hour) cells by open rate and
+hands the top few to the Console as "your best send times". It ranked them on
+the rate alone, with no floor under the sample, so one send that happened to be
+opened was a 100% cell and outranked every hour with real traffic behind it.
+
+That is not a rare tail case, it is the *default* state of the surface. Open
+rates live around 30-60%, so no busy hour ever reaches 100% — the top of this
+list was structurally reserved for the thinnest cells on the grid. A 7x24 grid
+has 168 cells and a new tenant fills them one send at a time, which means the
+recommendation was at its most confident exactly when it knew least, and it
+pointed at whichever near-empty cell got lucky. An operator following it moves
+their sending into the hour with the least evidence for it.
+
+``get_heatmap`` right below already refuses to nominate a ``best_cell`` under
+:data:`MIN_SAMPLE` — "not a lucky 1/1", as its own comment puts it. The same
+floor now applies to all three rankings here, and the cells that don't clear it
+are still *returned* (they are real data, and the counts are what show the grid
+filling up) — they are only barred from being called best. When nothing clears
+the floor the caller is told so explicitly, rather than being handed noise
+formatted as a recommendation.
+"""
 
 import logging
 from collections import defaultdict
@@ -9,6 +33,30 @@ from sqlalchemy import select, func, extract, and_
 from app.models.outreach import OutreachEvent
 
 logger = logging.getLogger(__name__)
+
+# Sends a bucket needs before its open rate may be ranked as a "best" time.
+# Shared by ``get_optimal_times`` and ``get_heatmap`` so the two surfaces cannot
+# recommend different hours from the same data.
+MIN_SAMPLE = 3
+
+
+def _rate(stats: dict) -> float:
+    """Open rate for a ``{"total", "opened"}`` bucket, 0.0 when nothing was sent."""
+    total = stats.get("total") or 0
+    return (stats.get("opened") or 0) / total if total else 0.0
+
+
+def _rank(buckets, *, min_sample: int = MIN_SAMPLE):
+    """``buckets`` sorted best-rate-first, keeping only those with enough sends.
+
+    Sorted on ``(rate, total)`` so that among buckets tied on rate — which is
+    common at these sample sizes, where most cells are some small fraction with
+    a small denominator — the one with more sends behind it wins. Without the
+    tiebreak the order among ties is whatever the dict happened to yield.
+    """
+    qualified = [(key, stats) for key, stats in buckets if (stats.get("total") or 0) >= min_sample]
+    qualified.sort(key=lambda kv: (_rate(kv[1]), kv[1].get("total") or 0), reverse=True)
+    return qualified
 
 
 class SendTimingAnalyzer:
@@ -91,29 +139,20 @@ class SendTimingAnalyzer:
                 "rate": round(opened / max(total, 1) * 100, 1),
             }
 
-        # Find best days
-        best_days = sorted(
-            by_day.items(),
-            key=lambda x: x[1]["opened"] / max(x[1]["total"], 1),
-            reverse=True,
-        )
-
-        # Find best hours
-        best_hours = sorted(
-            by_hour.items(),
-            key=lambda x: x[1]["opened"] / max(x[1]["total"], 1),
-            reverse=True,
-        )
-
-        # Top 5 day+hour combos
-        best_combos = sorted(
-            by_day_hour.items(),
-            key=lambda x: x[1]["rate"],
-            reverse=True,
-        )[:5]
+        # Ranked, and floored at MIN_SAMPLE sends. A bucket below the floor is
+        # still counted in the totals below — it happened — but it is not
+        # eligible to be called a best time on the strength of one open.
+        best_days = _rank(by_day.items())
+        best_hours = _rank(by_hour.items())
+        best_combos = _rank(by_day_hour.items())[:5]
 
         return {
             "has_data": True,
+            # Explicit, so the Console can say "not enough data yet" instead of
+            # rendering an empty list as though the analysis found nothing
+            # interesting. Data exists; none of it is thick enough to rank.
+            "min_sample": MIN_SAMPLE,
+            "has_ranking": bool(best_days or best_hours or best_combos),
             "total_emails_analyzed": sum(d["total"] for d in by_day.values()),
             "overall_open_rate": round(
                 sum(d["opened"] for d in by_day.values()) /
@@ -214,7 +253,7 @@ class SendTimingAnalyzer:
             total_sent += sent
             total_opened += opened
             # Best cell needs enough sample to be meaningful, not a lucky 1/1.
-            if sent >= 3 and (best is None or rate > best["open_rate"]):
+            if sent >= MIN_SAMPLE and (best is None or rate > best["open_rate"]):
                 best = cell
 
         cells.sort(key=lambda c: (c["dow"], c["hour"]))
@@ -225,7 +264,7 @@ class SendTimingAnalyzer:
             "total_opened": total_opened,
             "overall_open_rate": round(total_opened / max(total_sent, 1), 4),
             "best_cell": best,
-            "min_sample": 3,
+            "min_sample": MIN_SAMPLE,
         }
 
 
