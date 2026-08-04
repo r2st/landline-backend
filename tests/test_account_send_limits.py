@@ -19,11 +19,24 @@ from app.services.email_dispatch import (
 
 
 def _account(email="s@apprend.co", days_old=100, daily_sent=0, sending=True):
+    """A connected mailbox that has sent ``daily_sent`` messages **today**.
+
+    ``daily_count_reset_at`` is stamped whenever the count is non-zero, because
+    that is the only state production can produce: ``record_account_send``
+    writes both in one statement, and the count is meaningless without the
+    stamp saying which day it belongs to. Leaving it NULL described a mailbox
+    with 20 sends on no particular day, which the cap readers now correctly
+    treat as 0 — they consult ``warmup.used_today`` rather than the raw column,
+    so that yesterday's spent ramp stops freezing a mailbox out of rotation
+    today.
+    """
+    now = datetime.now(timezone.utc)
     return GmailAccount(
         id=uuid.uuid4(), email=email, google_sub=str(uuid.uuid4()),
         refresh_token_encrypted="x", is_active=False, sending_enabled=sending,
         status="connected", daily_send_count=daily_sent,
-        connected_at=datetime.now(timezone.utc) - timedelta(days=days_old),
+        daily_count_reset_at=now if daily_sent else None,
+        connected_at=now - timedelta(days=days_old),
     )
 
 

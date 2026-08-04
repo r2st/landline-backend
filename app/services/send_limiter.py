@@ -116,8 +116,24 @@ class SendLimiter:
         self.settings = get_settings()
 
     async def can_send_to_contact(self, db: AsyncSession, contact_email: str) -> tuple[bool, str]:
-        """Check if we can send to this contact. Returns (allowed, reason)."""
+        """Check if we can send to this contact. Returns (allowed, reason).
+
+        Both gates match the address **case-insensitively**, which is what makes
+        them gates on a *recipient* rather than on a contact row.
+
+        ``contacts.email`` has no unique constraint and is not normalised on
+        write, so one human routinely holds several rows — the scraper
+        rediscovers them, a CSV import adds them, and the casing differs between
+        sources because that is what the sources supplied. Comparing the column
+        raw split those rows into separate histories: ``john@acme.com`` and
+        ``John@Acme.com`` each counted only their own sends, so the monthly cap
+        and the minimum gap between touches both applied per row. Enrol the same
+        person twice under two spellings and they receive twice the cap, from the
+        control that exists to stop exactly that — and the reason string handed
+        back to the operator reports a count that looks correct.
+        """
         now = datetime.now(timezone.utc)
+        email_key = (contact_email or "").strip().lower()
 
         # Check monthly cap per contact
         thirty_days_ago = now - timedelta(days=30)
@@ -125,7 +141,7 @@ class SendLimiter:
             select(func.count(OutreachEvent.id))
             .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
             .join(Contact, OutreachEnrollment.contact_id == Contact.id)
-            .where(Contact.email == contact_email)
+            .where(func.lower(Contact.email) == email_key)
             .where(OutreachEvent.event_type == "sent")
             .where(OutreachEvent.occurred_at >= thirty_days_ago)
         )
@@ -138,13 +154,21 @@ class SendLimiter:
             select(OutreachEvent.occurred_at)
             .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
             .join(Contact, OutreachEnrollment.contact_id == Contact.id)
-            .where(Contact.email == contact_email)
+            .where(func.lower(Contact.email) == email_key)
             .where(OutreachEvent.event_type == "sent")
             .order_by(OutreachEvent.occurred_at.desc())
             .limit(1)
         )
         last_sent = result.scalar_one_or_none()
         if last_sent:
+            # ``_as_utc`` for the reason it exists: ``occurred_at`` is
+            # ``TIMESTAMP(timezone=True)``, so Postgres returns it aware and
+            # SQLite returns it naive, and subtracting a naive from an aware
+            # datetime raises. ``can_send_to_company`` normalises; this one did
+            # not, so the minimum-gap branch raised ``TypeError`` on the test
+            # engine — which is to say the gap check could not be covered at all,
+            # and any regression in it was invisible to the suite.
+            last_sent = _as_utc(last_sent)
             min_gap = timedelta(days=self.settings.min_days_between_followups)
             if now - last_sent < min_gap:
                 days_remaining = (min_gap - (now - last_sent)).days + 1
@@ -624,7 +648,12 @@ class SendLimiter:
         if warmup_limit is not None:
             effective = min(effective, warmup_limit)
 
-        used = account.daily_send_count or 0
+        # ``used_today`` honours the UTC rollover: ``daily_send_count`` still
+        # holds yesterday's number until a send zeroes it, and this report is
+        # what the Sender Health page shows an operator and what
+        # ``can_send`` answers. Read raw, a mailbox that finished yesterday's
+        # ramp reported ``0 remaining`` all of the next morning.
+        used = warmup.used_today(account)
         remaining = max(0, effective - used)
         return {
             "throttle_factor": throttle,

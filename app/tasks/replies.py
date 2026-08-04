@@ -26,7 +26,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tasks.org_runner import for_each_org
@@ -104,6 +104,42 @@ async def _enrollments_for_contact(
         )
     )
     return list(result.scalars().all())
+
+
+async def _contact_by_email(db: AsyncSession, email: Optional[str]) -> Optional[Contact]:
+    """The contact holding ``email``, matched the way the rest of the codebase does.
+
+    Case-insensitively, and taking the earliest row rather than asserting one.
+
+    ``contacts.email`` is not normalised on write — the scraper, the CSV import
+    and the quick-add all store whatever they were given — which is why ten other
+    call sites compare ``func.lower(Contact.email)``. The reply handler compared
+    the column raw. ``from_email`` is lower-cased on ingest, so the comparison
+    was between a lower-cased header and a column that is only *sometimes* lower
+    case, and a contact stored as ``John.Smith@Acme.com`` matched nothing.
+
+    On the routing path that costs a reply some context. On the branch above it,
+    it is the compliance failure the opt-out work was done to remove: the reply
+    is classified ``unsubscribe``, no contact is found, ``suppress_contact``
+    never runs, no flag is set, no consent record is written, **no address goes
+    on the suppression list**, and the enrollment keeps its schedule. The person
+    who answered our cold email with the word "unsubscribe" receives the next
+    four steps. Nothing errors and the reply is logged as handled.
+
+    Ordered by ``(created_at, id)`` — a duplicated address is expected here and
+    ``created_at`` is a server default, so rows written in one transaction tie
+    without the second key and repeat runs would pick different rows.
+    """
+    if not email:
+        return None
+    return (
+        await db.execute(
+            select(Contact)
+            .where(func.lower(Contact.email) == email.strip().lower())
+            .order_by(Contact.created_at.asc(), Contact.id.asc())
+            .limit(1)
+        )
+    ).scalars().first()
 
 
 async def suppress_contact(db: AsyncSession, contact: Contact, reason: str) -> int:
@@ -206,11 +242,7 @@ async def route_auto_action(
         # operator as an audit line.
         target = contact
         if target is None and reply.from_email:
-            target = (
-                await db.execute(
-                    select(Contact).where(Contact.email == reply.from_email)
-                )
-            ).scalars().first()
+            target = await _contact_by_email(db, reply.from_email)
         stopped = 0
         if target is not None:
             stopped = await suppress_contact(
@@ -332,9 +364,7 @@ async def classify_reply_record(
             await db.execute(select(Contact).where(Contact.id == reply.contact_id))
         ).scalars().first()
     if contact is None and reply.from_email:
-        contact = (
-            await db.execute(select(Contact).where(Contact.email == reply.from_email))
-        ).scalars().first()
+        contact = await _contact_by_email(db, reply.from_email)
 
     company = None
     if reply.company_id is not None:

@@ -507,9 +507,14 @@ class SmartReplyService:
                 await db.execute(select(Contact).where(Contact.id == email_send.contact_id))
             ).scalar_one_or_none()
         if contact is None:
-            contact = (
-                await db.execute(select(Contact).where(Contact.email == from_email))
-            ).scalars().first()
+            # Case-insensitive, like every other contact-by-address lookup in
+            # the codebase: ``contacts.email`` is not normalised on write, so a
+            # raw comparison against a lower-cased header silently missed every
+            # contact whose row was stored mixed-case. Here that decides whether
+            # the auto-reply knows who it is answering.
+            from app.tasks.replies import _contact_by_email
+
+            contact = await _contact_by_email(db, from_email)
 
         # Match the enrollment this reply stops. Broadened beyond 'active': a
         # reply that lands while a step is parked for review, after the sequence

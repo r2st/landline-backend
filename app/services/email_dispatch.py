@@ -150,9 +150,22 @@ def _rotation_key(account):
 
     Avoids comparing ``None`` directly (Python 3 forbids it) by sorting on a
     has-been-used flag first, then falling back to ``connected_at``.
+
+    Both timestamps are normalised to UTC first. They are
+    ``TIMESTAMP(timezone=True)`` columns, so a value read back from the database
+    and a value just assigned in Python are both aware — but a pool can mix a
+    row loaded by one driver with an instance stamped by
+    ``record_account_send``, and ``min()`` over a naive/aware mixture raises
+    ``TypeError`` rather than sorting badly. That would take down *sender
+    selection* for every send, which is a large failure for a comparison.
     """
-    last_used = account.last_used_at
-    connected = account.connected_at
+    def _utc(value):
+        if value is None:
+            return None
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+    last_used = _utc(account.last_used_at)
+    connected = _utc(account.connected_at)
     return (0 if last_used is None else 1, last_used or connected, connected)
 
 
@@ -283,7 +296,16 @@ async def _filter_by_sender_health(db: AsyncSession, accounts: list) -> list:
         if warmup is not None:
             effective = min(effective, warmup)
         try:
-            if int(a.daily_send_count or 0) >= effective:
+            # ``warmup.used_today`` and not the raw column: ``daily_send_count``
+            # is only *today's* count when ``daily_count_reset_at`` is today, and
+            # nothing rolls it over except a send. Reading it raw meant a mailbox
+            # that reached its cap yesterday was still at its cap this morning,
+            # so rotation excluded it, so it never sent, so nothing ever reset
+            # it — a mailbox frozen out for as long as any sibling stayed under
+            # cap. Silent, and precisely inverted: the warm-up fleet exists to
+            # spread volume, and this concentrated a whole day of it on whichever
+            # mailbox happened not to finish yesterday.
+            if warmup_svc.used_today(a) >= effective:
                 continue
         except (TypeError, ValueError):
             # Non-numeric send count (e.g. a bare mock) → don't exclude.
@@ -470,17 +492,54 @@ async def record_account_send(db: AsyncSession, account, *, sent: bool) -> None:
     rather than growing without bound, and only a send that actually landed
     increments it — an attempt that never reached the wire cost the mailbox
     nothing.
+
+    **The increment is a SQL expression, not a Python one.** ``count = count + 1``
+    on the loaded instance is a read-modify-write across a window that spans the
+    whole send: the attribute was read when the row was loaded, before recipient
+    validation, composition and the SMTP round trip. Two workers sending from the
+    same mailbox at once both load 3, both write 4, and the mailbox has sent 5.
+    Every concurrent send after the first is free — silently, in the direction
+    the ramp exists to prevent, on the one counter that is supposed to be
+    governing a cold domain's volume. The same shape as the org daily cap, which
+    is why that one is a Redis reservation rather than a row count.
+
+    ``daily_send_count + 1`` evaluated by the database under the row lock the
+    UPDATE takes is exact however many workers ask at once. The rollover moves
+    into the same statement — a ``CASE`` on ``daily_count_reset_at`` — so a
+    worker that reads a stale reset stamp cannot zero a counter another worker
+    has already rolled over and incremented today.
     """
+    from sqlalchemy import case, update as sa_update
+
     now = datetime.now(timezone.utc)
-    reset_at = account.daily_count_reset_at
-    if reset_at is not None and reset_at.tzinfo is None:
-        reset_at = reset_at.replace(tzinfo=timezone.utc)
-    if reset_at is None or reset_at.date() < now.date():
-        account.daily_send_count = 0
-        account.daily_count_reset_at = now
-    account.last_used_at = now
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Rolled over already today? Then keep the running count; otherwise this
+    # statement is the rollover. Decided in SQL against the row's *current*
+    # value, so it does not depend on how stale this instance is.
+    OrmAccount = type(account)
+    fresh = OrmAccount.daily_count_reset_at.isnot(None) & (
+        OrmAccount.daily_count_reset_at >= day_start
+    )
+    base = case((fresh, OrmAccount.daily_send_count), else_=0)
+
+    await db.execute(
+        sa_update(OrmAccount)
+        .where(OrmAccount.id == account.id)
+        .values(
+            last_used_at=now,
+            daily_send_count=(base + 1) if sent else base,
+            daily_count_reset_at=case((fresh, OrmAccount.daily_count_reset_at), else_=now),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    # The instance in hand is now behind the row. Callers read these attributes
+    # straight back — rotation's cap check and the warm-up gate both do — so
+    # reload them from the values the database just computed rather than leaving
+    # a stale count in the identity map for the rest of the request.
+    await db.refresh(account, ["daily_send_count", "daily_count_reset_at", "last_used_at"])
+
     if sent:
-        account.daily_send_count = (account.daily_send_count or 0) + 1
         # Auto-start the warm-up ramp on the first real send so the daily cap
         # ratchets up from the true first-send date (not a stale config).
         from app.services import system_settings
