@@ -198,6 +198,45 @@ async def touch_last_used(db: AsyncSession, api_key: ApiKey) -> None:
         await db.flush()
 
 
+# --- Tenant suspension -------------------------------------------------------
+
+
+async def _require_active_org(db: AsyncSession, org_id) -> None:
+    """403 unless ``org_id`` names an organization that is still active.
+
+    ``dependencies.get_current_user`` runs the same check and calls itself "the
+    single dependency every authenticated route runs through" — which was true
+    of the JWT surface and stopped being true of the platform the day this file
+    shipped a second one. A platform admin hitting
+    ``DELETE /platform/organizations/{id}`` locked that tenant's *humans* out of
+    everything and left every one of its API keys working: read and write on
+    contacts, companies, deals and sequences, server-to-server, indefinitely,
+    with the console showing the org suspended.
+
+    Revoking the keys by hand is not the answer — a suspension is one decision
+    and it should not depend on an operator enumerating credentials. Same shape
+    as the send-gate and volume-cap findings: a control installed on "the" choke
+    point, and a second path that was never a caller of it.
+
+    ``api_keys.org_id`` is NOT NULL (``OrgScopedMixin``), so there is no
+    platform-admin exemption to make here — unlike ``users.org_id``, which is
+    NULL for exactly that role. A missing organization row reads as inactive:
+    a key pointing at an org that no longer exists is not a key we can scope.
+    """
+    from app.models.tenant import Organization
+
+    org_active = (
+        await db.execute(
+            select(Organization.is_active).where(Organization.id == org_id)
+        )
+    ).scalar_one_or_none()
+    if not org_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Organization is deactivated",
+        )
+
+
 # --- The dependency ----------------------------------------------------------
 
 
@@ -207,9 +246,10 @@ async def get_api_key_context(
 ) -> ApiKeyContext:
     """Authenticate the ``X-API-Key`` header and bind the caller's org.
 
-    Fails closed with 401 for a missing, unknown, revoked, or expired key, and
-    429 when the per-key rate limit is exceeded. On success the key's org is
-    bound as the request context for the remainder of the request.
+    Fails closed with 401 for a missing, unknown, revoked, or expired key, 403
+    when the key's organization has been deactivated, and 429 when the per-key
+    rate limit is exceeded. On success the key's org is bound as the request
+    context for the remainder of the request.
     """
     if not presented_key:
         raise _unauthorized("Missing API key")
@@ -228,6 +268,7 @@ async def get_api_key_context(
         raise _unauthorized("API key has been revoked")
     if api_key.is_expired:
         raise _unauthorized("API key has expired")
+    await _require_active_org(db, api_key.org_id)
 
     # Per-key rate limit before doing any real work.
     await enforce_rate_limit(api_key)
