@@ -7,7 +7,7 @@ frontend's sequence picker and "enroll selected contacts" action call.
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -398,6 +398,33 @@ async def process_sequence_queue(
     Finds all active enrollments whose next step is due and dispatches
     sends synchronously. This is the HTTP-triggered alternative to the
     ``process_outreach_queue`` Celery beat task.
+
+    **A second dispatcher is a second copy of every rule the first one has.**
+    This one was written as the manual twin of the beat task and then stopped
+    tracking it. It kept the kill switch and drifted on the two interlocks the
+    sweep added afterwards, both of which it can defeat precisely *because* an
+    operator reaches for it when something looks stuck:
+
+    * **Paused campaigns.** ``PATCH /sequences/{id}/status`` sets
+      ``is_active=False`` and the console renders the sequence as paused. The
+      sweep joins on it; this endpoint selected every ``active`` enrollment
+      regardless, so one call re-dispatched the shelved campaign the operator
+      had just stopped. ``send_sequence_step`` holds the actual send, so no mail
+      goes out — but the whole point of the SQL filter in the sweep is that a
+      paused campaign costs nothing, and here it cost a task per enrollment.
+    * **The dispatch lease.** ``OutreachEnrollment.dispatched_at`` is what stops
+      an enrollment whose task is still in the broker from being queued again.
+      The sweep takes it; this endpoint neither read nor wrote it, so it handed
+      the broker a fresh copy of every task already in it — and each copy pays
+      for contact research and an LLM composition before ``send_claim`` refuses
+      it. That is the exact cost the lease was added to stop, reachable by the
+      button an operator presses when the queue looks behind.
+
+    What it deliberately still does not do is rank (``queue_priority``), check
+    the sending window, or run per-org: it is a manual trigger, not a scheduler,
+    and every one of those gates runs again inside ``send_sequence_step``. What
+    it must not do is *undo* an interlock, which is a different thing from not
+    implementing a heuristic.
     """
     from app.tasks.outreach import send_sequence_step
     from app.services import system_settings
@@ -413,13 +440,30 @@ async def process_sequence_queue(
         }
 
     result = await db.execute(
-        select(OutreachEnrollment).where(OutreachEnrollment.status == "active")
+        select(OutreachEnrollment)
+        .join(
+            OutreachSequence,
+            OutreachEnrollment.sequence_id == OutreachSequence.id,
+        )
+        .where(
+            OutreachEnrollment.status == "active",
+            OutreachSequence.is_active.is_(True),
+        )
     )
     enrollments = list(result.scalars().all())
     dispatched = 0
     skipped = 0
+    skipped_in_flight = 0
     results = []
     now = datetime.now(timezone.utc)
+
+    # Same lease the sweep takes, read from the same setting and floored the same
+    # way — a lease shorter than the sweep interval is inert.
+    from app.config import get_settings as _get_settings
+
+    dispatch_lease = timedelta(
+        minutes=max(getattr(_get_settings(), "dispatch_lease_minutes", 15), 6)
+    )
 
     limiter = get_send_limiter()
     can_send_today, limit_reason = await limiter.can_send_today(db)
@@ -432,6 +476,18 @@ async def process_sequence_queue(
         }
 
     for enrollment in enrollments:
+        # Already queued and not yet expired — the task is in the broker, and a
+        # second copy of it does research and an LLM composition before the send
+        # claim refuses it. Checked before the due test, since a leased
+        # enrollment is by definition one that was due a moment ago.
+        leased_at = enrollment.dispatched_at
+        if leased_at is not None:
+            if leased_at.tzinfo is None:
+                leased_at = leased_at.replace(tzinfo=timezone.utc)
+            if now - leased_at < dispatch_lease:
+                skipped_in_flight += 1
+                continue
+
         # Check if this enrollment is due
         is_due = False
         if enrollment.next_send_at is not None:
@@ -502,6 +558,13 @@ async def process_sequence_queue(
                 skipped += 1
                 continue
 
+        # Take the lease before queuing, in both branches. The broker rejecting
+        # the task is not a reason to skip it: the fallback path counts the
+        # enrollment as dispatched and reports it to the caller, so leaving it
+        # unleased would let the next call queue it again on the strength of a
+        # dispatch this one already claimed.
+        enrollment.dispatched_at = now
+
         # Dispatch via Celery if available, else process inline
         try:
             send_sequence_step.delay(str(enrollment.id))
@@ -517,5 +580,9 @@ async def process_sequence_queue(
         "active_enrollments": len(enrollments),
         "dispatched": dispatched,
         "skipped": skipped,
+        # Reported rather than folded into ``skipped``: a number that climbs
+        # across calls is the readable form of "the worker is not keeping up",
+        # which is the condition an operator is usually pressing this for.
+        "skipped_in_flight": skipped_in_flight,
         "results": results,
     }
