@@ -22,7 +22,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -32,6 +32,7 @@ from app.models.email_template import NON_WIRE_STATUS_VALUES, EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sender_health import SenderHealth, SenderHealthSnapshot
 from app.services.email_dispatch import get_sending_accounts, _transport_for
+from app.services.outreach_events import count_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +118,24 @@ class DeliverabilityOptimizer:
         ).scalar() or 0
 
         # --- Dialtone's sequence sends, scoped through the enrollment ---
-        # The denominator counts ATTEMPTS ('sent' + 'bounced'), not successes,
-        # for the reason the rail spells out: one event is written per attempt,
-        # and counting only 'sent' leaves the worst case — every attempt failing
-        # synchronously — dividing by zero and reading clean.
+        # The denominator counts ATTEMPTS, not successes: counting only 'sent'
+        # leaves the worst case — every attempt failing synchronously — dividing
+        # by zero and reading clean.
+        #
+        # But an attempt is a *step*, not a row, and summing ``sent + bounced``
+        # over-counts the common case in the other direction. ``bounce_handler``
+        # books a 'bounced' event on a send that already logged its 'sent' one
+        # hours earlier, so ten sends and one async DSN counted eleven attempts.
+        # ``count_attempts`` counts distinct ``(enrollment_id, step_number)``
+        # pairs, which is right under both shapes and makes a re-delivered DSN
+        # free rather than a second bounce. ``danger_monitor`` already resolves
+        # it this way; this module was the remaining naive sum.
+        #
+        # The two errors here pointed opposite ways — an inflated denominator
+        # (lenient) against the double-counted numerator below (harsh) — so they
+        # partially cancelled, and the rate looked plausible while neither half
+        # was right. Fixing one alone would have made the other visible as a new
+        # bug, which is why both move together.
         oe_base = (
             select(func.count(OutreachEvent.id))
             .join(OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id)
@@ -129,12 +144,14 @@ class DeliverabilityOptimizer:
                 OutreachEnrollment.sender_account_id == account.id,
             )
         )
-        seq_sent = (
-            await db.execute(oe_base.where(OutreachEvent.event_type.in_(("sent", "bounced"))))
-        ).scalar() or 0
-        seq_bounces = (
-            await db.execute(oe_base.where(OutreachEvent.event_type == "bounced"))
-        ).scalar() or 0
+        seq_sent, seq_bounces = await count_attempts(
+            db,
+            where=and_(
+                OutreachEvent.occurred_at >= cutoff,
+                OutreachEnrollment.sender_account_id == account.id,
+            ),
+            join_enrollment=True,
+        )
         seq_opens = (
             await db.execute(oe_base.where(OutreachEvent.event_type == "opened"))
         ).scalar() or 0
@@ -151,6 +168,27 @@ class DeliverabilityOptimizer:
         # STATUSES`` are values nothing writes, so ``complaint_rate_7d`` was a
         # constant 0.0 while the ARF/FBL sweep filed the real reports in
         # ``complaint_records``, which nothing read.
+        #
+        # ``funnel_events == 0`` is what keeps this population **disjoint from
+        # ``seq_bounces`` above**, and it is the same overlap ``danger_monitor``
+        # already carries a filter for. ``bounce_ingestion`` writes the ledger
+        # row and then calls ``record_bounce``, which books a ``bounced``
+        # ``OutreachEvent`` against the enrollment that sent — so an ingested DSN
+        # that hit a live sequence, the ordinary case for an autonomous outreach
+        # agent, was counted once as a sequence event and once as a ledger row.
+        #
+        # A sum has no way to notice, and here the consequence is not a badge:
+        # doubling the numerator doubles ``bounce_rate_7d``, which is what
+        # ``_score`` compares against ``sender_bounce_rate_throttle`` and what
+        # ``throttle_factor`` multiplies into the daily cap in
+        # ``send_limiter.account_capacity``. An account bouncing at a healthy 2%
+        # measured 4% and was throttled to 40% of its allowance, and the mailbox
+        # doing the *most* sequence sending was the one most likely to be cut —
+        # the reputation system quietly capping the sender it exists to protect.
+        #
+        # What remains counted here is the genuinely un-double-counted half:
+        # bounces on manual sends, and on addresses whose enrollments had already
+        # finished so there was no active one to book a funnel event against.
         ingested_bounces = 0
         ingested_complaints = 0
         if _transport_for(account) == "gmail":
@@ -159,6 +197,7 @@ class DeliverabilityOptimizer:
                     select(func.count(BounceRecord.id)).where(
                         BounceRecord.gmail_account_id == account.id,
                         BounceRecord.processed_at >= cutoff,
+                        BounceRecord.funnel_events == 0,
                     )
                 )
             ).scalar() or 0
@@ -197,6 +236,9 @@ class DeliverabilityOptimizer:
                 "sent_sequence": seq_sent,
                 "bounces_email": send_bounces,
                 "bounces_sequence": seq_bounces,
+                # DSNs that reached no live sequence — the ones ``bounces_
+                # sequence`` above does not already hold. See the disjointness
+                # note in the query.
                 "bounces_dsn": ingested_bounces,
                 "complaints_email": send_complaints,
                 "complaints_fbl": ingested_complaints,
