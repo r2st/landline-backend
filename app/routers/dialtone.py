@@ -803,6 +803,25 @@ _OUTREACH_COUNTERS = {
 }
 
 
+def _windows_span(
+    windows: list[_WINDOW],
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    """The smallest window enclosing every window in ``windows``.
+
+    Used to prefilter a multi-window tally in SQL. ``None`` on a side means
+    *unbounded there* — so a single open bound anywhere opens that side of the
+    span, which is the only safe reading: a filter that clipped an unbounded
+    window would drop rows the tally is supposed to count.
+    """
+    if not windows:
+        return None, None
+    starts = [w[0] for w in windows]
+    ends = [w[1] for w in windows]
+    lo = None if any(s is None for s in starts) else min(starts)
+    hi = None if any(e is None for e in ends) else max(ends)
+    return lo, hi
+
+
 async def _period_counts(
     db: AsyncSession, windows: list[_WINDOW]
 ) -> list[DialtoneTodayCounts]:
@@ -812,6 +831,25 @@ async def _period_counts(
     Both the selected timeframe and the previous period are tallied in a single
     pass over each source table: the row scan is the expensive part, and asking
     for a delta shouldn't double the cost of the console.
+
+    **The windows go into SQL first.** This is the console's landing endpoint and
+    it read *every row ever written* to ``email_sends``, ``outreach_events`` and
+    ``prospect_candidates`` on each load, then threw all but one day of them away
+    in Python. The cost is unrelated to the window asked for, so the default view
+    — "today", a few hundred rows — got monotonically slower for the life of the
+    account, and got slowest for the tenants sending most. Same shape as the
+    120-day funnel that read the whole send history to draw four months.
+
+    The Python pass stays: it is what splits one ``EmailSend`` row's four
+    timestamps across four metrics and two windows, which the prefilter can't do.
+    What the prefilter removes is only rows that no window could have counted, so
+    the arithmetic below is unchanged — it is the same rows, minus the ones that
+    were always going to be discarded.
+
+    The bound spans *all* windows (earliest start to latest end) because the
+    caller asks for a period and the one before it in one pass; an open bound on
+    either side (``all_time``) means no filter, which is the honest answer to
+    "count everything".
     """
     tallies: list[Counter] = [Counter() for _ in windows]
 
@@ -820,10 +858,21 @@ async def _period_counts(
             if _in_range(ts, start, end):
                 counts[metric] += 1
 
+    span_start, span_end = _windows_span(windows)
+
+    def scoped(stmt, *columns):
+        """Restrict *stmt* to rows any window could count. No-op when unbounded."""
+        clause = _window_sql(span_start, span_end, *columns)
+        return stmt if clause is None else stmt.where(clause)
+
     # EmailSend engagement (each timestamp column counts once when in-window):
     # manual sends, template sends, inbox replies, smart-reply auto-sends.
-    send_cols = select(
-        EmailSend.status, EmailSend.sent_at, EmailSend.opened_at,
+    send_cols = scoped(
+        select(
+            EmailSend.status, EmailSend.sent_at, EmailSend.opened_at,
+            EmailSend.clicked_at, EmailSend.replied_at,
+        ),
+        EmailSend.sent_at, EmailSend.opened_at,
         EmailSend.clicked_at, EmailSend.replied_at,
     )
     for status, sent_at, opened_at, clicked_at, replied_at in (await db.execute(send_cols)).all():
@@ -861,9 +910,12 @@ async def _period_counts(
     # ``emails_sent`` mean different things depending on how the mail failed.
     # Both shapes key the attempt on ``(enrollment_id, step_number)``.
     attempts = [AttemptTally() for _ in windows]
-    event_cols = select(
-        OutreachEvent.event_type, OutreachEvent.occurred_at,
-        OutreachEvent.enrollment_id, OutreachEvent.step_number,
+    event_cols = scoped(
+        select(
+            OutreachEvent.event_type, OutreachEvent.occurred_at,
+            OutreachEvent.enrollment_id, OutreachEvent.step_number,
+        ),
+        OutreachEvent.occurred_at,
     )
     for event_type, occurred_at, enrollment_id, step_number in (
         await db.execute(event_cols)
@@ -882,7 +934,10 @@ async def _period_counts(
         counts["bounces"] += tally.bounces
 
     # Leads discovered.
-    for created_at in (await db.execute(select(ProspectCandidate.created_at))).scalars().all():
+    lead_cols = scoped(
+        select(ProspectCandidate.created_at), ProspectCandidate.created_at
+    )
+    for created_at in (await db.execute(lead_cols)).scalars().all():
         bump("leads_discovered", created_at)
 
     return [

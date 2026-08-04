@@ -354,6 +354,45 @@ def send_sequence_step(self, enrollment_id: str):
                 if enrollment.status != "active":
                     return {"status": "skipped", "reason": f"enrollment status is {enrollment.status}"}
 
+                # Pausing a campaign has to stop the campaign's mail.
+                #
+                # ``PATCH /sequences/{id}/status`` is the operator's "pause this
+                # campaign" control: it sets ``status='paused'`` and syncs
+                # ``is_active=False``, and the console renders the sequence as
+                # paused. Nothing on the send path had ever read either column.
+                # ``is_active`` gated *enrolling* (``POST /outreach/enrollments``
+                # 400s on an inactive sequence) and listing, so the control
+                # stopped new contacts entering — and every contact already
+                # enrolled kept receiving steps 2..N on schedule, from a campaign
+                # the UI said was stopped. Same shape as the kill switch and the
+                # unsubscribe link before them: a control that reads as enforced
+                # everywhere except where the mail leaves.
+                #
+                # A hold, not a stop. The enrollment stays ``active`` and its
+                # ``next_send_at`` is untouched, so resuming the sequence resumes
+                # the cadence rather than requiring every contact to be re-enrolled
+                # — pausing is reversible by construction and un-pausing must not
+                # need a second, undocumented repair step. The queue sweep filters
+                # these out in SQL, so the refusal here is the interlock for a task
+                # already in the broker when the pause landed, not the hot path.
+                sequence = (
+                    await db.execute(
+                        select(OutreachSequence).where(
+                            OutreachSequence.id == enrollment.sequence_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if sequence is not None and not sequence.is_active:
+                    logger.info(
+                        "Enrollment %s held: sequence %s is paused",
+                        enrollment_id, enrollment.sequence_id,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "sequence_paused",
+                        "enrollment_id": enrollment_id,
+                    }
+
                 # Load contact
                 result = await db.execute(
                     select(Contact).where(Contact.id == enrollment.contact_id)
@@ -1445,9 +1484,24 @@ def process_outreach_queue():
                 logger.warning("Dialtone paused: outreach queue halted — sending kill switch engaged")
                 return {"status": "halted", "reason": "sending kill switch engaged", "dispatched": 0}
 
+            # Enrollments of *live* campaigns only. A paused sequence
+            # (``PATCH /sequences/{id}/status`` → ``is_active=False``) is the
+            # operator saying "stop sending this", and until this join existed
+            # the sweep went on dispatching every one of its enrollments —
+            # steps 2..N kept arriving from a campaign the console showed as
+            # paused. Filtered in SQL rather than in the loop below so a paused
+            # campaign costs the sweep nothing: an org that shelved a 20k-contact
+            # blast should not pay to rank and re-skip it every five minutes.
             result = await db.execute(
                 select(OutreachEnrollment)
-                .where(OutreachEnrollment.status == "active")
+                .join(
+                    OutreachSequence,
+                    OutreachEnrollment.sequence_id == OutreachSequence.id,
+                )
+                .where(
+                    OutreachEnrollment.status == "active",
+                    OutreachSequence.is_active.is_(True),
+                )
             )
             enrollments = list(result.scalars().all())
 

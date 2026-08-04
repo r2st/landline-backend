@@ -59,17 +59,25 @@ async def _events(
     db: AsyncSession, enrollment, *, days_ago: int, sent: int = 0, replied: int = 0,
     opened: int = 0, bounced: int = 0, task_created: int = 0,
 ):
-    """Write ``n`` events of each type, dated ``days_ago`` days back."""
+    """Write ``n`` events of each type, dated ``days_ago`` days back.
+
+    ``opened``/``clicked`` are unique per ``(enrollment, step)`` since migration
+    117, so ``n`` of them means ``n`` steps each engaged once — which is what n
+    opens on one enrollment has always actually meant. The other types are
+    repeatable per step and stay on step 1; trends bucket on ``occurred_at``, so
+    the step number changes nothing they measure.
+    """
     when = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    deduplicated = ("opened", "clicked")
     for event_type, count in (
         ("sent", sent), ("opened", opened), ("replied", replied),
         ("bounced", bounced), ("task_created", task_created),
     ):
-        for _ in range(count):
+        for i in range(count):
             db.add(OutreachEvent(
                 id=_uuid.uuid4(),
                 enrollment_id=enrollment.id,
-                step_number=1,
+                step_number=i + 1 if event_type in deduplicated else 1,
                 event_type=event_type,
                 occurred_at=when,
             ))

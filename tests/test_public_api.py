@@ -221,6 +221,34 @@ async def test_enroll_unknown_contact_404(client, api_headers, db_session):
     assert resp.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_enrolling_into_a_paused_sequence_is_refused(
+    client, api_headers, db_session, sample_contact
+):
+    """The same refusal ``POST /outreach/enrollments`` gives.
+
+    Pausing a campaign is an operator decision to stop sending it. A second
+    enrollment endpoint that doesn't know that is how the decision gets worked
+    around by an integration script nobody remembers writing — the contact is
+    added, the queue holds it, and the campaign silently resumes with a backlog
+    the moment anyone un-pauses it.
+    """
+    seq = OutreachSequence(
+        id=uuid.uuid4(), name="Shelved Seq", status="paused",
+        is_active=False, org_id=APPREND_ORG_ID,
+    )
+    db_session.add(seq)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/public/enrollments",
+        headers=api_headers,
+        json={"contact_id": str(sample_contact.id), "sequence_id": str(seq.id)},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "not active" in resp.json()["detail"]
+
+
 # --- cross-org isolation -----------------------------------------------------
 
 

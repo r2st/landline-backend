@@ -7,11 +7,13 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.org_context import org_scope
 from app.models.contact import Contact
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.email_template import (
@@ -364,6 +366,28 @@ async def record_event(
     The ``enrollment_id`` foreign key still scopes the write to an enrollment
     that exists — it is just not, on its own, an authorization check. See
     :func:`require_signed_webhook_or_user`.
+
+    **The webhook half binds no org, so the event must name one.** A JWT caller
+    arrives with ``org_id`` bound by ``get_current_user``, which both scopes the
+    lookup below and stamps the insert. A signed webhook arrives with nothing
+    bound — the route is in ``PUBLIC_ROUTES`` precisely so an ESP can reach it —
+    and ``org_id_for_insert()`` then falls back to the first-party org. Every
+    delivery event for every tenant was therefore filed under Apprend: the
+    tenant that actually sent the mail never saw its own bounces (the read
+    filter scopes them away), while ``SendLimiter._db_sent_today`` and
+    ``DangerMonitor`` counted a stranger's ``sent`` and ``bounced`` rows against
+    *our* daily cap and *our* bounce rate. Same failure the tracking pixel had
+    and ``opt_out.record`` documents: an unauthenticated writer has to carry the
+    org on the row, because there is no context to infer it from.
+
+    **An ESP redelivers, so a repeat is not an error.** Webhook delivery is
+    at-least-once by design, and migration 117 made ``opened``/``clicked`` unique
+    per ``(enrollment, step)``. A second delivery of the same open therefore hit
+    the index and came back a 500 — which every ESP reads as "not accepted" and
+    retries, indefinitely, on a body that can never be accepted. The duplicate is
+    answered with the row that already exists: idempotent is what a webhook
+    receiver is supposed to be, and it is the same "first occurrence wins"
+    ``_record_outreach_engagement`` applies to the pixel.
     """
     result = await db.execute(
         select(OutreachEnrollment).where(OutreachEnrollment.id == payload.enrollment_id)
@@ -372,21 +396,51 @@ async def record_event(
     if not enrollment:
         raise HTTPException(status_code=404, detail="Enrollment not found")
 
-    event = OutreachEvent(**payload.model_dump())
-    db.add(event)
+    # Bind the enrollment's own org for the write. Correct on both paths: the
+    # JWT caller's org already equals this one (the scoped read above is what
+    # proved it), and the webhook caller had none.
+    async with org_scope(enrollment.org_id):
+        event = OutreachEvent(org_id=enrollment.org_id, **payload.model_dump())
+        try:
+            # Inside the savepoint, so losing the race takes the row back and
+            # leaves the session usable — the same shape ``_record_outreach_
+            # engagement`` uses for the pixel. Rolling the savepoint back
+            # expunges the pending instance for us.
+            async with db.begin_nested():
+                db.add(event)
+                await db.flush()
+        except IntegrityError:
+            existing = (
+                await db.execute(
+                    select(OutreachEvent).where(
+                        OutreachEvent.enrollment_id == enrollment.id,
+                        OutreachEvent.step_number == payload.step_number,
+                        OutreachEvent.event_type == payload.event_type,
+                    ).limit(1)
+                )
+            ).scalars().first()
+            if existing is None:  # pragma: no cover - a constraint we don't model
+                raise
+            logger.info(
+                "Duplicate %s for enrollment %s step %s (actor=%s) — returning the "
+                "recorded event", payload.event_type, enrollment.id,
+                payload.step_number, actor,
+            )
+            return existing
 
-    # Auto-update enrollment status based on event type
-    if payload.event_type in ("replied", "bounced", "unsubscribed"):
-        # Worth a line: this is the one path where an *external* caller ends a
-        # cadence, so "who stopped this enrollment" should be answerable later.
-        logger.info(
-            "Enrollment %s → %s (actor=%s)", enrollment.id, payload.event_type, actor,
-        )
-        enrollment.status = payload.event_type
+        # Auto-update enrollment status based on event type
+        if payload.event_type in ("replied", "bounced", "unsubscribed"):
+            # Worth a line: this is the one path where an *external* caller ends
+            # a cadence, so "who stopped this enrollment" should be answerable
+            # later.
+            logger.info(
+                "Enrollment %s → %s (actor=%s)", enrollment.id, payload.event_type, actor,
+            )
+            enrollment.status = payload.event_type
 
-    await db.flush()
-    await db.refresh(event)
-    return event
+        await db.flush()
+        await db.refresh(event)
+        return event
 
 
 @router.get("/events")

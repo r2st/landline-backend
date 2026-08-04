@@ -58,12 +58,16 @@ async def test_empty_ok(client):
 async def test_rates_and_totals(client, db_session, sample_company, sample_contact):
     seq = await _campaign(db_session, "CNC — Deal Cracker", industry="cnc_machining")
     enr = await _enrollment(db_session, seq, sample_contact)
-    for _ in range(4):
-        await _event(db_session, enr, "sent")
-    await _event(db_session, enr, "opened")
-    await _event(db_session, enr, "opened")
-    await _event(db_session, enr, "clicked")
-    await _event(db_session, enr, "replied")
+    # Four steps sent; two of them opened, one of those clicked, one replied.
+    # The opens sit on different steps because migration 117 makes
+    # `(enrollment, step, 'opened')` unique — two opens is two steps opened,
+    # which is what the 50% open rate below has always meant.
+    for step in range(1, 5):
+        await _event(db_session, enr, "sent", step=step)
+    await _event(db_session, enr, "opened", step=1)
+    await _event(db_session, enr, "opened", step=2)
+    await _event(db_session, enr, "clicked", step=1)
+    await _event(db_session, enr, "replied", step=1)
     await db_session.commit()
 
     resp = await client.get("/api/v1/dialtone/campaigns/analytics")

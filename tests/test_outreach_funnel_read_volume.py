@@ -62,14 +62,14 @@ async def _enroll(db, contact, seq):
     return enr
 
 
-def _event(db, enr, event_type, when, *, subject=None, body=None):
+def _event(db, enr, event_type, when, *, subject=None, body=None, step=1):
     meta = {}
     if subject is not None:
         meta["subject"] = subject
     if body is not None:
         meta["body_html"] = body
     db.add(OutreachEvent(
-        id=uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+        id=uuid.uuid4(), enrollment_id=enr.id, step_number=step,
         event_type=event_type, occurred_at=when, event_metadata=meta,
     ))
 
@@ -216,16 +216,23 @@ async def test_a_subject_is_inherited_across_the_window_boundary(
 
 
 @pytest.mark.asyncio
-async def test_dedup_and_window_together(client, db_session, sample_company):
-    """An open pixel firing five times is one open — and only inside the window."""
+async def test_the_window_drops_an_older_open_on_another_step(
+    client, db_session, sample_company
+):
+    """An open outside the window is not counted, however many steps ran.
+
+    This used to plant five opens on one step to prove the funnel collapsed
+    them. Migration 117 makes that impossible — `(enrollment, step, 'opened')`
+    is unique — so the surviving question is the windowing one: a step opened
+    inside the window counts, an older step opened long before it does not.
+    """
     seq = await _seq(db_session, "Dedup Seq")
     enr = await _enroll(db_session, await _contact(db_session, sample_company, "d@x.com"), seq)
     now = datetime.now(timezone.utc)
 
     _event(db_session, enr, "sent", now - timedelta(days=2), subject=SUBJ)
-    for _ in range(5):
-        _event(db_session, enr, "opened", now - timedelta(days=1))
-    _event(db_session, enr, "opened", now - timedelta(days=400))
+    _event(db_session, enr, "opened", now - timedelta(days=1))
+    _event(db_session, enr, "opened", now - timedelta(days=400), step=2)
     await db_session.commit()
 
     resp = await client.get(

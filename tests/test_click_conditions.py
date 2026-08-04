@@ -214,8 +214,12 @@ async def test_sequence_engagement_counts_toward_velocity(
     db_session.add(seq)
     await db_session.flush()
     enr = await _enrollment(db_session, seq, sample_contact)
-    for kind in ("opened", "opened", "clicked"):
-        await _event(db_session, enr, kind, step=1)
+    # Three engagements across two steps. One open per step, not two on one:
+    # migration 117 makes ``opened``/``clicked`` unique per (enrollment, step),
+    # so the burst a velocity test needs is several *steps* landing close
+    # together — which is what a real burst is.
+    for kind, step_no in (("opened", 1), ("opened", 2), ("clicked", 1)):
+        await _event(db_session, enr, kind, step=step_no)
 
     count, most_recent = await _engagement_velocity(db_session, sample_company)
     assert count == 3

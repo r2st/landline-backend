@@ -544,6 +544,12 @@ async def create_enrollment(
     ).scalar_one_or_none()
     if sequence is None:
         raise HTTPException(status_code=404, detail="Sequence not found")
+    # Same refusal as ``POST /outreach/enrollments``. A paused campaign is an
+    # operator's decision to stop sending it; a second enrollment endpoint that
+    # doesn't know that is how the decision gets worked around by a script
+    # nobody remembers writing.
+    if not sequence.is_active:
+        raise HTTPException(status_code=400, detail="Sequence is not active")
 
     # One row answers "already enrolled?". Nothing in the schema stops a second
     # active enrollment for the pair, so asserting a single one would answer a

@@ -1,8 +1,11 @@
 """F3 — outreach funnel analytics from OutreachEvent (not EmailSend).
 
 Verifies the sent→opened→replied→bounced funnel, the three breakdowns (step,
-sequence, subject), per-contact dedup (an open pixel firing twice is one open),
-A/B variant attribution, and the sequence filter.
+sequence, subject), A/B variant attribution, and the sequence filter.
+
+Per-step open dedup is no longer expressible here: migration 117 makes
+`(enrollment, step, 'opened')` unique, so a doubled open cannot be written by
+any path. `tests/test_engagement_event_uniqueness.py` covers that directly.
 """
 
 import uuid
@@ -65,9 +68,15 @@ async def test_funnel_counts_and_breakdowns(client, db_session, sample_company, 
     await db_session.flush()
     enr2 = await _enroll(db_session, c2, seq)
 
-    # enr1 step1: sent(Subj A) + opened (twice → dedup to 1) + replied
+    # enr1 step1: sent(Subj A) + opened + replied.
+    #
+    # This used to plant two opens on the one step to prove the funnel collapsed
+    # them. Migration 117 made that row pair impossible — `(enrollment, step,
+    # event_type)` is unique for `opened`/`clicked` — so the duplicate can no
+    # longer be written by any path, including this fixture. The funnel's own
+    # dedup stays as belt-and-braces; what enforces it is covered directly in
+    # `tests/test_engagement_event_uniqueness.py`.
     _event(db_session, enr1, "sent", subject=SUBJ_A)
-    _event(db_session, enr1, "opened")
     _event(db_session, enr1, "opened")
     _event(db_session, enr1, "replied")
     # enr2 step1: sent(Subj A) + bounced
@@ -81,7 +90,7 @@ async def test_funnel_counts_and_breakdowns(client, db_session, sample_company, 
 
     overall = data["overall"]
     assert overall["sent"] == 2
-    assert overall["opened"] == 1     # deduped: two opens on one send count once
+    assert overall["opened"] == 1     # one open per send, one send opened
     assert overall["replied"] == 1
     assert overall["bounced"] == 1
     assert overall["open_rate"] == 0.5

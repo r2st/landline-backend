@@ -136,8 +136,12 @@ async def test_recent_click_beats_a_stale_pile_of_opens(db_session, sample_compa
 
     stale = await _contact(db_session, sample_company, "stale@acme.test", first="stale")
     stale_enr = await _enroll(db_session, stale)
+    # One open per step (migration 117): a pile of opens is a pile of *steps*
+    # each opened once, not one step re-counted five times.
     for i in range(5):
-        await _event(db_session, stale_enr, "opened", now - timedelta(days=90 + i))
+        await _event(
+            db_session, stale_enr, "opened", now - timedelta(days=90 + i), step=i + 1
+        )
 
     ranked = await es.rank_contacts(db_session)
     assert ranked[0]["contact_name"] == "fresh"
@@ -218,7 +222,7 @@ async def test_reasons_are_human_readable(db_session, sample_company, sample_con
     enr = await _enroll(db_session, sample_contact)
     await _event(db_session, enr, "sent", now - timedelta(days=2))
     await _event(db_session, enr, "opened", now - timedelta(days=1))
-    await _event(db_session, enr, "opened", now - timedelta(hours=5))
+    await _event(db_session, enr, "opened", now - timedelta(hours=5), step=2)
 
     ranked = await es.rank_contacts(db_session)
     reasons = " ".join(ranked[0]["reasons"])
