@@ -1,10 +1,11 @@
 """Celery task + routing logic for Dialtone reply classification (Feature 1).
 
 ``classify_new_replies`` runs every 5 minutes on the ``enrichment`` queue. It
-picks up every ``email_replies`` row that hasn't been classified yet
-(``reply_classification IS NULL`` — the idempotency guard), runs the keyword
-pre-filter → :meth:`AIService.classify_reply`, applies the confidence gate, then
-dispatches the per-category auto-action:
+**claims** every ``email_replies`` row that hasn't been classified yet — a
+conditional UPDATE stamping ``classified_at``, so a pass that overruns the Beat
+interval cannot have its batch re-actioned by the next one — then runs the
+keyword pre-filter → :meth:`AIService.classify_reply`, applies the confidence
+gate, and dispatches the per-category auto-action:
 
 * ``interested``     → flag for the priority inbox + notify the operator.
 * ``not_interested`` → complete the contact's active enrollments.
@@ -26,10 +27,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tasks.org_runner import for_each_org
+from app.models.bounce_record import BounceRecord
 from app.models.company import Company
 from app.models.consent import ConsentRecord
 from app.models.contact import Contact
@@ -300,11 +302,60 @@ async def route_auto_action(
             # Couldn't tie the bounce to a recipient — surface for manual review
             # rather than guess.
             return "none"
+
+        # Two pipelines read the same mailbox and this DSN can be in both.
+        # ``bounce_ingestion`` sweeps for delivery-failure notices and ledgers
+        # each one in ``BounceRecord`` keyed on its Gmail message id, precisely
+        # because ``record_bounce`` is not idempotent — it increments
+        # ``Contact.bounce_count``. This path had no such ledger, so a DSN that
+        # also landed in ``email_replies`` was counted once by each pipeline.
+        #
+        # The direction that costs is soft bounces. A hard bounce suppresses on
+        # the first one and a second count changes nothing; a soft bounce
+        # suppresses at ``soft_bounce_suppress_threshold``, so double-counting
+        # reaches the threshold in half the bounces and takes a live contact out
+        # of play. The contact is deliverable, the address is fine, and the only
+        # thing that went wrong is that two sweeps read one message.
+        #
+        # ``EmailReply.gmail_message_id`` is the same id the sweep keys on, so
+        # sharing the ledger makes the two paths dedup against each other rather
+        # than each against itself.
+        message_id = reply.gmail_message_id
+        if message_id:
+            already = (
+                await db.execute(
+                    select(BounceRecord.id)
+                    .where(BounceRecord.gmail_message_id == message_id)
+                    .limit(1)
+                )
+            ).first()
+            if already is not None:
+                logger.info(
+                    "Reply %s is a DSN the bounce sweep already recorded (%s) — "
+                    "not counting it twice", reply.id, message_id,
+                )
+                return "bounced"
+
         summary = await bounce_handler.record_bounce(
             db,
             target_email,
             diagnostic=f"{reply.subject or ''} {(reply.body_text or reply.snippet or '')[:500]}",
         )
+        if message_id:
+            # Ledgered after the fact rather than before, unlike the sweep: the
+            # sweep parses the DSN itself and can write the row before handling
+            # it, while here ``record_bounce`` is what determines the kind. The
+            # window this leaves is one pass wide and closes on the next.
+            db.add(
+                BounceRecord(
+                    gmail_message_id=message_id,
+                    recipient_email=target_email,
+                    bounce_kind=summary.get("kind") or "soft",
+                    diagnostic=(reply.subject or "")[:2000] or None,
+                    result={"source": "reply_classification", "reply_id": str(reply.id)},
+                )
+            )
+            await db.flush()
         reply.classification_meta = {
             **(reply.classification_meta or {}),
             "bounce": {
@@ -434,18 +485,92 @@ async def classify_new_replies_async(
     notification_service=None,
     limit: int = 200,
 ) -> dict:
-    """Classify every not-yet-processed reply (``reply_classification IS NULL``).
+    """Claim and classify every not-yet-processed reply.
 
-    Idempotent: rows already carrying a classification are skipped, so re-runs
-    (and the 5-minute Beat cadence overlapping a long run) never double-action.
+    Idempotent **across overlapping runs**, which the ``IS NULL`` filter alone
+    was not.
+
+    The filter reads as the guard and is one only within a single pass. The
+    classification a pass writes is not visible to anyone else until the task
+    commits, and the task commits once, after the whole batch. A batch is up to
+    ``limit`` replies and each costs an LLM round trip, so a pass routinely runs
+    for minutes — against a Beat cadence of five. The docstring anticipated that
+    overlap and drew the wrong conclusion from it: a second run starting mid-pass
+    re-selects the very same uncommitted rows, sees them as unclassified, and
+    runs every auto-action a second time.
+
+    Which auto-actions those are is the point. A duplicate ``unsubscribe``
+    re-suppresses (harmless). A duplicate ``out_of_office`` re-pauses and pushes
+    the return date out again. A duplicate ``interested`` notifies the operator
+    twice. A duplicate ``bounce`` calls ``record_bounce`` again, and that one is
+    explicitly *not* idempotent — it increments ``Contact.bounce_count``, so two
+    passes over one soft bounce count two, and the third such coincidence
+    suppresses a live contact for no reason but how the sweeps overlapped.
+
+    So the batch is **claimed** before it is worked: one conditional UPDATE
+    stamping ``classified_at`` on rows that don't have it yet, returning the ids
+    it actually took. This is the ``send_claim`` mechanism and it works for the
+    same reason — the row lock. A concurrent pass issuing the identical UPDATE
+    blocks until this transaction commits, then re-evaluates its ``IS NULL``
+    predicate against the committed value and claims nothing. No extra commit,
+    no new column, no broker coordination.
+
+    ``classified_at`` is the column stamped, because it is the one with no
+    meaning other than "a pass has taken this one" — ``reply_classification`` is
+    read as a *category* by four other surfaces, and parking a sentinel there
+    would surface as a category to all of them.
+
+    The *selection* still requires both to be unset. They are written together
+    here, but ``PATCH /replies/{id}/classify`` sets the category alone when an
+    operator corrects a reply, so a row can carry a human's classification and
+    no stamp. Selecting on the stamp alone would hand those back to the AI and
+    overwrite the correction with a guess.
     """
+    now = datetime.now(timezone.utc)
     result = await db.execute(
-        select(EmailReply)
-        .where(EmailReply.reply_classification.is_(None))
+        select(EmailReply.id)
+        .where(
+            EmailReply.classified_at.is_(None),
+            EmailReply.reply_classification.is_(None),
+        )
         .order_by(EmailReply.received_at.asc())
         .limit(limit)
     )
-    replies = list(result.scalars().all())
+    candidate_ids = list(result.scalars().all())
+
+    replies: list[EmailReply] = []
+    if candidate_ids:
+        claimed_ids = list(
+            (
+                await db.execute(
+                    sa_update(EmailReply)
+                    .where(
+                        EmailReply.id.in_(candidate_ids),
+                        EmailReply.classified_at.is_(None),
+                        EmailReply.reply_classification.is_(None),
+                    )
+                    .values(classified_at=now)
+                    .returning(EmailReply.id)
+                    .execution_options(synchronize_session=False)
+                )
+            ).scalars().all()
+        )
+        if claimed_ids:
+            replies = list(
+                (
+                    await db.execute(
+                        select(EmailReply)
+                        .where(EmailReply.id.in_(claimed_ids))
+                        .order_by(EmailReply.received_at.asc())
+                    )
+                ).scalars().all()
+            )
+        skipped = len(candidate_ids) - len(claimed_ids)
+        if skipped:
+            logger.info(
+                "Reply classification: %d of %d candidates already claimed by a "
+                "concurrent pass", skipped, len(candidate_ids),
+            )
 
     summaries = []
     for reply in replies:
