@@ -14,15 +14,30 @@ the address (email sends/replies/bounces). Two operations:
 
 The email match is case-insensitive. Multiple contact rows can share an address
 (email is not unique) — all of them are covered.
+
+**The two operations must cover the same tables.** They are halves of one
+obligation: what a subject access request has to hand over is what an erasure
+request has to be able to remove. When they disagree, the export is the one
+telling the truth — it is written by asking "where is this person's data?", and
+erasure is written by listing columns. That is how the sequence engine's copy of
+every message went missing for as long as it did: ``export_subject`` walked the
+subject's enrollments and returned their ``OutreachEvent`` rows, while
+``erase_subject`` scrubbed ``email_sends`` and stopped. Per "Sent mail lives in
+two tables", the sequence path writes no ``EmailSend`` row at all — recipient,
+subject and full ``body_html`` live in ``outreach_events.metadata`` — so the
+channel carrying most of the volume was disclosed on request and never erased.
+Adding a table to one of these functions means adding it to the other.
 """
 
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import func, inspect as sa_inspect, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.ai_email_draft import AiEmailDraft
 from app.models.bounce_record import BounceRecord
 from app.models.company import Company
 from app.models.consent import ConsentRecord
@@ -47,14 +62,38 @@ def _serialize(obj) -> dict:
     ``None`` rather than triggering a lazy DB load, which is illegal under an
     async session (``MissingGreenlet``). In the request path every column is
     loaded by the SELECT, so this only matters for oddly-hydrated instances.
+
+    **Walks the mapper, not the table.** A column's name and the attribute that
+    maps it are two different strings, and ``OutreachEvent`` is where they
+    differ: ``event_metadata: Mapped[dict] = mapped_column("metadata", ...)``,
+    because ``metadata`` is taken on a declarative class. Reading the *column*
+    name off the row therefore ran ``getattr(event, "metadata")`` and got
+    ``Base.metadata`` — the SQLAlchemy registry — in place of the JSONB blob.
+
+    Two consequences, and the loud one hid the quiet one. The export is returned
+    straight out of ``GET /gdpr/export``, and a ``MetaData`` object is not JSON
+    serialisable, so the endpoint **500'd for any subject who had been through a
+    sequence** — which is every real prospect, since the sequence engine is the
+    main sending path. Underneath that, the value it was substituting for was
+    the recipient, subject line and full message body of every send: the single
+    largest holding of the subject's data, silently absent from the disclosure
+    the endpoint exists to make.
+
+    Both halves are fixed by asking the mapper for the attribute and the column
+    for the key, rather than assuming one string does both jobs. The output keys
+    are unchanged (``metadata`` stays ``metadata``) — what changes is that the
+    value under them is now the row's.
     """
     unloaded = sa_inspect(obj).unloaded
     out: dict = {}
-    for col in obj.__table__.columns:
-        if col.key in unloaded:
+    for prop in sa_inspect(obj).mapper.column_attrs:
+        col = prop.columns[0]
+        # ``prop.key`` is the Python attribute; ``col.name`` is the database
+        # column. ``unloaded`` is keyed by the former, output by the latter.
+        if prop.key in unloaded:
             out[col.name] = None
             continue
-        val = getattr(obj, col.name)
+        val = getattr(obj, prop.key)
         if isinstance(val, (uuid.UUID, datetime)):
             val = str(val)
         out[col.name] = val
@@ -121,6 +160,11 @@ async def export_subject(db: AsyncSession, email: str) -> dict:
     tasks = await _by_contact(Task)
     consent = await _by_contact(ConsentRecord)
     enrollments = await _by_contact(OutreachEnrollment)
+    # Held about the subject, so disclosed on request — and, because it is the
+    # same obligation read from the other side, scrubbed by ``erase_subject``.
+    # ``personalization`` in particular is the research agent's dossier on this
+    # individual, which a subject access request is precisely for.
+    ai_drafts = await _by_contact(AiEmailDraft)
 
     enrollment_ids = [e.id for e in enrollments]
     events = []
@@ -179,6 +223,7 @@ async def export_subject(db: AsyncSession, email: str) -> dict:
             "tasks": len(tasks),
             "consent_records": len(consent),
             "bounce_records": len(bounces),
+            "ai_email_drafts": len(ai_drafts),
         },
         "contacts": [_serialize(c) for c in contacts],
         "companies": [_serialize(c) for c in companies],
@@ -191,6 +236,7 @@ async def export_subject(db: AsyncSession, email: str) -> dict:
         "tasks": [_serialize(x) for x in tasks],
         "consent_records": [_serialize(x) for x in consent],
         "bounce_records": [_serialize(x) for x in bounces],
+        "ai_email_drafts": [_serialize(x) for x in ai_drafts],
     }
 
 
@@ -198,6 +244,47 @@ def _scrub(obj, fields, value=None) -> None:
     for f in fields:
         if hasattr(obj, f):
             setattr(obj, f, value if value is not None else _REDACTED)
+
+
+# Keys inside ``outreach_events.event_metadata`` that carry the subject's own
+# data. Everything else in that blob is operational — ``status``, ``tracked``,
+# ``ai_generated``, ``sender_account_id``, the Gmail thread/message ids the
+# reply matcher and the reconciler key on — and is left alone, because erasure
+# is meant to remove the person, not the record that a message was sent.
+#
+# ``personalization`` is the one that matters most and reads as harmless: it is
+# where the research agent stores what it found out about this individual, which
+# is the *most* sensitive thing in the row and is not a message body. ``error``
+# is here because SMTP diagnostics quote the envelope recipient back verbatim,
+# which is how an address survives a scrub of every column named after one.
+_EVENT_PII_KEYS = (
+    "to_email", "from_email", "recipient", "sender",
+    "subject", "body_html", "body_text", "body", "snippet", "preview",
+    "personalization", "error",
+)
+
+
+def _scrub_metadata(blob: Optional[dict]) -> tuple[dict, bool]:
+    """Redact the PII keys in one ``event_metadata`` blob.
+
+    Returns the new blob and whether anything changed, so an already-erased
+    subject reports zero new scrubs rather than counting rows it rewrote to the
+    identical value — this function is what makes the OutreachEvent pass as
+    idempotent as the rest of :func:`erase_subject`.
+
+    A new dict, never a mutation in place: ``event_metadata`` is a JSONB column
+    and SQLAlchemy does not track mutations *inside* a plain dict, so scrubbing
+    key-by-key on the loaded value changes the object and writes nothing.
+    """
+    if not blob:
+        return {}, False
+    scrubbed = dict(blob)
+    changed = False
+    for key in _EVENT_PII_KEYS:
+        if key in scrubbed and scrubbed[key] not in (None, "", {}, _REDACTED):
+            scrubbed[key] = _REDACTED
+            changed = True
+    return scrubbed, changed
 
 
 async def erase_subject(db: AsyncSession, email: str) -> dict:
@@ -290,6 +377,80 @@ async def erase_subject(db: AsyncSession, email: str) -> dict:
     counts["interactions"] = await _scrub_by_contact(Interaction, ("subject", "notes", "content"))
     counts["follow_ups"] = await _scrub_by_contact(FollowUp, ("reason", "notes"))
     counts["tasks"] = await _scrub_by_contact(Task, ("title", "description"))
+
+    # --- The sequence engine's copy of every message it sent this subject -----
+    #
+    # This is the largest store of the subject's data in the system and erasure
+    # never touched it. Per "Sent mail lives in two tables": the sequence path
+    # writes **no** ``EmailSend`` row, and persists the recipient, the subject
+    # line and the full rendered ``body_html`` in ``outreach_events.metadata``
+    # instead. So scrubbing ``email_sends`` covered manual sends, template sends
+    # and inbox replies — and left untouched the channel that carries the bulk of
+    # the volume, in full, addressed by name.
+    #
+    # The asymmetry is what makes this a bug rather than a judgement call:
+    # :func:`export_subject` directly above already walks the subject's
+    # enrollments and returns their ``OutreachEvent`` rows in the Subject Access
+    # Request. The two operations are halves of one obligation — what Article 15
+    # says we must hand over is what Article 17 says we must be able to remove —
+    # and one of them was reading a table the other could not see.
+    #
+    # Keyed through the enrollments rather than by address, because an
+    # ``OutreachEvent`` has no email column of its own; the enrollment's
+    # ``contact_id`` is the only link, and it is the same link the export uses.
+    erased_events = 0
+    if contact_ids:
+        enrollment_ids = list(
+            (
+                await db.execute(
+                    select(OutreachEnrollment.id).where(
+                        OutreachEnrollment.contact_id.in_(contact_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        for chunk_start in range(0, len(enrollment_ids), 500):
+            chunk = enrollment_ids[chunk_start:chunk_start + 500]
+            events = list(
+                (
+                    await db.execute(
+                        select(OutreachEvent).where(
+                            OutreachEvent.enrollment_id.in_(chunk)
+                        )
+                    )
+                ).scalars().all()
+            )
+            for ev in events:
+                scrubbed, changed = _scrub_metadata(ev.event_metadata)
+                if changed:
+                    ev.event_metadata = scrubbed
+                    erased_events += 1
+    counts["outreach_events"] = erased_events
+
+    # AI drafts hold the same copy one step earlier, plus ``personalization`` —
+    # the research agent's findings about this individual, which is the single
+    # most sensitive column in the schema and belongs to no message.
+    counts["ai_email_drafts"] = await _scrub_by_contact(
+        AiEmailDraft, ("subject", "body", "static_subject", "static_body")
+    )
+    if contact_ids:
+        drafts = list(
+            (
+                await db.execute(
+                    select(AiEmailDraft).where(AiEmailDraft.contact_id.in_(contact_ids))
+                )
+            ).scalars().all()
+        )
+        for d in drafts:
+            # Dropped rather than redacted: unlike the event blob, nothing reads
+            # a key out of this one — it is displayed as a whole — so an empty
+            # object is the honest representation and leaves no key names behind
+            # to describe what was researched.
+            if d.personalization:
+                d.personalization = {}
+            scrubbed, changed = _scrub_metadata(d.send_result)
+            if changed:
+                d.send_result = scrubbed
 
     # --- Email-keyed tables (match by contact OR address) ---------------------
     sends = list(
