@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     desc,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -205,6 +206,26 @@ class OutreachEvent(Base, OrgScopedMixin):
         # and every per-step engagement lookup join on, and Postgres does not
         # index a foreign key for you. See ``tests/test_index_declarations.py``.
         Index("ix_events_enrollment", "enrollment_id"),
+        # One open and one click per step, enforced by the database rather than
+        # by the read that precedes the insert. ``_record_outreach_engagement``
+        # deduplicates because a mail client re-fetches the pixel on every
+        # re-render and the optimizer reads these as *counts* — but a
+        # SELECT-then-INSERT is not a constraint, and the pixel endpoint is
+        # public, unauthenticated and served concurrently. Two fetches landing
+        # together both saw no row and both wrote one. Migration 117.
+        #
+        # Partial, because it is only true of these two. ``sent`` is written per
+        # attempt and a reconciled send is a second one; ``replied`` is
+        # genuinely repeatable; the ``task_*`` types record separate touches.
+        Index(
+            "uq_outreach_events_engagement_once",
+            "enrollment_id",
+            "step_number",
+            "event_type",
+            unique=True,
+            postgresql_where=text("event_type IN ('opened','clicked')"),
+            sqlite_where=text("event_type IN ('opened','clicked')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

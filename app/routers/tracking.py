@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Response
 from fastapi.responses import RedirectResponse, HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from itsdangerous import URLSafeTimedSerializer
 
 from app.config import get_settings
@@ -130,6 +131,28 @@ def generate_sequence_click_url(enrollment_id: str, step_number: int, original_u
     return f"{base}/api/v1/track/click/{token}"
 
 
+async def _engagement_exists(
+    db: AsyncSession, enrollment_id, step_number: int, event_type: str
+) -> bool:
+    """Whether this (enrollment, step, event_type) has already been recorded.
+
+    The cheap check that answers the overwhelmingly common case — a mail client
+    re-fetching a pixel minutes or days later. It is *not* what makes the dedup
+    hold; the partial unique index from migration 117 is. Its own function so a
+    test can make it miss and exercise the losing side of the race, which is the
+    one path a single-connection test database cannot produce on its own.
+    """
+    return (
+        await db.execute(
+            select(OutreachEvent.id).where(
+                OutreachEvent.enrollment_id == enrollment_id,
+                OutreachEvent.step_number == int(step_number),
+                OutreachEvent.event_type == event_type,
+            ).limit(1)
+        )
+    ).scalars().first() is not None
+
+
 async def _record_outreach_engagement(
     db: AsyncSession, enrollment_id: str, step_number: int, event_type: str
 ) -> bool:
@@ -139,6 +162,18 @@ async def _record_outreach_engagement(
     open but mail clients re-fetch it on every re-render, and the optimizer reads
     these as *counts*, so writing one row per fetch would inflate engagement.
     First occurrence wins; repeats are dropped.
+
+    **The read below is the fast path, not the guarantee.** A SELECT followed by
+    an INSERT is not a constraint, and this endpoint is public, unauthenticated
+    and served concurrently — a phone and a laptop rendering the same message, a
+    provider prefetch landing beside the human's open, or the click handler
+    recording the implied ``opened`` while the pixel records the real one. Two
+    requests both read no row and both wrote one. The duplicate is not only a
+    count: ``adaptive_delay.register_engagement`` runs per recorded event, so a
+    doubled open shortened the cadence twice and pulled the next step in further
+    than the signal justified. Migration 117 adds the partial unique index; the
+    savepoint below is how losing that race is turned back into "already
+    recorded" rather than a 500 on a tracking pixel.
 
     Returns True when a new row was written. Never raises — tracking must not
     break the pixel response.
@@ -160,27 +195,34 @@ async def _record_outreach_engagement(
             return False
 
         async with org_scope(enrollment.org_id):
-            existing = (
-                await db.execute(
-                    select(OutreachEvent).where(
-                        OutreachEvent.enrollment_id == enrollment.id,
-                        OutreachEvent.step_number == int(step_number),
-                        OutreachEvent.event_type == event_type,
-                    )
-                )
-            ).scalars().first()
-            if existing is not None:
+            if await _engagement_exists(
+                db, enrollment.id, int(step_number), event_type
+            ):
                 return False
 
-            db.add(
-                OutreachEvent(
-                    enrollment_id=enrollment.id,
-                    step_number=int(step_number),
-                    event_type=event_type,
-                    occurred_at=datetime.now(timezone.utc),
-                    event_metadata={"source": "tracking_pixel"},
+            try:
+                async with db.begin_nested():
+                    db.add(
+                        OutreachEvent(
+                            enrollment_id=enrollment.id,
+                            step_number=int(step_number),
+                            event_type=event_type,
+                            occurred_at=datetime.now(timezone.utc),
+                            event_metadata={"source": "tracking_pixel"},
+                        )
+                    )
+                    await db.flush()
+            except IntegrityError:
+                # A concurrent fetch of the same pixel got there first. The
+                # savepoint takes the row back and leaves the session usable, so
+                # this returns the same "already recorded" the SELECT above
+                # would have — and, critically, returns *before* the engagement
+                # registration below, which must run once per real signal.
+                logger.debug(
+                    "Concurrent %s already recorded for enrollment %s step %s",
+                    event_type, enrollment_id, step_number,
                 )
-            )
+                return False
 
             # Adaptive Step Delays (Feature 3): an open/click is a warm signal —
             # shorten the enrollment's cadence and pull in the pending next step.
