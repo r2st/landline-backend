@@ -146,6 +146,24 @@ _POLICY_PHRASES = (
 # sending IP) and Google's ``5.7.1`` (unsolicited) all land here.
 _ENHANCED_POLICY_RE = re.compile(r"\b5\.7\.\d+\b")
 
+# The *permanent* and *transient* enhanced classes, matched against the whole
+# diagnostic for the same reason ``_ENHANCED_POLICY_RE`` is: a DSN routinely
+# carries its enhanced code only inside the diagnostic line ("421 4.7.28 …"),
+# with ``status_code`` holding the bare SMTP code or nothing at all.
+#
+# Rule 1 below — "a 4.x is transient, whatever its reason" — read ``status_code``
+# and nothing else, so it did not fire on the shape it was written for. Gmail's
+# rate-limit deferral is ``421-4.7.28 … unusual rate of unsolicited mail``:
+# transient, clears on its own, suppresses nothing, and the word "unsolicited"
+# in it dropped straight through to the policy-phrase match and came back
+# ``blocked`` — a permanent reputation verdict raised on a throttle. Same for a
+# ``451 4.7.1`` greylisting that mentions a blocklist, which is most of them.
+_ENHANCED_TRANSIENT_RE = re.compile(r"\b4\.\d{1,3}\.\d{1,3}\b")
+_ENHANCED_PERMANENT_RE = re.compile(r"\b5\.\d{1,3}\.\d{1,3}\b")
+# A bare SMTP reply code opening the diagnostic, for DSNs with no enhanced code
+# at all. Anchored: a "450" appearing mid-sentence is a number, not a verdict.
+_LEADING_TRANSIENT_RE = re.compile(r"^\s*4\d\d\b")
+
 
 def classify_bounce(status_code: Optional[str] = None, diagnostic: str = "") -> str:
     """Return ``"hard"``, ``"soft"`` or ``"blocked"`` for a bounce.
@@ -156,7 +174,11 @@ def classify_bounce(status_code: Optional[str] = None, diagnostic: str = "") -> 
     1. **A ``4.x`` is transient, whatever its reason.** First, so that a
        greylisting DSN mentioning "policy" is not escalated into a reputation
        alarm. ``4.7.x`` — a *temporary* policy refusal — belongs here: it
-       suppresses nothing today and clears on its own.
+       suppresses nothing today and clears on its own. Read from the
+       **diagnostic as well as the status code**, because the enhanced code
+       frequently appears only there — which is already why step 2 searches the
+       diagnostic, and step 1 not doing so meant every transient policy refusal
+       reached step 4 and was called a permanent block.
     2. **An enhanced ``5.7.x`` is a policy block.** RFC 3463 §3.8 reserves the
        ``.7.`` subclass for security and policy, and this is the step the
        revision exists for: every rejection in the class carries a 5, so a
@@ -181,6 +203,16 @@ def classify_bounce(status_code: Optional[str] = None, diagnostic: str = "") -> 
 
     if re.match(r"\s*4", code):
         return "soft"
+
+    # The same rule, applied to a diagnostic-only enhanced code. Guarded two
+    # ways so it can only ever *add* the case step 1 was meant to cover: an
+    # explicit ``5`` status code wins outright, and a diagnostic carrying both
+    # classes (a multi-recipient DSN, a quoted earlier attempt) defers to the
+    # permanent one. Getting this backwards would call a dead address transient
+    # and leave it in rotation, which is the failure the module exists to stop.
+    if not re.match(r"\s*5", code) and not _ENHANCED_PERMANENT_RE.search(haystack):
+        if _ENHANCED_TRANSIENT_RE.search(haystack) or _LEADING_TRANSIENT_RE.match(text):
+            return "soft"
 
     if _ENHANCED_POLICY_RE.search(haystack):
         return "blocked"
