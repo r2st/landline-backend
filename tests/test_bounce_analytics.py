@@ -216,7 +216,9 @@ async def test_summary_daily_series_is_ordered_and_split(db_session):
     daily = result["daily"]
     assert len(daily) == 2
     assert daily[0]["day"] < daily[1]["day"]
-    assert daily[-1] == {"day": daily[-1]["day"], "hard": 1, "soft": 1, "total": 2}
+    assert daily[-1] == {
+        "day": daily[-1]["day"], "hard": 1, "soft": 1, "blocked": 0, "total": 2,
+    }
 
 
 # --- by_recipient_domain -----------------------------------------------------

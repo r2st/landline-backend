@@ -19,6 +19,9 @@ class BounceDayPoint(BaseModel):
     day: date
     hard: int
     soft: int
+    # Policy rejections — a spam verdict, DMARC/SPF, our IP on a blocklist.
+    # Defaulted so a client reading an older payload still validates.
+    blocked: int = 0
     total: int
 
 
@@ -49,6 +52,11 @@ class BounceSummary(BaseModel):
     total: int
     hard: int
     soft: int
+    # Rejections about the *sender*, not the recipient. Counted in ``total`` and
+    # in ``bounce_rate`` — the message did come back, and the kill switch's own
+    # rate counts it — but deliberately not in ``hard_bounce_rate``, which asks
+    # how many addresses are dead.
+    blocked: int = 0
     # Distinct addresses, not notifications — a mailbox that soft-bounces every
     # day for a week is one bad address, not seven.
     distinct_addresses: int
@@ -81,6 +89,11 @@ class RecipientDomainStats(BaseModel):
     # events only) for a domain we also mail manually.
     hard_bounces: int
     soft_bounces: int
+    # Policy blocks into this domain. Its own field because it is the one kind
+    # that clusters on a single receiving domain — that is what a DMARC break
+    # or a filter verdict looks like — and folding it into ``soft_bounces``
+    # described it as the recipient's mailbox having a bad day.
+    blocked_bounces: int = 0
     open_rate: float
     reply_rate: float
     bounce_rate: float

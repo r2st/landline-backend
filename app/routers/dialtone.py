@@ -2235,7 +2235,10 @@ async def deliverability_by_domain(
 @router.get("/bounces", response_model=BounceListResponse)
 async def list_bounces(
     days: int = Query(30, ge=1, le=365),
-    kind: Optional[str] = Query(None, pattern="^(hard|soft)$"),
+    # All three ledger kinds. The pattern predated ``blocked`` (migration 113),
+    # so asking for the policy blocks — the rows an operator goes to this page
+    # to find when deliverability moves — was a 422.
+    kind: Optional[str] = Query(None, pattern="^(hard|soft|blocked)$"),
     domain: Optional[str] = Query(
         None, description="Exact receiving domain, e.g. 'acme.com'."
     ),

@@ -46,6 +46,7 @@ from app.models.contact import Contact
 from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.suppression import SuppressionEntry
+from app.services.bounce_handler import BOUNCE_KINDS
 from app.services.sql_search import LIKE_ESCAPE, contains_pattern, endswith_pattern
 
 logger = logging.getLogger(__name__)
@@ -182,11 +183,20 @@ async def by_recipient_domain(
     ).all()
     hard: Counter = Counter()
     soft: Counter = Counter()
+    blocked: Counter = Counter()
     for email, kind, n in ledger_rows:
         domain = email_domain(email)
         if domain is None:
             continue
-        (hard if kind == "hard" else soft)[domain] += n
+        # Three kinds, three counters. The fold used to be a two-way
+        # ``hard if kind == "hard" else soft``, so every policy block landed in
+        # ``soft_bounces`` — and a policy block is the one kind that arrives in
+        # a *cluster on one receiving domain*, because that is what a DMARC
+        # failure or a filter verdict does. So the surface built to name the
+        # domain refusing our mail reported the refusal as transient mailbox
+        # trouble at the recipient's end, which is the opposite of what it is.
+        target = hard if kind == "hard" else (blocked if kind == "blocked" else soft)
+        target[domain] += n
 
     domains: list[dict] = []
     for domain, counts in by_domain.items():
@@ -215,6 +225,11 @@ async def by_recipient_domain(
             "unsubscribed": counts.get("unsubscribed", 0),
             "hard_bounces": hard.get(domain, 0),
             "soft_bounces": soft.get(domain, 0),
+            # Rejections about *us* — a spam verdict, DMARC/SPF, our IP on a
+            # blocklist. Reported beside the other two rather than inside them:
+            # the operator response is to fix the sending domain, not to prune
+            # the list, and the two are told apart nowhere else on this page.
+            "blocked_bounces": blocked.get(domain, 0),
             "open_rate": _rate(counts.get("opened", 0), sent),
             "reply_rate": _rate(counts.get("replied", 0), sent),
             "bounce_rate": bounce_rate,
@@ -261,6 +276,15 @@ async def summary(db: AsyncSession, *, days: int = 30) -> dict:
     by_kind = {kind: n for kind, n in kind_rows}
     hard = by_kind.get("hard", 0)
     soft = by_kind.get("soft", 0)
+    # ``blocked`` is a real ledger kind (``BOUNCE_KINDS``, and the
+    # ``ck_bounce_kind`` CHECK since migration 113) and this module counted two
+    # of the three. ``total`` was ``hard + soft``, so the whole surface read
+    # zero during the one incident it exists for: a DMARC break or a filter
+    # verdict produces *nothing but* blocked records, and it produces them by
+    # the hundred. ``distinct_addresses`` below counts every row, so the
+    # documented "``auto_suppressed`` should track the addresses" comparison
+    # was being made against a total that had dropped the addresses.
+    blocked = by_kind.get("blocked", 0)
 
     # Sends in the same window, for the rate. Sequence engine only — see module
     # docstring on why this is not the union of both send tables.
@@ -302,6 +326,10 @@ async def summary(db: AsyncSession, *, days: int = 30) -> dict:
             "day": day,
             "hard": counts.get("hard", 0),
             "soft": counts.get("soft", 0),
+            "blocked": counts.get("blocked", 0),
+            # Already every kind — ``sum(counts.values())`` has been counting
+            # blocked records all along, which is why the trend line and the
+            # ``hard + soft`` total above it could disagree.
             "total": sum(counts.values()),
         }
         for day, counts in sorted(per_day.items())
@@ -366,12 +394,20 @@ async def summary(db: AsyncSession, *, days: int = 30) -> dict:
 
     return {
         "timeframe_days": days,
-        "total": hard + soft,
+        "total": hard + soft + blocked,
         "hard": hard,
         "soft": soft,
+        "blocked": blocked,
         "distinct_addresses": distinct_addresses,
         "sent": sent,
-        "bounce_rate": _rate(hard + soft, sent),
+        # Every kind, because every one of them is a message that came back —
+        # ``danger_monitor``'s brake counts a policy block in full for exactly
+        # this reason, and a dashboard rate that disagrees with the rate the
+        # kill switch reads is worse than no rate.
+        "bounce_rate": _rate(hard + soft + blocked, sent),
+        # Still hard alone. This one answers "how many dead addresses", and a
+        # policy block is not evidence of one — that distinction is the whole
+        # point of the third kind.
         "hard_bounce_rate": _rate(hard, sent),
         "auto_suppressed": auto_suppressed,
         "daily": daily,
@@ -400,7 +436,12 @@ async def recent(
     """
     since = _window_start(days)
     conditions = [BounceRecord.processed_at >= since]
-    if kind in ("hard", "soft"):
+    # Every kind the ledger can hold, taken from the one list that defines them
+    # rather than re-spelled here. The literal ``("hard", "soft")`` predated the
+    # third kind, so ``kind="blocked"`` matched nothing, fell through, and
+    # returned the *unfiltered* ledger — a filter that silently does nothing
+    # reads as "there is nothing else to see".
+    if kind in BOUNCE_KINDS:
         conditions.append(BounceRecord.bounce_kind == kind)
     if domain:
         conditions.append(
