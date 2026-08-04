@@ -51,7 +51,23 @@ class EventBus:
 
             settings = get_settings()
             self._redis = aioredis.from_url(
-                settings.redis_url, encoding="utf-8", decode_responses=True
+                settings.redis_url,
+                encoding="utf-8",
+                decode_responses=True,
+                # Bounded, like every other Redis client in this codebase
+                # (``send_limiter``, ``send_pacing``, ``cache``, ``api_key_auth``).
+                # This one had no timeouts, which made "streaming is best-effort"
+                # untrue in the case that matters: an unreachable *host* fails
+                # fast, but a host that accepts the TCP connection and then stops
+                # answering — a wedged Redis, a firewall blackholing an
+                # established connection, a failover mid-flight — leaves ``ping``
+                # and ``xadd`` waiting on a socket with no deadline. And this is
+                # not a background path: ``publish`` is awaited inline by the
+                # workflow ``emit`` endpoint and by every internal event a
+                # request raises, so the optional half of the work is what hangs
+                # the request.
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5,
             )
             # Verify connectivity once up front.
             await self._redis.ping()

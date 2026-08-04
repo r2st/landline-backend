@@ -236,7 +236,7 @@ async def rank_contacts_with_totals(
     """
     from app.models.contact import Contact
     from app.models.company import Company
-    from app.models.email_template import EmailSend
+    from app.models.email_template import NON_WIRE_STATUSES, EmailSend
     from app.models.outreach import OutreachEnrollment, OutreachEvent
 
     now = now or datetime.now(timezone.utc)
@@ -308,7 +308,12 @@ async def rank_contacts_with_totals(
         # recipient did afterwards. Both matter and they are not the same thing.
         if send.status == "bounced":
             _apply(record, "bounced", send.sent_at)
-        elif send.status not in ("skipped", "suppressed", "halted", "error", "failed", "scheduled"):
+        elif send.status not in NON_WIRE_STATUSES:
+            # ``NON_WIRE_STATUSES`` rather than a literal. The literal that stood
+            # here listed six of the seven and left out ``pending`` — the status
+            # a row is *born* in — so a message composed and not yet on the wire
+            # scored its recipient as engaged-with, and moved them up a list
+            # whose whole purpose is "who should a rep call next".
             _apply(record, "sent", send.sent_at)
         for kind, stamp in (
             ("opened", send.opened_at),

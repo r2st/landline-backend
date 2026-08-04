@@ -76,7 +76,9 @@ async def test_a_due_row_is_sent_and_marked(
 
     result = await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
 
-    assert result == {"due": 1, "sent": 1, "failed": 0, "abandoned": 0}
+    assert result == {
+        "due": 1, "sent": 1, "failed": 0, "deferred": 0, "abandoned": 0,
+    }
     assert [c["to_email"] for c in dispatched] == [row.to_email]
     assert dispatched[0]["body_html"] == "<p>Hi</p>"
     await db_session.refresh(row)
@@ -373,3 +375,133 @@ async def test_the_sweep_sends_from_the_pinned_mailbox(
     await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
 
     assert dispatched[0]["sender_account_id"] == account_id
+
+
+# ---------------------------------------------------------------------------
+# A hold is not an outcome (r46)
+# ---------------------------------------------------------------------------
+# The claim moves a row out of ``scheduled``, and the sweep then wrote the
+# dispatcher's answer onto it verbatim. Three of the dispatcher's refusals are
+# temporary — the kill switch, the daily cap, the warm-up ceiling — and none of
+# their statuses is ever selected again by anything. So a "send later" whose
+# minute happened to land inside a hold was destroyed: no send, no retry, and a
+# status the operator has to go looking for after being told at compose time
+# that the message was scheduled. The sequence engine has always deferred on
+# exactly these statuses; this sweep is the same situation one table over.
+
+
+def _holding(status: str, **extra):
+    """A dispatcher that declines every send with ``status``."""
+
+    async def _fake(db, **kwargs):
+        return {"status": status, "reason": f"held: {status}", **extra}
+
+    return _fake
+
+
+@pytest.mark.parametrize(
+    "status, extra",
+    [
+        ("halted", {}),                                  # kill switch engaged
+        ("skipped", {"daily_limit_reached": True}),      # daily cap spent
+        ("skipped", {}),                                 # warm-up ceiling
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_transient_hold_returns_the_row_to_the_queue(
+    db_session: AsyncSession, monkeypatch, status: str, extra: dict,
+):
+    """Held, not failed: still ``scheduled``, and due again after the backoff."""
+    row = _row(due=NOW - timedelta(minutes=1))
+    db_session.add(row)
+    await db_session.commit()
+    monkeypatch.setattr(scheduled_sends, "send_outreach_email", _holding(status, **extra))
+
+    result = await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
+
+    assert result["deferred"] == 1
+    assert result["failed"] == 0
+    await db_session.refresh(row)
+    assert row.status == "scheduled"
+    due = row.scheduled_at.replace(tzinfo=row.scheduled_at.tzinfo or timezone.utc)
+    assert due == NOW + scheduled_sends.HOLD_BACKOFF
+    # The reason survives, because "why is this still queued" is the next question.
+    assert row.error and status in row.error
+
+
+@pytest.mark.asyncio
+async def test_a_held_row_actually_sends_on_a_later_pass(
+    db_session: AsyncSession, monkeypatch, dispatched: list,
+):
+    """The whole point of deferring: the message is not lost, only late.
+
+    A held row that never reaches the wire once the hold lifts is the same bug
+    with a longer fuse, so the retry is asserted end to end rather than by
+    reading the row's status back.
+    """
+    row = _row(due=NOW - timedelta(minutes=1))
+    db_session.add(row)
+    await db_session.commit()
+
+    monkeypatch.setattr(scheduled_sends, "send_outreach_email", _holding("halted"))
+    assert (await scheduled_sends.send_due_scheduled_for_session(
+        db_session, now=NOW))["deferred"] == 1
+
+    # Kill switch lifted; the next pass after the backoff finds it due again.
+    later = NOW + scheduled_sends.HOLD_BACKOFF + timedelta(minutes=1)
+
+    async def _sends(db, **kwargs):
+        dispatched.append(kwargs)
+        return {"status": "sent"}
+
+    monkeypatch.setattr(scheduled_sends, "send_outreach_email", _sends)
+
+    result = await scheduled_sends.send_due_scheduled_for_session(db_session, now=later)
+
+    assert result["sent"] == 1
+    assert [c["to_email"] for c in dispatched] == [row.to_email]
+    await db_session.refresh(row)
+    assert row.status == "sent"
+
+
+@pytest.mark.asyncio
+async def test_a_suppressed_recipient_is_terminal_not_held(
+    db_session: AsyncSession, monkeypatch,
+):
+    """The opposite direction, and the reason the re-check exists at all.
+
+    Deferring a do-not-contact refusal would put the sweep in a loop re-offering
+    a message to someone who has opted out — the exact thing the send-time
+    re-check is there to prevent.
+    """
+    row = _row(due=NOW - timedelta(minutes=1))
+    db_session.add(row)
+    await db_session.commit()
+    monkeypatch.setattr(scheduled_sends, "send_outreach_email", _holding("suppressed"))
+
+    result = await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
+
+    assert result["deferred"] == 0
+    assert result["failed"] == 1
+    await db_session.refresh(row)
+    assert row.status == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_a_spam_blocked_body_is_terminal_not_held(
+    db_session: AsyncSession, monkeypatch,
+):
+    """A verdict on this exact copy. Retrying it unchanged is the same refusal."""
+    row = _row(due=NOW - timedelta(minutes=1))
+    db_session.add(row)
+    await db_session.commit()
+    monkeypatch.setattr(
+        scheduled_sends, "send_outreach_email", _holding("skipped", spam_blocked=True)
+    )
+
+    result = await scheduled_sends.send_due_scheduled_for_session(db_session, now=NOW)
+
+    assert result["deferred"] == 0
+    assert result["failed"] == 1
+    await db_session.refresh(row)
+    assert row.status == "skipped"

@@ -1529,6 +1529,10 @@ def process_outreach_queue():
             # the readable form of "the worker is not keeping up" — which used to
             # surface only as a mysteriously large LLM bill.
             skipped_in_flight = 0
+            # Enrollments this sweep closed because their contact has opted out.
+            # Reported rather than silent: it is the count that says the queue
+            # shrank for a compliance reason and not because sending stalled.
+            stopped_suppressed = 0
 
             # Anti-spam: don't send outside business hours / on weekends. Cold
             # mail that lands at 3 AM reads as a bot and tanks reply rates. The
@@ -1704,8 +1708,20 @@ def process_outreach_queue():
                 # Hard suppression: a contact suppressed via an unsubscribe reply
                 # (Feature 1), one who used the unsubscribe link, or an address on
                 # the org do-not-contact list (Feature 2), is never emailed again.
-                # Skip before any send — send_sequence_step re-checks and stops the
-                # enrollment properly. Same three-way check it makes; see there.
+                # Same three-way check ``send_sequence_step`` makes; see there.
+                #
+                # **Stopped here, not just skipped.** This block used to
+                # ``continue`` on the stated grounds that "send_sequence_step
+                # re-checks and stops the enrollment properly" — but skipping is
+                # precisely what stops that task from ever running, so nothing
+                # closed the enrollment. It stayed ``active`` forever: re-read,
+                # re-ranked and re-suppression-checked on every five-minute
+                # sweep, for every contact who has ever opted out, and shown as
+                # a live enrollment on a campaign that can never send it another
+                # message. An opt-out is terminal for the enrollment, and the
+                # sweep is the only thing that will ever look at this row again,
+                # so it has to be the one to end it — with the same status and
+                # stamp the send task would have written.
                 from app.services import suppression as _suppression
 
                 if contact and (
@@ -1713,7 +1729,14 @@ def process_outreach_queue():
                     or getattr(contact, "unsubscribed", False)
                     or await _suppression.is_suppressed(db, contact.email)
                 ):
-                    logger.info("Skipping enrollment %s: contact suppressed", enrollment.id)
+                    # ``unsubscribed``, never ``bounced``: a compliance stop is
+                    # not a delivery failure and must not move sender metrics.
+                    enrollment.status = "unsubscribed"
+                    enrollment.completed_at = now
+                    stopped_suppressed += 1
+                    logger.info(
+                        "Enrollment %s stopped: contact is suppressed", enrollment.id
+                    )
                     continue
 
                 # Timezone-aware send window: use the contact's own timezone when
@@ -1788,6 +1811,7 @@ def process_outreach_queue():
                 "held_for_optimal_window": scheduled_smart,
                 "skipped_daily_quota": skipped_quota,
                 "skipped_in_flight": skipped_in_flight,
+                "stopped_suppressed": stopped_suppressed,
             }
 
         return await for_each_org(_body, label="process_outreach_queue")

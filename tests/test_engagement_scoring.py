@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.models.contact import Contact
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUSES, WIRE_STATUSES, EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence
 from app.services import engagement_scoring as es
@@ -312,3 +312,81 @@ async def test_totals_describe_the_population_not_the_page(
     assert len(data["leads"]) == 2, "the page is still a page"
     assert data["total_ranked"] == 5
     assert sum(data["tier_counts"].values()) == 5
+
+
+# ---------------------------------------------------------------------------
+# A queued send is not a send (r46)
+# ---------------------------------------------------------------------------
+# The non-wire status list here was a hand-written literal that had drifted from
+# ``NON_WIRE_STATUSES``: it named six of the seven and left out ``pending`` — the
+# status every ``EmailSend`` is *born* in, and the one a composed-but-unsent
+# message sits in. So a row that had never reached a transport scored its
+# recipient as someone we had emailed, and moved them up a list whose entire job
+# is "who should a rep call next". The model keeps that vocabulary in one place
+# precisely so a new status has to be classified by whoever adds it.
+
+
+@pytest.mark.asyncio
+async def test_a_pending_send_does_not_score_its_recipient(
+    db_session, sample_company, sample_contact
+):
+    """Composed, not sent. Nothing has happened to this contact yet.
+
+    A pending row scoring as a send is worth more than the counter: it is the
+    ``sent`` weight, so a batch composed and held by a spent cap would lift its
+    whole recipient list up the "call these people this morning" ranking on the
+    strength of mail nobody has received.
+    """
+    now = datetime.now(timezone.utc)
+    db_session.add(EmailSend(
+        id=uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Queued", status="pending", sent_at=now - timedelta(minutes=1),
+    ))
+    await db_session.flush()
+
+    ranked = await es.rank_contacts(db_session)
+
+    assert [r["sent"] for r in ranked] == [0]
+    assert [r["score"] for r in ranked] == [0.0]
+
+
+@pytest.mark.parametrize("status", sorted(NON_WIRE_STATUSES))
+@pytest.mark.asyncio
+async def test_no_non_wire_status_counts_as_a_send(
+    db_session, sample_company, sample_contact, status: str,
+):
+    """Driven off the model's own list, so the next status added is covered."""
+    now = datetime.now(timezone.utc)
+    db_session.add(EmailSend(
+        id=uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Nope", status=status, sent_at=now - timedelta(minutes=1),
+    ))
+    await db_session.flush()
+
+    ranked = await es.rank_contacts(db_session)
+
+    assert [r["sent"] for r in ranked] == [0], f"{status!r} counted as a send"
+    assert [r["score"] for r in ranked] == [0.0]
+
+
+@pytest.mark.parametrize("status", [s for s in WIRE_STATUSES if s != "bounced"])
+@pytest.mark.asyncio
+async def test_every_wire_status_counts_as_a_send(
+    db_session, sample_company, sample_contact, status: str,
+):
+    """The other half. ``status`` is a ladder, not a terminal value.
+
+    The tracking router walks a row up ``sent -> opened -> clicked -> replied``,
+    so a roll-up that recognised only ``sent`` would count fewer sends the
+    better the campaign did.
+    """
+    now = datetime.now(timezone.utc)
+    db_session.add(EmailSend(
+        id=uuid.uuid4(), contact_id=sample_contact.id, to_email=sample_contact.email,
+        subject="Real", status=status, sent_at=now - timedelta(minutes=1),
+    ))
+    await db_session.flush()
+
+    ranked = await es.rank_contacts(db_session)
+
+    assert [r["sent"] for r in ranked] == [1], f"{status!r} was not counted"

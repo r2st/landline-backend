@@ -394,3 +394,64 @@ def test_regime_lookup_tolerates_casing_and_padding():
     assert regime_for(" DE ") == COUNTRY_CONSENT_REGIMES["DE"]
     assert regime_for(None) is None
     assert regime_for("") is None
+
+
+# ---------------------------------------------------------------------------
+# A model the gate has no branch for (r46)
+# ---------------------------------------------------------------------------
+# The two branches were exhaustive over today's ``COUNTRY_CONSENT_REGIMES``, and
+# the ``else`` carried a bare ``assert model == OPT_IN`` to say so. Two things
+# were wrong with that as a compliance gate: ``assert`` is stripped by ``python
+# -O``, so under the flag the statement is *nothing* and the opt-in branch runs
+# for a model it was never written for; and an assertion that fires is an
+# AssertionError out of the send path, not a refusal. The third model this is
+# about does not exist yet — the point is that the day someone adds one, the
+# gate refuses instead of guessing.
+
+
+@pytest.mark.asyncio
+async def test_a_consent_model_with_no_branch_refuses(
+    db_session: AsyncSession, sample_company: Company, sample_contact: Contact,
+    monkeypatch,
+):
+    """Fail closed on an unhandled model, and say which one."""
+    from app.constants import COUNTRY_CONSENT_REGIMES
+    from app.services import consent as consent_module
+
+    monkeypatch.setitem(
+        COUNTRY_CONSENT_REGIMES, "US", ("SOME-FUTURE-ACT", "double_opt_in")
+    )
+
+    result = await consent_module.check_consent(
+        db_session, sample_contact, sample_company
+    )
+
+    assert result.can_email is False
+    assert result.regime == "SOME-FUTURE-ACT"
+    assert "double_opt_in" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_survives_assertions_being_stripped(
+    db_session: AsyncSession, sample_company: Company, sample_contact: Contact,
+    monkeypatch,
+):
+    """The failure mode ``-O`` produces, without needing a second interpreter.
+
+    An ``assert`` compiled out leaves the branch it guarded reachable and
+    silent. Nothing here may be load-bearing on an assertion, so the check is
+    that the refusal is a returned ``ConsentCheckResult`` — a value the caller
+    acts on — rather than a raised ``AssertionError`` it would have to catch.
+    """
+    from app.constants import COUNTRY_CONSENT_REGIMES
+    from app.services import consent as consent_module
+
+    monkeypatch.setitem(COUNTRY_CONSENT_REGIMES, "US", ("MYSTERY", "unknown_model"))
+
+    result = await consent_module.check_consent(
+        db_session, sample_contact, sample_company
+    )
+
+    assert isinstance(result, consent_module.ConsentCheckResult)
+    assert result.can_email is False
+    assert result.consent_type == "none"

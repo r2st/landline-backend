@@ -22,7 +22,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.email_template import EmailSend
+from app.models.email_template import NON_WIRE_STATUSES, EmailSend
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence
 
@@ -37,7 +37,15 @@ _COUNTED = ("sent", "opened", "clicked", "replied", "bounced")
 # sends inflates the denominator every rate is divided by, so a contact whose
 # sends were all declined by the warm-up cap would read as 0% open rate rather
 # than "we haven't emailed them".
-_NON_SENDS = frozenset({"skipped", "suppressed", "halted", "error", "failed", "scheduled"})
+#
+# Taken from the model rather than spelled out here. The hand-written copy this
+# replaces had drifted: it listed six of the seven and omitted ``pending`` — the
+# status every row *starts* in and the one a queued-but-unsent message sits in.
+# So a compose that had not yet reached the transport already counted as a send
+# on the contact's panel, with a timestamp, and already divided into their open
+# and reply rates. ``NON_WIRE_STATUSES`` exists so a new status has to be
+# classified by whoever adds it; a local literal is how that guarantee is lost.
+_NON_SENDS = NON_WIRE_STATUSES
 
 
 def _aware(dt: Optional[datetime]) -> Optional[datetime]:

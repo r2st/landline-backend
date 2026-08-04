@@ -166,9 +166,8 @@ async def check_consent(
             consent_type="implied",
         )
 
-    else:
+    elif model == OPT_IN:
         # Opt-in model (CASL and friends) — need valid express or implied consent
-        assert model == OPT_IN, f"unhandled consent model {model!r}"
         now = datetime.now(timezone.utc)
 
         result = await db.execute(
@@ -224,6 +223,23 @@ async def check_consent(
             regime=regime,
             consent_type="none",
         )
+
+    # A consent model the regime table names but this gate has no branch for.
+    # Unreachable today; reachable the moment someone adds a third model to
+    # ``COUNTRY_CONSENT_REGIMES`` and forgets this function. Refusing is the
+    # only safe answer — an `assert` here would evaporate under ``python -O``,
+    # and falling off the end would hand the caller a ``None`` it would then
+    # crash on, mid-dispatch.
+    logger.error(
+        "Consent model %r (regime %s) has no branch in check_consent — refusing to send",
+        model, regime,
+    )
+    return ConsentCheckResult(
+        can_email=False,
+        reason=f"Unsupported consent model {model!r} for {regime} — refusing to send",
+        regime=regime,
+        consent_type="none",
+    )
 
 
 async def record_consent(

@@ -22,11 +22,16 @@ Two properties matter more than the sweep itself:
   scheduled send is cold outreach with a delay on it, not an exemption from any
   of that — a message queued on Monday and sent on Thursday must still see the
   Wednesday unsubscribe.
+- **A hold puts the row back.** Three of those gates are temporary — the kill
+  switch, the daily cap, the warm-up ceiling — and a message that meets one of
+  them has not been refused, it has been asked to wait. Writing the dispatcher's
+  hold status onto the row was fatal, because nothing selects a row that is no
+  longer ``scheduled``. See :func:`_is_transient_hold`.
 """
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +47,36 @@ logger = logging.getLogger(__name__)
 #: minute should not become one unbounded Celery task; the next pass takes the
 #: rest, and the daily cap governs the real ceiling either way.
 BATCH_LIMIT = 100
+
+#: How far forward a held row's ``scheduled_at`` moves before it is due again.
+#: Long enough that a spent daily cap or an engaged kill switch is not re-asked
+#: every minute; short enough that a hold lifting mid-morning does not cost the
+#: message the rest of the day.
+HOLD_BACKOFF = timedelta(minutes=30)
+
+
+def _is_transient_hold(result: dict) -> bool:
+    """Whether the dispatcher *held* this message rather than refusing it.
+
+    The dispatcher declines a send for five reasons and they are not the same
+    kind of answer:
+
+    * the kill switch is engaged (``halted``) — an operator's pause, which they
+      will lift;
+    * the warm-up ramp or the daily cap is spent (``skipped``) — a ceiling that
+      resets on its own;
+    * the recipient is on the do-not-contact list (``suppressed``) — permanent,
+      and the whole reason a week-old scheduled send is re-checked at send time;
+    * the spam gate blocked the copy (``skipped`` + ``spam_blocked``) — a
+      deterministic verdict on this exact body, so retrying it unchanged is just
+      the same refusal on a timer;
+    * anything else (``error``, a bounce) — already terminal.
+
+    The first two are holds. Everything else is a decision.
+    """
+    if result.get("spam_blocked"):
+        return False
+    return result.get("status") in ("halted", "skipped")
 
 
 def _run_async(coro):
@@ -95,7 +130,7 @@ async def send_due_scheduled_for_session(db: AsyncSession, *, now=None) -> dict:
         .all()
     )
 
-    sent = failed = abandoned = 0
+    sent = failed = abandoned = deferred = 0
     for row in due:
         if not row.to_email or not row.body_html:
             # Rows scheduled before the compose endpoint persisted the rendered
@@ -132,6 +167,34 @@ async def send_due_scheduled_for_session(db: AsyncSession, *, now=None) -> dict:
             continue
 
         status = result.get("status", "error")
+
+        # A hold is not an outcome. The claim above moved this row out of
+        # ``scheduled``, and writing the dispatcher's ``halted``/``skipped``
+        # straight onto it made that move permanent: nothing selects a row in
+        # any of those statuses, so a message whose minute arrived while the
+        # day's cap was spent — or while the kill switch was engaged, or while
+        # its mailbox was inside its warm-up ceiling — was simply deleted, in a
+        # status the operator has to go looking for, having been told at compose
+        # time that it was scheduled. The sequence engine has always treated
+        # exactly these statuses as a soft skip and deferred the enrollment;
+        # this sweep is the same situation with a different table, and the fix
+        # is the same. Put it back in the queue, a backoff later so a
+        # long-running hold neither re-asks every pass nor starves the newer
+        # rows behind it in ``BATCH_LIMIT``.
+        if _is_transient_hold(result):
+            row.status = "scheduled"
+            row.scheduled_at = now + HOLD_BACKOFF
+            # Kept, not cleared: "why is this still queued" is the question the
+            # operator will ask, and the dispatcher's reason is the answer.
+            row.error = result.get("reason") or result.get("detail")
+            await db.commit()
+            deferred += 1
+            logger.info(
+                "Scheduled send %s held (%s); retrying after %s",
+                row.id, status, row.scheduled_at.isoformat(),
+            )
+            continue
+
         row.status = status
         row.error = None if status == "sent" else (
             result.get("reason") or result.get("detail")
@@ -154,11 +217,12 @@ async def send_due_scheduled_for_session(db: AsyncSession, *, now=None) -> dict:
 
     if due:
         logger.info(
-            "Scheduled sends: %d due, %d sent, %d not sent, %d abandoned",
-            len(due), sent, failed, abandoned,
+            "Scheduled sends: %d due, %d sent, %d not sent, %d held, %d abandoned",
+            len(due), sent, failed, deferred, abandoned,
         )
     return {
-        "due": len(due), "sent": sent, "failed": failed, "abandoned": abandoned,
+        "due": len(due), "sent": sent, "failed": failed,
+        "deferred": deferred, "abandoned": abandoned,
     }
 
 
@@ -180,6 +244,7 @@ def send_due_scheduled_emails():
 
 __all__ = [
     "BATCH_LIMIT",
+    "HOLD_BACKOFF",
     "send_due_scheduled_emails",
     "send_due_scheduled_for_session",
 ]
