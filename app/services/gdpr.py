@@ -430,9 +430,7 @@ async def erase_subject(db: AsyncSession, email: str) -> dict:
     # AI drafts hold the same copy one step earlier, plus ``personalization`` —
     # the research agent's findings about this individual, which is the single
     # most sensitive column in the schema and belongs to no message.
-    counts["ai_email_drafts"] = await _scrub_by_contact(
-        AiEmailDraft, ("subject", "body", "static_subject", "static_body")
-    )
+    drafts = []
     if contact_ids:
         drafts = list(
             (
@@ -441,16 +439,19 @@ async def erase_subject(db: AsyncSession, email: str) -> dict:
                 )
             ).scalars().all()
         )
-        for d in drafts:
-            # Dropped rather than redacted: unlike the event blob, nothing reads
-            # a key out of this one — it is displayed as a whole — so an empty
-            # object is the honest representation and leaves no key names behind
-            # to describe what was researched.
-            if d.personalization:
-                d.personalization = {}
-            scrubbed, changed = _scrub_metadata(d.send_result)
-            if changed:
-                d.send_result = scrubbed
+    for d in drafts:
+        _scrub(d, ("subject", "body", "static_subject", "static_body"))
+        # ``personalization`` is dropped rather than redacted: unlike the event
+        # blob, nothing reads a key out of this one — it is displayed whole — so
+        # an empty object is the honest representation, and it leaves behind no
+        # key names describing what was collected about someone who asked to be
+        # forgotten.
+        if d.personalization:
+            d.personalization = {}
+        scrubbed, changed = _scrub_metadata(d.send_result)
+        if changed:
+            d.send_result = scrubbed
+    counts["ai_email_drafts"] = len(drafts)
 
     # --- Email-keyed tables (match by contact OR address) ---------------------
     sends = list(
