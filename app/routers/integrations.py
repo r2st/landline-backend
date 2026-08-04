@@ -26,6 +26,11 @@ from app.models.user import User
 from app.services.crm_import import CRM_PULL_PROVIDERS, get_crm_importer
 from app.services.crypto import TokenCryptoError, decrypt, encrypt
 from app.services.integrations import get_connector, marketplace_catalog
+from app.services.web_scraper import (
+    UnresolvableHostError,
+    UnsafeURLError,
+    validate_public_url_async,
+)
 from app.services.webhook_dispatch import get_webhook_dispatcher
 
 logger = logging.getLogger(__name__)
@@ -399,8 +404,24 @@ async def create_webhook(
     db: AsyncSession = Depends(get_db),
 ):
     """Register a webhook subscription for internal events."""
-    if not body.target_url.startswith(("http://", "https://")):
-        raise HTTPException(400, "target_url must be an http(s) URL")
+    # The scheme check alone admitted `http://169.254.169.254/…` and
+    # `http://127.0.0.1:8001/…`, which this server then POSTs to — with a valid
+    # HMAC signature over a body the same user supplies via
+    # `POST /integrations/webhooks/emit`, whose response reports the target's
+    # status code back to them. `validate_public_url` is the guard the codebase
+    # already applies to org-supplied RSS feed URLs; rejecting here gives the
+    # user a 400 they can act on, and `webhook_dispatch` re-checks at delivery
+    # because DNS can be re-pointed after registration.
+    try:
+        await validate_public_url_async(body.target_url)
+    except UnresolvableHostError:
+        # Storing a URL is not fetching one. A host that doesn't resolve in this
+        # second says nothing about whether it is private — a receiver whose DNS
+        # is briefly down, or whose record is about to be created, is an ordinary
+        # thing to configure — and the delivery path re-checks and fails closed.
+        logger.info("Webhook target %r did not resolve at registration", body.target_url)
+    except UnsafeURLError as exc:
+        raise HTTPException(400, f"target_url is not a reachable public URL: {exc}")
     sub = WebhookSubscription(
         org_id=current_user.org_id,
         target_url=body.target_url,

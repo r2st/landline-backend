@@ -8,6 +8,29 @@ can verify authenticity (``X-Landline-Signature: sha256=<hex>``).
 
 Delivery is best-effort and never raises into the caller — an emit that can't
 reach a subscriber marks the event failed and moves on.
+
+The target URL is a tenant's, so it goes through the SSRF guard
+--------------------------------------------------------------
+``target_url`` is whatever an org user typed into a form, and this module POSTs
+to it from inside the production network. Registration checked that the string
+started with ``http://`` or ``https://`` and nothing else, so
+``http://169.254.169.254/latest/meta-data/`` and ``http://127.0.0.1:8001/…`` were
+both accepted.
+
+Two things made that more than theoretical. ``POST
+/integrations/webhooks/emit`` lets the same user fire a delivery on demand with a
+payload of their choosing, and the response hands back each delivery's status and
+``response_code`` — so the pair is not a blind SSRF but an interactive one with a
+result channel. And the request carries a valid ``X-Landline-Signature`` for a
+body the caller controls, which is exactly the shape a receiver is told to trust.
+
+``web_scraper.validate_public_url`` already existed for this and is already
+applied to org-supplied RSS feed URLs in the social-listening agent. It is
+applied here at both ends: at registration, so a bad target is a 400 the user
+sees, and again at delivery, because DNS is not a property of the string — a
+hostname that resolved publicly when it was registered can be re-pointed at
+169.254.169.254 afterwards, and a subscription outlives the check that admitted
+it.
 """
 
 from __future__ import annotations
@@ -26,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.integration import WebhookEvent, WebhookSubscription
 from app.services.crypto import TokenCryptoError, decrypt
+from app.services.web_scraper import UnsafeURLError, validate_public_url_async
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +122,21 @@ class WebhookDispatcher:
 
     async def _deliver(self, sub: WebhookSubscription, event: WebhookEvent) -> None:
         """Attempt one HTTP delivery, updating the event's status in place."""
+        # Re-checked per delivery, not just at registration: DNS is not a
+        # property of the stored string. A host that resolved publicly when the
+        # subscription was created can be re-pointed at a private address the
+        # next day, and the subscription outlives the check that admitted it.
+        try:
+            await validate_public_url_async(sub.target_url)
+        except UnsafeURLError as exc:
+            event.attempts += 1
+            event.status = "failed"
+            event.last_error = f"Refused unsafe target URL: {exc}"
+            logger.warning(
+                "Webhook subscription %s targets a disallowed address: %s", sub.id, exc
+            )
+            return
+
         body = json.dumps(
             {"event": event.event_type, "data": event.payload, "id": str(event.id)},
             default=str,

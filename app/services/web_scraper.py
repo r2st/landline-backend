@@ -119,6 +119,20 @@ class UnsafeURLError(ValueError):
     """Raised when a URL resolves to a private / disallowed address (SSRF guard)."""
 
 
+class UnresolvableHostError(UnsafeURLError):
+    """The host could not be resolved at all — distinct from resolving badly.
+
+    A subclass, so every existing ``except UnsafeURLError`` keeps refusing it:
+    for anything that is about to *fetch* the URL this is still a refusal, and it
+    has to be, because a nameserver the attacker controls can answer our
+    ``getaddrinfo`` with NXDOMAIN and the client's with ``127.0.0.1``.
+
+    It is separable for callers that are only *storing* a URL. Refusing to save a
+    webhook target because DNS hiccuped in that second says nothing about whether
+    the target is private, and the delivery path re-checks anyway.
+    """
+
+
 def _ip_is_disallowed(ip: ipaddress._BaseAddress) -> bool:
     """Return True for any address an outbound scrape must never reach.
 
@@ -171,10 +185,10 @@ def validate_public_url(url: str) -> str:
     try:
         ips = _resolve_host_ips(host)
     except (socket.gaierror, UnicodeError) as exc:
-        raise UnsafeURLError(f"Could not resolve host {host!r}: {exc}") from exc
+        raise UnresolvableHostError(f"Could not resolve host {host!r}: {exc}") from exc
 
     if not ips:
-        raise UnsafeURLError(f"Host {host!r} did not resolve to any address")
+        raise UnresolvableHostError(f"Host {host!r} did not resolve to any address")
 
     for ip in ips:
         if _ip_is_disallowed(ip):
@@ -184,9 +198,19 @@ def validate_public_url(url: str) -> str:
     return url
 
 
-async def _validate_public_url_async(url: str) -> str:
-    """Async wrapper — DNS resolution is blocking, so run it off the loop."""
+async def validate_public_url_async(url: str) -> str:
+    """Async wrapper — DNS resolution is blocking, so run it off the loop.
+
+    Public because the guard is not a scraper concern: any path that fetches a
+    URL a tenant supplied needs it, and one of them (outbound webhooks) is on the
+    request path where a blocking ``getaddrinfo`` would stall the event loop.
+    """
     return await asyncio.to_thread(validate_public_url, url)
+
+
+# The name this had while it was scraper-internal. Kept so the in-module callers
+# below read unchanged.
+_validate_public_url_async = validate_public_url_async
 
 
 class WebScraper:

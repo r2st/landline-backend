@@ -269,6 +269,21 @@ async def test_webhook_subscription_rejects_bad_url(client):
     assert resp.status_code == 400
 
 
+def _resolves_publicly(monkeypatch, ip="93.184.216.34"):
+    """Make every hostname resolve to one public address, for the SSRF guard.
+
+    Both webhook registration and delivery run `validate_public_url`, which does
+    a real `getaddrinfo`. Stubbing the resolver rather than reaching for a domain
+    that happens to resolve keeps these tests hermetic and offline.
+    """
+    import ipaddress
+
+    monkeypatch.setattr(
+        "app.services.web_scraper._resolve_host_ips",
+        lambda host: [ipaddress.ip_address(ip)],
+    )
+
+
 @pytest.mark.asyncio
 async def test_emit_webhook_delivers_and_records(client, monkeypatch):
     # Subscribe to an event.
@@ -295,6 +310,10 @@ async def test_emit_webhook_delivers_and_records(client, monkeypatch):
             return _Resp()
 
     monkeypatch.setattr("app.services.webhook_dispatch.httpx.AsyncClient", _Client)
+    # `example.test` is a reserved TLD and does not resolve, so the delivery-time
+    # SSRF guard would refuse it. Point the resolver at a public address: the
+    # test is about delivery bookkeeping, and stubbing DNS keeps it hermetic.
+    _resolves_publicly(monkeypatch)
 
     resp = await client.post(
         "/api/v1/integrations/webhooks/emit",
