@@ -592,6 +592,12 @@ async def test_console_lists_senders(
         refresh_token_encrypted="enc",
         sending_enabled=True,
         daily_send_count=3,
+        # Stamped, because ``daily_send_count`` only means "today" when
+        # ``daily_count_reset_at`` is today — nothing rolls it over except a
+        # send, so the readers consult ``warmup.used_today`` rather than the
+        # raw column. A count with no stamp describes 3 sends on no particular
+        # day, which correctly reads as 0.
+        daily_count_reset_at=datetime.now(timezone.utc),
     ))
     await db_session.commit()
 

@@ -26,6 +26,7 @@ callers that mattered. These pin the two that didn't.
 
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
@@ -281,3 +282,24 @@ async def test_capacity_report_still_reports_a_mailbox_spent_today(db_session):
     assert report["used_today"] == 5
     assert report["remaining_today"] == 0
     assert report["can_send"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_non_mapped_account_costs_nothing_rather_than_raising():
+    """The counter write runs *after* the message is on the wire.
+
+    ``record_account_send`` builds its UPDATE from the account's mapped class,
+    so an object that isn't one has no table to name. Raising there would not
+    lose a counter — it would roll back the send's whole bookkeeping
+    transaction and let Celery retry the step, which is the duplicate cold email
+    ``send_claim`` exists to prevent. An account shape we can't book against
+    must cost the send nothing, not turn a delivered message into a resend.
+    """
+    db = AsyncMock()
+    account = MagicMock()
+    account.id = uuid.uuid4()
+
+    await email_dispatch.record_account_send(db, account, sent=True)
+
+    db.execute.assert_not_awaited()
+    db.refresh.assert_not_awaited()

@@ -508,8 +508,20 @@ async def record_account_send(db: AsyncSession, account, *, sent: bool) -> None:
     into the same statement — a ``CASE`` on ``daily_count_reset_at`` — so a
     worker that reads a stale reset stamp cannot zero a counter another worker
     has already rolled over and incremented today.
+
+    **Everything here runs after the message is already on the wire.** That is
+    what makes the shape of the failure matter more than the odds of it: an
+    exception raised in this function rolls back the send's whole bookkeeping
+    transaction and Celery retries the step, which is the duplicate cold email
+    ``send_claim`` exists to prevent. The statement above needs a *mapped* class
+    to name a table and a column; an account object that isn't one — a stub, a
+    test double, some future transport that reports sends without a row — has no
+    counter to keep, and raising ``AttributeError`` at it would convert a
+    delivered message into a retry over accounting we never had anywhere to put.
+    So a non-mapped account is a no-op, logged, not an exception.
     """
-    from sqlalchemy import case, update as sa_update
+    from sqlalchemy import case, inspect as sa_inspect, update as sa_update
+    from sqlalchemy.exc import NoInspectionAvailable
 
     now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -518,6 +530,15 @@ async def record_account_send(db: AsyncSession, account, *, sent: bool) -> None:
     # statement is the rollover. Decided in SQL against the row's *current*
     # value, so it does not depend on how stale this instance is.
     OrmAccount = type(account)
+    try:
+        sa_inspect(OrmAccount)
+    except NoInspectionAvailable:
+        logger.debug(
+            "record_account_send: %r is not a mapped account — no counter to keep",
+            OrmAccount.__name__,
+        )
+        return
+
     fresh = OrmAccount.daily_count_reset_at.isnot(None) & (
         OrmAccount.daily_count_reset_at >= day_start
     )
