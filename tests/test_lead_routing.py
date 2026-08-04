@@ -15,6 +15,7 @@ from app.models.email_template import EmailSend
 from app.models.lead_score import LeadScore
 from app.models.rep_profile import RepProfile
 from app.models.user import User, UserRole
+from app.org_context import APPREND_ORG_ID
 from app.security import hash_password
 from app.services import lead_router
 
@@ -161,8 +162,16 @@ async def test_prioritized_endpoint(client: AsyncClient, db_session: AsyncSessio
 
 @pytest.mark.asyncio
 async def test_rep_profile_upsert_endpoint(client: AsyncClient, db_session: AsyncSession):
+    # `org_id` is explicit because `PUT /routing/reps/{user_id}` now resolves the
+    # target through `scope_users_to_current_org`, so a rep has to be in the
+    # caller's org. `User` is one of the three models outside `OrgScopedMixin`,
+    # so nothing stamps it — and a NULL `org_id` is not the shape a real rep has:
+    # migration 078 backfilled every existing user to Apprend and the column is
+    # nullable for exactly one role, `platform_admin`, which is not a tenant's
+    # rep. Before that change this test passed by creating an unaffiliated user.
     user = User(id=_uuid.uuid4(), email="upsert@x.com", name="Upsert Rep",
-                role=UserRole.AGENT.value, password_hash=hash_password("x"), is_active=True)
+                role=UserRole.AGENT.value, password_hash=hash_password("x"),
+                is_active=True, org_id=APPREND_ORG_ID)
     db_session.add(user)
     await db_session.commit()
 
