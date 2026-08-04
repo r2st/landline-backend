@@ -62,3 +62,61 @@ COUNTRY_CONSENT_REGIMES: dict[str, tuple[str, str]] = {
     "SG": ("PDPA", OPT_OUT),
     "AE": ("AE-CRA", OPT_OUT),
 }
+
+
+# --- Country name resolution ------------------------------------------------
+#
+# Sources do not agree on how to spell a country. Google Places returns ISO
+# alpha-2 (``parse_place`` asks for the short form); Apollo returns a full
+# name ("United States", "Germany"); a business card scanned by OCR returns
+# whatever was printed on it.
+#
+# Both normalizers in this codebase handled that by slicing the first two
+# characters, which is correct only for input that was already a code. On a
+# full name it does not fail — it produces a *different, plausible* code:
+#
+#     "Germany"        -> "GE"   (not DE — GE is Georgia)
+#     "Singapore"      -> "SI"   (not SG — SI is Slovenia)
+#     "United Kingdom" -> "UN"
+#     "United States"  -> "UN"
+#
+# None of those are in ``ALLOWED_COUNTRIES``, so the record is rejected with
+# "country 'UN' is not supported" — an error that blames the source's data for
+# a truncation we performed. The ones that happened to survive did so by
+# coincidence of spelling: India, Canada, France and Australia all begin with
+# their own code.
+#
+# Resolution is therefore explicit. An unrecognised value returns ``None``; what
+# to do about it is the caller's decision, and the two callers differ.
+COUNTRY_ALIASES: dict[str, str] = {
+    "united states": "US", "united states of america": "US", "usa": "US",
+    "u.s.": "US", "u.s.a.": "US", "america": "US",
+    "canada": "CA", "can": "CA",
+    "india": "IN", "ind": "IN", "bharat": "IN",
+    "united kingdom": "GB", "great britain": "GB", "britain": "GB",
+    "uk": "GB", "u.k.": "GB", "england": "GB", "scotland": "GB",
+    "wales": "GB", "northern ireland": "GB",
+    "australia": "AU", "aus": "AU",
+    "germany": "DE", "deutschland": "DE", "ger": "DE",
+    "france": "FR", "fra": "FR",
+    "singapore": "SG", "sgp": "SG",
+    "united arab emirates": "AE", "uae": "AE", "u.a.e.": "AE",
+}
+
+
+def resolve_country(raw: str | None) -> str | None:
+    """Best-effort ISO alpha-2 for a country as some source spelled it.
+
+    Returns ``None`` when the value is empty or unrecognised — deliberately, so
+    a caller cannot mistake a guess for a reading. Never truncates: a value that
+    isn't already a supported code and isn't a known alias has no answer here.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    upper = value.upper()
+    if upper in ALLOWED_COUNTRIES:
+        return upper
+    return COUNTRY_ALIASES.get(value.lower())

@@ -36,6 +36,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.constants import resolve_country
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.prospecting import IcpProfile
@@ -233,16 +234,24 @@ class IngestionService:
         relabels it**. The old paths coerced anything non-US/CA to ``"US"``,
         which quietly turned an Indian company into an American one; a rejected
         row is recoverable, a mislabelled one is not.
+
+        Resolution goes through :func:`constants.resolve_country` rather than a
+        two-character slice. Apollo reports a full country name, and the slice
+        turned "United States" into ``"UN"`` and "Germany" into ``"GE"`` — so
+        the record was refused for being unsupported, naming a code no source
+        ever sent. The error now quotes what the source actually said, because
+        "country 'UN' is not supported" sent every reader looking at Apollo.
         """
         if raw is None:
             return None
-        value = str(raw).strip().upper()[:2]
-        if not value:
+        original = str(raw).strip()
+        if not original:
             return None
         supported = [c.upper() for c in self.settings.supported_countries]
-        if value not in supported:
+        value = resolve_country(original)
+        if value is None or value not in supported:
             raise IngestionError(
-                f"country '{value}' is not supported "
+                f"country '{original}' is not supported "
                 f"(supported: {', '.join(supported)})"
             )
         return value

@@ -10,6 +10,7 @@ from sqlalchemy.orm import undefer
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.constants import resolve_country
 from app.database import get_db
 from app.dependencies import get_current_user_optional
 from app.models.company import Company
@@ -736,17 +737,21 @@ async def get_company_contacts(
 
 from app.schemas.contact import QuickAddRequest, QuickAddResponse
 
-# Companies are constrained to these two countries (see Company check constraint),
-# so free-text country values from OCR must be mapped onto US/CA.
-_COUNTRY_MAP = {
-    "us": "US", "usa": "US", "u.s.": "US", "u.s.a.": "US",
-    "united states": "US", "united states of america": "US", "america": "US",
-    "ca": "CA", "can": "CA", "canada": "CA",
-}
-
-
 def _normalize_country(raw: Optional[str]) -> str:
-    return _COUNTRY_MAP.get((raw or "").strip().lower(), "US")
+    """Map an OCR'd country onto a code the ``companies`` constraint accepts.
+
+    This used to carry its own US/CA-only table, on a comment saying companies
+    are "constrained to these two countries". They are constrained to nine.
+    So a card reading "United Kingdom" or "Germany" did not fail the scan — it
+    filed the company as ``US``, which is the mislabelling ``ingestion`` refuses
+    to do on the grounds that a rejected row is recoverable and a relabelled one
+    is not. The consent gate then read that ``US`` and applied CAN-SPAM to a
+    German company.
+
+    ``US`` remains the fallback for a blank or unreadable country, which is what
+    a scanner mostly produces and what the endpoint has always defaulted to.
+    """
+    return resolve_country(raw) or "US"
 
 
 def _digits(s: str) -> str:
