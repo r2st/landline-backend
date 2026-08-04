@@ -1,4 +1,25 @@
-"""CASL / CAN-SPAM consent verification service."""
+"""Consent verification — the per-jurisdiction send gate.
+
+Two consent models cover every market the schema admits, and
+``constants.COUNTRY_CONSENT_REGIMES`` says which one each country takes:
+
+* **opt-out** (CAN-SPAM's model) — a cold send is permitted; the duty is an
+  honoured unsubscribe, which every send discharges via the footer link and the
+  RFC 8058 header.
+* **opt-in** (CASL's model) — express or unexpired implied consent must be on
+  record *before* the first send.
+
+An unrecognised country is still refused, because failing closed is the right
+default for a compliance gate. What was wrong was *which* countries were
+unrecognised: the branch tested ``US`` and ``CA`` literals while the schema
+allowlist had grown to nine countries, so a company in GB, IN, AU, DE, FR, SG or
+AE reached the wire, answered "Unknown jurisdiction", and
+``tasks.outreach.send_sequence_step`` **paused the enrollment** — permanently,
+since nothing re-examines a paused enrollment's consent. Sourcing, enrichment
+and enrollment all worked for those markets; only the last hop refused, once,
+quietly, per contact. The regime table is now the single list, and a drift test
+requires every allowed country to appear in it.
+"""
 
 import logging
 from datetime import datetime, timezone
@@ -6,11 +27,29 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.constants import COUNTRY_CONSENT_REGIMES, OPT_IN, OPT_OUT
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.consent import ConsentRecord
 
 logger = logging.getLogger(__name__)
+
+
+def regime_for(country: str | None) -> tuple[str, str] | None:
+    """``(regime name, consent model)`` for a country, or None if unrecognised."""
+    if not country:
+        return None
+    return COUNTRY_CONSENT_REGIMES.get(country.strip().upper())
+
+
+def _regime_name(country: str | None) -> str:
+    """The regime label to stamp on a *refusal*, which happens before dispatch.
+
+    A suppressed contact is refused whatever the jurisdiction, and the operator
+    still wants to know which one applied.
+    """
+    mapped = regime_for(country)
+    return mapped[0] if mapped else "unknown"
 
 
 class ConsentCheckResult:
@@ -44,10 +83,12 @@ async def check_consent(
 ) -> ConsentCheckResult:
     """Check whether we can email a contact based on their country's regulations.
 
-    CASL (Canada): Must have express or valid implied consent BEFORE sending.
-    CAN-SPAM (US): Can send without prior consent, but must include unsubscribe.
+    Opt-in regimes (CASL, and the others marked ``OPT_IN``): express or unexpired
+    implied consent must exist BEFORE sending. Opt-out regimes (CAN-SPAM and
+    friends): send without prior consent, honour the unsubscribe.
     """
     country = company.country
+    mapped = regime_for(country)
 
     # Hard suppression (single source of truth). A contact suppressed via an
     # unsubscribe reply (Feature 1) is never emailed again, regardless of regime.
@@ -56,7 +97,7 @@ async def check_consent(
         return ConsentCheckResult(
             can_email=False,
             reason="Contact is suppressed (unsubscribe/compliance) — never email",
-            regime="CAN-SPAM" if country == "US" else "CASL" if country == "CA" else "unknown",
+            regime=_regime_name(country),
             consent_type="none",
         )
 
@@ -65,12 +106,24 @@ async def check_consent(
         return ConsentCheckResult(
             can_email=False,
             reason="Contact has unsubscribed via email link",
-            regime="CAN-SPAM" if country == "US" else "CASL" if country == "CA" else "unknown",
+            regime=_regime_name(country),
             consent_type="none",
         )
 
-    if country == "US":
-        # CAN-SPAM: opt-out model — check they haven't unsubscribed
+    if mapped is None:
+        # Fail closed — but this is now reachable only for a country the schema
+        # allowlist itself rejects, not for a market we deliberately support.
+        return ConsentCheckResult(
+            can_email=False,
+            reason=f"Unknown jurisdiction: {country}",
+            regime="unknown",
+            consent_type="none",
+        )
+
+    regime, model = mapped
+
+    if model == OPT_OUT:
+        # Opt-out model — check they haven't unsubscribed
         result = await db.execute(
             select(ConsentRecord)
             .where(ConsentRecord.contact_id == contact.id)
@@ -84,8 +137,8 @@ async def check_consent(
         if unsubscribed:
             return ConsentCheckResult(
                 can_email=False,
-                reason="Contact has unsubscribed (CAN-SPAM opt-out)",
-                regime="CAN-SPAM",
+                reason=f"Contact has unsubscribed ({regime} opt-out)",
+                regime=regime,
                 consent_type="none",
             )
 
@@ -102,19 +155,20 @@ async def check_consent(
             return ConsentCheckResult(
                 can_email=False,
                 reason="Contact has revoked consent",
-                regime="CAN-SPAM",
+                regime=regime,
                 consent_type="none",
             )
 
         return ConsentCheckResult(
             can_email=True,
-            reason="CAN-SPAM allows sending with unsubscribe option",
-            regime="CAN-SPAM",
+            reason=f"{regime} allows sending with unsubscribe option",
+            regime=regime,
             consent_type="implied",
         )
 
-    elif country == "CA":
-        # CASL: opt-in model — must have valid express or implied consent
+    else:
+        # Opt-in model (CASL and friends) — need valid express or implied consent
+        assert model == OPT_IN, f"unhandled consent model {model!r}"
         now = datetime.now(timezone.utc)
 
         result = await db.execute(
@@ -128,8 +182,8 @@ async def check_consent(
         if not records:
             return ConsentCheckResult(
                 can_email=False,
-                reason="No consent record found — CASL requires opt-in before sending",
-                regime="CASL",
+                reason=f"No consent record found — {regime} requires opt-in before sending",
+                regime=regime,
                 consent_type="none",
             )
 
@@ -140,7 +194,7 @@ async def check_consent(
                     return ConsentCheckResult(
                         can_email=True,
                         reason=f"Express consent on record (basis: {record.basis or 'N/A'})",
-                        regime="CASL",
+                        regime=regime,
                         consent_type="express",
                     )
 
@@ -151,7 +205,7 @@ async def check_consent(
                     return ConsentCheckResult(
                         can_email=True,
                         reason=f"Implied consent valid until {record.expires_at.isoformat()} (basis: {record.basis or 'N/A'})",
-                        regime="CASL",
+                        regime=regime,
                         consent_type="implied",
                     )
                 elif record.expires_at is None:
@@ -160,22 +214,14 @@ async def check_consent(
                     return ConsentCheckResult(
                         can_email=True,
                         reason=f"Implied consent on record (basis: {record.basis or 'N/A'}) — verify expiry",
-                        regime="CASL",
+                        regime=regime,
                         consent_type="implied",
                     )
 
         return ConsentCheckResult(
             can_email=False,
             reason="No valid consent — all records expired or insufficient",
-            regime="CASL",
-            consent_type="none",
-        )
-
-    else:
-        return ConsentCheckResult(
-            can_email=False,
-            reason=f"Unknown jurisdiction: {country}",
-            regime="unknown",
+            regime=regime,
             consent_type="none",
         )
 
