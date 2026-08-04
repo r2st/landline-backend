@@ -29,14 +29,35 @@ def _encryption_key():
     crypto._fernet.cache_clear()
 
 
+def _resolves_publicly(monkeypatch, ip="93.184.216.34"):
+    """Make every hostname resolve to one public address, for the SSRF guard.
+
+    Both webhook registration and delivery run `validate_public_url`, which does
+    a real `getaddrinfo`. Stubbing the resolver rather than reaching for a domain
+    that happens to resolve keeps these tests hermetic and offline.
+    """
+    import ipaddress
+
+    monkeypatch.setattr(
+        "app.services.web_scraper._resolve_host_ips",
+        lambda host: [ipaddress.ip_address(ip)],
+    )
+
+
 # --- Connector interface (async) ------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_slack_test_connection_requires_webhook():
+async def test_slack_test_connection_requires_webhook(monkeypatch):
     c = SlackConnector()
     fail = await c.test_connection({}, {})
     assert fail.ok is False
+    # ``test_connection`` runs the SSRF guard, which resolves the host — so a
+    # webhook nobody can reach is reported at configuration time rather than
+    # sitting in the UI reading "connected". That makes this a DNS-dependent
+    # assertion unless the resolver is stubbed, and `.test` is reserved
+    # precisely so that it never resolves.
+    _resolves_publicly(monkeypatch)
     ok = await c.test_connection({}, {"webhook_url": "https://hooks.slack.test/x"})
     assert ok.ok is True
 
@@ -77,6 +98,11 @@ async def test_slack_send_notification_success(monkeypatch):
             return _Resp()
 
     monkeypatch.setattr("app.services.integrations.providers.httpx.AsyncClient", _Client)
+    # The send path re-runs the SSRF guard on the webhook URL — DNS is not a
+    # property of the string, and a host that resolved at configuration time can
+    # be re-pointed at link-local space afterwards. Stub the resolver so this
+    # test stays about the send.
+    _resolves_publicly(monkeypatch)
     result = await c.execute(
         "send_notification", {"text": "deal won"}, {}, {"webhook_url": "https://hooks.slack.test/x"}
     )
@@ -95,7 +121,10 @@ async def test_marketplace_lists_all_providers(client):
 
 
 @pytest.mark.asyncio
-async def test_create_integration_encrypts_credentials(client, db_engine):
+async def test_create_integration_encrypts_credentials(client, db_engine, monkeypatch):
+    # ``POST /integrations`` calls the connector's ``test_connection``, which
+    # resolves the webhook host, so ``status`` here depends on DNS.
+    _resolves_publicly(monkeypatch)
     resp = await client.post(
         "/api/v1/integrations",
         json={
@@ -267,21 +296,6 @@ async def test_webhook_subscription_rejects_bad_url(client):
         "/api/v1/integrations/webhooks/subscriptions", json={"target_url": "ftp://bad"}
     )
     assert resp.status_code == 400
-
-
-def _resolves_publicly(monkeypatch, ip="93.184.216.34"):
-    """Make every hostname resolve to one public address, for the SSRF guard.
-
-    Both webhook registration and delivery run `validate_public_url`, which does
-    a real `getaddrinfo`. Stubbing the resolver rather than reaching for a domain
-    that happens to resolve keeps these tests hermetic and offline.
-    """
-    import ipaddress
-
-    monkeypatch.setattr(
-        "app.services.web_scraper._resolve_host_ips",
-        lambda host: [ipaddress.ip_address(ip)],
-    )
 
 
 @pytest.mark.asyncio
