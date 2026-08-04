@@ -20,6 +20,7 @@ import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from typing import Optional
 
 import httpx
 from sqlalchemy import select
@@ -32,6 +33,38 @@ from app.services.ai_service import get_ai_service
 logger = logging.getLogger(__name__)
 
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+
+
+def parse_pub_date(raw: Optional[str]) -> Optional[datetime]:
+    """An RSS ``pubDate`` as an **aware** UTC datetime, or ``None``.
+
+    The normalisation is the point. ``parsedate_to_datetime`` returns a *naive*
+    datetime for the two date forms RFC 5322 says carry no usable zone — a
+    missing offset, and the literal ``-0000`` that means "time known, zone
+    deliberately withheld". Both are ordinary in real feeds; ``-0000`` is what
+    several syndication tools emit by default.
+
+    A naive result compared against an aware cutoff raises ``TypeError``, and
+    the freshness filter is exactly such a comparison. In
+    :meth:`IntentMonitor._fetch_news` that comparison sits *outside* the
+    ``try``, so one badly-stamped item did not skip an article — it aborted
+    ``scan_company``, and the per-company handler in ``scan_all_companies``
+    logged it and moved on. That company's intent scan produced nothing, for
+    every source query, on every run, because of one date string in one
+    unrelated article.
+
+    ``social_listening_agent._parse_rss`` already normalises this way; the
+    Google-News readers did not.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 # Default buying-window (days) per signal type when the AI can't infer one.
 _DEFAULT_WINDOW_DAYS = {
@@ -173,13 +206,7 @@ class IntentMonitor:
             title = item.findtext("title", "")
             if not title:
                 continue
-            pub_date = item.findtext("pubDate", "")
-            published_at = None
-            if pub_date:
-                try:
-                    published_at = parsedate_to_datetime(pub_date)
-                except Exception:
-                    pass
+            published_at = parse_pub_date(item.findtext("pubDate", ""))
             if published_at and published_at < cutoff:
                 continue  # intent signals must be fresh
             articles.append({

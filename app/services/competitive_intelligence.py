@@ -18,7 +18,6 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from typing import Optional
 from uuid import UUID
 
@@ -28,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.competitor import Competitor, CompetitorMention
+from app.services.intent_monitor import parse_pub_date
 from app.services.llm_providers import ChainClient, any_llm_available, chain_client
 
 logger = logging.getLogger(__name__)
@@ -311,13 +311,11 @@ Return ONLY valid JSON:
             title = item.findtext("title", "")
             if not title:
                 continue
-            pub_date = item.findtext("pubDate", "")
-            published_at = None
-            if pub_date:
-                try:
-                    published_at = parsedate_to_datetime(pub_date)
-                except Exception:
-                    pass
+            # Normalised to UTC — a naive ``pubDate`` (a missing offset, or the
+            # literal ``-0000``) compared against an aware cutoff raises
+            # ``TypeError``, and this comparison sits outside the try above, so
+            # one such article aborted the whole competitor's news check.
+            published_at = parse_pub_date(item.findtext("pubDate", ""))
             if published_at and published_at < cutoff:
                 continue
             articles.append({"title": title, "link": item.findtext("link", "")})

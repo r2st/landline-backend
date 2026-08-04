@@ -331,14 +331,16 @@ Return ONLY valid JSON: {{"subject": "...", "body": "..."}}"""
                     source = item.findtext("source", "")
                     description = item.findtext("description", "")
 
-                    # Parse date
-                    published_at = None
-                    if pub_date:
-                        try:
-                            from email.utils import parsedate_to_datetime
-                            published_at = parsedate_to_datetime(pub_date)
-                        except Exception:
-                            pass
+                    # Parse date, normalised to UTC. A naive ``pubDate`` (a
+                    # missing offset, or the literal ``-0000`` that means "zone
+                    # withheld") compared against an aware cutoff raises
+                    # ``TypeError``. Here that lands in the enclosing ``except``
+                    # and returns ``[]`` — so one badly-stamped article silently
+                    # discarded the *whole feed*, and the company simply had no
+                    # news, run after run.
+                    from app.services.intent_monitor import parse_pub_date
+
+                    published_at = parse_pub_date(pub_date)
 
                     # Only include articles from last 30 days
                     if published_at and published_at < datetime.now(timezone.utc) - timedelta(days=30):
