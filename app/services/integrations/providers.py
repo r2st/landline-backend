@@ -11,19 +11,66 @@ Each connector performs a real HTTP call when credentials are present and
 returns a :class:`ConnectorResult`. With missing credentials or an offline
 provider it returns a failure result rather than raising, so callers (the
 marketplace router and workflow actions) degrade gracefully.
+
+**Two of these connectors are told where to send the request.** Most talk to a
+constant host — ``api.hubapi.com``, ``company.clearbit.com`` — and a tenant
+cannot move them. Slack's ``webhook_url`` and Salesforce's ``instance_url`` are
+different in kind: they are ordinary configuration fields, written by any
+authenticated user of any tenant through ``POST /integrations``, and then fetched
+by *our* process from inside the VPC. That is a server-side request forgery
+primitive with a UI in front of it — point a "Slack" integration at
+``http://169.254.169.254/…`` or at the API's own ``127.0.0.1:8001`` and
+``POST /integrations/{id}/actions`` makes the call, with the connector's status
+code and (for Salesforce, which parses and returns rows) the response body coming
+back in the reply. Same class as the outbound-webhook hole and the scraper's, and
+it takes the same guard: :func:`~app.services.web_scraper.validate_public_url_async`,
+applied to the URL actually about to be requested rather than to the configured
+prefix, because the path is caller-supplied too.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import httpx
 
 from app.services.integrations.base import BaseConnector, ConnectorResult
+from app.services.web_scraper import (
+    UnresolvableHostError,
+    UnsafeURLError,
+    validate_public_url_async,
+)
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(15.0)
+
+
+async def _refuse_if_unsafe(url: str, label: str) -> Optional[ConnectorResult]:
+    """``None`` if *url* may be fetched, else the failure to return instead.
+
+    Returns rather than raises so callers keep the connector contract ("never
+    raise") without a try block around every request. ``label`` names the
+    configuration field in the message, so an operator who typo'd an instance URL
+    is told which one to fix rather than reading a bare "refused".
+
+    An unresolvable host is reported separately from a disallowed one. They are
+    different operator problems — a wrong hostname versus a hostname aimed inside
+    the perimeter — and collapsing them makes a DNS blip look like an attempted
+    breach in the logs. ``UnresolvableHostError`` is a *subclass* of
+    ``UnsafeURLError`` (deliberately, so an existing single-clause handler keeps
+    refusing it), so it has to be caught first or the broad clause takes both.
+    Either way the URL is refused; only the wording differs.
+    """
+    try:
+        await validate_public_url_async(url)
+    except UnresolvableHostError as exc:
+        return ConnectorResult.failure(f"{label} could not be resolved: {exc}")
+    except UnsafeURLError as exc:
+        logger.warning("Refused %s pointing inside the perimeter (%s)", label, exc)
+        return ConnectorResult.failure(f"{label} is not an allowed destination: {exc}")
+    return None
 
 
 class SlackConnector(BaseConnector):
@@ -37,8 +84,19 @@ class SlackConnector(BaseConnector):
     supported_actions = ["send_notification"]
 
     async def test_connection(self, config: dict, credentials: dict) -> ConnectorResult:
-        if not credentials.get("webhook_url"):
+        url = credentials.get("webhook_url")
+        if not url:
             return ConnectorResult.failure("Missing Slack webhook_url")
+        # Checked at configuration time as well as at send time. Not because one
+        # check implies the other — DNS is not a property of the string, and a
+        # host that resolves publicly today can be re-pointed at 169.254.169.254
+        # tomorrow, so the send path re-checks — but because ``POST
+        # /integrations`` calls this immediately after storing the row, and an
+        # integration that will never be allowed to fire should say so then
+        # rather than sit in the UI reading "connected".
+        refusal = await _refuse_if_unsafe(url, "Slack webhook_url")
+        if refusal is not None:
+            return refusal
         return ConnectorResult.success("Slack webhook configured")
 
     async def _action_send_notification(
@@ -50,9 +108,15 @@ class SlackConnector(BaseConnector):
         text = params.get("text") or params.get("message") or ""
         if not text:
             return ConnectorResult.failure("Nothing to send: empty text")
+        refusal = await _refuse_if_unsafe(url, "Slack webhook_url")
+        if refusal is not None:
+            return refusal
         payload = {"text": text}
         if params.get("channel") or config.get("default_channel"):
             payload["channel"] = params.get("channel") or config["default_channel"]
+        # ``follow_redirects`` stays off, as it is for every connector here: a
+        # 302 is a second destination the guard above never saw, and following
+        # one would hand the whole check back to the host we just validated.
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(url, json=payload)
         if resp.status_code == 200:
@@ -238,12 +302,28 @@ class SalesforceConnector(BaseConnector):
         headers = {"Authorization": f"Bearer {token}"}
         cursor = params.get("cursor")
         limit = max(1, min(int(params.get("limit") or 200), 2000))
+        # Salesforce's cursor is a *path* it hands back in ``nextRecordsUrl``.
+        # Concatenated onto the base without that being required, a cursor of
+        # ``@example.net/`` turns ``https://acme.my.salesforce.com`` into
+        # userinfo and the request — bearer token attached — goes somewhere else
+        # entirely. The caller passes this value through from the request body
+        # (``CrmImportRequest.cursor``), so "it came from Salesforce" describes
+        # the intended flow, not the reachable one.
+        if cursor is not None and not str(cursor).startswith("/"):
+            return ConnectorResult.failure("Salesforce cursor must be a path")
+        url = (
+            f"{base}{cursor}" if cursor
+            else f"{base}/services/data/{self._API}/query"
+        )
+        refusal = await _refuse_if_unsafe(url, "Salesforce instance_url")
+        if refusal is not None:
+            return refusal
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             if cursor:
-                resp = await client.get(f"{base}{cursor}", headers=headers)
+                resp = await client.get(url, headers=headers)
             else:
                 resp = await client.get(
-                    f"{base}/services/data/{self._API}/query",
+                    url,
                     headers=headers,
                     params={"q": f"{self._SOQL} LIMIT {limit}"},
                 )
@@ -286,9 +366,13 @@ class SalesforceConnector(BaseConnector):
             body["LastName"] = params["lastname"]
         if params.get("company"):
             body["Company"] = params["company"]
+        url = f"{instance.rstrip('/')}/services/data/v59.0/sobjects/Lead"
+        refusal = await _refuse_if_unsafe(url, "Salesforce instance_url")
+        if refusal is not None:
+            return refusal
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(
-                f"{instance.rstrip('/')}/services/data/v59.0/sobjects/Lead",
+                url,
                 headers={"Authorization": f"Bearer {token}"},
                 json=body,
             )
