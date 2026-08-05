@@ -68,6 +68,36 @@ async def _events(db, enrollment, event_type, n=1, when=None):
     await db.flush()
 
 
+async def _attempts(db, contact, sequence, *, sent, bounced=0, when=None):
+    """``sent`` attempts for one address, ``bounced`` of which failed.
+
+    One enrollment per send, because an attempt is ``(enrollment_id,
+    step_number)`` — the send-claim interlock makes one ``sent`` event per pair
+    the invariant, and ``outreach_events.AttemptTally`` counts bounces as
+    *distinct attempts* so a redelivered DSN is free rather than a second
+    bounce. Stacking a window onto one enrollment asks for a shape production
+    cannot produce, and the arithmetic reads it correctly as one attempt that
+    bounced N times.
+    """
+    when = when or datetime.now(timezone.utc)
+    for i in range(sent):
+        enr = OutreachEnrollment(
+            id=uuid.uuid4(), contact_id=contact.id, sequence_id=sequence.id,
+            current_step=1, status="active",
+        )
+        db.add(enr)
+        db.add(OutreachEvent(
+            id=uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+            event_type="sent", occurred_at=when, event_metadata={},
+        ))
+        if i < bounced:
+            db.add(OutreachEvent(
+                id=uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+                event_type="bounced", occurred_at=when, event_metadata={},
+            ))
+    await db.flush()
+
+
 async def _bounce_record(db, email, kind="hard", when=None, account_id=None,
                          diagnostic=None):
     record = BounceRecord(
@@ -281,13 +311,10 @@ async def test_a_blocked_domain_hides_inside_a_healthy_blend(db_session):
     seq = await _sequence(db_session)
 
     healthy = await _contact(db_session, company, "ok@gmail.com")
-    healthy_enr = await _enroll(db_session, healthy, seq)
-    await _events(db_session, healthy_enr, "sent", n=1000)
+    await _attempts(db_session, healthy, seq, sent=1000)
 
     blocked = await _contact(db_session, company, "nope@outlook.com")
-    blocked_enr = await _enroll(db_session, blocked, seq)
-    await _events(db_session, blocked_enr, "sent", n=40)
-    await _events(db_session, blocked_enr, "bounced", n=40)
+    await _attempts(db_session, blocked, seq, sent=40, bounced=40)
 
     result = await bounce_analytics.by_recipient_domain(db_session, days=30)
 
@@ -307,9 +334,7 @@ async def test_at_risk_band_sits_between_healthy_and_blocked(db_session):
     company = await _company(db_session)
     seq = await _sequence(db_session)
     contact = await _contact(db_session, company, "lead@wobbly.com")
-    enr = await _enroll(db_session, contact, seq)
-    await _events(db_session, enr, "sent", n=100)
-    await _events(db_session, enr, "bounced", n=10)  # 10% — over 8%, under 20%
+    await _attempts(db_session, contact, seq, sent=100, bounced=10)  # 10%
 
     result = await bounce_analytics.by_recipient_domain(db_session, days=30)
     row = next(d for d in result["domains"] if d["domain"] == "wobbly.com")
@@ -436,9 +461,7 @@ async def test_bounce_endpoints_are_wired(client, db_session):
     company = await _company(db_session)
     contact = await _contact(db_session, company, "lead@acme.com")
     seq = await _sequence(db_session)
-    enr = await _enroll(db_session, contact, seq)
-    await _events(db_session, enr, "sent", n=40)
-    await _events(db_session, enr, "bounced", n=12)
+    await _attempts(db_session, contact, seq, sent=40, bounced=12)
     await _bounce_record(db_session, "lead@acme.com", kind="hard")
     await db_session.commit()
 
@@ -459,3 +482,123 @@ async def test_bounce_endpoints_are_wired(client, db_session):
 async def test_bounce_list_rejects_an_unknown_kind(client):
     resp = await client.get("/api/v1/dialtone/bounces?kind=medium")
     assert resp.status_code == 422
+
+
+# --- The receiving domain that refused everything ----------------------------
+#
+# This report's whole premise is that the domain rejecting *everything* is
+# invisible in a blended rate. It had a blind spot of exactly that shape.
+#
+# A **synchronous** rejection writes a ``bounced`` event with no ``sent``
+# partner — the transport refused the message, so nothing was ever accepted.
+# Divided by ``count(sent)`` a domain that refused every message has a
+# denominator of zero, and ``_rate`` answers 0.0 rather than dividing. Worse,
+# ``sufficient = sent >= min_sends`` was then False, so it took the
+# ``insufficient_data`` verdict and sorted to the bottom of a list ordered by
+# risk. ``risk`` is not a display value — ``blocked`` is what tells an operator
+# to stop mailing a domain.
+
+@pytest.mark.asyncio
+async def test_a_domain_that_refused_every_message_is_blocked_not_unknown(db_session):
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    contact = await _contact(db_session, company, "lead@fortress.com")
+    # Refused on the wire: a bounce event and no send event, 30 times.
+    for _ in range(30):
+        enr = await _enroll(db_session, contact, seq)
+        await _events(db_session, enr, "bounced", n=1)
+
+    result = await bounce_analytics.by_recipient_domain(db_session, days=30)
+    row = next(d for d in result["domains"] if d["domain"] == "fortress.com")
+
+    assert row["attempts"] == 30
+    assert row["sent"] == 0, "nothing was ever accepted — that is the finding"
+    assert row["bounced"] == 30
+    assert row["bounce_rate"] == 100.0
+    assert row["sufficient_sample"] is True
+    assert row["risk"] == "blocked"
+    assert "fortress.com" in result["flagged"]
+
+
+@pytest.mark.asyncio
+async def test_that_domain_sorts_above_the_healthy_ones(db_session):
+    """Risk-first ordering only helps if the risky domain gets a verdict."""
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    fine = await _contact(db_session, company, "ok@gmail.com")
+    await _attempts(db_session, fine, seq, sent=500)
+    refused = await _contact(db_session, company, "lead@fortress.com")
+    for _ in range(30):
+        enr = await _enroll(db_session, refused, seq)
+        await _events(db_session, enr, "bounced", n=1)
+
+    result = await bounce_analytics.by_recipient_domain(db_session, days=30)
+    assert result["domains"][0]["domain"] == "fortress.com", (
+        f"risk-first ordering put {result['domains'][0]['domain']} above the "
+        "domain refusing every message"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_retried_dsn_does_not_move_a_domains_verdict(db_session):
+    """The numerator half: a mailer-daemon retrying is one bounce.
+
+    Six deliveries of one DSN against 40 attempts is 2.5%, which is healthy.
+    Counted as rows it is 15% — an ``at_risk`` verdict on a domain that refused
+    one message.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    contact = await _contact(db_session, company, "lead@retry.com")
+    await _attempts(db_session, contact, seq, sent=39)
+    enr = await _enroll(db_session, contact, seq)
+    await _events(db_session, enr, "sent", n=1)
+    await _events(db_session, enr, "bounced", n=6)
+
+    result = await bounce_analytics.by_recipient_domain(db_session, days=30)
+    row = next(d for d in result["domains"] if d["domain"] == "retry.com")
+    assert row["attempts"] == 40
+    assert row["bounced"] == 1
+    assert row["bounce_rate"] == 2.5
+    assert row["risk"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_an_async_bounce_is_not_a_second_attempt(db_session):
+    """The boundary in the other direction.
+
+    The ordinary bounce is asynchronous — the message was accepted and the DSN
+    arrived hours later — so the pair is one attempt. Counting two would
+    understate every bounce rate, which is the mirror of the bug being fixed.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    contact = await _contact(db_session, company, "lead@async.com")
+    await _attempts(db_session, contact, seq, sent=20, bounced=2)
+
+    result = await bounce_analytics.by_recipient_domain(db_session, days=30)
+    row = next(d for d in result["domains"] if d["domain"] == "async.com")
+    assert row["attempts"] == 20, "20 attempts, not 22"
+    assert row["bounced"] == 2
+    assert row["bounce_rate"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_a_refused_address_still_counts_as_a_contact(db_session):
+    """"12 bounces" is unreadable against zero contacts.
+
+    Contacts were counted from ``sent`` groups, so an address that only ever
+    failed synchronously was never counted at its domain at all.
+    """
+    company = await _company(db_session)
+    seq = await _sequence(db_session)
+    for i in range(3):
+        contact = await _contact(db_session, company, f"user{i}@fortress.com")
+        for _ in range(10):
+            enr = await _enroll(db_session, contact, seq)
+            await _events(db_session, enr, "bounced", n=1)
+
+    result = await bounce_analytics.by_recipient_domain(db_session, days=30)
+    row = next(d for d in result["domains"] if d["domain"] == "fortress.com")
+    assert row["contacts"] == 3
+    assert row["attempts"] == 30

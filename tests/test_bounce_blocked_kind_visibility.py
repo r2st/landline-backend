@@ -53,7 +53,17 @@ async def _bounce(db, email, kind, when=None):
 
 
 async def _sends(db, email, *, sent, bounced):
-    """``sent``/``bounced`` sequence-engine events for one address."""
+    """``sent``/``bounced`` sequence-engine events for one address.
+
+    One enrollment per send. An attempt is ``(enrollment_id, step_number)`` —
+    the send-claim interlock makes one ``sent`` event per pair the invariant —
+    and ``outreach_events.AttemptTally`` counts bounces as *distinct attempts*
+    so a redelivered DSN is free rather than a second bounce.
+
+    Stacking the whole window onto one enrollment at step 1 asked for a shape
+    production cannot produce, and the arithmetic reads it correctly as one
+    attempt that bounced, redelivered N-1 times.
+    """
     company = Company(id=uuid.uuid4(), name=f"Co {uuid.uuid4().hex[:6]}", source="test")
     db.add(company)
     await db.flush()
@@ -65,18 +75,21 @@ async def _sends(db, email, *, sent, bounced):
     sequence = OutreachSequence(id=uuid.uuid4(), name=f"Seq-{uuid.uuid4().hex[:6]}")
     db.add(sequence)
     await db.flush()
-    enrollment = OutreachEnrollment(
-        id=uuid.uuid4(), contact_id=contact.id, sequence_id=sequence.id,
-        current_step=1, status="active",
-    )
-    db.add(enrollment)
-    await db.flush()
-    for event_type, n in (("sent", sent), ("bounced", bounced)):
-        for _ in range(n):
+    now = datetime.now(timezone.utc)
+    for i in range(sent):
+        enrollment = OutreachEnrollment(
+            id=uuid.uuid4(), contact_id=contact.id, sequence_id=sequence.id,
+            current_step=1, status="active",
+        )
+        db.add(enrollment)
+        db.add(OutreachEvent(
+            id=uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
+            event_type="sent", occurred_at=now, event_metadata={},
+        ))
+        if i < bounced:
             db.add(OutreachEvent(
                 id=uuid.uuid4(), enrollment_id=enrollment.id, step_number=1,
-                event_type=event_type, occurred_at=datetime.now(timezone.utc),
-                event_metadata={},
+                event_type="bounced", occurred_at=now, event_metadata={},
             ))
     await db.flush()
 

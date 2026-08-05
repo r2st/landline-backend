@@ -267,6 +267,84 @@ async def count_attempts_by_sequence(
     return {k: (v[0], v[1]) for k, v in tallies.items()}
 
 
+async def count_attempts_by_contact_email(
+    db: AsyncSession, *, where=None
+) -> dict:
+    """``{email: (attempts, bounces)}`` — :func:`count_attempts`, grouped by recipient.
+
+    The third grouping of the same arithmetic (see
+    :func:`count_attempts_by_sequence` for why raw counts are wrong in both
+    directions at once). This one keys on the address we mailed, for the
+    receiving-domain report, which folds addresses into domains in Python
+    because extracting a domain in SQL needs a dialect branch this codebase does
+    not carry.
+
+    ``Contact.email`` is not normalised on write, so addresses are compared
+    lower-cased here for the same reason ten other call sites do it: the same
+    mailbox stored two ways would otherwise split one domain's traffic across
+    two keys and halve its measured bounce rate.
+    """
+    from sqlalchemy import func as _func
+
+    from app.models.contact import Contact
+
+    email = _func.lower(Contact.email)
+
+    def _events():
+        q = (
+            select(
+                email.label("email"),
+                OutreachEvent.enrollment_id,
+                OutreachEvent.step_number,
+            )
+            .join(
+                OutreachEnrollment,
+                OutreachEvent.enrollment_id == OutreachEnrollment.id,
+            )
+            .join(Contact, OutreachEnrollment.contact_id == Contact.id)
+            .where(Contact.email.isnot(None))
+        )
+        if where is not None:
+            q = q.where(where)
+        return q
+
+    tallies: dict = {}
+
+    sent_q = _events().where(OutreachEvent.event_type == "sent").subquery()
+    for addr, n in (
+        await db.execute(select(sent_q.c.email, _func.count()).group_by(sent_q.c.email))
+    ).all():
+        tallies[addr] = [int(n), 0]
+
+    bounce_q = (
+        _events().where(OutreachEvent.event_type == "bounced").distinct().subquery()
+    )
+    for addr, n in (
+        await db.execute(
+            select(bounce_q.c.email, _func.count()).group_by(bounce_q.c.email)
+        )
+    ).all():
+        tallies.setdefault(addr, [0, 0])[1] = int(n)
+
+    sent_keys = _events().where(OutreachEvent.event_type == "sent").subquery()
+    for addr, n in (
+        await db.execute(
+            select(bounce_q.c.email, _func.count())
+            .select_from(bounce_q)
+            .outerjoin(
+                sent_keys,
+                (bounce_q.c.enrollment_id == sent_keys.c.enrollment_id)
+                & (bounce_q.c.step_number == sent_keys.c.step_number),
+            )
+            .where(sent_keys.c.enrollment_id.is_(None))
+            .group_by(bounce_q.c.email)
+        )
+    ).all():
+        tallies.setdefault(addr, [0, 0])[0] += int(n)
+
+    return {k: (v[0], v[1]) for k, v in tallies.items()}
+
+
 async def last_sent_step(db: AsyncSession, enrollment: OutreachEnrollment) -> int:
     """The step number of the most recent ``sent`` event for this enrollment.
 

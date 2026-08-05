@@ -79,6 +79,13 @@ class RecipientDomainStats(BaseModel):
     domain: str
     contacts: int
     sent: int
+    # Steps put on the wire, the denominator of ``bounce_rate`` and of ``risk``.
+    # A send the transport refused writes a ``bounced`` event and no ``sent``
+    # one, so a domain rejecting everything has ``sent == 0`` and would
+    # otherwise fall under the sample gate as "insufficient data" — which is the
+    # one domain this report exists to name. See
+    # ``outreach_events.AttemptTally``.
+    attempts: int = 0
     opened: int
     clicked: int
     replied: int

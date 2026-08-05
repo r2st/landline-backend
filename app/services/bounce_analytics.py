@@ -47,6 +47,7 @@ from app.models.gmail_account import GmailAccount
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.suppression import SuppressionEntry
 from app.services.bounce_handler import BOUNCE_KINDS
+from app.services.outreach_events import count_attempts_by_contact_email
 from app.services.sql_search import LIKE_ESCAPE, contains_pattern, endswith_pattern
 
 logger = logging.getLogger(__name__)
@@ -133,19 +134,56 @@ async def _sends_by_domain(
         )
     ).all()
 
+    # The bounce arithmetic is not a row count — see
+    # ``outreach_events.AttemptTally``. An attempt is ``(enrollment, step)``, so
+    # a mailer-daemon retrying books one bounce rather than several, and a
+    # **synchronous** failure writes ``bounced`` with no ``sent`` partner and is
+    # therefore an attempt that a count of ``sent`` rows cannot see.
+    #
+    # That second half is what this report exists to catch and could not. Its own
+    # docstring names the case — the domain rejecting *everything*, diluted by
+    # the domains that are fine — and a domain rejecting everything on the wire
+    # has no ``sent`` rows at all, so it fell under ``min_sends``, took the
+    # ``insufficient_data`` verdict and sorted to the bottom. The verdict is a
+    # risk classification, not a display value: ``blocked`` is what tells an
+    # operator to stop mailing a domain.
+    attempts_by_address = await count_attempts_by_contact_email(
+        db, where=OutreachEvent.occurred_at >= since
+    )
+
     by_domain: dict[str, dict[str, int]] = {}
+    # Addresses with any attempt at this domain, counted as a set rather than
+    # incremented per ``sent`` group: an address that only ever failed
+    # synchronously has no ``sent`` row at all, and a domain reporting bounces
+    # against zero contacts is unreadable.
+    contacts: dict[str, set[str]] = {}
     total_sent = 0
     for email, event_type, n in rows:
         domain = email_domain(email)
         if domain is None:
             continue
+        if event_type == "bounced":
+            # Counted per *attempt* below. The raw row count doubles a
+            # redelivered DSN.
+            continue
         bucket = by_domain.setdefault(domain, {})
         bucket[event_type] = bucket.get(event_type, 0) + n
-        # Contacts are tracked per domain too — "12 bounces" reads very
-        # differently against 12 addresses than against one retried twelve times.
         if event_type == "sent":
             total_sent += n
-            bucket["_contacts"] = bucket.get("_contacts", 0) + 1
+            contacts.setdefault(domain, set()).add(email.lower())
+
+    for email, (attempts, bounces) in attempts_by_address.items():
+        domain = email_domain(email)
+        if domain is None or not attempts:
+            continue
+        bucket = by_domain.setdefault(domain, {})
+        bucket["attempts"] = bucket.get("attempts", 0) + attempts
+        bucket["bounced"] = bucket.get("bounced", 0) + bounces
+        contacts.setdefault(domain, set()).add(email.lower())
+
+    for domain, bucket in by_domain.items():
+        bucket["_contacts"] = len(contacts.get(domain, ()))
+
     return by_domain, total_sent
 
 
@@ -202,14 +240,24 @@ async def by_recipient_domain(
     for domain, counts in by_domain.items():
         sent = counts.get("sent", 0)
         bounced = counts.get("bounced", 0)
-        sufficient = sent >= min_sends
-        bounce_rate = _rate(bounced, sent)
+        # Sampled and divided by **attempts**, matching the numerator. Gating on
+        # ``sent`` asked whether the domain accepted enough mail to be judged,
+        # which is not the question — a domain that accepted nothing is the
+        # finding, not a domain with no data. It took ``insufficient_data`` and
+        # sorted to the bottom of a list whose whole premise is that the domain
+        # rejecting everything is the one worth seeing.
+        attempts = counts.get("attempts", 0)
+        sufficient = attempts >= min_sends
+        bounce_rate = _rate(bounced, attempts)
 
+        # The bands are fractions and ``_rate`` returns a percentage, so the
+        # comparison is against the quotient, not against ``bounce_rate``.
+        # ``sufficient`` guarantees ``attempts >= min_sends >= 1``.
         if not sufficient:
             risk = "insufficient_data"
-        elif bounced / sent >= DOMAIN_BOUNCE_BLOCKED:
+        elif bounced / attempts >= DOMAIN_BOUNCE_BLOCKED:
             risk = "blocked"
-        elif bounced / sent >= DOMAIN_BOUNCE_AT_RISK:
+        elif bounced / attempts >= DOMAIN_BOUNCE_AT_RISK:
             risk = "at_risk"
         else:
             risk = "healthy"
@@ -218,6 +266,10 @@ async def by_recipient_domain(
             "domain": domain,
             "contacts": counts.get("_contacts", 0),
             "sent": sent,
+            # Steps put on the wire — the denominator of ``bounce_rate`` and of
+            # the risk verdict. Differs from ``sent`` exactly where a send was
+            # refused rather than accepted. See ``outreach_events.AttemptTally``.
+            "attempts": attempts,
             "opened": counts.get("opened", 0),
             "clicked": counts.get("clicked", 0),
             "replied": counts.get("replied", 0),
