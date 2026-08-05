@@ -71,19 +71,54 @@ async def _events(db, enrollment, event_type, n=1, when=None, metadata=None):
 
 async def _traffic(db, company, sequence, *, sent, replied=0, bounced=0,
                    when=None, metadata=None, label="t"):
-    """One enrollment carrying a campaign's whole window of events.
+    """One enrollment per send — the shape the bounce arithmetic assumes.
 
-    Events hang off the enrollment and the dashboard aggregates by sequence, so
-    one enrollment per campaign is enough and keeps the fixtures readable.
+    An attempt is ``(enrollment_id, step_number)``; the send-claim interlock
+    makes one ``sent`` event per pair the invariant, and
+    ``outreach_events.AttemptTally`` counts bounces as *distinct attempts* so a
+    redelivered DSN is free rather than a second bounce.
+
+    This used to stack a campaign's whole window onto one enrollment at step 1,
+    which is not a shape production can produce: 200 sends and 30 bounces on one
+    attempt reads — correctly — as one attempt that bounced, redelivered 29
+    times. The fixture was pinning a 15% bounce rate that the arithmetic has no
+    way to derive from those rows. Spread across enrollments the same call means
+    what it says.
+
+    ``replied`` and ``bounced`` are laid down from opposite ends so a single
+    enrollment is not both, which no real prospect is.
+
+    Built in one flush: the per-row helpers above issue a flush each, and these
+    fixtures ask for hundreds of sends.
     """
-    contact = await _contact(db, company, f"{label}-{uuid.uuid4().hex[:8]}@acme.com")
-    enr = await _enroll(db, sequence, contact)
-    await _events(db, enr, "sent", n=sent, when=when, metadata=metadata)
-    if replied:
-        await _events(db, enr, "replied", n=replied, when=when)
-    if bounced:
-        await _events(db, enr, "bounced", n=bounced, when=when)
-    return enr
+    when = when or datetime.now(timezone.utc)
+    for i in range(sent):
+        contact = Contact(
+            id=uuid.uuid4(), company_id=company.id,
+            email=f"{label}-{uuid.uuid4().hex[:8]}@acme.com",
+            first_name="Dana", source="test",
+        )
+        db.add(contact)
+        enr = OutreachEnrollment(
+            id=uuid.uuid4(), contact_id=contact.id, sequence_id=sequence.id,
+            current_step=1, status="active",
+        )
+        db.add(enr)
+        db.add(OutreachEvent(
+            id=uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+            event_type="sent", occurred_at=when, event_metadata=metadata or {},
+        ))
+        if i < replied:
+            db.add(OutreachEvent(
+                id=uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+                event_type="replied", occurred_at=when, event_metadata={},
+            ))
+        if i >= sent - bounced:
+            db.add(OutreachEvent(
+                id=uuid.uuid4(), enrollment_id=enr.id, step_number=1,
+                event_type="bounced", occurred_at=when, event_metadata={},
+            ))
+    await db.flush()
 
 
 def _kinds(payload):

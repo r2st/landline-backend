@@ -173,6 +173,100 @@ async def count_attempts(
     return sent_rows + orphan_bounces, bounces
 
 
+async def count_attempts_by_sequence(
+    db: AsyncSession, *, where=None
+) -> dict:
+    """``{sequence_id: (attempts, bounces)}`` — :func:`count_attempts`, grouped.
+
+    Same arithmetic and the same reasoning as :class:`AttemptTally`; what
+    changes is that every campaign gets its own tally in one pass instead of one
+    query per campaign.
+
+    It exists because the per-campaign surfaces were the ones still dividing raw
+    ``count(sent)`` into raw ``count(bounced)`` after the danger rail,
+    ``lead_metrics`` and ``funnel_analytics`` were all corrected. Both halves of
+    that are wrong and they fail in opposite directions, so neither cancels the
+    other:
+
+    * the numerator counts *rows*, so a mailer-daemon that retries books a
+      second bounce against one send;
+    * the denominator counts ``sent`` rows only, and a **synchronous** failure
+      writes ``bounced`` with no ``sent`` event of its own — so an attempt that
+      never reached anyone is missing from the denominator entirely.
+
+    The second is the one that matters, because at the limit it inverts. A
+    campaign whose every send failed synchronously has no ``sent`` rows at all,
+    so its bounce rate divides by zero, comes back ``0.0``, and reads as the
+    healthiest campaign on the board — while the campaign that is actually
+    burning the domain is the one the sample-size gate then drops for having
+    sent nothing.
+
+    Grouped by the *sequence* behind each enrollment, which is what a campaign
+    is here. The join is unconditional for that reason; ``where`` may reference
+    ``OutreachEnrollment`` as a result.
+    """
+    from sqlalchemy import func as _func
+
+    def _events():
+        q = (
+            select(
+                OutreachEnrollment.sequence_id,
+                OutreachEvent.enrollment_id,
+                OutreachEvent.step_number,
+            )
+            .join(
+                OutreachEnrollment,
+                OutreachEvent.enrollment_id == OutreachEnrollment.id,
+            )
+        )
+        if where is not None:
+            q = q.where(where)
+        return q
+
+    tallies: dict = {}
+
+    sent_q = _events().where(OutreachEvent.event_type == "sent").subquery()
+    for sequence_id, n in (
+        await db.execute(
+            select(sent_q.c.sequence_id, _func.count()).group_by(sent_q.c.sequence_id)
+        )
+    ).all():
+        tallies[sequence_id] = [int(n), 0]
+
+    # Distinct ``(enrollment, step)``, so a redelivered DSN is free rather than a
+    # second bounce — the whole point of the dedup.
+    bounce_q = (
+        _events().where(OutreachEvent.event_type == "bounced").distinct().subquery()
+    )
+    for sequence_id, n in (
+        await db.execute(
+            select(bounce_q.c.sequence_id, _func.count()).group_by(bounce_q.c.sequence_id)
+        )
+    ).all():
+        tallies.setdefault(sequence_id, [0, 0])[1] = int(n)
+
+    # A bounced attempt with no ``sent`` partner is a synchronous failure and an
+    # attempt in its own right. Anything else is the async DSN sitting on top of
+    # a send already counted above.
+    sent_keys = _events().where(OutreachEvent.event_type == "sent").subquery()
+    for sequence_id, n in (
+        await db.execute(
+            select(bounce_q.c.sequence_id, _func.count())
+            .select_from(bounce_q)
+            .outerjoin(
+                sent_keys,
+                (bounce_q.c.enrollment_id == sent_keys.c.enrollment_id)
+                & (bounce_q.c.step_number == sent_keys.c.step_number),
+            )
+            .where(sent_keys.c.enrollment_id.is_(None))
+            .group_by(bounce_q.c.sequence_id)
+        )
+    ).all():
+        tallies.setdefault(sequence_id, [0, 0])[0] += int(n)
+
+    return {k: (v[0], v[1]) for k, v in tallies.items()}
+
+
 async def last_sent_step(db: AsyncSession, enrollment: OutreachEnrollment) -> int:
     """The step number of the most recent ``sent`` event for this enrollment.
 

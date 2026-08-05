@@ -47,6 +47,10 @@ class PortfolioSummary(BaseModel):
     active_campaigns: int     # campaigns currently switched on
 
     sent: int
+    # Steps put on the wire, the denominator ``bounce_rate`` divides by. See
+    # ``CampaignAnalytics.attempts``: a synchronous failure writes ``bounced``
+    # and no ``sent``, so the two numbers differ exactly where it matters.
+    attempts: int
     opened: int
     clicked: int
     replied: int

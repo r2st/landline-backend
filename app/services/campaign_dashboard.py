@@ -247,7 +247,13 @@ def _alerts(
     ai_enabled = bool(getattr(settings, "ai_compose_enabled", False))
 
     for row in rows:
-        if row.sent >= min_sample and row.bounce_rate >= bounce_warn:
+        # Sampled on **attempts**, matching the rate's own denominator. Gating on
+        # ``sent`` asked a different question than the one being answered, and
+        # the two diverge exactly where the alert matters most: a synchronous
+        # failure writes ``bounced`` and no ``sent``, so the campaign whose every
+        # send died on the wire had ``sent == 0``, failed the sample gate, and
+        # was the one campaign that could never raise a bounce alert.
+        if row.attempts >= min_sample and row.bounce_rate >= bounce_warn:
             critical = row.bounce_rate >= bounce_critical
             alerts.append(DashboardAlert(
                 severity="critical" if critical else "warning",
@@ -255,7 +261,7 @@ def _alerts(
                 sequence_id=row.sequence_id,
                 campaign=row.name,
                 message=(
-                    f"{row.bounced} of {row.sent} sends bounced "
+                    f"{row.bounced} of {row.attempts} sends bounced "
                     f"({_pct(row.bounce_rate)}). This campaign is on its own "
                     f"past the {'auto-pause' if critical else 'warning'} line "
                     f"the danger monitor applies to the whole fleet — the "
@@ -354,6 +360,10 @@ def _portfolio(rows: list[CampaignAnalytics], active_campaigns: int) -> Portfoli
     clicked = sum(r.clicked for r in rows)
     replied = sum(r.replied for r in rows)
     bounced = sum(r.bounced for r in rows)
+    # The bounce rate's own denominator — see ``CampaignAnalytics.attempts``.
+    # Campaigns do not share enrollments, so summing already-deduplicated
+    # per-campaign attempts is the portfolio's attempt count.
+    attempts = sum(r.attempts for r in rows)
     unsubscribed = sum(r.unsubscribed for r in rows)
     ai_composed = sum(r.ai_composed for r in rows)
 
@@ -381,6 +391,7 @@ def _portfolio(rows: list[CampaignAnalytics], active_campaigns: int) -> Portfoli
         campaigns=len(rows),
         active_campaigns=active_campaigns,
         sent=sent,
+        attempts=attempts,
         opened=opened,
         clicked=clicked,
         replied=replied,
@@ -389,7 +400,7 @@ def _portfolio(rows: list[CampaignAnalytics], active_campaigns: int) -> Portfoli
         open_rate=campaign_analytics.rate(opened, sent),
         click_rate=campaign_analytics.rate(clicked, sent),
         reply_rate=reply_rate,
-        bounce_rate=campaign_analytics.rate(bounced, sent),
+        bounce_rate=campaign_analytics.rate(bounced, attempts),
         unsubscribe_rate=campaign_analytics.rate(unsubscribed, sent),
         reply_rate_ci_low=campaign_analytics.wilson_lower(replied, sent),
         sample_sufficient=sent >= min_sends,
@@ -426,9 +437,15 @@ async def build(
     # and nothing this one belongs in the portfolio comparison — dropping it
     # would silently remove its previous volume from the denominator and report
     # a portfolio that improved by having a campaign stop.
+    # Admitted on **attempts**, not on ``sent``. A campaign whose every send was
+    # refused on the wire has no ``sent`` rows, and gating on those excluded it
+    # from the portfolio, from ``campaign_count`` and from the alert pass — so
+    # the campaign burning the domain was the one campaign the dashboard could
+    # not see. ``previous_sent`` stays as it is: it governs the reply-rate
+    # comparison below, which is a rate over delivered mail.
     rows = [
         r for r in every_sequence
-        if r.sent > 0 or (r.trend is not None and r.trend.previous_sent > 0)
+        if r.attempts > 0 or (r.trend is not None and r.trend.previous_sent > 0)
     ]
 
     # Take the window from the aggregation rather than re-deriving it, so the
@@ -505,5 +522,7 @@ async def build(
         laggards=laggards,
         needs_volume=needs_volume,
         alerts=alerts,
-        campaign_count=sum(1 for r in rows if r.sent > 0),
+        # "Campaigns that ran in this window", so a campaign that attempted and
+        # bounced every one counts as having run.
+        campaign_count=sum(1 for r in rows if r.attempts > 0),
     )

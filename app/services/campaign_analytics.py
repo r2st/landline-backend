@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.deal import Deal
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence
+from app.services.outreach_events import count_attempts_by_sequence
 from app.schemas.sequence_analytics import (
     CampaignAnalytics,
     CampaignAnalyticsResponse,
@@ -134,6 +135,21 @@ async def compute(
     for sequence_id, event_type, n in (await db.execute(event_query)).all():
         counts.setdefault(sequence_id, {})[event_type] = n
 
+    # The bounce arithmetic is not a row count, and this was the last surface
+    # still treating it as one. See ``outreach_events.AttemptTally``: an attempt
+    # is ``(enrollment, step)``, a redelivered DSN is not a second bounce, and a
+    # **synchronous** failure writes ``bounced`` with no ``sent`` partner — so it
+    # is an attempt that never appears in a ``count(sent)`` denominator. Dividing
+    # raw by raw is wrong in both directions at once, and at the limit it
+    # inverts: a campaign whose every send failed synchronously has no ``sent``
+    # rows, divides by zero, reports ``0.0`` and ranks as the healthiest on the
+    # board. ``attempts`` is the honest denominator for a bounce rate; ``sent``
+    # stays the count of messages that were actually accepted, which is the right
+    # denominator for the engagement rates below it.
+    attempt_tallies = await count_attempts_by_sequence(
+        db, where=(OutreachEvent.occurred_at >= since) if since is not None else None
+    )
+
     # --- The same counts for the period immediately before, when comparing ---
     previous: dict[uuid.UUID, dict[str, int]] = {}
     if previous_start is not None and since is not None:
@@ -155,6 +171,18 @@ async def compute(
         )
         for sequence_id, event_type, n in (await db.execute(previous_query)).all():
             previous.setdefault(sequence_id, {})[event_type] = n
+        # The comparison is only a comparison if both sides are the same
+        # measurement — a corrected current rate differenced against a raw
+        # previous one reports movement that is entirely the change of method.
+        previous_tallies = await count_attempts_by_sequence(
+            db,
+            where=(
+                (OutreachEvent.occurred_at >= previous_start)
+                & (OutreachEvent.occurred_at < since)
+            ),
+        )
+    else:
+        previous_tallies = {}
 
     # --- Last send + AI-composition mix, per sequence ---
     # The composition markers live in the send event's metadata (there is no
@@ -219,9 +247,14 @@ async def compute(
     for sequence in sequences:
         c = counts.get(sequence.id, {})
         sent = c.get("sent", 0)
-        if not sent and not include_empty:
+        attempts, bounced = attempt_tallies.get(sequence.id, (0, 0))
+        # Gated on **attempts**, not on ``sent``. A campaign whose every send
+        # failed synchronously has no ``sent`` rows, so gating on that dropped
+        # from the report exactly the campaign doing the damage — and the
+        # dashboard's sample-size gate then had nothing to raise an alert about.
+        if not attempts and not include_empty:
             continue
-        if sent < min_sent:
+        if attempts < min_sent:
             continue
         by_status = enrollments.get(sequence.id, {})
         total_enrollments = sum(by_status.values())
@@ -232,9 +265,10 @@ async def compute(
         if previous_start is not None and since is not None:
             p = previous.get(sequence.id, {})
             p_sent = p.get("sent", 0)
+            p_attempts, p_bounced = previous_tallies.get(sequence.id, (0, 0))
             p_replied = p.get("replied", 0)
             p_reply_rate = rate(p_replied, p_sent)
-            p_bounce_rate = rate(p.get("bounced", 0), p_sent)
+            p_bounce_rate = rate(p_bounced, p_attempts)
             reply_delta = round(rate(c.get("replied", 0), sent) - p_reply_rate, 4)
 
             # A direction needs both periods to carry enough volume to have a
@@ -259,7 +293,7 @@ async def compute(
                 sent_delta=sent - p_sent,
                 reply_rate_delta=reply_delta,
                 bounce_rate_delta=round(
-                    rate(c.get("bounced", 0), sent) - p_bounce_rate, 4
+                    rate(bounced, attempts) - p_bounce_rate, 4
                 ),
                 direction=direction,
                 newly_active=p_sent == 0 and sent > 0,
@@ -275,15 +309,16 @@ async def compute(
             total_enrollments=total_enrollments,
             active_enrollments=by_status.get("active", 0),
             sent=sent,
+            attempts=attempts,
             opened=c.get("opened", 0),
             clicked=c.get("clicked", 0),
             replied=c.get("replied", 0),
-            bounced=c.get("bounced", 0),
+            bounced=bounced,
             unsubscribed=c.get("unsubscribed", 0),
             open_rate=rate(c.get("opened", 0), sent),
             click_rate=rate(c.get("clicked", 0), sent),
             reply_rate=rate(c.get("replied", 0), sent),
-            bounce_rate=rate(c.get("bounced", 0), sent),
+            bounce_rate=rate(bounced, attempts),
             unsubscribe_rate=rate(c.get("unsubscribed", 0), sent),
             deals_attributed=deals.get(sequence.id, 0),
             conversion_rate=rate(deals.get(sequence.id, 0), total_enrollments),
@@ -306,6 +341,10 @@ async def compute(
         t_clicked = sum(c.clicked for c in campaigns)
         t_replied = sum(c.replied for c in campaigns)
         t_bounced = sum(c.bounced for c in campaigns)
+        # Summed, not recomputed: each row's attempts are already deduplicated
+        # per ``(enrollment, step)`` and campaigns do not share enrollments, so
+        # the sum is the portfolio's attempt count.
+        t_attempts = sum(c.attempts for c in campaigns)
         t_unsub = sum(c.unsubscribed for c in campaigns)
         t_deals = sum(c.deals_attributed for c in campaigns)
         t_ai = sum(c.ai_composed for c in campaigns)
@@ -323,6 +362,7 @@ async def compute(
             total_enrollments=t_enrolled,
             active_enrollments=sum(c.active_enrollments for c in campaigns),
             sent=t_sent,
+            attempts=t_attempts,
             opened=t_opened,
             clicked=t_clicked,
             replied=t_replied,
@@ -331,7 +371,7 @@ async def compute(
             open_rate=rate(t_opened, t_sent),
             click_rate=rate(t_clicked, t_sent),
             reply_rate=rate(t_replied, t_sent),
-            bounce_rate=rate(t_bounced, t_sent),
+            bounce_rate=rate(t_bounced, t_attempts),
             unsubscribe_rate=rate(t_unsub, t_sent),
             deals_attributed=t_deals,
             conversion_rate=rate(t_deals, t_enrolled),

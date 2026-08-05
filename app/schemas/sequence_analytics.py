@@ -92,6 +92,20 @@ class CampaignAnalytics(BaseModel):
     active_enrollments: int
 
     sent: int
+    # Steps put on the wire, which is not the same number as ``sent`` and is the
+    # honest denominator for ``bounce_rate``. A **synchronous** failure writes a
+    # ``bounced`` event and no ``sent`` one, so it is an attempt that a count of
+    # ``sent`` rows cannot see — and a campaign where every send failed that way
+    # has ``sent == 0``, a bounce rate that divides by zero, and a reported
+    # ``0.0`` that reads as the healthiest campaign on the board. See
+    # ``outreach_events.AttemptTally``. ``sent`` keeps its meaning — messages
+    # actually accepted — and stays the denominator of the engagement rates.
+    #
+    # Required rather than defaulted: a construction site that forgets it would
+    # report ``attempts=0``, and ``rate()`` returns 0.0 on a zero denominator —
+    # so the omission would come back as a perfectly healthy bounce rate, which
+    # is the exact failure this field exists to remove.
+    attempts: int
     opened: int
     clicked: int
     replied: int
