@@ -507,11 +507,27 @@ Return ONLY valid JSON:
     ) -> bool:
         """Best-effort enroll a warm-lead contact into a matching sequence.
 
-        Returns True only when a *new* enrollment was created. A contact with no
-        email can never send, so it is skipped (mirrors the prospector). Requires
-        a resolvable active sequence for the contact's company vertical.
+        Returns True only when a *new* enrollment was created. Requires a
+        resolvable active sequence for the contact's company vertical, and a
+        contact who may be mailed at all.
+
+        **That last check is the whole of what this used to do wrong.** It asked
+        only whether the address was non-empty and said it "mirrors the
+        prospector" — which asks all three do-not-contact questions
+        (``suppressed``, ``unsubscribed``, and the org list). So the one enroller
+        with no human between the signal and the enrollment was also the only one
+        that would enroll a contact who had unsubscribed, hard-bounced or been
+        uploaded on a compliance list. ``check_send_allowed`` refuses the
+        message, so nothing was mailed; what happened instead is that a warm
+        lead was manufactured out of someone who had opted out — dispatched,
+        paid for, refused, and counted — and the line below advanced their
+        company to ``pipeline_stage='outreach'`` on the strength of it. A false
+        pipeline advance is the part no downstream gate corrects: it is a claim
+        about the *company*, and it outlives the enrollment that was refused.
         """
-        if not contact.email or not contact.email.strip():
+        from app.services import suppression as _suppression
+
+        if await _suppression.blocking_reason(db, contact) is not None:
             return False
         company = (
             await db.execute(select(Company).where(Company.id == contact.company_id))

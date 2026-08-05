@@ -58,7 +58,14 @@ from app.services.out_of_office import OOO_DEFAULT_PAUSE_DAYS as OOO_DEFAULT_REQ
 
 # Enrollment statuses that a reply can still act on (a completed/bounced/
 # unsubscribed enrollment is already terminal).
-_ACTIONABLE_STATUSES = ("active", "paused")
+#
+# Taken from ``opt_out`` rather than spelled out here. The literal this replaces
+# was ``("active", "paused")`` and omitted ``pending_review`` — an enrollment
+# parked on an AI draft awaiting a human. That is not a resting state:
+# ``expire_stale_review_drafts`` un-parks it back to ``active`` and dispatches a
+# send. So a reply saying "unsubscribe" stopped the enrollments it could see and
+# the review sweep revived the one it couldn't.
+from app.services.opt_out import ACTIONABLE_STATUSES as _ACTIONABLE_STATUSES  # noqa: E402
 
 
 def _run_async(coro):

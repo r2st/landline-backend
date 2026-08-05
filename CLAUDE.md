@@ -672,6 +672,59 @@ the entry, and the send gate goes on refusing with no explanation. With it
 widened, a checkbox round-trip would erase a complaint or an erasure record.
 Removing any other reason stays an explicit, per-entry action on the list itself.
 
+**Erasure ends the cadence too.** The other four writers close the subject's
+enrollments in `ACTIONABLE_STATUSES`; erasure set the flags, scrubbed every
+column, wrote the list entry and left them running. The queue sweep stops an
+`active` enrollment whose contact is suppressed, so no mail went out — but it
+selects `status == "active"` and therefore never sees a `pending_review` one,
+and that is not a resting state: `expire_stale_review_drafts` un-parks it back
+to `active`, stamps it due now and dispatches. An erased subject's parked
+enrollment was revived *after* the erasure completed. There is also no second
+chance at it — erasure overwrites the address with the `anonymized+<id>@
+redacted.invalid` placeholder, so re-running it finds no contacts at all.
+
+## Enrolling is a do-not-contact decision, and six paths disagreed about it
+
+The send gate is the compliance floor and it holds. What it cannot stop is the
+**enrollment**, and six writers created those with six different ideas of who is
+mailable. Only `autonomous_prospector` asked all three questions:
+
+- `signal_enrollment` and `POST /sequences/{id}/enroll` read the two contact
+  flags and not the list;
+- `POST /outreach/enrollments` and the public API's `POST /sequences/enrollments`
+  asked nothing beyond "is there an address" — and the first of those dispatches
+  `send_sequence_step` immediately;
+- `social_listening_agent.auto_enroll_lead` asked nothing at all, while its own
+  docstring claimed it mirrored the prospector.
+
+**The list is the clause that gets dropped, and it is the one the contact row
+cannot answer.** `suppression.add_entry` deliberately does not touch
+`Contact.suppressed` — an address outlives every row that carries it — so a
+compliance CSV upload, a bounce recorded against a re-scraped duplicate, and an
+erasure whose subject the scraper later rediscovered all present as a contact
+with clean flags whose address must never be mailed. That last one is what
+`erase_subject` writes its entry *for*.
+
+Nothing leaked, which is why it accumulated. What it cost is everything up to
+the gate: a live enrollment for someone who opted out, dispatched and paid for,
+counted as outreach on a campaign that can never mail it — and in the
+social-listening path a company advanced to `pipeline_stage='outreach'` on the
+strength of it, which is a claim about the *company* that no downstream gate
+corrects.
+
+`suppression.blocking_reason(db, contact)` is the shared test and returns the
+operator-facing reason, so a bulk endpoint can report *which* clause refused
+rather than a bare False. `blocking_flag` is its row-only half and
+`suppressed_addresses` the batch list query, for callers holding a page of
+contacts — use both rather than a per-row existence check in a loop.
+
+`tests/test_enrollment_gate_coverage.py` enforces it mechanically and
+**function-locally**, mirroring `test_send_gate_coverage`: "some caller checks
+first" is exactly the assumption that was wrong. It carries self-tests that
+plant each shape, including the flags-only one that five of the six had — that
+plant must *fail*, because reading `contact.suppressed` by hand is precisely the
+check that cannot see the list.
+
 ## "The single choke point" was a claim about the callers, not the system
 
 `send_outreach_email` holds the two compliance floors — the kill switch and the

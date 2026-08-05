@@ -8,7 +8,8 @@ failure:
 
 * the contact is suppressed immediately (``suppressed`` + legacy ``unsubscribed``
   do-not-email gates),
-* every active/paused enrollment is stopped as ``unsubscribed``,
+* every enrollment a do-not-contact decision must interrupt
+  (``opt_out.ACTIONABLE_STATUSES``) is stopped as ``unsubscribed``,
 * the address is added to the org suppression LIST (``reason="complaint"``) so a
   future import or a manually-added contact with the same address is never mailed,
 * a revoked ``ConsentRecord`` is written for the audit trail.
@@ -26,7 +27,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.consent import ConsentRecord
 from app.models.contact import Contact
-from app.models.outreach import OutreachEnrollment
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +59,17 @@ async def _suppress_contact(db: AsyncSession, contact: Contact, reason: str) -> 
         )
     )
 
-    rows = await db.execute(
-        select(OutreachEnrollment).where(
-            OutreachEnrollment.contact_id == contact.id,
-            OutreachEnrollment.status.in_(("active", "paused")),
-        )
-    )
+    # ``opt_out.ACTIONABLE_STATUSES``, not a local copy. The literal that stood
+    # here was ``("active", "paused")`` and left ``pending_review`` untouched —
+    # an enrollment parked on an AI draft awaiting review, which
+    # ``expire_stale_review_drafts`` un-parks back to ``active`` and dispatches.
+    # So a complaint stopped the sequences it could see and the review sweep
+    # revived the one it couldn't, hours later, for the recipient who had just
+    # reported us as spam.
+    from app.services.opt_out import stoppable_enrollments
+
     stopped = 0
-    for enr in rows.scalars().all():
+    for enr in await stoppable_enrollments(db, contact.id):
         enr.status = "unsubscribed"
         enr.completed_at = now
         stopped += 1

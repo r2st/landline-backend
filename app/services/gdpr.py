@@ -362,6 +362,38 @@ async def erase_subject(db: AsyncSession, email: str) -> dict:
         erased_contacts += 1
     counts["contacts"] = erased_contacts
 
+    # --- Stop what is still running for this subject --------------------------
+    # The fifth do-not-contact writer, and the one that was stopping nothing.
+    # ``opt_out.record``, ``complaint_handler``, ``bounce_handler`` and the
+    # reply path all close the subject's live enrollments; erasure — the
+    # strongest of the six decisions — set the flags and left them enrolled.
+    #
+    # Suppressing the contact is what made that survivable rather than a leak:
+    # the queue sweep stops an ``active`` enrollment whose contact is suppressed
+    # the next time it comes due. But it only looks at ``active`` ones, and
+    # ``pending_review`` is not a resting state — ``expire_stale_review_drafts``
+    # un-parks it back to ``active``, stamps it due now and dispatches. So an
+    # erased subject's parked enrollment was revived hours later and put back on
+    # the send path, and the enrollments that *were* active stayed listed as
+    # live outreach until their next due date, for someone who had exercised
+    # their right to be forgotten. ``ACTIONABLE_STATUSES`` is the shared answer
+    # to which enrollments a decision like this has to interrupt.
+    #
+    # ``unsubscribed``, never ``bounced``: a compliance stop is not a delivery
+    # failure and must not move sender reputation metrics.
+    #
+    # Gated on ``contact_ids`` rather than on ``erased_contacts``: a re-run
+    # against an already-anonymised subject scrubs no new columns and must still
+    # close anything that has been enrolled since.
+    from app.services.opt_out import stoppable_enrollments
+
+    stopped = 0
+    for enr in await stoppable_enrollments(db, contact_ids):
+        enr.status = "unsubscribed"
+        enr.completed_at = now
+        stopped += 1
+    counts["enrollments_stopped"] = stopped
+
     async def _scrub_by_contact(model, fields):
         if not contact_ids:
             return 0

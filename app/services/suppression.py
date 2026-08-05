@@ -75,6 +75,97 @@ async def is_suppressed(db: AsyncSession, email: Optional[str]) -> bool:
     return hit is not None
 
 
+async def suppressed_addresses(db: AsyncSession, emails) -> set[str]:
+    """The subset of ``emails`` on the current org's list, normalized.
+
+    The batch form of :func:`is_suppressed`, for callers holding a page of
+    contacts. One query rather than one per contact — the bulk-enrol endpoint
+    takes up to a full page of ids, and a per-row existence check there is the
+    N+1 the rest of that handler goes out of its way to avoid.
+    """
+    normalized = {n for n in (normalize_email(e) for e in emails) if n}
+    if not normalized:
+        return set()
+    rows = (
+        await db.execute(
+            select(SuppressionEntry.email).where(SuppressionEntry.email.in_(normalized))
+        )
+    ).scalars().all()
+    return set(rows)
+
+
+# --- The do-not-contact test -------------------------------------------------
+
+# What the send gate asks, in the words it answers with. See
+# ``email_dispatch.check_send_allowed`` and the queue sweep in
+# ``tasks/outreach.py``: a contact is mailable unless the per-contact
+# ``suppressed`` flag, the legacy ``unsubscribed`` flag, or the org
+# do-not-contact LIST says otherwise. Three sources, not two.
+NO_EMAIL = "Contact has no email address"
+UNSUBSCRIBED = "Contact has unsubscribed"
+SUPPRESSED = "Contact is suppressed"
+ON_LIST = "Contact's address is on the do-not-contact list"
+
+
+def blocking_flag(contact) -> Optional[str]:
+    """The contact-row half of the do-not-contact test, or ``None`` if clear.
+
+    Split out from :func:`blocking_reason` for callers holding a batch: the
+    flags are already loaded, so filtering on them costs nothing and shrinks the
+    set of addresses the list query has to ask about.
+    """
+    if not (getattr(contact, "email", None) or "").strip():
+        return NO_EMAIL
+    if getattr(contact, "unsubscribed", False):
+        return UNSUBSCRIBED
+    if getattr(contact, "suppressed", False):
+        return SUPPRESSED
+    return None
+
+
+async def blocking_reason(db: AsyncSession, contact) -> Optional[str]:
+    """Why ``contact`` must not be mailed, or ``None`` if they may be.
+
+    **The enrollment side of the compliance gate, and the reason it is one
+    function.** ``check_send_allowed`` is the floor and stops the message; what
+    it cannot stop is the *enrollment*, and six paths created those with six
+    different ideas of who is mailable. Only ``autonomous_prospector`` asked all
+    three questions. ``signal_enrollment`` and the bulk-enrol endpoint read the
+    two flags and not the list; the two single-enrol endpoints and
+    ``social_listening_agent`` asked nothing at all.
+
+    The list is the clause that gets dropped, and it is the one that cannot be
+    reconstructed from the contact row. ``add_entry`` does not touch
+    ``Contact.suppressed`` — deliberately, because an address outlives every row
+    that carries it — so a compliance CSV upload, a bounce recorded against a
+    duplicate row, or an erasure whose subject the scraper later rediscovered
+    all leave a contact whose flags are clean and whose address must never be
+    mailed. That last one is the case ``gdpr.erase_subject`` writes the entry
+    *for*: erasure anonymises the contact row, so the list is the only surviving
+    link between the person and the decision.
+
+    Nothing leaked, because the send gate holds. What it cost is everything up
+    to it: a live enrollment for someone who opted out, dispatched and paid for,
+    counted as outreach on a campaign that can never mail it, and — in
+    ``social_listening_agent`` — a company advanced to ``pipeline_stage=
+    'outreach'`` on the strength of it.
+
+    Returns the operator-facing reason so the bulk endpoint can report which
+    clause refused, rather than a bare False.
+    """
+    reason = blocking_flag(contact)
+    if reason is not None:
+        return reason
+    if await is_suppressed(db, contact.email):
+        return ON_LIST
+    return None
+
+
+async def is_mailable(db: AsyncSession, contact) -> bool:
+    """Whether ``contact`` may be enrolled/mailed. See :func:`blocking_reason`."""
+    return await blocking_reason(db, contact) is None
+
+
 # Entries an operator's un-suppress may lift. A ``manual`` entry records
 # somebody's decision and can be reversed by another decision. The rest record
 # something that *happened* to the address — it bounced, its owner reported us

@@ -254,8 +254,20 @@ async def enroll_contact(
     contact = result.scalar_one_or_none()
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
-    if not contact.email:
-        raise HTTPException(status_code=400, detail="Contact has no email address")
+
+    # The same do-not-contact test the send gate makes, asked before the row
+    # exists rather than after the task has been dispatched. This endpoint
+    # checked only for an address — not the two opt-out flags the bulk endpoint
+    # next door checks, and not the org list that neither of them did — so the
+    # narrowest way to enrol a contact was also the least guarded. It ends by
+    # dispatching ``send_sequence_step`` immediately, which is what turns the
+    # omission into a task per opted-out contact: refused at the gate, then
+    # closed, having reported a live enrollment in between.
+    from app.services import suppression as _suppression
+
+    blocked = await _suppression.blocking_reason(db, contact)
+    if blocked is not None:
+        raise HTTPException(status_code=400, detail=blocked)
 
     # Verify sequence
     result = await db.execute(

@@ -539,6 +539,20 @@ async def create_enrollment(
     ).scalar_one_or_none()
     if contact is None:
         raise HTTPException(status_code=404, detail="Contact not found")
+
+    # Same do-not-contact test as ``POST /outreach/enrollments``, and here for
+    # the same reason the paused-sequence refusal below is: a second enrollment
+    # endpoint that doesn't know what the first one refuses is how the refusal
+    # gets worked around by a script nobody remembers writing. This one is
+    # server-to-server, so there is no operator reading a skip reason — an
+    # integration bulk-syncing its CRM would enrol every opted-out address it
+    # holds, on every run, indefinitely.
+    from app.services import suppression as _suppression
+
+    blocked = await _suppression.blocking_reason(db, contact)
+    if blocked is not None:
+        raise HTTPException(status_code=400, detail=blocked)
+
     sequence = (
         await db.execute(select(OutreachSequence).where(OutreachSequence.id == body.sequence_id))
     ).scalar_one_or_none()

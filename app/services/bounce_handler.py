@@ -99,7 +99,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.contact import Contact
-from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.models.outreach import OutreachEvent
 from app.services.outreach_events import sent_step_or_none
 
 logger = logging.getLogger(__name__)
@@ -268,7 +268,7 @@ async def _suppress_address(db: AsyncSession, email: str, kind: str) -> bool:
 async def _suppress_contact(
     db: AsyncSession, contact: Contact, *, observed: bool = True
 ) -> tuple[int, int]:
-    """Mark a contact do-not-email and stop its active enrollments.
+    """Mark a contact do-not-email and stop its live enrollments.
 
     Returns ``(enrollments_paused, funnel_events_written)``. Idempotent.
 
@@ -303,16 +303,25 @@ async def _suppress_contact(
     # one the enrollment gate and the contact filters read. A bounce means both.
     contact.suppressed = True
     contact.unsubscribed = True
-    rows = await db.execute(
-        select(OutreachEnrollment).where(
-            OutreachEnrollment.contact_id == contact.id,
-            OutreachEnrollment.status == "active",
-        )
-    )
+    # ``opt_out.ACTIONABLE_STATUSES``, not ``status == "active"``. The narrow
+    # filter this replaces missed two live states. ``paused`` is the ordinary
+    # one: an out-of-office hold sets it, and ``resume_out_of_office`` flips it
+    # back to ``active`` on the return date — so a hard bounce arriving during
+    # an OOO window left the enrollment for the resume sweep to revive against a
+    # mailbox that no longer exists. ``pending_review`` is the same shape via
+    # ``expire_stale_review_drafts``. Neither leaks a message (the send gate
+    # refuses a suppressed contact) and both leave a dead address enrolled,
+    # dispatched and counted as live outreach.
+    #
+    # Widening is safe for the funnel event below because that is gated on
+    # ``sent_step_or_none``: an enrollment with no send of its own books
+    # nothing, whatever status it was in.
+    from app.services.opt_out import stoppable_enrollments
+
     paused = 0
     events = 0
     now = datetime.now(timezone.utc)
-    for enr in rows.scalars().all():
+    for enr in await stoppable_enrollments(db, contact.id):
         enr.status = "bounced"
         enr.completed_at = now
         paused += 1

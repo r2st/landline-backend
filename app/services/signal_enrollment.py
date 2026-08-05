@@ -97,12 +97,48 @@ class _Signal:
     kind: str  # 'news' | 'intent'
 
 
-def _emailable(contact: Contact) -> bool:
-    return bool(
-        contact.email
-        and not getattr(contact, "unsubscribed", False)
-        and not getattr(contact, "suppressed", False)
-    )
+async def _emailable(db: AsyncSession, contact: Contact) -> bool:
+    """Whether this contact may be acted on at all.
+
+    ``suppression.blocking_reason``, not the two contact flags this used to
+    read. The missing third clause is the org do-not-contact LIST, and it is the
+    one that cannot be inferred from the row in front of you: ``add_entry``
+    deliberately does not touch ``Contact.suppressed``, because an address
+    outlives every contact row that carries it. A compliance CSV upload, a
+    bounce recorded against a re-scraped duplicate, and an erasure whose subject
+    the scraper later found again all leave exactly this shape — clean flags, an
+    address that must never be mailed.
+
+    Gates the follow-up branch as well as the enrollment one, which is why it is
+    a predicate over the contact rather than a filter on the enrol path: putting
+    "reach out while the lead is warm" on an operator's task list for someone
+    who unsubscribed is the same mistake with a human carrying it out.
+    """
+    from app.services import suppression as _suppression
+
+    return await _suppression.blocking_reason(db, contact) is None
+
+
+async def _emailable_subset(db: AsyncSession, contacts: list[Contact]) -> list[Contact]:
+    """:func:`_emailable` over a company's contacts, in one list query.
+
+    The flags are already loaded, so they filter for free and shrink the set of
+    addresses the list has to be asked about — which matters because this runs
+    per company inside the sweep, and a per-contact existence check would make
+    it N+1 in the loop.
+    """
+    from app.services import suppression as _suppression
+
+    candidates = [c for c in contacts if _suppression.blocking_flag(c) is None]
+    if not candidates:
+        return []
+    listed = await _suppression.suppressed_addresses(db, [c.email for c in candidates])
+    if not listed:
+        return candidates
+    return [
+        c for c in candidates
+        if _suppression.normalize_email(c.email) not in listed
+    ]
 
 
 async def _resolve_sequence_for_company(
@@ -269,7 +305,7 @@ async def surface_prospects_on_signals(
                 await db.execute(select(Contact).where(Contact.company_id == company_id))
             ).scalars().all()
         )
-        emailable = [c for c in contacts if _emailable(c)]
+        emailable = await _emailable_subset(db, contacts)
         if not emailable:
             continue
 

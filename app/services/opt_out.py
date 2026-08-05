@@ -150,10 +150,65 @@ def make_unsubscribe_url(email: str, org_id: Optional[uuid.UUID] = None) -> str:
     return f"{UNSUBSCRIBE_ENDPOINT}?token={make_unsubscribe_token(email, org_id)}"
 
 
-# Enrollment states an opt-out has to interrupt. Everything else is already
-# finished (``completed``, ``bounced``, ``unsubscribed``) and rewriting it would
-# only destroy the record of how it ended.
+# Enrollment states a do-not-contact decision has to interrupt. Everything else
+# is already finished (``completed``, ``bounced``, ``unsubscribed``) and
+# rewriting it would only destroy the record of how it ended.
+#
+# **Every** do-not-contact writer uses this set, not a copy of it. Five paths
+# take an address out of play — the unsubscribe link, a reply saying
+# "unsubscribe", a spam complaint, a hard bounce, an erasure request — and until
+# now four of them carried their own narrower literal:
+#
+# * ``complaint_handler`` and ``tasks.replies`` stopped ``("active", "paused")``,
+#   missing ``pending_review``;
+# * ``bounce_handler`` stopped ``status == "active"`` alone, missing both;
+# * ``gdpr.erase_subject`` stopped nothing at all.
+#
+# ``pending_review`` is the one that matters, because it is not a resting state.
+# ``expire_stale_review_drafts`` un-parks a stale draft's enrollment back to
+# ``active``, stamps it due now, and dispatches ``send_sequence_step`` — so an
+# enrollment left parked by a complaint or a bounce is revived hours later and
+# put back on the send path. The compliance floor in ``check_send_allowed``
+# refuses the message, which is why this was survivable; what it costs is a
+# revived enrollment for someone who complained, a full research-and-compose
+# cycle spent to be refused, and a campaign that reports live outreach to a
+# contact it can never mail.
+#
+# This is the lesson ``reply_matching.REPLY_STOPPABLE_STATUSES`` already
+# records — "status too narrow" — arrived at a second time, from compliance
+# rather than from replies.
 ACTIONABLE_STATUSES = ("active", "paused", "pending_review")
+
+
+async def stoppable_enrollments(
+    db: AsyncSession, contact_ids, *, skip_org_filter: bool = False
+) -> list[OutreachEnrollment]:
+    """Every enrollment a do-not-contact decision has to interrupt.
+
+    Takes one contact id or an iterable of them; returns the rows in
+    :data:`ACTIONABLE_STATUSES`. Deliberately returns rows rather than writing
+    the status itself, because the callers legitimately disagree about what to
+    write: a compliance stop is ``unsubscribed`` and a hard bounce is
+    ``bounced``, and ``bounce_handler`` additionally books a funnel event per
+    enrollment. What they must *not* disagree about is which enrollments they
+    are looking at, which is the whole of what this shares.
+
+    ``skip_org_filter`` is for the unsubscribe-link handler, which runs on a
+    token rather than a logged-in caller and so has no org bound.
+    """
+    if isinstance(contact_ids, (str, uuid.UUID)) or not hasattr(contact_ids, "__iter__"):
+        contact_ids = [contact_ids]
+    ids = [cid for cid in contact_ids if cid is not None]
+    if not ids:
+        return []
+
+    stmt = select(OutreachEnrollment).where(
+        OutreachEnrollment.contact_id.in_(ids),
+        OutreachEnrollment.status.in_(ACTIONABLE_STATUSES),
+    )
+    if skip_org_filter:
+        stmt = stmt.execution_options(skip_org_filter=True)
+    return list((await db.execute(stmt)).scalars().all())
 
 
 class OptOutResult(NamedTuple):
@@ -238,16 +293,9 @@ async def record(
 
     enrollments_stopped = 0
     if contacts:
-        enrollments = (
-            await db.execute(
-                select(OutreachEnrollment)
-                .where(
-                    OutreachEnrollment.contact_id.in_([c.id for c in contacts]),
-                    OutreachEnrollment.status.in_(ACTIONABLE_STATUSES),
-                )
-                .execution_options(skip_org_filter=True)
-            )
-        ).scalars().all()
+        enrollments = await stoppable_enrollments(
+            db, [c.id for c in contacts], skip_org_filter=True
+        )
         for enr in enrollments:
             # ``unsubscribed``, never ``bounced``. A compliance stop is not a
             # delivery failure and must not move sender reputation metrics.

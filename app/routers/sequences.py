@@ -138,6 +138,31 @@ async def _enroll_into_sequence(
         ).all()
     }
 
+    # Addresses on the org do-not-contact list, in one query for the batch.
+    #
+    # The third clause of the send gate's test, and the one this handler was
+    # missing: it read ``unsubscribed`` and ``suppressed`` off the contact row
+    # and stopped. ``suppression.add_entry`` does not touch those flags — an
+    # address outlives every contact row that carries it — so a compliance CSV
+    # upload, a bounce against a re-scraped duplicate, and an erasure whose
+    # subject was later rediscovered all present as a contact with clean flags
+    # that must never be mailed. Enrolling them cost a dispatch and a refusal
+    # each, and reported a campaign of live outreach that could never send.
+    #
+    # Batched deliberately: the flag checks below run first and this only has to
+    # ask about the addresses that survive them, which keeps a full page of
+    # contacts at one query rather than the per-row existence check the rest of
+    # this handler goes out of its way to avoid.
+    from app.services import suppression as _suppression
+
+    listed = await _suppression.suppressed_addresses(
+        db,
+        [
+            c.email for c in contacts.values()
+            if _suppression.blocking_flag(c) is None
+        ],
+    )
+
     enrolled: list[uuid.UUID] = []
     skipped: list[EnrollSkip] = []
     new_enrollment_ids: list[str] = []
@@ -147,14 +172,12 @@ async def _enroll_into_sequence(
         if contact is None:
             skipped.append(EnrollSkip(contact_id=cid, reason="Contact not found"))
             continue
-        if not contact.email:
-            skipped.append(EnrollSkip(contact_id=cid, reason="Contact has no email address"))
+        flag_reason = _suppression.blocking_flag(contact)
+        if flag_reason is not None:
+            skipped.append(EnrollSkip(contact_id=cid, reason=flag_reason))
             continue
-        if contact.unsubscribed:
-            skipped.append(EnrollSkip(contact_id=cid, reason="Contact has unsubscribed"))
-            continue
-        if getattr(contact, "suppressed", False):
-            skipped.append(EnrollSkip(contact_id=cid, reason="Contact is suppressed"))
+        if _suppression.normalize_email(contact.email) in listed:
+            skipped.append(EnrollSkip(contact_id=cid, reason=_suppression.ON_LIST))
             continue
         if cid in already:
             skipped.append(EnrollSkip(contact_id=cid, reason="Already enrolled in this sequence"))
