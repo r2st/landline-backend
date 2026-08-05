@@ -47,16 +47,14 @@ def _apply_unsubscribe_headers(
     providers can present a native "unsubscribe" affordance. The mailto defaults
     to the sending account's own address (a real, monitored, reply-synced
     mailbox) unless ``unsubscribe_mailto`` is explicitly configured.
+
+    The header pair itself comes from :func:`opt_out.unsubscribe_headers` — one
+    builder for all three transports, since the third one shipped without it.
     """
-    if not list_unsubscribe_url:
-        return
-    methods = []
-    mailto = get_settings().unsubscribe_mailto or sender_email
-    if mailto:
-        methods.append(f"<mailto:{mailto}?subject=unsubscribe>")
-    methods.append(f"<{list_unsubscribe_url}>")
-    message["List-Unsubscribe"] = ", ".join(methods)
-    message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    from app.services.opt_out import unsubscribe_headers
+
+    for name, value in unsubscribe_headers(list_unsubscribe_url, sender_email).items():
+        message[name] = value
 
 
 class GmailSender:

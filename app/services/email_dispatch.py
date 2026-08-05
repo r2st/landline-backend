@@ -432,10 +432,21 @@ async def check_send_allowed(
       while paused; ``check_kill_switch=False`` is for mail that is not outreach
       at all (a connectivity test to your own mailbox), where the pause has
       nothing to say.
-    * the **do-not-contact suppression list** — a compliance gate, not an
-      operational one. An address on it must never receive *any* outbound mail,
-      which is why it is enforced even for kill-switch-bypass callers and why no
-      flag turns it off. Suppression is stricter than the operational pause.
+    * the **do-not-contact decision** — a compliance gate, not an operational
+      one. An address under one must never receive *any* outbound mail, which is
+      why it is enforced even for kill-switch-bypass callers and why no flag
+      turns it off. Suppression is stricter than the operational pause.
+
+      That decision lives in **three** places, not one: the org suppression list
+      and the two per-contact flags. This gate read only the list, while
+      ``send_sequence_step`` reads all three and explains in its own comment why
+      the flags cannot be dropped — rows with ``unsubscribed=True`` and no list
+      entry are in the database now, written by handlers that predate
+      ``opt_out.record``. Since every non-sequence send path is gated *here* and
+      nowhere else, those opt-outs stopped the cadence and stopped nothing else:
+      the smart-reply auto-send, a meeting proposal, a reminder, a human's inbox
+      reply and a per-account test send all cleared a gate that could not see
+      them. ``suppression.address_blocking_reason`` is the three-clause test.
 
     This exists as a function rather than as a block inside
     :func:`send_outreach_email` because ``send_outreach_email`` is *not*, in
@@ -463,11 +474,12 @@ async def check_send_allowed(
 
     from app.services import suppression
 
-    if await suppression.is_suppressed(db, to_email):
-        logger.info("Send to %s blocked: address is on the suppression list", to_email)
+    reason = await suppression.address_blocking_reason(db, to_email)
+    if reason is not None:
+        logger.info("Send to %s blocked: %s", to_email, reason)
         return {
             "status": "suppressed",
-            "reason": "Recipient is on the do-not-contact suppression list.",
+            "reason": f"Recipient must not be contacted: {reason.lower()}.",
             "transport": "none",
             "sender": None,
         }
@@ -488,10 +500,21 @@ async def record_account_send(db: AsyncSession, account, *, sent: bool) -> None:
     meeting proposals, auto-replies, inbox replies and "tests" as the day
     produced, and every warm-up check still read 5/5.
 
-    The counter rolls over at the UTC date boundary so it reflects *today*
-    rather than growing without bound, and only a send that actually landed
-    increments it — an attempt that never reached the wire cost the mailbox
-    nothing.
+    The counter rolls over at the **sending day** boundary
+    (:mod:`app.services.send_day` — the sender's local midnight) so it reflects
+    *today* rather than growing without bound, and only a send that actually
+    landed increments it: an attempt that never reached the wire cost the
+    mailbox nothing.
+
+    It rolled on the UTC boundary, which is not the same instant and not outside
+    the sending day. The send window is evaluated in the *contact's* timezone,
+    so with the shipped Toronto defaults a contact in Los Angeles is still
+    inside their 08:00–18:00 window at 00:00 UTC — 17:00 for them. The ramp
+    therefore reset an hour before that mailbox stopped sending, and a day-1
+    plan on a 5/day limit put ten on the wire while every warm-up check read
+    ``5/5``. The one number governing a cold domain's volume, doubled by the
+    clock. ``warmup.used_today`` reads the same boundary; they have to agree or
+    the counter and the gate disagree about which sends are today's.
 
     **The increment is a SQL expression, not a Python one.** ``count = count + 1``
     on the loaded instance is a read-modify-write across a window that spans the
@@ -523,8 +546,10 @@ async def record_account_send(db: AsyncSession, account, *, sent: bool) -> None:
     from sqlalchemy import case, inspect as sa_inspect, update as sa_update
     from sqlalchemy.exc import NoInspectionAvailable
 
+    from app.services import send_day
+
     now = datetime.now(timezone.utc)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start = send_day.day_start(now)
 
     # Rolled over already today? Then keep the running count; otherwise this
     # statement is the rollover. Decided in SQL against the row's *current*
@@ -841,6 +866,13 @@ async def send_outreach_email(
     # Fallback: Amazon SES. No account, so no ramp and nothing to book a
     # per-mailbox count against — but the daily slot claimed above is real and
     # has to be settled either way.
+    #
+    # ``include_unsubscribe=False`` because the footer is already in ``body_html``
+    # above; ``list_unsubscribe_url`` is the *header* pair, which this branch
+    # could not set at all until ``EmailSender`` grew a raw-MIME path. The same
+    # URL the Gmail and SMTP branches send — a fallback transport sharing the
+    # domain's reputation must not be the one that looks like a bulk sender with
+    # no one-click unsubscribe.
     ses = EmailSender()
     try:
         result = await asyncio.to_thread(
@@ -851,6 +883,7 @@ async def send_outreach_email(
             body_text=body_text,
             reply_to=reply_to,
             include_unsubscribe=False,
+            list_unsubscribe_url=unsubscribe_url,
         )
     except Exception:
         await settle_send_volume(db, slot, sent=False)

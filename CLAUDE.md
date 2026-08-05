@@ -472,6 +472,20 @@ nominate hardest:
   re-engage"* — about a pipeline stage the enrollment that had been mailing them
   for weeks had itself set.
 
+**The per-contact communication timeline was the same read, one surface over.**
+`communication_history.get_contact_communications` — the thing behind
+`GET /contacts/{id}/communications`, whose own docstring calls itself a unified,
+user-attributed history of *every* touchpoint — unioned `EmailSend`, replies,
+calls and interactions, and not the sequence engine. So the contact it was most
+wrong about is the one being worked hardest: a prospect five steps into a
+cadence showed their replies with nothing they were replying to, and the
+timeline opened with the prospect speaking first. It reuses
+`EmailHistoryService._fetch_sequence_sends` rather than writing a third query,
+so there stays one place that knows how a sequence send is stored. A cadence
+step has no `user_id` of its own and is attributed to the owner of the mailbox
+it left from — the same fallback the `EmailSend` branch already used, which is
+what keeps `?mine_only=true` from hiding it.
+
 `app/services/last_contact.py` is the one resolver (`last_send_by_contact`,
 `last_send_by_company`). Note that `OutreachEvent` carries no `contact_id` — the
 enrollment holds it — which is exactly why it is the easy table to forget:
@@ -504,6 +518,69 @@ outcome that isn't a real send (soft skip, dispatcher exception, bounce). One
 at once. The counter seeds from the DB (`SET … NX`) so a restart or an eviction
 resumes at the real number. With Redis unreachable it degrades to the row-count
 check — per-worker, never looser — and says `[degraded: …]` in the reason.
+
+## "Today" is the sender's day, and it was UTC's
+
+Three counters answer "has this mailbox sent enough today?" — the cap's Redis
+key, the row count that seeds it, and the per-account warm-up counter — and all
+three keyed on the UTC date. That is only the right boundary if the sending day
+sits inside a UTC day, and this system deliberately does not send inside one:
+`within_send_window` is evaluated in **the contact's** timezone
+(`tasks/outreach.py` passes `contact.timezone` at both dispatch sites).
+
+Take the shipped defaults — 08:00–18:00, `America/Toronto` — and a contact in
+Los Angeles. Their window runs 15:00 UTC to 01:00 UTC the next day, so 00:00 UTC
+is 17:00 for them: an hour *before* it closes. Every counter reset while the
+mailbox was still sending, and that last hour got a fresh full allowance.
+
+The warm-up ramp is the half that matters. A day-1 mailbox on a 5/day plan sent
+five, rolled over at 17:00 local, sent five more — and every warm-up check after
+that read `5/5`, because the counter it reads is the one that rolled. The single
+number governing a cold domain's volume, doubled by the clock, with nothing to
+notice: no error, a textbook ramp graph, and a receiving side that finds out
+weeks later.
+
+`app.services.send_day` owns the boundary and everything that counts a day uses
+it: `_daily_key`, `_db_sent_today`, `get_send_stats`, `warmup.used_today`,
+`record_account_send`'s rollover `CASE`. They have to agree — a seed taken over
+a different window than the key it is written under hands back allowance the
+mailbox already spent, which is the one direction a cap must never be wrong in.
+
+**It is anchored to `send_window_timezone`, and that is the only setting that
+can carry it.** The window is `start_hour`–`end_hour` on a 24h clock in that
+zone, so it cannot span local midnight — which makes local midnight the one
+instant the sender is guaranteed not to be sending at, whatever hours an
+operator configures. `daily_summary_timezone` is the operator's *reporting* zone
+(shipped `Asia/Kolkata`) and would put the rollover at 18:30 UTC, squarely
+inside the default Toronto window: worse than the UTC boundary it replaced.
+
+Contacts far enough east still cross it — a Tokyo business day spans Toronto's
+local midnight no matter what — but that residue is bounded by the sender's own
+ten-hour window, where the UTC anchor had no bound and broke on the ordinary
+case of a North American sender mailing the West Coast.
+
+**Two more surfaces were still on the UTC boundary, and they are the two shapes
+a leftover one takes.** Both now call `send_day`:
+
+- **A display.** The dashboard's two `emails_sent_today` tiles
+  (`/dashboard/overview` and `/dashboard/kpis`) sit beside a cap readout that
+  counts against the new boundary, so between 20:00 and midnight in Toronto the
+  tile read zero while the cap reported the day's allowance spent — and a send
+  in the last hour of a US-Pacific window appeared here as today's while the cap
+  booked it against yesterday. Two "today"s on one screen, neither labelled.
+- **A decision.** `OrchestrationPolicy.max_daily_touches` compared UTC *dates*,
+  so the per-contact touch cap refilled at 17:00 in Los Angeles — inside that
+  prospect's own window — and a cadence could put twice the policy's touches
+  into one of their business days. Not a reporting inconsistency: the same
+  doubling the warm-up ramp had, one level down. `orchestrator.count_touches_today`
+  is split out of `_gather_context` so the guardrail is testable without a
+  session; a guardrail whose only test has to mock a database is untested.
+
+Two boundaries were left alone on purpose. `api_credits._day_start` is a
+*vendor's* quota day (Apollo, Google Places) and belongs to their clock, not
+ours. `check_lead_gen_health` runs at 21:30 UTC — 17:30 Toronto, inside the
+window and on the same calendar date either way — so its UTC window already
+covers the whole sending day it reports on.
 
 ## A cap that counts one of six sources is not a cap
 
@@ -671,6 +748,75 @@ suppression list. Never write the flags directly.
 The send path checks `suppressed` **or** `unsubscribed` **or** the list, in both
 `send_sequence_step` and the queue sweep. The `unsubscribed` read is deliberate
 redundancy: rows written by the old link handler are in the database now.
+
+**And that redundancy was in the sequence path only.** `check_send_allowed` —
+"the two compliance floors, in one place", the gate *every other* path calls —
+read the kill switch and the list. Not the flags. So the state the sequence path
+keeps a redundant read for, and says so in its own comment, was the state that
+walked straight past the gate for the smart-reply auto-send, all four
+meeting-agent sends, the inbox reply composer, the per-account test send, and
+`send_outreach_email` itself. The opt-out stopped the cadence and stopped
+nothing else. Same shape as the gate's origin story one level down: the floor
+was consolidated out of its callers and one of its clauses stayed behind.
+
+`suppression.address_blocking_reason(db, email)` is the three-clause test for a
+caller holding an **address** rather than a `Contact` — which is what a send path
+has, since the gate takes what goes in the `To:` header.
+`blocking_reason(db, contact)` is the row version, for the enrollment gate. Both
+match case-insensitively across every row carrying the address: `contacts.email`
+has no unique constraint, and which duplicate a path happened to load is not a
+fact about the person.
+
+## `lower(email)` is what is queried, so `lower(email)` is what is indexed
+
+Sixteen call sites filter `func.lower(Contact.email)` and none filter the raw
+column, for the reason `can_send_to_contact` documents: the column is not
+normalised on write, so a lookup on the raw value is about a *row* and not about
+a *recipient*. `ix_contacts_email` from migration 001 indexes the raw column and
+can serve none of them — Postgres plans a sequential scan.
+
+Migration 119 adds `ix_contacts_email_lower` on the expression. Worth knowing
+where the scans were, because it is not the reporting surfaces: the compliance
+gate on every outbound message, the limiter's monthly cap and minimum-gap checks
+twice more per send, reply/bounce/complaint attribution on their beats, and
+`gdpr.erase_subject`. The fastest-growing table in the schema, scanned by the
+paths that run per send and per inbound message — it degrades in step with the
+product working, which is why it doesn't look like a problem until it is one.
+
+An expression index rather than a normalised column: a column needs every writer
+to maintain it, and a writer that forgets is a compliance lookup that silently
+misses.
+
+## Every transport sets the one-click unsubscribe headers
+
+`List-Unsubscribe` + `List-Unsubscribe-Post` are a Gmail/Yahoo bulk-sender
+requirement, and there are **three** transports. Gmail and SMTP each carried
+their own copy of the header builder. Amazon SES — the fallback
+`send_outreach_email` takes when no account resolves — carried neither, and
+could not: SES's `send_email` action takes a structured message with nowhere to
+put a custom header, so setting one means `send_raw_email` with a MIME document.
+
+The gap was invisible from every angle except the transport that lacked it, and
+that transport is the one that fires when the operator's mailboxes are down —
+carrying the day's volume, on the sending domain's shared reputation, rated by
+every bulk filter as a sender who offers no one-click affordance.
+
+`opt_out.unsubscribe_headers(url, sender_email)` is the one builder; all three
+transports splat it. A fourth transport that hand-rolls the pair shows up as a
+difference in `tests/test_ses_list_unsubscribe.py` rather than as mail that
+quietly lacks the affordance.
+
+**`ses:SendRawEmail` is a different IAM action from `ses:SendEmail`.** Changing
+which API call a transport makes changes which permission it needs, and an
+identity provisioned back when this path only ever sent structured mail holds
+only the old one — so the fix would have turned every fallback send into an
+`AccessDenied`, on precisely the day the fallback is what's carrying the mail.
+Missing headers are a deliverability problem; sending nothing is an outage, so
+an authorization failure specifically retries the structured call and logs the
+permission to grant. **Only** that one: a throttle, a rejected address or an
+unverified sending domain fails identically on both actions, so retrying them is
+a second round trip, a duplicate log line, and — for a throttle — more pressure
+on the thing already refusing us.
 
 ## Every do-not-contact writer writes the list, erasure most of all
 

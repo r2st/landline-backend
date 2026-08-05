@@ -40,6 +40,7 @@ from app.models.outreach import OutreachEvent, OutreachEnrollment
 from app.models.contact import Contact
 from app.models.email_template import EmailSend, WIRE_STATUSES
 from app.org_context import get_current_org_id
+from app.services import send_day
 
 logger = logging.getLogger(__name__)
 
@@ -91,22 +92,27 @@ def _reset_redis_for_tests() -> None:
 
 
 def _daily_key(now: Optional[datetime] = None) -> str:
-    """Per-org, per-UTC-day counter key.
+    """Per-org, per-sending-day counter key.
 
     Org-scoped because the daily cap is a tenant's cap: one busy org must not be
     able to spend another's allowance.
+
+    Keyed on the *sending* day (:mod:`app.services.send_day`), not the UTC one.
+    The window is evaluated in each contact's own timezone, so a UTC boundary
+    falls inside the sending day for anyone west of the sender — 00:00 UTC is
+    17:00 in Los Angeles, an hour before that contact's window closes — and the
+    counter reset while the mailbox was still sending.
     """
     now = now or datetime.now(timezone.utc)
-    return f"dialtone:daily_sends:{get_current_org_id() or 'global'}:{now:%Y-%m-%d}"
-
-
-def _seconds_until_utc_midnight(now: Optional[datetime] = None) -> int:
-    """TTL for the daily key — the key expires when the day it counts ends."""
-    now = now or datetime.now(timezone.utc)
-    tomorrow = (now + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    return (
+        f"dialtone:daily_sends:{get_current_org_id() or 'global'}:"
+        f"{send_day.day_key(now)}"
     )
-    return max(60, int((tomorrow - now).total_seconds()) + 300)
+
+
+def _seconds_until_day_rollover(now: Optional[datetime] = None) -> int:
+    """TTL for the daily key — the key expires when the day it counts ends."""
+    return send_day.seconds_until_next_day(now)
 
 
 class SendLimiter:
@@ -400,10 +406,14 @@ class SendLimiter:
         return events + direct
 
     async def _db_sent_today(self, db: AsyncSession, now: Optional[datetime] = None) -> int:
-        """Sends recorded in the current UTC day (the counter's seed value)."""
-        now = now or datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return await self._db_sent_since(db, today_start)
+        """Sends recorded in the current sending day (the counter's seed value).
+
+        The day starts at the sender's local midnight, not at 00:00 UTC — see
+        :mod:`app.services.send_day`. It has to be the same boundary
+        :func:`_daily_key` rolls on, or the seed a Redis eviction re-reads
+        answers a different question than the key it is written under.
+        """
+        return await self._db_sent_since(db, send_day.day_start(now))
 
     async def reserve_daily_send(
         self, db: AsyncSession, *, now: Optional[datetime] = None
@@ -440,7 +450,7 @@ class SendLimiter:
             # a no-op and both workers then INCR the same seeded counter.
             seeded = await client.set(
                 key, await self._db_sent_today(db, now),
-                nx=True, ex=_seconds_until_utc_midnight(now),
+                nx=True, ex=_seconds_until_day_rollover(now),
             )
             if seeded:
                 logger.info("Seeded daily send counter %s from DB", key)
@@ -448,7 +458,7 @@ class SendLimiter:
             # Belt and braces: a key that somehow lost its TTL would otherwise
             # freeze today's count into tomorrow.
             if await client.ttl(key) < 0:
-                await client.expire(key, _seconds_until_utc_midnight(now))
+                await client.expire(key, _seconds_until_day_rollover(now))
         except Exception as exc:  # noqa: BLE001 — any redis failure → DB fallback
             logger.warning("Daily send reservation failed (%s); using row count", exc)
             allowed, reason = await self.can_send_today(db)
@@ -497,11 +507,11 @@ class SendLimiter:
         try:
             await client.set(
                 key, await self._db_sent_today(db, now),
-                nx=True, ex=_seconds_until_utc_midnight(now),
+                nx=True, ex=_seconds_until_day_rollover(now),
             )
             await client.incr(key)
             if await client.ttl(key) < 0:
-                await client.expire(key, _seconds_until_utc_midnight(now))
+                await client.expire(key, _seconds_until_day_rollover(now))
         except Exception as exc:  # noqa: BLE001 — counting is best-effort
             logger.warning("Could not count daily send on %s: %s", key, exc)
 
@@ -519,7 +529,7 @@ class SendLimiter:
         try:
             remaining = int(await client.decr(key))
             if remaining < 0:
-                await client.set(key, 0, ex=_seconds_until_utc_midnight(now))
+                await client.set(key, 0, ex=_seconds_until_day_rollover(now))
         except Exception as exc:  # noqa: BLE001 — release is best-effort
             logger.debug("Could not release daily send reservation: %s", exc)
 
@@ -558,7 +568,10 @@ class SendLimiter:
     async def get_send_stats(self, db: AsyncSession) -> dict:
         """Get current sending statistics for display."""
         now = datetime.now(timezone.utc)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # The same day boundary the cap enforces. This tile reports how much of
+        # today's allowance is gone, so a different "today" here would show a
+        # remaining figure the gate does not agree with.
+        today_start = send_day.day_start(now)
         thirty_days_ago = now - timedelta(days=30)
 
         # Both send tables, for the same reason the cap's seed reads both: the

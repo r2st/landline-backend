@@ -150,6 +150,34 @@ def make_unsubscribe_url(email: str, org_id: Optional[uuid.UUID] = None) -> str:
     return f"{UNSUBSCRIBE_ENDPOINT}?token={make_unsubscribe_token(email, org_id)}"
 
 
+def unsubscribe_headers(
+    list_unsubscribe_url: Optional[str], sender_email: Optional[str] = None
+) -> dict[str, str]:
+    """The RFC 2369 + RFC 8058 headers, for every transport that sends outreach.
+
+    One builder, for the same reason there is one serializer and one URL: the
+    header pair is a Gmail/Yahoo bulk-sender requirement (June 2024), and a
+    transport that omits it is not slightly less compliant than the others —
+    it loses the native "Unsubscribe" affordance in the recipient's client and
+    gets rated as a bulk sender who doesn't offer one.
+
+    There were two copies (``gmail_sender`` and ``smtp_sender``) and a third
+    transport that had neither. Returns ``{}`` when there is no URL, so a caller
+    can splat it unconditionally.
+    """
+    if not list_unsubscribe_url:
+        return {}
+    methods = []
+    mailto = get_settings().unsubscribe_mailto or sender_email
+    if mailto:
+        methods.append(f"<mailto:{mailto}?subject=unsubscribe>")
+    methods.append(f"<{list_unsubscribe_url}>")
+    return {
+        "List-Unsubscribe": ", ".join(methods),
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    }
+
+
 # Enrollment states a do-not-contact decision has to interrupt. Everything else
 # is already finished (``completed``, ``bounced``, ``unsubscribed``) and
 # rewriting it would only destroy the record of how it ended.

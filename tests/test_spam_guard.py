@@ -161,12 +161,16 @@ async def test_dispatcher_blocks_spammy_copy(monkeypatch):
         return True
 
     async def _not_suppressed(db, email):
-        return False
+        # The whole compliance gate, not just its list clause: it also reads the
+        # per-contact flags now, and this test runs with ``db=None``.
+        return None
 
     monkeypatch.setattr(
         "app.services.system_settings.is_sending_enabled", _enabled
     )
-    monkeypatch.setattr("app.services.suppression.is_suppressed", _not_suppressed)
+    monkeypatch.setattr(
+        "app.services.suppression.address_blocking_reason", _not_suppressed
+    )
 
     result = await email_dispatch.send_outreach_email(
         db=None, to_email="dana@example.com",
@@ -190,7 +194,9 @@ async def test_dispatcher_scan_can_be_skipped_by_a_caller_that_already_scanned(m
         return True
 
     async def _not_suppressed(db, email):
-        return False
+        # The whole compliance gate, not just its list clause: it also reads the
+        # per-contact flags now, and this test runs with ``db=None``.
+        return None
 
     calls: list = []
 
@@ -199,7 +205,9 @@ async def test_dispatcher_scan_can_be_skipped_by_a_caller_that_already_scanned(m
         return True, spam_guard.SpamVerdict()
 
     monkeypatch.setattr("app.services.system_settings.is_sending_enabled", _enabled)
-    monkeypatch.setattr("app.services.suppression.is_suppressed", _not_suppressed)
+    monkeypatch.setattr(
+        "app.services.suppression.address_blocking_reason", _not_suppressed
+    )
     monkeypatch.setattr(spam_guard, "scan_for_send", _record)
 
     with pytest.raises(AttributeError):

@@ -15,7 +15,6 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from typing import Optional
 
-from app.config import get_settings
 from app.services import crypto
 
 logger = logging.getLogger(__name__)
@@ -34,16 +33,14 @@ def _apply_unsubscribe_headers(
     the same one-click unsubscribe affordance Gmail/Yahoo require of bulk senders
     (June 2024). Without these headers on the SMTP transport, sequences sent from
     Outlook/custom hosts were shipping with no List-Unsubscribe at all.
+
+    The header pair itself comes from :func:`opt_out.unsubscribe_headers` — one
+    builder for all three transports, since the third one shipped without it.
     """
-    if not list_unsubscribe_url:
-        return
-    methods = []
-    mailto = get_settings().unsubscribe_mailto or sender_email
-    if mailto:
-        methods.append(f"<mailto:{mailto}?subject=unsubscribe>")
-    methods.append(f"<{list_unsubscribe_url}>")
-    message["List-Unsubscribe"] = ", ".join(methods)
-    message["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    from app.services.opt_out import unsubscribe_headers
+
+    for name, value in unsubscribe_headers(list_unsubscribe_url, sender_email).items():
+        message[name] = value
 
 
 class SmtpSender:

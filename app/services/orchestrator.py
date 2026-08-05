@@ -47,6 +47,7 @@ from app.models.orchestration import (
     OrchestrationPolicy,
 )
 from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.services import send_day
 from app.services.llm_providers import ChainClient, any_llm_available, chain_client
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,32 @@ def _aware(dt: Optional[datetime]) -> Optional[datetime]:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def count_touches_today(sends, now: datetime) -> int:
+    """How many of *sends* land in the current **sending** day.
+
+    Feeds ``OrchestrationPolicy.max_daily_touches``, which is a volume guardrail
+    — so its day is the one :mod:`app.services.send_day` defines (the sender's
+    local midnight) rather than the UTC one.
+
+    This compared UTC *dates*, which put the reset at 00:00 UTC. That instant is
+    17:00 in Los Angeles, an hour before that contact's send window closes with
+    the shipped 08:00–18:00 defaults, so the per-contact cap refilled while the
+    cadence was still running and a prospect could take up to twice the policy's
+    touches inside one of their own business days. Identical to the failure the
+    org daily cap and the warm-up ramp had, on the same clock.
+
+    Split out of ``_gather_context`` because that method needs a live session for
+    three unrelated queries, and a guardrail whose only test has to mock a
+    database is a guardrail with no test.
+    """
+    day_start = send_day.day_start(now)
+    return sum(
+        1
+        for e in sends
+        if e.occurred_at is not None and _aware(e.occurred_at) >= day_start
+    )
 
 
 @dataclass
@@ -206,13 +233,7 @@ class Orchestrator:
             channels_used.append(ch)
 
         last_touch_at = _aware(sends[-1].occurred_at) if sends else None
-        touches_today = 0
-        if sends:
-            today = now.date()
-            touches_today = sum(
-                1 for e in sends
-                if e.occurred_at and _aware(e.occurred_at).date() == today
-            )
+        touches_today = count_touches_today(sends, now)
 
         email_sends = channels_used.count("email")
         return {

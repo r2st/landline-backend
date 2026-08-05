@@ -45,6 +45,24 @@ REPLY_STOPPABLE_STATUSES = ("active", "pending_review", "completed", "paused")
 # ``<CAEfid_abc@mail.gmail.com>``.
 _MSGID_RE = re.compile(r"<([^>]+)>")
 
+# How many ids one reply may contribute to the lookup.
+#
+# ``References`` is written by the *sender* of the inbound message — it is
+# attacker-controlled input arriving from the open internet, and nothing between
+# the mail server and here bounds it. Every token becomes two bind parameters in
+# an ``IN`` clause (the full id and its local part, against two columns), and
+# psycopg refuses a statement with more than 65535 of them: a single crafted
+# reply with a few thousand ids would raise inside the sweep and take down
+# ingestion for the *whole batch* it arrived in, which is the failure mode a
+# mailbox cannot recover from on its own — no replies at all reads exactly like
+# no replies.
+#
+# The cap costs nothing real. A genuine ``References`` chain is the thread's
+# history, RFC 5322 encourages trimming it, and we match against ids *we* wrote:
+# the one that threads a reply to our send is the most recent, and the newest
+# entries are at the end.
+_MAX_MSGID_TOKENS = 64
+
 
 def _message_id_tokens(*header_values: Optional[str]) -> list[str]:
     """Extract candidate id strings from one or more reply headers.
@@ -52,26 +70,45 @@ def _message_id_tokens(*header_values: Optional[str]) -> list[str]:
     For each ``<...>`` token we keep both the full inner string and its local
     part (before ``@``), because the send path stores the bare Gmail id while the
     RFC message-id it threads under is ``<{gmail_id}@mail.gmail.com>``.
+
+    Bounded at :data:`_MAX_MSGID_TOKENS`. **What is dropped matters**: callers
+    pass ``In-Reply-To`` first and it is the *direct parent* — the single id most
+    likely to be one of ours — so a plain tail-slice of the combined list would
+    discard exactly the token worth keeping. Each header is trimmed on its own,
+    earlier arguments keep their tokens whole, and only the surplus header is
+    cut, from its **head**: a ``References`` chain runs oldest to newest, so its
+    newest entries are the ones adjacent to our send.
     """
-    tokens: list[str] = []
+    per_header: list[list[str]] = []
+    seen: set = set()
     for value in header_values:
-        if not value:
-            continue
-        for match in _MSGID_RE.findall(value):
+        found: list[str] = []
+        for match in _MSGID_RE.findall(value or ""):
             inner = match.strip()
             if not inner:
                 continue
-            tokens.append(inner)
-            local = inner.split("@", 1)[0]
-            if local and local != inner:
-                tokens.append(local)
-    # De-dup, preserve order.
-    seen: set = set()
+            for token in (inner, inner.split("@", 1)[0]):
+                if token and token not in seen:
+                    seen.add(token)
+                    found.append(token)
+        per_header.append(found)
+
+    total = sum(len(f) for f in per_header)
+    if total <= _MAX_MSGID_TOKENS:
+        return [t for header in per_header for t in header]
+
+    logger.info(
+        "Reply carried %d threading ids; matching against at most %d",
+        total, _MAX_MSGID_TOKENS,
+    )
     out: list[str] = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+    remaining = _MAX_MSGID_TOKENS
+    for header in per_header:
+        if remaining <= 0:
+            break
+        keep = min(len(header), remaining)
+        out.extend(header[-keep:])
+        remaining -= keep
     return out
 
 

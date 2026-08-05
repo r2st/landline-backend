@@ -211,20 +211,34 @@ async def test_redis_error_mid_call_falls_back(monkeypatch):
     assert "degraded" in reason
 
 
-def test_daily_key_rolls_over_at_utc_midnight():
-    """Each UTC day gets its own counter, so yesterday's volume never leaks in."""
+def test_daily_key_rolls_over_at_the_sending_day_boundary():
+    """Each *sending* day gets its own counter, so yesterday's volume never leaks in.
+
+    The boundary is the sender's local midnight, not 00:00 UTC — see
+    :mod:`app.services.send_day` for why a UTC boundary lands *inside* the
+    sending day and hands a mailbox a second full allowance. With the shipped
+    ``America/Toronto`` default that is 04:00/05:00 UTC depending on DST, so
+    these two instants either side of 00:00 UTC are the *same* sending day.
+    """
     a = sl._daily_key(datetime(2026, 7, 25, 23, 59, tzinfo=timezone.utc))
     b = sl._daily_key(datetime(2026, 7, 26, 0, 1, tzinfo=timezone.utc))
-    assert a != b
-    assert "2026-07-25" in a and "2026-07-26" in b
+    assert a == b, "00:00 UTC is 20:00 in Toronto — mid-evening, not a new day"
+
+    # 03:59 UTC is 23:59 EDT; 04:01 UTC is 00:01 EDT the next day.
+    before = sl._daily_key(datetime(2026, 7, 26, 3, 59, tzinfo=timezone.utc))
+    after = sl._daily_key(datetime(2026, 7, 26, 4, 1, tzinfo=timezone.utc))
+    assert before != after
+    assert "2026-07-25" in before and "2026-07-26" in after
 
 
 def test_key_ttl_outlives_the_day_it_counts():
     """The TTL must not expire the counter before the day it is counting ends."""
-    late = datetime(2026, 7, 25, 23, 30, tzinfo=timezone.utc)
-    early = datetime(2026, 7, 25, 0, 30, tzinfo=timezone.utc)
-    assert sl._seconds_until_utc_midnight(late) >= 30 * 60
-    assert sl._seconds_until_utc_midnight(early) > 23 * 3600
+    # 03:30 UTC on the 26th is 23:30 the previous evening in Toronto — half an
+    # hour from the rollover — and 04:30 UTC is 00:30, a fresh sending day.
+    late = datetime(2026, 7, 26, 3, 30, tzinfo=timezone.utc)
+    early = datetime(2026, 7, 26, 4, 30, tzinfo=timezone.utc)
+    assert sl._seconds_until_day_rollover(late) >= 30 * 60
+    assert sl._seconds_until_day_rollover(early) > 23 * 3600
 
 
 # --- The arithmetic behind the verdict ---------------------------------------

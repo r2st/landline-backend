@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
     inspect as sa_inspect,
 )
 from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP, JSONB
@@ -30,6 +31,18 @@ class Contact(Base, OrgScopedMixin):
         # for why an index the database has and the model doesn't is dangerous
         # rather than merely untidy.
         Index("ix_contacts_company", "company_id"),
+        # ``email`` is indexed raw by 001 and **nothing matches it raw**. The
+        # column has no unique constraint and is not normalised on write, so one
+        # human holds several rows with different casing; every lookup that is
+        # about a recipient rather than a row compares ``lower(email)``, which a
+        # b-tree on ``email`` cannot serve. Sixteen call sites — the compliance
+        # gate on every send, the limiter's cap and gap checks, reply/bounce/
+        # complaint attribution on their beats, and GDPR erasure — sequentially
+        # scanned the fastest-growing table in the schema. Migration 119.
+        # ``text()`` rather than ``func.lower(email)``: inside ``__table_args__``
+        # the column object does not exist yet, and passing the *string*
+        # ``"email"`` would index the SQL literal instead of the column.
+        Index("ix_contacts_email_lower", text("lower(email)")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

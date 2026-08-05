@@ -3,6 +3,20 @@
 Aggregates every touchpoint with a contact — outbound emails, inbound replies,
 calls, and logged interactions — into a single timeline that records *who*
 (which user) communicated *what*, *when*, and *via which email account*.
+
+**Outbound email lives in two tables**, per the "Sent mail lives in two tables"
+rule: manual/template/reply sends write ``EmailSend``, and the sequence engine
+writes ``OutreachEvent(event_type='sent')`` and no ``EmailSend`` row at all —
+which is where the bulk of outreach volume goes. This read was built on
+``EmailSend`` alone, so a "unified" history of a prospect worked by a cadence
+showed their replies with nothing they were replying *to*: the timeline of a
+contact five steps into a sequence opened with the prospect speaking first.
+That is the same half-migrated read the inbox and the dashboard tiles each had.
+
+The union is read-side only. ``EmailHistoryService._fetch_sequence_sends`` is
+reused rather than re-queried here, so there is one place that knows how a
+sequence send is stored — the send accounting keeps its single source of truth
+and only the *view* is made whole.
 """
 
 import uuid
@@ -108,6 +122,40 @@ async def get_contact_communications(
             "user_id": uid,
             "email_account_id": s.sender_account_id,
             "email_account": (acct.email if acct else s.from_email),
+            "contact_id": contact_id,
+            "company_id": contact.company_id,
+        })
+
+    # --- Outbound sequence sends (OutreachEvent) -----------------------------
+    # The other send table. Everything the timeline needs is in the event's
+    # metadata, which the dispatcher merges its result into — the subject and
+    # the mailbox it actually went out on, which sender rotation can move
+    # between steps, so the enrollment's column is only a fallback.
+    from app.services.email_history import EmailHistoryService
+
+    history = EmailHistoryService()
+    for event, enrollment in await history._fetch_sequence_sends(
+        db, contact_ids=[contact_id]
+    ):
+        meta = event.event_metadata or {}
+        account_id, from_email = history._sequence_send_identity(event, enrollment)
+        acct = gmail_map.get(account_id) if account_id else None
+        # No ``user_id`` of its own: a cadence step is sent by the system, so
+        # the owner of the mailbox it left from is the only person to attribute
+        # it to — the same fallback the ``EmailSend`` branch uses.
+        uid = acct.user_id if acct else None
+        involved_users.add(uid)
+        entries.append({
+            "id": str(event.id),
+            "type": "email_sent",
+            "direction": "outbound",
+            "timestamp": event.occurred_at,
+            "subject": meta.get("subject"),
+            "summary": None,
+            "status": "sent",
+            "user_id": uid,
+            "email_account_id": account_id,
+            "email_account": (acct.email if acct else from_email),
             "contact_id": contact_id,
             "company_id": contact.company_id,
         })

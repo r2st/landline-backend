@@ -8,7 +8,7 @@ from sqlalchemy import func, select, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.services import cache
+from app.services import cache, send_day
 from app.models.company import Company
 from app.models.contact import Contact
 from app.models.deal import Deal
@@ -182,8 +182,9 @@ async def _build_overview(db: AsyncSession) -> DashboardOverview:
     deals_won_this_month = won_row[0] or 0
     deals_won_value_this_month = float(won_row[1] or 0)
 
-    # Emails sent today
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Emails sent today — the *sending* day, which is what the cap counts.
+    # See the note on ``_build_kpis``.
+    today_start = send_day.day_start(now)
     emails_sent_today = await _count_emails_sent(db, since=today_start)
 
     # Emails opened (total from OutreachEvent)
@@ -278,8 +279,19 @@ async def get_kpis(db: AsyncSession = Depends(get_db)):
 
 
 async def _build_kpis(db: AsyncSession) -> DashboardKPIs:
+    """Quick KPI tiles.
+
+    ``today_start`` is the **sending** day's start (``app.services.send_day``),
+    not 00:00 UTC. These tiles sit beside the daily-cap readout, which counts
+    against that boundary, and two "today"s on one screen is a bug report:
+    with the shipped ``America/Toronto`` default, UTC midnight is 20:00 local,
+    so between 20:00 and midnight the tile reset to zero while the cap still
+    reported the day's allowance spent — and the last hour of a US-Pacific
+    contact's window lands the other side of it, so sends the cap books against
+    yesterday would appear here as today's.
+    """
     now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = send_day.day_start(now)
     week_ago = now - timedelta(days=7)
     first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 

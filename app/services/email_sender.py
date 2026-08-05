@@ -65,6 +65,95 @@ class EmailSender:
             f"{settings.company_postal_address}"
         )
 
+    def _send_raw(
+        self,
+        *,
+        to_email: str,
+        subject: str,
+        body_html: str,
+        body_text: Optional[str],
+        reply_to: Optional[str],
+        list_unsubscribe_url: str,
+    ) -> dict:
+        """``send_raw_email`` with a MIME document, so headers can be set.
+
+        Same body shape the structured call produces — ``multipart/alternative``
+        with the plain-text part first, per RFC 2046 (clients pick the *last*
+        part they can render, so text must precede HTML or a text-only client is
+        the only one that sees the right thing).
+
+        The mailto: half of ``List-Unsubscribe`` falls back to the SES sender
+        identity, which is a real configured address here rather than a
+        connected mailbox.
+        """
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        from app.services.opt_out import unsubscribe_headers
+
+        message = MIMEMultipart("alternative")
+        message["To"] = to_email
+        message["From"] = self.sender
+        message["Subject"] = subject
+        if reply_to:
+            message["Reply-To"] = reply_to
+        for name, value in unsubscribe_headers(
+            list_unsubscribe_url, self.sender
+        ).items():
+            message[name] = value
+        if body_text:
+            message.attach(MIMEText(body_text, "plain", "utf-8"))
+        message.attach(MIMEText(body_html, "html", "utf-8"))
+
+        return self.client.send_raw_email(
+            Source=self.sender,
+            Destinations=[to_email],
+            RawMessage={"Data": message.as_string()},
+        )
+
+    def _send_structured(
+        self,
+        *,
+        to_email: str,
+        subject: str,
+        body_html: str,
+        body_text: Optional[str],
+        reply_to: Optional[str],
+    ) -> dict:
+        """SES's ``send_email`` action — the shape this transport always used.
+
+        No custom headers are possible here (see :meth:`_send_raw`); it is kept
+        as its own method because it is now reached from two places: the ordinary
+        no-URL call, and the fallback when the deployed IAM identity turns out
+        not to be allowed to send raw.
+        """
+        message = {
+            "Subject": {"Data": subject, "Charset": "UTF-8"},
+            "Body": {"Html": {"Data": body_html, "Charset": "UTF-8"}},
+        }
+        if body_text:
+            message["Body"]["Text"] = {"Data": body_text, "Charset": "UTF-8"}
+        return self.client.send_email(
+            Source=self.sender,
+            Destination={"ToAddresses": [to_email]},
+            Message=message,
+            ReplyToAddresses=[reply_to] if reply_to else [],
+        )
+
+    @staticmethod
+    def _is_authorization_error(exc: Exception) -> bool:
+        """Is this SES refusing the *action*, rather than refusing the message?
+
+        Narrow on purpose. A throttle, a rejected address or a verification
+        failure will fail identically on either action, so retrying them on the
+        structured call is a second wasted round trip and a second log line
+        saying the same thing. An authorization failure is the one error whose
+        cause is *which API call we made*.
+        """
+        error_response = getattr(exc, "response", None) or {}
+        code = (error_response.get("Error") or {}).get("Code") or ""
+        return code in {"AccessDenied", "AccessDeniedException", "AuthorizationError"}
+
     def send_email(
         self,
         to_email: str,
@@ -73,10 +162,24 @@ class EmailSender:
         body_text: Optional[str] = None,
         reply_to: Optional[str] = None,
         include_unsubscribe: bool = True,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> dict:
         """Send an email via SES.
 
         Returns dict with 'message_id' on success or 'error' on failure.
+
+        ``list_unsubscribe_url`` adds the RFC 2369 / RFC 8058 header pair, which
+        this transport could not carry at all: SES's ``send_email`` action takes
+        a *structured* message (subject + body parts) and has nowhere to put a
+        custom header, so the only way to set one is ``send_raw_email`` with a
+        MIME document we build ourselves. That is why this path went without.
+
+        Gmail and SMTP both set the headers, so the gap was invisible from every
+        angle except the transport that fired **when neither of them was
+        available** — the fallback that carries the volume on exactly the day an
+        operator's mailboxes are down. Mail that reaches a bulk filter with no
+        one-click affordance is rated as a bulk sender who doesn't offer one,
+        and this fallback shares the sending domain's reputation with the rest.
         """
         if not settings.aws_access_key_id or not settings.aws_secret_access_key:
             logger.warning("AWS SES credentials not configured — email not sent")
@@ -88,23 +191,51 @@ class EmailSender:
                 body_text += footer
             body_html += footer.replace("\n", "<br>")
 
-        destination = {"ToAddresses": [to_email]}
-        message = {
-            "Subject": {"Data": subject, "Charset": "UTF-8"},
-            "Body": {
-                "Html": {"Data": body_html, "Charset": "UTF-8"},
-            },
-        }
-        if body_text:
-            message["Body"]["Text"] = {"Data": body_text, "Charset": "UTF-8"}
-
         try:
-            response = self.client.send_email(
-                Source=self.sender,
-                Destination=destination,
-                Message=message,
-                ReplyToAddresses=[reply_to] if reply_to else [],
-            )
+            if list_unsubscribe_url:
+                try:
+                    response = self._send_raw(
+                        to_email=to_email,
+                        subject=subject,
+                        body_html=body_html,
+                        body_text=body_text,
+                        reply_to=reply_to,
+                        list_unsubscribe_url=list_unsubscribe_url,
+                    )
+                except Exception as raw_exc:
+                    if not self._is_authorization_error(raw_exc):
+                        raise
+                    # ``ses:SendRawEmail`` is a **separate IAM action** from
+                    # ``ses:SendEmail``, and an identity provisioned before this
+                    # transport learned to set headers holds only the latter.
+                    # Setting the header pair is worth a great deal; it is not
+                    # worth turning every fallback send into a hard failure on
+                    # the day the operator's own mailboxes are down, which is
+                    # the only day this transport runs. Send it without the
+                    # headers and say exactly what to grant — the alternative is
+                    # a silent full stop that reads as "SES is broken".
+                    logger.error(
+                        "SES rejected send_raw_email for lack of permission; "
+                        "falling back to send_email WITHOUT the RFC 8058 "
+                        "one-click unsubscribe headers. Grant ses:SendRawEmail "
+                        "to the sending identity to restore them. (%s)",
+                        raw_exc,
+                    )
+                    response = self._send_structured(
+                        to_email=to_email,
+                        subject=subject,
+                        body_html=body_html,
+                        body_text=body_text,
+                        reply_to=reply_to,
+                    )
+            else:
+                response = self._send_structured(
+                    to_email=to_email,
+                    subject=subject,
+                    body_html=body_html,
+                    body_text=body_text,
+                    reply_to=reply_to,
+                )
             message_id = response["MessageId"]
             logger.info("Email sent to %s — MessageId: %s", to_email, message_id)
             return {"status": "sent", "message_id": message_id}

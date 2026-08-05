@@ -166,6 +166,61 @@ async def is_mailable(db: AsyncSession, contact) -> bool:
     return await blocking_reason(db, contact) is None
 
 
+async def address_blocking_reason(db: AsyncSession, email: Optional[str]) -> Optional[str]:
+    """The do-not-contact test for a bare **address**, or ``None`` if clear.
+
+    :func:`blocking_reason` is the version for a caller holding a ``Contact``.
+    This is the version for a caller holding only the string it is about to put
+    in the ``To:`` header — which is what every *send* path has, since the send
+    gate takes an address and not a row.
+
+    **It asks all three questions, and the send gate asked one.**
+    ``email_dispatch.check_send_allowed`` calls itself "the two compliance
+    floors, in one place" and consulted the kill switch and the LIST. The two
+    contact flags it did not read, while the sequence path
+    (``send_sequence_step``) reads all three and says in its own comment why:
+    *"three writers have set this column alone at various times"*. Rows carrying
+    ``unsubscribed=True`` with no list entry are in the database now — that is
+    the whole reason the sequence path keeps the redundant read — and every path
+    that is not the sequence engine is gated by ``check_send_allowed`` alone.
+
+    So the opt-out that stopped a cadence did not stop the smart-reply
+    auto-send, a meeting proposal, a reminder, an inbox reply or a test send to
+    the same person. Same shape as the gate's own origin story, one level down:
+    the floor was consolidated and one of its clauses was left behind in the
+    caller it was consolidated out of.
+
+    Matching is by **address**, case-insensitively, across every row carrying
+    it, because ``contacts.email`` has no unique constraint and the scraper
+    re-creates rows. One flagged duplicate is enough: the flag is a fact about
+    the person, and which row the send path happened to load is not.
+    """
+    normalized = normalize_email(email)
+    if normalized is None:
+        # Not email-shaped. Nothing to look up, and the transport will refuse it
+        # anyway — this gate is not the place to decide an address is malformed.
+        return None
+
+    from app.models.contact import Contact
+
+    flagged = (
+        await db.execute(
+            select(Contact.unsubscribed, Contact.suppressed)
+            .where(func.lower(Contact.email) == normalized)
+            .where(
+                (Contact.unsubscribed.is_(True)) | (Contact.suppressed.is_(True))
+            )
+            .limit(1)
+        )
+    ).first()
+    if flagged is not None:
+        return UNSUBSCRIBED if flagged.unsubscribed else SUPPRESSED
+
+    if await is_suppressed(db, normalized):
+        return ON_LIST
+    return None
+
+
 # Entries an operator's un-suppress may lift. A ``manual`` entry records
 # somebody's decision and can be reversed by another decision. The rest record
 # something that *happened* to the address — it bounced, its owner reported us

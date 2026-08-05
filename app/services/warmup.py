@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.sender_warmup import SenderWarmupPlan
+from app.services import send_day
 
 logger = logging.getLogger(__name__)
 
@@ -91,17 +92,24 @@ def _transport_for(account) -> str:
 
 
 def used_today(account) -> int:
-    """Today's send count for an account, honouring the UTC daily rollover.
+    """Today's send count for an account, honouring the daily rollover.
 
-    ``daily_send_count`` is only "today's" count when ``daily_count_reset_at`` is
-    today; a stale reset stamp means the stored number is yesterday's and will be
-    zeroed on the next send, so it reads as 0 for warm-up accounting.
+    ``daily_send_count`` is only "today's" count when ``daily_count_reset_at``
+    falls inside the current sending day; a stale reset stamp means the stored
+    number is yesterday's and will be zeroed on the next send, so it reads as 0
+    for warm-up accounting.
+
+    "Today" is the sender's local day (:mod:`app.services.send_day`), matching
+    the boundary ``record_account_send`` rolls the counter on and the one the
+    org daily cap keys itself by. On the UTC boundary this read, a ramp for a
+    mailbox sending into US Pacific hours reset an hour before that contact's
+    window closed — so a day-1 mailbox on a 5/day plan sent five, rolled over,
+    sent five more, and still reported ``5/5``.
     """
     reset_at = getattr(account, "daily_count_reset_at", None)
     if reset_at is not None and reset_at.tzinfo is None:
         reset_at = reset_at.replace(tzinfo=timezone.utc)
-    today = datetime.now(timezone.utc).date()
-    if reset_at is None or reset_at.date() < today:
+    if reset_at is None or reset_at < send_day.day_start():
         return 0
     try:
         return int(account.daily_send_count or 0)

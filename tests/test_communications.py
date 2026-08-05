@@ -161,3 +161,170 @@ async def test_email_compose_attributes_sender(
     ).scalars().first()
     assert row is not None
     assert row.user_id == agent_user.id
+
+
+# --- The other send table -----------------------------------------------------
+#
+# ``get_contact_communications`` read ``EmailSend`` alone. The sequence engine
+# writes ``OutreachEvent(event_type='sent')`` and no ``EmailSend`` row, and that
+# is where the bulk of outreach volume goes — so this "unified" timeline showed
+# a cadenced prospect's replies with nothing they were replying to. Same
+# half-migrated read the inbox and the dashboard tiles each had.
+
+
+async def _sequence_send(
+    db, contact, *, acct, subject: str, days_ago: int, sender_in_metadata=True
+):
+    """One cadence step, recorded the way ``send_sequence_step`` records it."""
+    from app.models.outreach import OutreachEnrollment, OutreachEvent
+    from app.models.sequence import OutreachSequence
+
+    seq = OutreachSequence(id=uuid.uuid4(), name=f"Seq {subject}")
+    db.add(seq)
+    await db.flush()
+    enr = OutreachEnrollment(
+        id=uuid.uuid4(),
+        contact_id=contact.id,
+        sequence_id=seq.id,
+        sender_account_id=None if sender_in_metadata else acct.id,
+    )
+    db.add(enr)
+    await db.flush()
+    meta = {"subject": subject, "to_email": contact.email}
+    if sender_in_metadata:
+        meta["sender_account_id"] = str(acct.id)
+        meta["from_email"] = acct.email
+    db.add(OutreachEvent(
+        id=uuid.uuid4(),
+        enrollment_id=enr.id,
+        step_number=1,
+        event_type="sent",
+        occurred_at=datetime.now(timezone.utc) - timedelta(days=days_ago),
+        event_metadata=meta,
+    ))
+    await db.commit()
+    return enr
+
+
+@pytest.mark.asyncio
+async def test_communications_includes_sequence_sends(
+    client: AsyncClient, db_session, sample_company, sample_contact, agent_user
+):
+    """A cadence step appears in the timeline, attributed and subject-carrying.
+
+    Mutation control: reading ``EmailSend`` alone returns 4 entries and no
+    "Step 1 — quick question" anywhere.
+    """
+    acct = await _gmail_account(db_session, "sales@company.com", agent_user.id)
+    await _seed_history(db_session, sample_contact, sample_company, agent_user, acct)
+    await _sequence_send(
+        db_session, sample_contact, acct=acct,
+        subject="Step 1 — quick question", days_ago=4,
+    )
+
+    data = (await client.get(f"{CONTACTS}/{sample_contact.id}/communications")).json()
+    assert data["total"] == 5
+
+    step = next(
+        e for e in data["communications"]
+        if e["subject"] == "Step 1 — quick question"
+    )
+    assert step["type"] == "email_sent"
+    assert step["direction"] == "outbound"
+    assert step["status"] == "sent"
+    assert step["email_account"] == "sales@company.com"
+    # No user of its own — a cadence step is sent by the system, so it is
+    # attributed to whoever owns the mailbox it left from.
+    assert step["user_id"] == str(agent_user.id)
+    assert step["user_name"] == agent_user.name
+
+
+@pytest.mark.asyncio
+async def test_sequence_send_sorts_into_the_timeline_by_its_own_timestamp(
+    client: AsyncClient, db_session, sample_company, sample_contact, agent_user
+):
+    """The step predates the manual send, so it must sort below it — not append.
+
+    A union that simply concatenated would still return the right *count* while
+    putting the outbound step after the reply it prompted.
+    """
+    acct = await _gmail_account(db_session, "sales@company.com", agent_user.id)
+    await _seed_history(db_session, sample_contact, sample_company, agent_user, acct)
+    await _sequence_send(
+        db_session, sample_contact, acct=acct, subject="Oldest touch", days_ago=10
+    )
+
+    data = (await client.get(f"{CONTACTS}/{sample_contact.id}/communications")).json()
+    assert data["communications"][-1]["subject"] == "Oldest touch"
+
+
+@pytest.mark.asyncio
+async def test_sequence_send_falls_back_to_the_enrollment_mailbox(
+    client: AsyncClient, db_session, sample_company, sample_contact, agent_user
+):
+    """Events recorded before the dispatcher merged its result carry no sender.
+
+    Those rows are in the database now, and dropping their attribution would
+    show a send from nobody rather than from the mailbox it went out on.
+    """
+    acct = await _gmail_account(db_session, "sales@company.com", agent_user.id)
+    await _sequence_send(
+        db_session, sample_contact, acct=acct, subject="Legacy step",
+        days_ago=2, sender_in_metadata=False,
+    )
+
+    data = (await client.get(f"{CONTACTS}/{sample_contact.id}/communications")).json()
+    step = next(e for e in data["communications"] if e["subject"] == "Legacy step")
+    assert step["email_account"] == "sales@company.com"
+    assert step["user_id"] == str(agent_user.id)
+
+
+@pytest.mark.asyncio
+async def test_sequence_sends_for_another_contact_do_not_leak_in(
+    client: AsyncClient, db_session, sample_company, sample_contact, agent_user
+):
+    """The union is joined through the enrollment, so it must filter on it."""
+    from app.models.contact import Contact
+
+    acct = await _gmail_account(db_session, "sales@company.com", agent_user.id)
+    other = Contact(
+        id=uuid.uuid4(), company_id=sample_company.id,
+        first_name="Someone", last_name="Else", email="else@example.com",
+    )
+    db_session.add(other)
+    await db_session.flush()
+    await _sequence_send(
+        db_session, other, acct=acct, subject="Not yours", days_ago=1
+    )
+    await _sequence_send(
+        db_session, sample_contact, acct=acct, subject="Yours", days_ago=1
+    )
+
+    data = (await client.get(f"{CONTACTS}/{sample_contact.id}/communications")).json()
+    subjects = {e["subject"] for e in data["communications"]}
+    assert "Yours" in subjects
+    assert "Not yours" not in subjects
+
+
+@pytest.mark.asyncio
+async def test_mine_only_still_sees_a_sequence_step_from_your_mailbox(
+    client: AsyncClient, db_session, sample_company, sample_contact,
+    agent_user, admin_user, auth_headers,
+):
+    """``mine_only`` filters on the attributed user, which the union supplies."""
+    acct = await _gmail_account(db_session, "sales@company.com", agent_user.id)
+    await _sequence_send(
+        db_session, sample_contact, acct=acct, subject="Mine", days_ago=1
+    )
+
+    mine = await client.get(
+        f"{CONTACTS}/{sample_contact.id}/communications?mine_only=true",
+        headers=auth_headers(agent_user),
+    )
+    assert mine.json()["total"] == 1
+
+    theirs = await client.get(
+        f"{CONTACTS}/{sample_contact.id}/communications?mine_only=true",
+        headers=auth_headers(admin_user),
+    )
+    assert theirs.json()["total"] == 0
