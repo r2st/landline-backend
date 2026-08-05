@@ -191,3 +191,105 @@ async def test_funnel_endpoint_is_wired(client):
     resp2 = await client.get("/api/v1/dialtone/analytics/funnel?days=7")
     assert resp2.status_code == 200
     assert resp2.json()["window_days"] == 7
+
+
+# --- The step that was refused on the wire ------------------------------------
+#
+# ``AttemptTally``'s own docstring names this module: it divided by ``sent``
+# alone, "which is right for the async shape and leaves a run where *every*
+# attempt failed synchronously with a denominator of zero — a bounce rate of
+# 0.0, read as healthy."
+
+
+async def _attempts(db, seq, *, sent, bounced=0, opened=0, refused=0):
+    """``sent`` accepted attempts (``bounced`` of which later DSN'd), plus
+    ``refused`` attempts the transport rejected outright — a ``bounced`` event
+    with no ``sent`` partner, which is the shape that has no denominator."""
+    events = []
+    for i in range(sent):
+        enr = await _enrollment(db, await _contact(db), seq)
+        events.append(_ev(enr, 1, "sent"))
+        if i < bounced:
+            events.append(_ev(enr, 1, "bounced"))
+        if i < opened:
+            events.append(_ev(enr, 1, "opened"))
+    for _ in range(refused):
+        enr = await _enrollment(db, await _contact(db), seq)
+        events.append(_ev(enr, 1, "bounced"))
+    db.add_all(events)
+    await db.flush()
+
+
+async def test_a_step_that_bounced_every_send_is_not_reported_clean(db_session):
+    """Divided by ``count(sent)`` the step has no denominator at all, so its
+    bounce rate comes back 0.0 and its delivered rate with it — the step that
+    failed completely reads exactly like a step that did nothing wrong."""
+    seq = await _seq(db_session, "AllDead")
+    await _attempts(db_session, seq, sent=0, refused=10)
+
+    result = await compute_funnel(db_session)
+    step = result["sequences"][0]["steps"][0]
+
+    assert step["attempts"] == 10
+    assert step["sent"] == 0, "nothing was accepted — that is the finding"
+    assert step["bounced"] == 10
+    assert step["bounce_rate"] == 100.0
+    assert step["delivered"] == 0
+    assert step["delivered_rate"] == 0.0
+
+
+async def test_a_retried_dsn_is_one_bounce_on_the_funnel(db_session):
+    """The numerator half: a mailer-daemon retrying must not move the rate."""
+    seq = await _seq(db_session, "Retried")
+    await _attempts(db_session, seq, sent=9)
+    enr = await _enrollment(db_session, await _contact(db_session), seq)
+    db_session.add_all(
+        [_ev(enr, 1, "sent")] + [_ev(enr, 1, "bounced") for _ in range(5)]
+    )
+    await db_session.flush()
+
+    result = await compute_funnel(db_session)
+    step = result["sequences"][0]["steps"][0]
+
+    assert step["attempts"] == 10
+    assert step["bounced"] == 1, "five deliveries of one DSN are one bounce"
+    assert step["bounce_rate"] == 10.0
+    assert step["delivered"] == 9
+
+
+async def test_an_async_bounce_is_not_a_second_attempt_on_the_funnel(db_session):
+    """The boundary. The ordinary bounce is accepted-then-DSN: one attempt.
+
+    Counting the pair as two would understate every bounce rate, which is the
+    mirror of the bug being fixed."""
+    seq = await _seq(db_session, "Async")
+    await _attempts(db_session, seq, sent=10, bounced=2)
+
+    result = await compute_funnel(db_session)
+    step = result["sequences"][0]["steps"][0]
+
+    assert step["attempts"] == 10, "10 attempts, not 12"
+    assert step["sent"] == 10
+    assert step["bounced"] == 2
+    assert step["bounce_rate"] == 20.0
+    assert step["delivered"] == 8
+
+
+async def test_engagement_rates_still_divide_by_accepted_mail(db_session):
+    """The deliberate asymmetry, so it is not "made consistent" later.
+
+    A message the transport refused was never in an inbox, so folding it into
+    the open-rate denominator would report an open rate for mail that does not
+    exist. ``sent`` keeps meaning "accepted"."""
+    seq = await _seq(db_session, "Engagement")
+    await _attempts(db_session, seq, sent=4, opened=2, refused=4)
+
+    result = await compute_funnel(db_session)
+    step = result["sequences"][0]["steps"][0]
+
+    assert step["attempts"] == 8
+    assert step["sent"] == 4
+    assert step["bounce_rate"] == 50.0, "half of what was attempted bounced"
+    assert step["open_rate"] == 50.0, (
+        "…and half of what was *delivered* was opened"
+    )

@@ -173,20 +173,20 @@ async def count_attempts(
     return sent_rows + orphan_bounces, bounces
 
 
-async def count_attempts_by_sequence(
-    db: AsyncSession, *, where=None
+async def count_attempts_grouped(
+    db: AsyncSession, *, group_by, where=None, join_contact: bool = False
 ) -> dict:
-    """``{sequence_id: (attempts, bounces)}`` — :func:`count_attempts`, grouped.
+    """``{key: (attempts, bounces)}`` — :func:`count_attempts`, per group.
 
     Same arithmetic and the same reasoning as :class:`AttemptTally`; what
-    changes is that every campaign gets its own tally in one pass instead of one
-    query per campaign.
+    changes is that every group gets its own tally in one pass rather than one
+    query per group. ``group_by`` is a list of selectable columns; the key is a
+    tuple when there is more than one, and the bare value when there is one.
 
-    It exists because the per-campaign surfaces were the ones still dividing raw
-    ``count(sent)`` into raw ``count(bounced)`` after the danger rail,
-    ``lead_metrics`` and ``funnel_analytics`` were all corrected. Both halves of
-    that are wrong and they fail in opposite directions, so neither cancels the
-    other:
+    It exists because the *per-something* surfaces — per campaign, per campaign
+    step, per receiving domain — were the ones still dividing raw
+    ``count(sent)`` into raw ``count(bounced)``. Both halves of that are wrong
+    and they fail in opposite directions, so neither cancels the other:
 
     * the numerator counts *rows*, so a mailer-daemon that retries books a
       second bounce against one send;
@@ -195,63 +195,73 @@ async def count_attempts_by_sequence(
       never reached anyone is missing from the denominator entirely.
 
     The second is the one that matters, because at the limit it inverts. A
-    campaign whose every send failed synchronously has no ``sent`` rows at all,
-    so its bounce rate divides by zero, comes back ``0.0``, and reads as the
-    healthiest campaign on the board — while the campaign that is actually
-    burning the domain is the one the sample-size gate then drops for having
-    sent nothing.
+    campaign or domain whose every send failed synchronously has no ``sent``
+    rows at all, so its bounce rate divides by zero, comes back ``0.0``, and
+    reads as the healthiest thing on the board — while the sample-size gate
+    beside it then drops the row for having sent nothing.
 
-    Grouped by the *sequence* behind each enrollment, which is what a campaign
-    is here. The join is unconditional for that reason; ``where`` may reference
-    ``OutreachEnrollment`` as a result.
+    ``OutreachEnrollment`` is always joined, so ``group_by`` and ``where`` may
+    reference it. ``join_contact`` adds the contact behind the enrollment, for
+    callers grouping by the address that was mailed.
     """
     from sqlalchemy import func as _func
 
     def _events():
-        q = (
-            select(
-                OutreachEnrollment.sequence_id,
-                OutreachEvent.enrollment_id,
-                OutreachEvent.step_number,
-            )
-            .join(
-                OutreachEnrollment,
-                OutreachEvent.enrollment_id == OutreachEnrollment.id,
-            )
+        q = select(
+            *group_by, OutreachEvent.enrollment_id, OutreachEvent.step_number
+        ).join(
+            OutreachEnrollment, OutreachEvent.enrollment_id == OutreachEnrollment.id
         )
+        if join_contact:
+            from app.models.contact import Contact
+
+            q = q.join(Contact, OutreachEnrollment.contact_id == Contact.id)
         if where is not None:
             q = q.where(where)
         return q
 
+    width = len(group_by)
+
+    def _key(row):
+        return tuple(row[:width]) if width > 1 else row[0]
+
     tallies: dict = {}
 
-    sent_q = _events().where(OutreachEvent.event_type == "sent").subquery()
-    for sequence_id, n in (
-        await db.execute(
-            select(sent_q.c.sequence_id, _func.count()).group_by(sent_q.c.sequence_id)
-        )
-    ).all():
-        tallies[sequence_id] = [int(n), 0]
+    def _fold(rows, index, *, add=False):
+        for row in rows:
+            key, n = _key(row), int(row[-1])
+            slot = tallies.setdefault(key, [0, 0])
+            slot[index] = slot[index] + n if add else n
 
-    # Distinct ``(enrollment, step)``, so a redelivered DSN is free rather than a
-    # second bounce — the whole point of the dedup.
+    sent_q = _events().where(OutreachEvent.event_type == "sent").subquery()
+    sent_cols = list(sent_q.c)[:width]
+    _fold(
+        (await db.execute(
+            select(*sent_cols, _func.count()).group_by(*sent_cols)
+        )).all(),
+        0,
+    )
+
+    # Distinct ``(enrollment, step)``, so a redelivered DSN is free rather than
+    # a second bounce — the whole point of the dedup.
     bounce_q = (
         _events().where(OutreachEvent.event_type == "bounced").distinct().subquery()
     )
-    for sequence_id, n in (
-        await db.execute(
-            select(bounce_q.c.sequence_id, _func.count()).group_by(bounce_q.c.sequence_id)
-        )
-    ).all():
-        tallies.setdefault(sequence_id, [0, 0])[1] = int(n)
+    bounce_cols = list(bounce_q.c)[:width]
+    _fold(
+        (await db.execute(
+            select(*bounce_cols, _func.count()).group_by(*bounce_cols)
+        )).all(),
+        1,
+    )
 
     # A bounced attempt with no ``sent`` partner is a synchronous failure and an
     # attempt in its own right. Anything else is the async DSN sitting on top of
     # a send already counted above.
     sent_keys = _events().where(OutreachEvent.event_type == "sent").subquery()
-    for sequence_id, n in (
-        await db.execute(
-            select(bounce_q.c.sequence_id, _func.count())
+    _fold(
+        (await db.execute(
+            select(*bounce_cols, _func.count())
             .select_from(bounce_q)
             .outerjoin(
                 sent_keys,
@@ -259,25 +269,47 @@ async def count_attempts_by_sequence(
                 & (bounce_q.c.step_number == sent_keys.c.step_number),
             )
             .where(sent_keys.c.enrollment_id.is_(None))
-            .group_by(bounce_q.c.sequence_id)
-        )
-    ).all():
-        tallies.setdefault(sequence_id, [0, 0])[0] += int(n)
+            .group_by(*bounce_cols)
+        )).all(),
+        0,
+        add=True,
+    )
 
     return {k: (v[0], v[1]) for k, v in tallies.items()}
 
 
-async def count_attempts_by_contact_email(
-    db: AsyncSession, *, where=None
-) -> dict:
-    """``{email: (attempts, bounces)}`` — :func:`count_attempts`, grouped by recipient.
+async def count_attempts_by_sequence(db: AsyncSession, *, where=None) -> dict:
+    """``{sequence_id: (attempts, bounces)}`` — a campaign's tally.
 
-    The third grouping of the same arithmetic (see
-    :func:`count_attempts_by_sequence` for why raw counts are wrong in both
-    directions at once). This one keys on the address we mailed, for the
-    receiving-domain report, which folds addresses into domains in Python
-    because extracting a domain in SQL needs a dialect branch this codebase does
-    not carry.
+    A campaign is a sequence here, and enrollments are not shared between them,
+    so a portfolio total is the sum of these.
+    """
+    return await count_attempts_grouped(
+        db, group_by=[OutreachEnrollment.sequence_id], where=where
+    )
+
+
+async def count_attempts_by_sequence_step(db: AsyncSession, *, where=None) -> dict:
+    """``{(sequence_id, step_number): (attempts, bounces)}`` — one step's tally.
+
+    The funnel buckets per step, and a step is where the off-by-one in bounce
+    attribution shows up (see ``last_sent_step``): a bounce filed against the
+    wrong step leaves one bucket reporting no bounces and the next dividing
+    bounces by a ``sent`` of zero.
+    """
+    return await count_attempts_grouped(
+        db,
+        group_by=[OutreachEnrollment.sequence_id, OutreachEvent.step_number],
+        where=where,
+    )
+
+
+async def count_attempts_by_contact_email(db: AsyncSession, *, where=None) -> dict:
+    """``{email: (attempts, bounces)}`` — keyed by the address we mailed.
+
+    For the receiving-domain report, which folds addresses into domains in
+    Python because extracting a domain in SQL needs a dialect branch this
+    codebase does not carry.
 
     ``Contact.email`` is not normalised on write, so addresses are compared
     lower-cased here for the same reason ten other call sites do it: the same
@@ -288,61 +320,12 @@ async def count_attempts_by_contact_email(
 
     from app.models.contact import Contact
 
-    email = _func.lower(Contact.email)
-
-    def _events():
-        q = (
-            select(
-                email.label("email"),
-                OutreachEvent.enrollment_id,
-                OutreachEvent.step_number,
-            )
-            .join(
-                OutreachEnrollment,
-                OutreachEvent.enrollment_id == OutreachEnrollment.id,
-            )
-            .join(Contact, OutreachEnrollment.contact_id == Contact.id)
-            .where(Contact.email.isnot(None))
-        )
-        if where is not None:
-            q = q.where(where)
-        return q
-
-    tallies: dict = {}
-
-    sent_q = _events().where(OutreachEvent.event_type == "sent").subquery()
-    for addr, n in (
-        await db.execute(select(sent_q.c.email, _func.count()).group_by(sent_q.c.email))
-    ).all():
-        tallies[addr] = [int(n), 0]
-
-    bounce_q = (
-        _events().where(OutreachEvent.event_type == "bounced").distinct().subquery()
+    return await count_attempts_grouped(
+        db,
+        group_by=[_func.lower(Contact.email).label("email")],
+        where=where,
+        join_contact=True,
     )
-    for addr, n in (
-        await db.execute(
-            select(bounce_q.c.email, _func.count()).group_by(bounce_q.c.email)
-        )
-    ).all():
-        tallies.setdefault(addr, [0, 0])[1] = int(n)
-
-    sent_keys = _events().where(OutreachEvent.event_type == "sent").subquery()
-    for addr, n in (
-        await db.execute(
-            select(bounce_q.c.email, _func.count())
-            .select_from(bounce_q)
-            .outerjoin(
-                sent_keys,
-                (bounce_q.c.enrollment_id == sent_keys.c.enrollment_id)
-                & (bounce_q.c.step_number == sent_keys.c.step_number),
-            )
-            .where(sent_keys.c.enrollment_id.is_(None))
-            .group_by(bounce_q.c.email)
-        )
-    ).all():
-        tallies.setdefault(addr, [0, 0])[0] += int(n)
-
-    return {k: (v[0], v[1]) for k, v in tallies.items()}
 
 
 async def last_sent_step(db: AsyncSession, enrollment: OutreachEnrollment) -> int:

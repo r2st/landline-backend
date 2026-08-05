@@ -28,11 +28,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.sequence import OutreachSequence
+from app.services.outreach_events import count_attempts_by_sequence_step
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,12 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 def _blank_counts() -> dict:
-    return {stage: 0 for stage in _STAGES} | {"bounced": 0, "positive": 0, "ai_composed": 0}
+    # ``attempts`` is steps put on the wire and ``sent`` is messages accepted;
+    # they differ exactly where a send was refused rather than delivered. See
+    # ``outreach_events.AttemptTally``.
+    return {stage: 0 for stage in _STAGES} | {
+        "attempts": 0, "bounced": 0, "positive": 0, "ai_composed": 0,
+    }
 
 
 def _with_rates(counts: dict) -> dict:
@@ -66,12 +72,18 @@ def _with_rates(counts: dict) -> dict:
     sent = counts.get("sent", 0)
     replied = counts.get("replied", 0)
     bounced = counts.get("bounced", 0)
-    delivered = max(0, sent - bounced)
+    # Attempts, not sends: a step that was refused on the wire has no ``sent``
+    # rows, so dividing by those reports a 0.0 bounce rate for the step that
+    # failed completely. ``max`` keeps a legacy row whose bounce was filed
+    # against the wrong step (pre-``last_sent_step``) from producing a
+    # denominator smaller than its own numerator.
+    attempts = max(counts.get("attempts", 0), sent, bounced)
+    delivered = max(0, attempts - bounced)
     return {
         **counts,
         "delivered": delivered,
-        "delivered_rate": _rate(delivered, sent),
-        "bounce_rate": _rate(bounced, sent),
+        "delivered_rate": _rate(delivered, attempts),
+        "bounce_rate": _rate(bounced, attempts),
         "open_rate": _rate(counts.get("opened", 0), sent),
         "reply_rate": _rate(replied, sent),
         "positive_rate": _rate(counts.get("positive", 0), sent),
@@ -126,6 +138,26 @@ async def compute_funnel(
 
     rows = (await db.execute(_base())).all()
 
+    # The bounce arithmetic is not a row count. An attempt is
+    # ``(enrollment, step)``, a redelivered DSN is not a second bounce, and a
+    # **synchronous** failure writes ``bounced`` with no ``sent`` partner — so a
+    # step whose every send was refused on the wire has no ``sent`` rows, and
+    # ``bounce_rate`` divided by those reports 0.0 for the step that failed
+    # completely. ``AttemptTally``'s own docstring names this module as the
+    # surface with that shape. ``attempts`` is the denominator for
+    # ``bounce_rate`` and ``delivered``; ``sent`` keeps meaning "accepted" and
+    # stays the denominator of the engagement rates, since mail the transport
+    # refused was never in an inbox to open.
+    step_where = None
+    clauses = []
+    if sequence_id is not None:
+        clauses.append(OutreachEnrollment.sequence_id == sequence_id)
+    if since is not None:
+        clauses.append(OutreachEvent.occurred_at >= since)
+    if clauses:
+        step_where = and_(*clauses) if len(clauses) > 1 else clauses[0]
+    tallies = await count_attempts_by_sequence_step(db, where=step_where)
+
     # (sequence_id, step_number) → counts dict.
     per_step: dict[tuple, dict] = {}
     for seq_id, step_number, event_type, n in rows:
@@ -133,8 +165,13 @@ async def compute_funnel(
         bucket = per_step.setdefault(key, _blank_counts())
         if event_type in _STAGES:
             bucket[event_type] += int(n)
-        elif event_type == "bounced":
-            bucket["bounced"] += int(n)
+        # ``bounced`` is deliberately not folded from the row counts — it comes
+        # from the tally below, deduplicated per attempt.
+
+    for (seq_id, step_number), (attempts, bounces) in tallies.items():
+        bucket = per_step.setdefault((seq_id, int(step_number)), _blank_counts())
+        bucket["attempts"] = bucket.get("attempts", 0) + attempts
+        bucket["bounced"] = bucket.get("bounced", 0) + bounces
 
     # Positive replies: replied events whose metadata flags interest. Portable
     # across Postgres/SQLite by reading the JSON in Python (the volume here is
