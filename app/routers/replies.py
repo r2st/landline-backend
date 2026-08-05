@@ -33,7 +33,7 @@ from app.schemas.replies import (
     ReclassifyRequest,
 )
 from app.services.ai_service import REPLY_CATEGORIES, get_ai_service
-from app.tasks.replies import route_auto_action
+from app.tasks.replies import resolve_reply_contact, route_auto_action
 
 logger = logging.getLogger(__name__)
 
@@ -310,8 +310,16 @@ async def reclassify_reply(
         "return_date": meta.get("return_date"),
         "referral": meta.get("referral") or {"name": None, "email": None},
     }
+    # ``_load_reply_context`` resolves the contact for *display*, from the
+    # ``contact_id`` the ingest filled by ``From:`` address. That is NULL for
+    # every reply admitted on a thread match from an address we hold no row for —
+    # and this endpoint is the human fix for exactly those replies. Routed on the
+    # display value, an operator marking one "unsubscribe" stopped no enrollment
+    # and suppressed no contact, silently. ``resolve_reply_contact`` is the same
+    # resolution the classifier uses.
+    action_contact = contact or await resolve_reply_contact(db, reply)
     handled = await route_auto_action(
-        db, reply, contact, company, category, result
+        db, reply, action_contact, company, category, result
     )
     reply.handled_action = handled
 

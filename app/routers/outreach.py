@@ -452,7 +452,69 @@ async def record_event(
 
         await db.flush()
         await db.refresh(event)
+
+        # An ESP-reported unsubscribe is an opt-out, and this was the seventh
+        # do-not-contact writer that only wrote *one* enrollment.
+        #
+        # Per "Every do-not-contact writer writes the list": the six known
+        # writers (footer link, one-click POST, a reply saying unsubscribe, a
+        # complaint, a hard bounce, an erasure) all set the contact flags, write
+        # the revoked consent record, stop **every** actionable enrollment and
+        # add the address to the org suppression list. This one set
+        # ``enrollment.status`` and stopped. Three things follow, and none of
+        # them raise:
+        #
+        # * the contact's *other* live sequences kept their schedule, so the
+        #   recipient who told the ESP to stop went on receiving our mail from a
+        #   different campaign;
+        # * ``contact.suppressed`` stayed False, so every gate that reads the row
+        #   — the enrollment gates, ``check_send_allowed`` — waved the address
+        #   through;
+        # * nothing address-keyed was recorded at all, so a re-scrape next month
+        #   creates a clean row and the cadence starts over.
+        #
+        # Deliberately only ``unsubscribed``. ``bounced`` is ambiguous here (an
+        # ESP reports soft and hard alike with one event type) and belongs to
+        # ``bounce_handler``, which is what decides the kind; ``replied`` is not
+        # a do-not-contact decision. ``opt_out.record`` is idempotent, and its
+        # campaign attribution asks whether *this contact* already carries an
+        # ``unsubscribed`` event — the one written a few lines up — rather than
+        # whether one particular enrollment does, so neither a redelivery nor a
+        # contact enrolled in two campaigns books the opt-out twice.
+        if payload.event_type == "unsubscribed":
+            await _record_external_opt_out(db, enrollment)
+
         return event
+
+
+async def _record_external_opt_out(db: AsyncSession, enrollment) -> None:
+    """Run the full opt-out for the contact behind an ESP unsubscribe event.
+
+    Best-effort and non-fatal: the event row is the receipt the ESP is waiting
+    for, and answering a delivered webhook with a 500 makes it redeliver forever.
+    A failure here is loud in the log and leaves the enrollment stopped, which is
+    what the handler already did on its own.
+    """
+    contact_id = getattr(enrollment, "contact_id", None)
+    if contact_id is None:
+        return
+    email = (
+        await db.execute(select(Contact.email).where(Contact.id == contact_id))
+    ).scalars().first()
+    if not email:
+        return
+    try:
+        from app.services import opt_out
+
+        await opt_out.record(
+            db, email, org_id=enrollment.org_id, reason="unsubscribe",
+            source="auto", basis="ESP unsubscribe event",
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail the webhook receipt
+        logger.error(
+            "Could not record the opt-out for enrollment %s (%s): %s",
+            enrollment.id, email, exc,
+        )
 
 
 @router.get("/events")

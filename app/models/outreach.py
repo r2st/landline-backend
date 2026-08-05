@@ -226,6 +226,42 @@ class OutreachEvent(Base, OrgScopedMixin):
             postgresql_where=text("event_type IN ('opened','clicked')"),
             sqlite_where=text("event_type IN ('opened','clicked')"),
         ),
+        # One unsubscribe per step, for the same reason and by the same
+        # mechanism as the two above. Migration 118.
+        #
+        # 117 reasoned about which types repeat and settled ``sent``, ``replied``
+        # and the ``task_*`` types. It left ``unsubscribed`` unstated, and it
+        # does not repeat: a person either objected to a given send or did not.
+        #
+        # ``POST /outreach/events`` is the writer that matters. It is reachable
+        # by a signed ESP webhook, delivery there is at-least-once by design, and
+        # its own docstring says so — but the duplicate it answers is the
+        # ``IntegrityError`` 117's index raises, so for a type 117 did not cover
+        # there was nothing to catch and the redelivery simply inserted again.
+        # ``campaign_analytics`` counts these rows with a plain ``count()``, so
+        # the second row is a second opt-out on every campaign surface that
+        # reports ``unsubscribe_rate``.
+        #
+        # **Deliberately not ``bounced``,** which fails the same way and is
+        # handled elsewhere on purpose. Duplicate DSNs are an expected fact of
+        # mail — a mailer-daemon retries — so the bounce rail neutralises them in
+        # the *arithmetic*: ``outreach_events.count_attempts`` counts distinct
+        # ``(enrollment, step)`` and makes a redelivered DSN free. Constraining
+        # the table instead would forbid rows the rail is built to tolerate and
+        # that real databases already hold.
+        #
+        # ``opt_out.attribute_to_campaign`` already pre-checks per contact, but a
+        # pre-check is a SELECT before an INSERT and this runs from public
+        # endpoints served concurrently.
+        Index(
+            "uq_outreach_events_unsubscribe_once",
+            "enrollment_id",
+            "step_number",
+            "event_type",
+            unique=True,
+            postgresql_where=text("event_type = 'unsubscribed'"),
+            sqlite_where=text("event_type = 'unsubscribed'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

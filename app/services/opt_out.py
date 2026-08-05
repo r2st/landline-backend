@@ -426,37 +426,66 @@ async def attribute_to_campaign(
 
         # Idempotent: ``record`` is called again by every one-click retry and by
         # a human clicking the link after their provider already POSTed it.
+        #
+        # Asked of the **contact**, not of the enrollment this pass happens to
+        # have chosen. "One event per org per opt-out" is the rule stated above,
+        # and a per-enrollment check only enforces it while this function is the
+        # sole writer of ``unsubscribed`` events. It is not: ``POST
+        # /outreach/events`` records an ESP's unsubscribe against the enrollment
+        # the ESP names, which need not be the one holding the most recent send.
+        # Scoped per org already — ``contact_ids`` comes from the ``by_org``
+        # grouping — so one tenant's booking cannot suppress another's.
         already = (
             await db.execute(
                 select(OutreachEvent.id)
+                .join(
+                    OutreachEnrollment,
+                    OutreachEvent.enrollment_id == OutreachEnrollment.id,
+                )
                 .where(
-                    OutreachEvent.enrollment_id == enrollment_id,
+                    OutreachEnrollment.contact_id.in_(contact_ids),
                     OutreachEvent.event_type == "unsubscribed",
                 )
                 .limit(1)
                 .execution_options(skip_org_filter=True)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if already is not None:
             continue
 
-        db.add(
-            OutreachEvent(
-                # Explicit: this runs from an unauthenticated endpoint with no
-                # org bound, where the insert stamp falls back to the
-                # first-party org and would file a stranger's opt-out under ours.
-                org_id=target_org,
-                enrollment_id=enrollment_id,
-                step_number=step_number,
-                event_type="unsubscribed",
-                occurred_at=now,
-                event_metadata={"source": "opt_out", "reason": reason},
-            )
+        event = OutreachEvent(
+            # Explicit: this runs from an unauthenticated endpoint with no
+            # org bound, where the insert stamp falls back to the
+            # first-party org and would file a stranger's opt-out under ours.
+            org_id=target_org,
+            enrollment_id=enrollment_id,
+            step_number=step_number,
+            event_type="unsubscribed",
+            occurred_at=now,
+            event_metadata={"source": "opt_out", "reason": reason},
         )
+        # The check above is a SELECT, and this is the INSERT — which is not one
+        # statement, and this function runs from public endpoints served
+        # concurrently: a mailbox provider POSTing one-click twice in parallel,
+        # or a human clicking the footer link while that POST is in flight. Both
+        # passes read no event and both wrote one. ``uq_outreach_events_outcome_
+        # once`` (migration 118) now refuses the second, so losing the race has
+        # to leave the session usable — hence the savepoint, the same shape
+        # ``_ensure_entry`` uses a few lines down for the suppression row and
+        # for the same reason. Losing means the opt-out is already booked, which
+        # is the whole requirement.
+        try:
+            async with db.begin_nested():
+                db.add(event)
+                await db.flush()
+        except IntegrityError:
+            logger.debug(
+                "Opt-out event for enrollment %s step %s was written by a "
+                "concurrent pass", enrollment_id, step_number,
+            )
+            continue
         written += 1
 
-    if written:
-        await db.flush()
     return written
 
 

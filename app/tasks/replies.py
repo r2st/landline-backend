@@ -151,6 +151,127 @@ async def _contact_by_email(db: AsyncSession, email: Optional[str]) -> Optional[
     ).scalars().first()
 
 
+async def _contact_via_thread(db: AsyncSession, reply: EmailReply) -> Optional[Contact]:
+    """The person *we mailed*, for a reply whose ``From:`` we hold no row for.
+
+    Address matching is the only way this handler has ever resolved a reply, and
+    ``email_history`` admits a message to the inbox on a **thread** match — rule
+    1 of ``_is_outreach_reply``, and the one that catches essentially every
+    genuine reply. Those two facts do not line up. A prospect who answers from
+    an alias, a personal address, a shared ``team@`` box, or a mailbox that
+    rewrites the envelope sender is a reply we deliberately accepted and a
+    ``from_email`` that matches no ``contacts`` row, so ``contact_id`` is NULL
+    and every address lookup after it returns None.
+
+    On the ``unsubscribe`` branch that is the same silent compliance failure
+    case-folding was fixed for, reached by a different route: no flag, no
+    consent record, no suppression entry, **and the enrollment keeps its
+    schedule** — so the remaining steps go out to the address we originally
+    mailed, which is exactly the address the person replying is asking us to
+    stop using. Nothing raises; the reply is logged as handled and the operator
+    notification says they were suppressed.
+
+    The thread is the strongest link we have, and the ingest already stored both
+    ends of it: ``email_send_id`` (matched by ``gmail_thread_id`` when the reply
+    was written) and ``gmail_thread_id`` itself, which the sequence engine
+    stamps on the enrollment. Either resolves to the contact the outreach was
+    addressed to.
+
+    **A forwarded thread can resolve to someone who did not write the reply.**
+    That is accepted deliberately, on the reasoning ``opt_out`` already records:
+    the cost of being wrong here is one prospect an org stops mailing, against a
+    person who asked us to stop and kept receiving mail. Those are not
+    comparable. ``wrong_person`` is the category for "you have the wrong
+    person", and it does not suppress.
+    """
+    contact_id = None
+
+    if reply.email_send_id is not None:
+        row = (
+            await db.execute(
+                select(EmailSend.contact_id, EmailSend.to_email)
+                .where(EmailSend.id == reply.email_send_id)
+                .limit(1)
+            )
+        ).first()
+        if row is not None:
+            contact_id = row[0]
+            if contact_id is None and row[1]:
+                by_address = await _contact_by_email(db, row[1])
+                if by_address is not None:
+                    return by_address
+
+    if contact_id is None and reply.gmail_thread_id:
+        # The sequence engine writes no ``EmailSend`` row (see "Sent mail lives
+        # in two tables"), so the enrollment is the only carrier of the thread id
+        # for the channel with the most volume. Most recent enrollment on the
+        # thread, with the id breaking a tie so repeat passes agree.
+        contact_id = (
+            await db.execute(
+                select(OutreachEnrollment.contact_id)
+                .where(OutreachEnrollment.gmail_thread_id == reply.gmail_thread_id)
+                .order_by(
+                    OutreachEnrollment.enrolled_at.desc(),
+                    OutreachEnrollment.id.desc(),
+                )
+                .limit(1)
+            )
+        ).scalars().first()
+
+        if contact_id is None:
+            # …and the non-sequence side of the same thread, for replies whose
+            # ``email_send_id`` was never filled — ``POST /replies`` and the
+            # smart-reply webhook write a thread id and nothing else.
+            contact_id = (
+                await db.execute(
+                    select(EmailSend.contact_id)
+                    .where(
+                        EmailSend.gmail_thread_id == reply.gmail_thread_id,
+                        EmailSend.contact_id.isnot(None),
+                    )
+                    .order_by(EmailSend.sent_at.asc(), EmailSend.id.asc())
+                    .limit(1)
+                )
+            ).scalars().first()
+
+    if contact_id is None:
+        return None
+    return (
+        await db.execute(select(Contact).where(Contact.id == contact_id).limit(1))
+    ).scalars().first()
+
+
+async def resolve_reply_contact(
+    db: AsyncSession, reply: EmailReply
+) -> Optional[Contact]:
+    """Who this reply is about: the ingest's guess, then the address, then the thread.
+
+    One resolver, because the auto-action is reached from two places and both
+    have to answer this the same way. The Celery classifier does it for a fresh
+    reply; ``POST /dialtone/inbox/{id}/reclassify`` does it when an operator
+    corrects a category and ``route_auto_action`` is re-run. The router resolved
+    ``reply.contact_id`` alone — the column the ingest fills by ``From:`` address
+    — so the *manual* fix for a mis-routed reply landed on exactly the replies
+    that had no such row, and an operator marking one "unsubscribe" by hand
+    stopped no enrollment either.
+
+    Order matters and is cheapest-and-strongest first: an id the ingest already
+    resolved is never second-guessed (see ``_contact_via_thread`` on why a shared
+    thread must not be able to redirect a named reply).
+    """
+    if reply.contact_id is not None:
+        contact = (
+            await db.execute(select(Contact).where(Contact.id == reply.contact_id))
+        ).scalars().first()
+        if contact is not None:
+            return contact
+    if reply.from_email:
+        contact = await _contact_by_email(db, reply.from_email)
+        if contact is not None:
+            return contact
+    return await _contact_via_thread(db, reply)
+
+
 async def suppress_contact(db: AsyncSession, contact: Contact, reason: str) -> int:
     """Compliance-critical hard suppression for an unsubscribe.
 
@@ -225,6 +346,14 @@ async def route_auto_action(
     contact_name = contact.full_name if contact else (reply.from_email or "a contact")
     company_name = company.name if company else "their company"
 
+    # ``reply.contact_id`` is what the Gmail sync could resolve at ingest, and it
+    # resolves by ``From:`` address alone — so it is NULL for every reply that
+    # reached the inbox on a thread match from an address we hold no row for.
+    # The caller has already done the wider resolution (address fold, then
+    # thread); using the column instead of the result is how three branches below
+    # acted on nothing for exactly the replies that ask us to stop.
+    contact_id = contact.id if contact is not None else reply.contact_id
+
     if effective_category == "interested":
         # Route to the priority inbox and tell the operator. Do NOT auto-advance
         # or complete the sequence — a human takes it from here.
@@ -257,14 +386,42 @@ async def route_auto_action(
             stopped = await suppress_contact(
                 db, target, reason=f"Unsubscribe reply: {reply.subject or ''}"
             )
+
+        # The address that actually asked us to stop goes on the list, whatever
+        # we happen to hold for it. ``suppress_contact`` lists ``contact.email``
+        # — the address we *mailed* — and those are only the same string when the
+        # prospect replied from the mailbox we wrote to. Reply from an alias, a
+        # personal address or a shared inbox and the two diverge, and the half of
+        # this that survives a re-scrape recorded the wrong one, or (with no
+        # contact row at all) recorded nothing while the notification below
+        # claimed a suppression had happened.
+        #
+        # Unconditional and address-keyed, for the same reason erasure's entry is:
+        # the list is what binds the send gate for a row that does not exist yet.
+        # Ingest has already refused DSNs, autoresponders and our own mail before
+        # a row reaches here, so ``from_email`` is a person.
+        from app.services import suppression as _suppression
+
+        listed = False
+        if reply.from_email:
+            _, list_status = await _suppression.add_entry(
+                db, reply.from_email, reason="unsubscribe", source="auto"
+            )
+            listed = list_status in ("added", "duplicate")
+
         notif = notification_service or get_notification_service()
         try:
+            outcome = (
+                f"They have been suppressed across all sequences "
+                f"({stopped} enrollment(s) stopped)."
+                if (target is not None or listed)
+                else "No suppression could be recorded — review this reply by hand."
+            )
             await notif._send_notification(
                 subject=f"[Dialtone] Unsubscribe — {contact_name}",
                 body=(
                     f"{contact_name} ({reply.from_email}) requested to unsubscribe. "
-                    f"They have been suppressed across all sequences "
-                    f"({stopped} enrollment(s) stopped)."
+                    f"{outcome}"
                 ),
             )
         except Exception as exc:  # pragma: no cover - best-effort audit line
@@ -281,7 +438,7 @@ async def route_auto_action(
         from app.services import out_of_office
 
         summary = await out_of_office.pause_for_ooo(
-            db, reply.contact_id, return_date=result.get("return_date"), now=now
+            db, contact_id, return_date=result.get("return_date"), now=now
         )
         reply.classification_meta = {
             **(reply.classification_meta or {}),
@@ -375,7 +532,7 @@ async def route_auto_action(
 
     if effective_category == "not_interested":
         # Remove from active sequences (complete), no notification.
-        enrollments = await _enrollments_for_contact(db, reply.contact_id)
+        enrollments = await _enrollments_for_contact(db, contact_id)
         for enr in enrollments:
             enr.status = "completed"
             enr.completed_at = now
@@ -391,7 +548,7 @@ async def route_auto_action(
                 **(reply.classification_meta or {}),
                 "referral": {"name": referral.get("name"), "email": referral.get("email")},
             }
-        enrollments = await _enrollments_for_contact(db, reply.contact_id)
+        enrollments = await _enrollments_for_contact(db, contact_id)
         for enr in enrollments:
             enr.status = "completed"
             enr.completed_at = now
@@ -415,14 +572,12 @@ async def classify_reply_record(
     """
     ai_service = ai_service or get_ai_service()
 
-    # Resolve contact/company for context + routing (fall back to email match).
-    contact = None
-    if reply.contact_id is not None:
-        contact = (
-            await db.execute(select(Contact).where(Contact.id == reply.contact_id))
-        ).scalars().first()
-    if contact is None and reply.from_email:
-        contact = await _contact_by_email(db, reply.from_email)
+    # Resolve contact/company for context + routing: the ingest's id, then the
+    # address, then the thread. The inbox admits replies on a thread match, so
+    # "we accepted this as a reply to our outreach" and "we hold a contact row
+    # for the sender" are not the same condition, and the gap between them is
+    # where an opt-out went missing.
+    contact = await resolve_reply_contact(db, reply)
 
     company = None
     if reply.company_id is not None:
