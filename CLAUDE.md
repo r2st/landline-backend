@@ -454,26 +454,38 @@ came from `OutreachEvent`, so the tiles divided sequence opens by non-sequence
 sends and could show an open rate above 100%. A half-migrated read surface is
 worse than an unmigrated one — it is wrong in the direction that flatters.
 
-**"Have we emailed them?" is the same question**, and the stale-lead sweep
-(`tasks/followups.py`) answered it from `EmailSend` alone. So a prospect three
-steps into a live sequence had no send it could see, and was filed as *"Active-
-pipeline lead has never been emailed — send the first touch."* The task exists
-to stop leads going cold and was manufacturing reminders for the contacts we
-were mailing most, asking a human to open a cold first touch on top of a running
-cadence. It is self-sustaining, too: the operator's follow-up writes no
-`EmailSend` row either unless they reply from the inbox, so the same contact
-resurfaces every run and takes a slot of `auto_followup_batch_limit` a genuinely
-stale lead never gets. `_last_send_subquery` unions both tables — note that
-`OutreachEvent` carries no `contact_id`, which is exactly why it is the easy one
-to forget: reaching a contact from it means joining through the enrollment.
+**"Have we emailed them?" is the same question, and three surfaces answered it
+from one table.** All three are "chase this lead, nobody has" features, so the
+error compounds in one direction — the contacts we mail most are the ones they
+nominate hardest:
 
-The same query counted every `EmailSend` row whatever its status, which is the
+- `tasks/followups.py` filed a prospect three steps into a live sequence as
+  *"Active-pipeline lead has never been emailed — send the first touch"* and put
+  a reminder in a human's queue. The task exists to stop leads going cold and was
+  manufacturing cold first touches on top of running cadences. It is
+  self-sustaining: the operator's follow-up writes no `EmailSend` row either
+  unless they reply from the inbox, so the same contact resurfaces every run and
+  takes a slot of `auto_followup_batch_limit` a genuinely stale lead never gets.
+- `GET /follow-ups/stale-contacts` listed those same prospects with
+  `last_emailed_at: null`.
+- `suggestions._stale_leads` proposed *"In 'outreach' but never emailed —
+  re-engage"* — about a pipeline stage the enrollment that had been mailing them
+  for weeks had itself set.
+
+`app/services/last_contact.py` is the one resolver (`last_send_by_contact`,
+`last_send_by_company`). Note that `OutreachEvent` carries no `contact_id` — the
+enrollment holds it — which is exactly why it is the easy table to forget:
+including it means a join, so the shortest correct query is longer than the
+wrong one.
+
+All three also counted every `EmailSend` row whatever its status, which is the
 *opposite* error from the same omission — a `skipped` row stamps `sent_at` and
 put nothing on the wire, so a spent cap or an engaged kill switch read as
-"contacted recently" and held the lead out of the queue. It filters
-`WIRE_STATUSES`. Both directions are pinned in
-`tests/test_stale_followup_send_sources.py`, with controls proving `bounced` and
-an engagement-advanced status still count.
+"contacted recently" and held the lead out. `WIRE_STATUSES` now, which keeps
+`bounced` (mail that went out) and every engagement-advanced status. Both
+directions are pinned in `tests/test_stale_followup_send_sources.py` and
+`tests/test_stale_surfaces_read_both_send_tables.py`, with controls proving a
+long-quiet lead still surfaces.
 
 ## The daily send cap is a Redis reservation, not a row count
 

@@ -23,10 +23,10 @@ from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.company_news import CompanyNews
 from app.models.contact import Contact
-from app.models.email_template import EmailSend
 from app.models.follow_up import FollowUp
 from app.models.lead_score import LeadScore
 from app.models.suggestion_outcome import SuggestionOutcome
+from app.services.last_contact import last_send_by_company
 from app.schemas.suggestions import (
     AISuggestion,
     AISuggestionsResponse,
@@ -106,16 +106,12 @@ async def _overdue_follow_ups(db: AsyncSession, now: datetime) -> list[Suggestio
 async def _stale_leads(
     db: AsyncSession, now: datetime, stale_days: int
 ) -> list[Suggestion]:
-    # Most recent email to any contact at each company.
-    last_email = (
-        select(
-            Contact.company_id.label("company_id"),
-            func.max(EmailSend.sent_at).label("last_sent_at"),
-        )
-        .join(Contact, EmailSend.contact_id == Contact.id)
-        .group_by(Contact.company_id)
-        .subquery()
-    )
+    # Most recent email to any contact at each company, across **both** send
+    # tables. This read `EmailSend` alone, and the sequence engine writes no row
+    # there — so a company the queue had been mailing for weeks produced
+    # "In 'outreach' but never emailed — re-engage", about a pipeline stage the
+    # enrollment itself had set. See `services.last_contact`.
+    last_email = last_send_by_company()
 
     rows = await db.execute(
         select(Company, last_email.c.last_sent_at)

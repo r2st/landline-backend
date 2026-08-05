@@ -14,15 +14,14 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select, func, union_all
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.tasks.org_runner import for_each_org
 from app.models.company import Company
 from app.models.contact import Contact
-from app.models.email_template import EmailSend, WIRE_STATUSES
 from app.models.follow_up import FollowUp
-from app.models.outreach import OutreachEnrollment, OutreachEvent
+from app.services.last_contact import last_send_by_contact
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -45,62 +44,6 @@ def _run_async(coro):
 _SUPPRESSION_CHUNK = 200
 
 
-def _last_send_subquery():
-    """Most recent message actually put on the wire, per contact.
-
-    **Reads both send tables**, per "Sent mail lives in two tables" in
-    ``CLAUDE.md``. It read ``EmailSend`` alone, and the sequence engine — where
-    the bulk of outreach volume goes — writes no ``EmailSend`` row at all. So a
-    prospect three steps into a live cadence had no send this query could see,
-    came back ``last_sent_at IS NULL``, and was filed as *"Active-pipeline lead
-    has never been emailed — send the first touch."*
-
-    That is the failure mode this task exists to prevent, produced by the task
-    itself: the follow-up queue filled with the contacts we were mailing most,
-    and the reminder asked a human to open a cold first touch on top of an
-    automated cadence already mid-flight. Being wrong in the "never contacted"
-    direction is also what makes it self-sustaining — nothing the operator does
-    writes an ``EmailSend`` row either unless they reply from the inbox, so the
-    same contact resurfaces every run, and each one consumes a slot of
-    ``auto_followup_batch_limit`` that a genuinely stale lead never gets.
-
-    ``WIRE_STATUSES`` rather than every row, for the opposite error. A
-    ``skipped`` send stamps ``sent_at`` and put no message on the wire — the
-    template blast writes one for a contact with no address, one who
-    unsubscribed and one on the list, and the dispatcher returns it for a
-    spam-gate block, a warm-up hold, a spent cap and an engaged kill switch. Any
-    of those read as "contacted recently" and silently held the lead out of the
-    queue: the day a cap holds a blast is the day this stops chasing the leads
-    it held.
-    """
-    direct = select(
-        EmailSend.contact_id.label("contact_id"),
-        EmailSend.sent_at.label("sent_at"),
-    ).where(
-        EmailSend.contact_id.isnot(None),
-        EmailSend.status.in_(WIRE_STATUSES),
-    )
-    # ``OutreachEvent`` carries no ``contact_id`` — the enrollment holds it,
-    # which is the whole reason this table is the easy one to forget.
-    sequence = (
-        select(
-            OutreachEnrollment.contact_id.label("contact_id"),
-            OutreachEvent.occurred_at.label("sent_at"),
-        )
-        .join(OutreachEnrollment, OutreachEnrollment.id == OutreachEvent.enrollment_id)
-        .where(OutreachEvent.event_type == "sent")
-    )
-    both = union_all(direct, sequence).subquery()
-    return (
-        select(
-            both.c.contact_id.label("contact_id"),
-            func.max(both.c.sent_at).label("last_sent_at"),
-        )
-        .group_by(both.c.contact_id)
-        .subquery()
-    )
-
-
 async def generate_stale_lead_followups_for_session(db) -> dict:
     """Core logic for stale-lead follow-up generation (testable with any session).
 
@@ -116,7 +59,8 @@ async def generate_stale_lead_followups_for_session(db) -> dict:
     now = datetime.now(timezone.utc)
     threshold = now - timedelta(days=days)
 
-    last_send = _last_send_subquery()
+    # Both send tables, wire statuses only — see ``services.last_contact``.
+    last_send = last_send_by_contact()
 
     rows = await db.execute(
         select(Contact.id, Contact.company_id, Contact.email, last_send.c.last_sent_at)

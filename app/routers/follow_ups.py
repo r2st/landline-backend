@@ -7,15 +7,15 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select, and_
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import UserScope, get_scope
 from app.models.company import Company
 from app.models.contact import Contact
-from app.models.email_template import EmailSend
 from app.models.follow_up import FollowUp
+from app.services.last_contact import last_send_by_contact
 from app.schemas.follow_up import (
     FollowUpCreate,
     FollowUpRead,
@@ -189,16 +189,12 @@ async def get_stale_contacts(
     Contacts that have never been emailed are included. Each row notes whether
     an open (pending) follow-up already exists so the UI can avoid nagging.
     """
-    # Latest send time per contact (only successful/recorded sends count).
-    last_send = (
-        select(
-            EmailSend.contact_id.label("contact_id"),
-            func.max(EmailSend.sent_at).label("last_sent_at"),
-        )
-        .where(EmailSend.contact_id.isnot(None))
-        .group_by(EmailSend.contact_id)
-        .subquery()
-    )
+    # Latest message that actually reached the wire, per contact, across **both**
+    # send tables. This read `EmailSend` alone, so every prospect the sequence
+    # engine was mailing showed up here as stale with `last_emailed_at: null` —
+    # and it counted `skipped` rows, so a contact a spent cap or an engaged kill
+    # switch declined to mail read as contacted. See `services.last_contact`.
+    last_send = last_send_by_contact()
 
     query = (
         select(
