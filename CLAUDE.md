@@ -454,6 +454,27 @@ came from `OutreachEvent`, so the tiles divided sequence opens by non-sequence
 sends and could show an open rate above 100%. A half-migrated read surface is
 worse than an unmigrated one — it is wrong in the direction that flatters.
 
+**"Have we emailed them?" is the same question**, and the stale-lead sweep
+(`tasks/followups.py`) answered it from `EmailSend` alone. So a prospect three
+steps into a live sequence had no send it could see, and was filed as *"Active-
+pipeline lead has never been emailed — send the first touch."* The task exists
+to stop leads going cold and was manufacturing reminders for the contacts we
+were mailing most, asking a human to open a cold first touch on top of a running
+cadence. It is self-sustaining, too: the operator's follow-up writes no
+`EmailSend` row either unless they reply from the inbox, so the same contact
+resurfaces every run and takes a slot of `auto_followup_batch_limit` a genuinely
+stale lead never gets. `_last_send_subquery` unions both tables — note that
+`OutreachEvent` carries no `contact_id`, which is exactly why it is the easy one
+to forget: reaching a contact from it means joining through the enrollment.
+
+The same query counted every `EmailSend` row whatever its status, which is the
+*opposite* error from the same omission — a `skipped` row stamps `sent_at` and
+put nothing on the wire, so a spent cap or an engaged kill switch read as
+"contacted recently" and held the lead out of the queue. It filters
+`WIRE_STATUSES`. Both directions are pinned in
+`tests/test_stale_followup_send_sources.py`, with controls proving `bounced` and
+an engagement-advanced status still count.
+
 ## The daily send cap is a Redis reservation, not a row count
 
 `SendLimiter.can_send_today` counts `OutreachEvent(event_type='sent')` rows and
@@ -717,6 +738,14 @@ operator-facing reason, so a bulk endpoint can report *which* clause refused
 rather than a bare False. `blocking_flag` is its row-only half and
 `suppressed_addresses` the batch list query, for callers holding a page of
 contacts — use both rather than a per-row existence check in a loop.
+
+**A reminder is a do-not-contact decision too.** The stale-lead sweep's entire
+output is "reach out to this person", handed to a human who will — and it read
+the two contact flags and not the list, so it chased addresses nothing is
+allowed to mail. There is no send gate behind a task queue; this is the only
+gate in front of it. It filters *before* the batch limit is spent, because a
+listed candidate dropped from an already-capped batch takes a slot on every run
+and never yields it — nothing about it changes.
 
 `tests/test_enrollment_gate_coverage.py` enforces it mechanically and
 **function-locally**, mirroring `test_send_gate_coverage`: "some caller checks
