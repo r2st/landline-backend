@@ -5,7 +5,7 @@ connected Gmail accounts. Syncs incoming replies to the local database and
 allows sending threaded replies through the Gmail API.
 """
 
-import base64
+import asyncio
 import html as html_mod
 import logging
 import uuid
@@ -30,6 +30,8 @@ from app.models.inbox_thread_state import InboxThreadState
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import crypto, google_oauth
 from app.services.bounce_ingestion import is_bounce_message
+from app.services.gmail_body import decode_body
+from app.services.reply_matching import bound_header_tokens
 from app.services.sql_search import LIKE_ESCAPE, contains_pattern, endswith_pattern
 from app.services.gmail_sender import GmailSender
 
@@ -42,17 +44,43 @@ def _parse_message_ids(*header_values: Optional[str]) -> set[str]:
     """Pull individual RFC-2822 Message-IDs out of In-Reply-To / References
     header values. Each is a space-separated list of ``<id@host>`` tokens; we
     return them both bracket-stripped and raw so a match works whichever form
-    the sent message stored."""
-    ids: set[str] = set()
+    the sent message stored.
+
+    **Bounded**, for the same reason ``reply_matching._message_id_tokens`` is.
+    These two headers are written by the *sender* of the inbound message —
+    attacker-controlled input arriving from the open internet, bounded by
+    nothing between the mail server and here. Every token becomes several bind
+    parameters in the ``IN`` clauses ``_is_outreach_reply`` builds from this
+    set, and every driver refuses a statement past its own parameter ceiling
+    (psycopg: 65535). One crafted reply with a few thousand ids therefore raised
+    *inside the mailbox sweep*, which is the failure a mailbox cannot recover
+    from on its own: ingestion stops, and no replies at all reads exactly like
+    no replies yet. `reply_matching` was capped for precisely this; this second
+    parser was written before that and never was.
+
+    :func:`~app.services.reply_matching.bound_header_tokens` owns which tokens
+    survive — the direct parent in ``In-Reply-To`` is kept whole and only the
+    ``References`` chain is cut, from its oldest end. The cap costs a real
+    conversation nothing: RFC 5322 encourages trimming the chain, and the id
+    that threads a reply to *our* send is the most recent one in it.
+    """
+    per_header: list[list[str]] = []
+    seen: set[str] = set()
     for value in header_values:
-        if not value:
-            continue
-        for token in value.split():
+        found: list[str] = []
+        for token in (value or "").split():
             token = token.strip()
-            if not token:
-                continue
-            ids.add(token)
-            ids.add(token.strip("<>"))
+            if token and token not in seen:
+                seen.add(token)
+                found.append(token)
+        per_header.append(found)
+
+    # Bound the *tokens*, then expand each to its two matchable forms — so the
+    # ceiling on bind parameters is 2x the cap and not 2x the header.
+    ids: set[str] = set()
+    for token in bound_header_tokens(per_header):
+        ids.add(token)
+        ids.add(token.strip("<>"))
     return ids
 
 
@@ -87,6 +115,26 @@ class EmailHistoryService:
         """Build an authorized Gmail API service for the given account."""
         creds = self._build_credentials(account)
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    @staticmethod
+    async def _gexec(request):
+        """Run one Gmail API request off the event loop.
+
+        ``googleapiclient`` is synchronous: ``request.execute()`` is a blocking
+        HTTPS round trip. Called straight from a coroutine it stops *every*
+        other coroutine in the process for its duration, and the sync below
+        makes one of these per message — up to 50 per mailbox, across every
+        connected account — behind ``POST /api/v1/emails/sync``, which is a
+        request-path endpoint. One operator pressing "Sync now" therefore
+        stalled the whole API worker, for every tenant on it, for as long as
+        Gmail took to answer. Nothing here is slow in the CPU sense; the worker
+        is simply waiting on a socket with the loop in its hand.
+
+        ``smart_reply`` has offloaded the identical calls since it was written
+        (its own ``_gexec``). This module did not, which is the only reason the
+        two behave differently under load.
+        """
+        return await asyncio.to_thread(request.execute)
 
     # ------------------------------------------------------------------
     # Reply syncing
@@ -208,8 +256,18 @@ class EmailHistoryService:
         errors = 0
         skipped = 0
 
+        # Held as plain values. A rollback — which the per-message handler below
+        # now does — expires every instance loaded on this session, and reading
+        # an expired attribute back needs a database round trip that the sync
+        # ORM accessor cannot make from a coroutine (``MissingGreenlet``). So
+        # the recovery would itself break the messages after the bad one.
+        account_id = account.id
+        account_email = account.email
+
         try:
-            service = self._build_gmail_service(account)
+            # Off the loop as well: ``build`` refreshes credentials and, on some
+            # client versions, fetches the discovery document — both network.
+            service = await asyncio.to_thread(self._build_gmail_service, account)
 
             # Get all connected account emails to skip internal messages
             connected_result = await db.execute(
@@ -218,11 +276,8 @@ class EmailHistoryService:
             connected_emails = {e.lower() for e in connected_result.scalars().all()}
 
             query = "in:inbox newer_than:1d -from:me"
-            results = (
-                service.users()
-                .messages()
-                .list(userId="me", q=query, maxResults=50)
-                .execute()
+            results = await self._gexec(
+                service.users().messages().list(userId="me", q=query, maxResults=50)
             )
             messages = results.get("messages", [])
 
@@ -240,11 +295,10 @@ class EmailHistoryService:
                         continue
 
                     # Fetch full message
-                    msg = (
+                    msg = await self._gexec(
                         service.users()
                         .messages()
                         .get(userId="me", id=msg_info["id"], format="full")
-                        .execute()
                     )
 
                     headers = {
@@ -342,7 +396,7 @@ class EmailHistoryService:
                         email_send_id=email_send_id,
                         contact_id=contact_id,
                         company_id=company_id,
-                        gmail_account_id=account.id,
+                        gmail_account_id=account_id,
                         gmail_message_id=msg_info["id"],
                         gmail_thread_id=gmail_thread_id,
                         from_email=from_email,
@@ -355,9 +409,25 @@ class EmailHistoryService:
                         is_read=False,
                     )
                     db.add(reply)
+                    # Committed per message, not per mailbox. The rollback in
+                    # the handler below is what makes one bad message survivable
+                    # at all, and a rollback discards everything still pending —
+                    # so batching the commit would mean recovering from message
+                    # 2 by throwing away message 1.
+                    await db.commit()
                     synced += 1
 
                 except Exception as e:
+                    # A failed statement leaves the session in a state where
+                    # every later statement raises until someone rolls back.
+                    # Nothing did, so the message after the bad one failed, and
+                    # the one after that, and the commit at the end — and then
+                    # the *next mailbox* in the sweep, on the same session, and
+                    # the caller's session after that. One crafted reply to one
+                    # mailbox stopped reply ingestion for the whole org, and a
+                    # mailbox that stops ingesting is indistinguishable from a
+                    # quiet one.
+                    await db.rollback()
                     logger.debug(
                         "Error processing message %s: %s", msg_info.get("id"), str(e)
                     )
@@ -370,14 +440,20 @@ class EmailHistoryService:
             # let sync_all_accounts self-heal by deactivating the account.
             raise
         except Exception as e:
-            logger.error("Gmail sync error for %s: %s", account.email, str(e))
+            logger.error("Gmail sync error for %s: %s", account_email, str(e))
+            # Same reasoning as the per-message handler: the failure may well
+            # have been a statement, and the caller keeps using this session.
+            try:
+                await db.rollback()
+            except Exception:  # pragma: no cover - rollback of a dead session
+                pass
             errors += 1
 
         return {
             "synced": synced,
             "errors": errors,
             "skipped": skipped,
-            "account": account.email,
+            "account": account_email,
         }
 
     async def sync_all_accounts(self, db: AsyncSession, user_id=None) -> dict:
@@ -389,7 +465,12 @@ class EmailHistoryService:
         if user_id is not None:
             query = query.where(GmailAccount.user_id == user_id)
         result = await db.execute(query)
-        accounts = result.scalars().all()
+        # Ids, not instances. A mailbox that fails is recovered from with a
+        # rollback, and a rollback expires every instance on this session — so
+        # holding the list would leave the *remaining* mailboxes as expired
+        # objects whose next attribute read is a lazy refresh from a coroutine
+        # (``MissingGreenlet``). Re-reading each row is the recovery working.
+        account_ids = [a.id for a in result.scalars().all()]
 
         total_synced = 0
         total_errors = 0
@@ -397,7 +478,11 @@ class EmailHistoryService:
 
         deactivated = 0
 
-        for account in accounts:
+        for account_id in account_ids:
+            account = await db.get(GmailAccount, account_id)
+            if account is None:  # pragma: no cover - deleted mid-sweep
+                continue
+            account_email = account.email
             try:
                 r = await self.sync_replies_for_account(db, account)
                 total_synced += r["synced"]
@@ -417,10 +502,18 @@ class EmailHistoryService:
                 logger.warning(
                     "Gmail account %s auto-deactivated (status=revoked): "
                     "OAuth token revoked / invalid_grant (%s)",
-                    account.email, str(e),
+                    account_email, str(e),
                 )
             except Exception as e:
-                logger.error("Failed to sync replies for %s: %s", account.email, str(e))
+                logger.error("Failed to sync replies for %s: %s", account_email, str(e))
+                # The account after this one shares the session. If what failed
+                # was a statement, leaving it unrolled-back makes every mailbox
+                # behind this one fail too — the sweep stops at the first bad
+                # mailbox and reports the whole org as having no replies.
+                try:
+                    await db.rollback()
+                except Exception:  # pragma: no cover - rollback of a dead session
+                    pass
                 total_errors += 1
 
         return {
@@ -482,10 +575,14 @@ class EmailHistoryService:
 
     @staticmethod
     def _decode_base64url(data: str) -> str:
-        """Decode a base64url-encoded string (Gmail API format)."""
-        # Add padding if needed
-        padded = data + "=" * (4 - len(data) % 4)
-        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+        """Decode a base64url-encoded string (Gmail API format).
+
+        Delegates to ``gmail_body.decode_body``, which is the one decoder. This
+        module was the only one of four that padded at all, so it kept working
+        while the bounce and complaint sweeps silently read two message bodies
+        in three as empty.
+        """
+        return decode_body(data)
 
     # ------------------------------------------------------------------
     # Lead emails — all threads for a company
@@ -2111,12 +2208,11 @@ class EmailHistoryService:
             return []
 
         try:
-            service = self._build_gmail_service(account)
-            thread = (
+            service = await asyncio.to_thread(self._build_gmail_service, account)
+            thread = await self._gexec(
                 service.users()
                 .threads()
                 .get(userId="me", id=gmail_thread_id, format="full")
-                .execute()
             )
 
             messages = []

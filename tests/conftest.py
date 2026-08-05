@@ -198,6 +198,116 @@ def _send_window_open_by_default():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_send_counter(monkeypatch):
+    """Give every test its own daily-send counter instead of the machine's.
+
+    ``SendLimiter.reserve_daily_send`` claims a slot with an ``INCR`` on
+    ``dialtone:daily_sends:<org>:<day>`` in **real Redis**, which on a developer
+    box is reachable — so that key was shared by every test in the suite *and*
+    by every previous run on the same calendar day. Around a hundred sends in,
+    the cap is spent and the next test that sends is refused with
+    ``Daily limit reached (100/100)``.
+
+    The symptoms are what make it worth a fixture rather than a note. It is a
+    function of machine state and time of day, so the suite is green on CI and
+    on a fresh container and red on a laptop by mid-afternoon; *which* test
+    fails is decided by execution order, so it moves between runs and reads as
+    four unrelated flakes; and it fails an assertion about the sending code
+    (``status == 'sent'``) rather than anything about limits, so it looks like a
+    regression in whatever it landed on.
+
+    A per-test fake, not a disabled limiter: the reservation is the mechanism
+    that makes the cap correct under concurrency, and a suite that stubs it out
+    stops testing it. Tests that want to drive Redis behaviour themselves patch
+    ``_get_redis`` again in their own fixture (``test_send_limit_race`` and
+    friends), and a later monkeypatch wins.
+    """
+    from app.services import send_limiter as _sl
+
+    class _CounterRedis:
+        """The commands the limiter uses, over a dict private to one test.
+
+        Real Redis runs commands on one thread, so ``INCR`` is indivisible;
+        asyncio gives the same guarantee to a synchronous section between
+        awaits, which is what these are — so the concurrency the limiter
+        depends on is reproduced, not bypassed.
+        """
+
+        def __init__(self):
+            self.store: dict[str, int] = {}
+            self.ttl_store: dict[str, int] = {}
+
+        async def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.store:
+                return None
+            self.store[key] = int(value)
+            if ex is not None:
+                self.ttl_store[key] = ex
+            return True
+
+        async def incr(self, key):
+            self.store[key] = self.store.get(key, 0) + 1
+            return self.store[key]
+
+        async def decr(self, key):
+            self.store[key] = self.store.get(key, 0) - 1
+            return self.store[key]
+
+        async def get(self, key):
+            value = self.store.get(key)
+            return None if value is None else str(value)
+
+        async def ttl(self, key):
+            return self.ttl_store.get(key, -1)
+
+        async def expire(self, key, seconds):
+            self.ttl_store[key] = seconds
+            return True
+
+    client = _CounterRedis()
+
+    async def _get_redis():
+        return client
+
+    monkeypatch.setattr(_sl, "_get_redis", _get_redis)
+    # The module caches its client in globals; clear them so a test that did
+    # reach real Redis before this fixture existed cannot leave one behind.
+    _sl._reset_redis_for_tests()
+    yield client
+    _sl._reset_redis_for_tests()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_ambient_google_oauth():
+    """Google OAuth is *unconfigured* in tests unless a test configures it.
+
+    Several tests assert the unconfigured behaviour — ``/gmail/oauth/authorize``
+    returns 503, ``/gmail/status`` reports ``configured: false`` — and
+    ``Settings`` reads ``.env``. So whether they passed depended on whether the
+    developer's machine happened to hold real credentials: green on CI and on a
+    fresh clone, red the moment anyone put a working client id in ``.env``
+    (which is exactly what rotating the Google project required). The test was
+    asserting a property of the *machine*, not of the code.
+
+    This is the mirror of the ``_google_configured`` fixture that already exists
+    in ``tests/test_gmail.py``: that one turns the credentials on for the tests
+    that need them, and nothing turned them off for the tests that need them
+    off. Session-scoped so it is in place before any function-scoped fixture
+    saves the value to restore.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    previous = (settings.google_client_id, settings.google_client_secret)
+    settings.google_client_id = ""
+    settings.google_client_secret = ""
+    try:
+        yield
+    finally:
+        settings.google_client_id, settings.google_client_secret = previous
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_breaker():
     """Clear the process-wide LLM circuit breaker and rate limiter around every test.
 

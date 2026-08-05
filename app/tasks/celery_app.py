@@ -66,6 +66,14 @@ celery_app.conf.update(
         "app.tasks.lead_monitor.*": {"queue": "enrichment"},
     },
     beat_schedule={
+        # Credential overrides set from the dashboard are applied per process,
+        # so without this every *other* worker would keep using the retired key
+        # until the next deploy — the UI reporting success while the beat worker
+        # went on failing. Five minutes: these change about once a year.
+        "refresh-credentials": {
+            "task": "app.tasks.credentials.refresh_credentials",
+            "schedule": 300.0,
+        },
         "process-outreach-queue": {
             "task": "app.tasks.outreach.process_outreach_queue",
             "schedule": 300.0,  # every 5 minutes
@@ -440,6 +448,9 @@ celery_app.autodiscover_tasks(["app.tasks"], force=True)
 
 # Force-import all task modules to guarantee registration
 import app.tasks.outreach  # noqa: F401
+# Registers refresh_credentials — the "refresh-credentials" beat entry.
+# Unregistered, dashboard credential rotations never reach this worker.
+import app.tasks.credentials  # noqa: F401
 # Registers send_due_scheduled_emails — the "send-due-scheduled-emails" beat
 # entry above. Without the force-import the task is unregistered and every
 # scheduled batch stays queued forever, exactly as it did before it existed.

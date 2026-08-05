@@ -38,6 +38,14 @@ GLOBAL_MODELS = {
         "cross-org views read users before any org context is bound, and the "
         "filter would make both invisible to themselves"
     ),
+    "AppCredential": (
+        "identifies the deployment to a third party, not a tenant to us — one "
+        "Google Cloud project, one registered redirect URI, one set of provider "
+        "accounts. Resolved where no org is bound at all (the OAuth callback "
+        "runs before any user context exists, as do the beat sweeps), and "
+        "per-tenant writes would let an org admin repoint the consent flow at a "
+        "client they control. platform_admin only — see app/routers/credentials.py"
+    ),
 }
 
 

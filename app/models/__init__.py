@@ -84,6 +84,7 @@ from app.models.social_listening_agent import (
 from app.models.inbox_thread_state import InboxThreadState
 from app.models.inbox_label import InboxLabel, InboxThreadLabel
 from app.models.api_key import ApiKey
+from app.models.app_credential import AppCredential
 
 __all__ = [
     "SystemSetting",
@@ -184,4 +185,5 @@ __all__ = [
     "InboxLabel",
     "InboxThreadLabel",
     "ApiKey",
+    "AppCredential",
 ]

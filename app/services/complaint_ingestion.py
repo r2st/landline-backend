@@ -41,6 +41,7 @@ from app.models.complaint_record import ComplaintRecord
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.services.complaint_handler import record_complaint
+from app.services.gmail_body import decode_body
 from app.services.smtp_reader import SmtpMailboxReader
 
 logger = logging.getLogger(__name__)
@@ -196,8 +197,6 @@ class ComplaintIngestionService:
     @staticmethod
     def _message_text(msg: dict) -> str:
         """Flatten a Gmail message (snippet + every decoded part) into text."""
-        import base64
-
         chunks: list[str] = []
         snippet = msg.get("snippet")
         if snippet:
@@ -207,12 +206,13 @@ class ComplaintIngestionService:
             body = part.get("body", {}) or {}
             data = body.get("data")
             if data:
+                # See ``gmail_body.decode_body``: Gmail strips the padding, and
+                # decoding inline raised on most bodies — which this ``except``
+                # turned into "the report named no complainant".
                 try:
-                    chunks.append(
-                        base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", "replace")
-                    )
+                    chunks.append(decode_body(data))
                 except Exception:  # pragma: no cover - defensive
-                    pass
+                    logger.warning("Undecodable body part on complaint message")
             for sub in part.get("parts", []) or []:
                 _walk(sub)
 

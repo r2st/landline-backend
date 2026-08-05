@@ -56,6 +56,15 @@ REVIEWED: dict[str, str] = {
         "used to be computed on the platform sum and so asked 'is every tenant "
         "dead?' — see the CLAUDE.md section on alarms and sums."
     ),
+    "app.tasks.credentials.refresh_credentials": (
+        "app_credentials is platform-wide by design (it identifies the "
+        "deployment to Google and to the LLM providers, not a tenant to us) and "
+        "carries no org_id to filter on, so there is nothing for a binding to "
+        "narrow. What it writes is not a row at all — it applies values onto "
+        "the process-global Settings singleton — so the usual hazard of an "
+        "unbound task, an insert landing on the first-party org, does not "
+        "exist here. Binding one org would be misleading, not safer."
+    ),
 }
 
 

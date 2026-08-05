@@ -818,6 +818,230 @@ unverified sending domain fails identically on both actions, so retrying them is
 a second round trip, a duplicate log line, and — for a throttle — more pressure
 on the thing already refusing us.
 
+## The test suite must not depend on the machine it runs on
+
+Two autouse fixtures in `tests/conftest.py` exist because the suite was reading
+ambient state and calling it a result. Both were found the same way — a change
+elsewhere flipped tests that had nothing to do with it — and both failure modes
+read as a regression in whatever they landed on:
+
+- **`_isolated_send_counter`.** `reserve_daily_send` claims its slot with an
+  `INCR` in **real Redis**, which on a developer box is reachable, so
+  `dialtone:daily_sends:<org>:<day>` was shared by every test in the suite *and*
+  by every earlier run that calendar day. About a hundred sends in, the cap is
+  spent and the next test that sends fails on `status == 'sent'` — an assertion
+  about sending, not about limits. Green on CI and on a fresh container, red on
+  a laptop by mid-afternoon, and *which* test fails is decided by ordering, so
+  it moves between runs and reads as several unrelated flakes. The fixture gives
+  each test a private in-memory counter rather than disabling the limiter: the
+  reservation is the mechanism that makes the cap correct under concurrency, and
+  a suite that stubs it out stops testing it.
+- **`_no_ambient_google_oauth`.** `Settings` reads `.env`, and several tests
+  assert the *unconfigured* path (`/gmail/oauth/authorize` → 503,
+  `/gmail/status` → `configured: false`, three more in `test_postmaster.py`).
+  They passed because the developer's `.env` happened to hold no Google
+  credentials, and went red the moment rotating the Google project required
+  putting a working client id there. `test_gmail.py` already had a
+  `_google_configured` fixture turning them *on* for the tests that need them;
+  nothing turned them off for the tests that need them off.
+
+The general rule: a test whose outcome depends on Redis being reachable, on
+`.env` contents, or on the time of day is asserting a property of the machine.
+Fixtures for both directions — on *and* off — or the absence is the bug.
+
+## A test that reads the clock twice is a test that fails by the calendar
+
+`tests/test_daily_summary.py` stamped its fixture events from a module-level
+`NOW = datetime.now(timezone.utc)` — evaluated at **import**, which in a full
+suite run is a quarter of an hour before the test that uses it — and resolved
+the day it then asked the endpoint about at **call** time. Cross a day boundary
+in between and the events are in one day while the question is about the next.
+
+The timezone is what makes the window findable and is not the bug. The
+endpoints reckon a day in `daily_summary_timezone` (`Asia/Kolkata`, UTC+5:30),
+so the boundary lands at 18:30 UTC — inside the working day, in the middle of a
+suite run, roughly every day. Note the file already carried a docstring about
+exactly this hazard and had fixed **half** of it: the target date was moved to
+call time and the seeded events were left at import time, which narrowed the
+failure from 5.5 hours to 15 minutes and made it read as flake.
+
+Rules: take one reading per test and derive everything from it, and test the
+boundary on a **fixed** instant rather than on `now` — a test that reads the
+real clock can be right but cannot be proven. `test_a_minute_before_local_midnight_still_belongs_to_that_day`
+is the deterministic half; the `Pacific/Kiritimati` / `Pacific/Midway`
+parametrization is the generalisation, because a scenario exercised only in the
+shipped timezone can only fail during that timezone's own boundary window.
+
+## Every Google/SMTP client in this codebase is blocking
+
+`googleapiclient`, `smtplib` and `imaplib` are synchronous. A call to one of
+them made directly from a coroutine holds the event loop for the whole network
+round trip — not a slow function, a *stopped process*: every other request, beat
+task and coroutine on that worker waits.
+
+Nearly everything here already knows that. `email_dispatch` wraps the senders in
+`asyncio.to_thread`, `smart_reply` has `_gexec`, the calendar and DNS helpers are
+offloaded at their call sites, and `smtp_sender` / `smtp_reader` say in their
+module docstrings that callers must do it. `EmailHistoryService.sync_replies_for_account`
+was the one that did not, and it is the worst place for it to have been missed:
+
+- it makes **one `messages().get` per message**, up to 50 per mailbox, on top of
+  the `messages().list` — so the stall is tens of round trips deep, not one;
+- `sync_all_accounts` loops that over every connected mailbox the caller owns;
+- and it is reached from **`POST /api/v1/emails/sync`**, a request-path endpoint.
+  One operator pressing "Sync now" froze the API for every tenant sharing the
+  worker, for as long as Gmail took to answer.
+
+`EmailHistoryService._gexec` is the offload, mirroring `smart_reply`'s.
+`_build_gmail_service` goes through `to_thread` too — `build()` refreshes
+credentials and, depending on the client version, fetches a discovery document.
+
+**`bounce_ingestion.ingest_account` was the other one**, and it is the same
+function as `complaint_ingestion.ingest_account` — whose docstring says it
+*mirrors* this one — with the offload present in the mirror and absent in the
+original. It is the deeper stall of the two: a `messages().get` per DSN, up to
+**100** per mailbox, across every connected mailbox on the beat. What it holds
+is the beat worker, so what waits is every other scheduled task on it,
+including the send queue. `ingest_smtp_account` directly below it wraps its
+IMAP reads in `asyncio.to_thread`, which is what makes this a slip rather than
+a decision. `tests/test_bounce_scan_offloaded.py` pins both halves of the pair —
+the fixed one and the control — because "these two are the same function twice"
+is the fact that let them drift.
+
+`tests/test_gmail_sync_offloaded.py` pins the behaviour rather than the call
+shape: the Gmail calls must land on a thread that is not the loop's, and the
+loop must keep servicing timers while they run. **The responsiveness threshold
+cannot be "the loop advanced at all"** — a blocked sweep still yields at each of
+its `await db.execute(...)` points, so the broken version ticks a handful of
+times. What separates them is the rate.
+
+## A credential can be rotated from the dashboard, and the environment is still the base
+
+`app_credentials` (migration 120) holds **overrides**: a row wins for its key,
+and no row means the `.env` value stands. An empty table is therefore a no-op,
+and clearing an override restores the deployed value rather than blanking it.
+`Platform → API Credentials` (platform_admin only) is the UI; the registry
+`credential_store.MANAGED_CREDENTIALS` is an allowlist, without which the
+endpoint would be an arbitrary write primitive over `Settings`.
+
+Four things about it that are not obvious from the code:
+
+- **It hydrates `Settings` rather than being a lookup.** Fifteen call sites read
+  `get_settings().google_client_id`, several inside synchronous OAuth helpers
+  with no session in hand (`GmailSender`, `google_calendar`, `postmaster_oauth`,
+  both ingestion sweeps). Resolving once and writing onto the `lru_cache`d
+  singleton is what avoids threading a session through all of them.
+- **`_ENV_BASELINE` is snapshotted before the first hydrate**, because by the
+  second one the attribute holds the *previous override*, not the environment.
+  A store that read it back at clear-time would "restore" to the value being
+  backed out — discovered while backing out a bad credential, i.e. at the worst
+  moment. `test_clearing_an_override_restores_the_deployed_value` pins it.
+- **Propagation is per process and therefore explicit.** The worker that served
+  the write has the value at once; the rest get it from
+  `app.tasks.credentials.refresh_credentials` (5-minute beat) or a restart.
+  Without that task the UI would report success while the beat worker went on
+  using the retired key — worse than not having the feature. `applied_at` in
+  the API response is per-worker, so the propagation is visible rather than
+  assumed.
+- **Not org-scoped, and it must not become so.** These identify the deployment
+  to a third party — one Google Cloud project, one redirect URI — and are
+  resolved where no org is bound (the OAuth callback runs before any user
+  context exists). A tenant admin who could write `google_client_id` could point
+  the consent flow at a client they control. The exemptions in
+  `test_org_scoping_coverage.py` and `test_task_org_binding.py` both say so.
+
+**Rotating the Google client invalidates every stored Gmail refresh token.** A
+refresh token is issued *to* an OAuth client; the new client cannot refresh the
+old one's grants. Every connected mailbox has to be reconnected, and until it
+is, `sync_replies_for_account` raises `RefreshError` per account and
+`sync_all_accounts` self-heals by flipping each to `status='revoked'` — which is
+correct behaviour that looks exactly like a mass revocation incident.
+
+## Gmail strips the base64 padding, and three of four decoders didn't restore it
+
+`base64.urlsafe_b64decode` raises `binascii.Error: Incorrect padding` unless the
+encoded length is a multiple of 4, and an **unpadded** encoded length is a
+multiple of 4 for only one raw byte-length in three. Gmail returns
+`body.data` unpadded. So decoding it inline fails on roughly **two message
+bodies in three** — selected by nothing but the message's length, which is why
+it never looked like a pattern.
+
+There were four readers of Gmail bodies and one of them padded. Where each put
+the failure is the whole story:
+
+- **`email_history._decode_base64url` padded**, so the *inbox* — the surface
+  anyone actually looks at — worked. Solved ground, visibly.
+- **`bounce_ingestion` and `complaint_ingestion` wrapped the decode in
+  `except Exception: pass`** and fell back to Gmail's ~100-character `snippet`.
+  A DSN's `Final-Recipient` and an ARF report's `Original-Rcpt-To` are in the
+  body, not the snippet, so the sweep logged *"matched the query but parsed no
+  recipient"* at DEBUG and moved on: no `BounceRecord`, no suppression, and the
+  cadence kept mailing a dead mailbox. That is precisely the loop
+  `bounce_ingestion`'s own module docstring exists to close, failing two times
+  in three while reporting a clean sweep.
+- **`smart_reply._extract_body` didn't catch**, so it raised — an ordinary
+  prospect reply took the auto-responder down instead of being answered. The
+  loud failure, and by far the cheaper one.
+
+`app.services.gmail_body.decode_body` is the one decoder; all four go through
+it. `tests/test_gmail_body_padding.py` parametrizes every case over the three
+length classes and asserts no module outside `gmail_body` calls
+`urlsafe_b64decode`.
+
+**Every test body must be length-parametrized.** A body that happens to encode
+to a multiple of 4 passes against the broken decoder — `test_gmail_sync_offloaded`'s
+`"Sounds good."` is one, which is exactly how a suite of 4700 tests contained no
+evidence of this. Note also the second-order lesson about defensive `except`
+blocks around *parsers*: a swallowed decode error reads as "this message had
+nothing in it", which is indistinguishable from the quiet correct case. Nothing
+here was ever going to show up as an error rate.
+
+## One bad inbound message must not take the mailbox — or the sweep — with it
+
+The reply sync ran a whole mailbox in one transaction with no way back from a
+statement that failed inside it. Two faults compounded, and both are about
+input arriving from the open internet:
+
+- **The unbounded header.** `_is_outreach_reply` matches an inbound message's
+  `In-Reply-To` / `References` against ids we recorded when sending, by putting
+  every token into two `IN` clauses. Those headers are written by the *sender of
+  the inbound message* — attacker-controlled, bounded by nothing between the
+  mail server and here — and every driver refuses a statement past its own
+  parameter ceiling (psycopg: 65535). `reply_matching._message_id_tokens` was
+  capped for exactly this; `email_history._parse_message_ids` is a second parser
+  of the same two headers, written earlier, and never was. Both now go through
+  `reply_matching.bound_header_tokens`, which owns the policy: `In-Reply-To` is
+  the *direct parent* and is kept whole, and only the `References` chain is cut,
+  from its **oldest** end.
+- **The cascade.** A failed statement leaves the session unusable until someone
+  rolls back. Nothing did, so the message after the bad one failed, and the one
+  after that, and the `commit` at the end — and then the **next mailbox** in the
+  sweep, on the same session, and the caller's session after that. One crafted
+  reply to one mailbox stopped reply ingestion for the whole org, and "no
+  replies at all" is indistinguishable from "no replies yet".
+
+Recovering has two consequences that are easy to get wrong:
+
+- **Commit per message, not per mailbox.** A rollback discards everything still
+  pending, so recovering from message 2 with a batched commit means throwing
+  away message 1.
+- **A rollback expires every instance on the session**, and reading an expired
+  attribute back is a database round trip the sync ORM accessor cannot make from
+  a coroutine (`MissingGreenlet`). So the recovery breaks the iteration it was
+  added to save unless the loop holds plain values: `sync_replies_for_account`
+  captures `account.id`/`.email` up front, and `sync_all_accounts` iterates ids
+  and re-`get`s each row.
+
+**`tests/test_gmail_sync_resilience.py` poisons the session with a failed
+*flush*, not a failed SELECT, and that is the whole test.** Postgres aborts the
+transaction on any error, so in production a bad SELECT cascades exactly as
+described — but SQLite does not, and the test engine is SQLite. Written the
+obvious way, both cascade tests passed with the rollback deleted. A failed flush
+deactivates the transaction in SQLAlchemy itself, driver-independently, so the
+test now fails without the fix. Any resilience test asserting "the thing after
+the broken one still works" has this trap: verify it fails without the fix, or
+it is pinning nothing.
+
 ## Every do-not-contact writer writes the list, erasure most of all
 
 Five paths suppress an address (unsubscribe link, reply, bounce, complaint, bulk

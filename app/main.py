@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import RateLimitStateMiddleware, limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys, credentials
 from app.routers.public_api import public_app
 
 settings = get_settings()
@@ -125,6 +125,24 @@ async def lifespan(app: FastAPI):
     # be built before the first request, which is before this runs.)
     require_secret_key()
     logger.info("Starting Landline API (%s)", settings.app_env)
+
+    # Apply any credential overrides an operator set from the dashboard, before
+    # the first request can resolve a Google client id or a provider key. A
+    # failure here must not stop the app booting: every managed credential has
+    # its environment value as the fallback, and an API that will not start is a
+    # worse outcome than one running on the deployed credentials.
+    try:
+        from app.database import async_session_factory
+        from app.services import credential_store
+
+        async with async_session_factory() as session:
+            await credential_store.hydrate(session)
+    except Exception as exc:  # pragma: no cover - exercised via the beat task
+        logger.warning(
+            "Could not load credential overrides at startup (%s); "
+            "using environment values", exc,
+        )
+
     yield
     logger.info("Shutting down Landline API")
     # Close the database engine
@@ -238,6 +256,8 @@ app.include_router(routing.router, prefix=settings.api_prefix, dependencies=_aut
 app.include_router(tenants.router, prefix=settings.api_prefix, dependencies=_auth)
 # SaaS Phase 2 — Platform Admin (cross-org management; platform_admin only).
 app.include_router(platform.router, prefix=settings.api_prefix, dependencies=_auth)
+# Platform credential management (view/rotate API keys from the dashboard).
+app.include_router(credentials.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(integrations.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(workflows.router, prefix=settings.api_prefix, dependencies=_auth)
 # Phase 3 — Advanced AI & Autonomous Operations

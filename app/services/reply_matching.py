@@ -61,7 +61,44 @@ _MSGID_RE = re.compile(r"<([^>]+)>")
 # history, RFC 5322 encourages trimming it, and we match against ids *we* wrote:
 # the one that threads a reply to our send is the most recent, and the newest
 # entries are at the end.
-_MAX_MSGID_TOKENS = 64
+#
+# Public because it is a property of *this* codebase's threading lookups rather
+# than of this module: ``email_history._parse_message_ids`` parses the same two
+# attacker-written headers into the same shape of ``IN`` clause and needs the
+# same ceiling. A second, independently-chosen constant is a second thing to
+# forget.
+MAX_MSGID_TOKENS = 64
+
+
+def bound_header_tokens(per_header: list[list[str]]) -> list[str]:
+    """Flatten per-header token lists down to :data:`MAX_MSGID_TOKENS`.
+
+    **What is dropped matters**, which is why this takes the headers *apart*
+    rather than one combined list. Callers pass ``In-Reply-To`` first and it is
+    the *direct parent* — the single id most likely to be one of ours — so a
+    plain tail-slice of the combined list would discard exactly the token worth
+    keeping. Each header is trimmed on its own, earlier arguments keep their
+    tokens whole, and only the surplus header is cut, from its **head**: a
+    ``References`` chain runs oldest to newest, so its newest entries are the
+    ones adjacent to our send.
+    """
+    total = sum(len(f) for f in per_header)
+    if total <= MAX_MSGID_TOKENS:
+        return [t for header in per_header for t in header]
+
+    logger.info(
+        "Reply carried %d threading ids; matching against at most %d",
+        total, MAX_MSGID_TOKENS,
+    )
+    out: list[str] = []
+    remaining = MAX_MSGID_TOKENS
+    for header in per_header:
+        if remaining <= 0:
+            break
+        keep = min(len(header), remaining)
+        out.extend(header[-keep:])
+        remaining -= keep
+    return out
 
 
 def _message_id_tokens(*header_values: Optional[str]) -> list[str]:
@@ -71,13 +108,8 @@ def _message_id_tokens(*header_values: Optional[str]) -> list[str]:
     part (before ``@``), because the send path stores the bare Gmail id while the
     RFC message-id it threads under is ``<{gmail_id}@mail.gmail.com>``.
 
-    Bounded at :data:`_MAX_MSGID_TOKENS`. **What is dropped matters**: callers
-    pass ``In-Reply-To`` first and it is the *direct parent* — the single id most
-    likely to be one of ours — so a plain tail-slice of the combined list would
-    discard exactly the token worth keeping. Each header is trimmed on its own,
-    earlier arguments keep their tokens whole, and only the surplus header is
-    cut, from its **head**: a ``References`` chain runs oldest to newest, so its
-    newest entries are the ones adjacent to our send.
+    Bounded at :data:`MAX_MSGID_TOKENS` by :func:`bound_header_tokens`, which
+    owns the "which tokens survive" policy.
     """
     per_header: list[list[str]] = []
     seen: set = set()
@@ -93,23 +125,7 @@ def _message_id_tokens(*header_values: Optional[str]) -> list[str]:
                     found.append(token)
         per_header.append(found)
 
-    total = sum(len(f) for f in per_header)
-    if total <= _MAX_MSGID_TOKENS:
-        return [t for header in per_header for t in header]
-
-    logger.info(
-        "Reply carried %d threading ids; matching against at most %d",
-        total, _MAX_MSGID_TOKENS,
-    )
-    out: list[str] = []
-    remaining = _MAX_MSGID_TOKENS
-    for header in per_header:
-        if remaining <= 0:
-            break
-        keep = min(len(header), remaining)
-        out.extend(header[-keep:])
-        remaining -= keep
-    return out
+    return bound_header_tokens(per_header)
 
 
 async def find_stoppable_enrollment(

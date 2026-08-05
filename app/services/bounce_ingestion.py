@@ -46,6 +46,7 @@ from app.models.bounce_record import BounceRecord
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
 from app.services.bounce_handler import classify_bounce, record_bounce
+from app.services.gmail_body import decode_body
 from app.services.smtp_reader import SmtpMailboxReader
 
 logger = logging.getLogger(__name__)
@@ -235,8 +236,6 @@ class BounceIngestionService:
         same whether the provider puts the detail in message/delivery-status,
         text/plain, or only the snippet.
         """
-        import base64
-
         chunks: list[str] = []
         snippet = msg.get("snippet")
         if snippet:
@@ -246,17 +245,32 @@ class BounceIngestionService:
             body = part.get("body", {}) or {}
             data = body.get("data")
             if data:
+                # ``decode_body`` restores the padding Gmail strips. Decoding
+                # inline here raised on two message bodies in three, and this
+                # ``except`` turned that into "the DSN named no recipient" —
+                # silently, on the sweep whose whole job is suppressing the
+                # address it could not read.
                 try:
-                    chunks.append(
-                        base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", "replace")
-                    )
+                    chunks.append(decode_body(data))
                 except Exception:  # pragma: no cover - defensive
-                    pass
+                    logger.warning("Undecodable body part on bounce message")
             for sub in part.get("parts", []) or []:
                 _walk(sub)
 
         _walk(msg.get("payload", {}) or {})
         return "\n".join(chunks)
+
+    async def _gexec(self, request):
+        """Run a blocking googleapiclient request off the event loop.
+
+        Identical to ``ComplaintIngestionService._gexec``, and this module is
+        the one the complaint sweep says it *mirrors* — it was the half of the
+        pair that never got it. The stall is not one round trip: the scan makes
+        a ``messages().get`` per DSN, up to 100 per mailbox, across every
+        connected mailbox on the beat, with the loop held throughout. Every
+        other beat task and coroutine on that worker waits.
+        """
+        return await asyncio.to_thread(request.execute)
 
     async def _already_processed(self, db: AsyncSession, gmail_message_id: str) -> bool:
         return (
@@ -274,16 +288,15 @@ class BounceIngestionService:
         processed: list[dict] = []
         try:
             creds = self._build_credentials(account)
-            service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-            results = (
-                service.users()
-                .messages()
-                .list(
+            service = await asyncio.to_thread(
+                build, "gmail", "v1", credentials=creds, cache_discovery=False
+            )
+            results = await self._gexec(
+                service.users().messages().list(
                     userId="me",
                     q=BOUNCE_QUERY.format(days=lookback_days),
                     maxResults=100,
                 )
-                .execute()
             )
         except Exception as exc:
             logger.error("Bounce scan failed for %s: %s", account.email, exc)
@@ -297,11 +310,8 @@ class BounceIngestionService:
                 if await self._already_processed(db, msg_id):
                     continue
 
-                msg = (
-                    service.users()
-                    .messages()
-                    .get(userId="me", id=msg_id, format="full")
-                    .execute()
+                msg = await self._gexec(
+                    service.users().messages().get(userId="me", id=msg_id, format="full")
                 )
                 parsed = parse_bounce(self._message_text(msg))
                 if not parsed:

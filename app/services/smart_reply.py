@@ -35,6 +35,7 @@ from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.services import crypto, google_oauth
 from app.services.ai_service import get_ai_service
 from app.services.bounce_ingestion import is_bounce_message
+from app.services.gmail_body import decode_body
 
 logger = logging.getLogger(__name__)
 
@@ -804,11 +805,15 @@ class SmartReplyService:
         }
 
     def _extract_body(self, payload: dict) -> str:
-        """Extract plain text body from Gmail message payload."""
+        """Extract plain text body from Gmail message payload.
+
+        ``decode_body`` restores the padding Gmail strips off ``body.data``.
+        Decoding inline raised ``binascii.Error`` on two message bodies in
+        three, and nothing here catches it — so an ordinary reply took the
+        auto-responder down instead of being answered.
+        """
         if payload.get("body", {}).get("data"):
-            return base64.urlsafe_b64decode(payload["body"]["data"]).decode(
-                "utf-8", errors="replace"
-            )
+            return decode_body(payload["body"]["data"])
 
         parts = payload.get("parts", [])
         for part in parts:
@@ -816,9 +821,7 @@ class SmartReplyService:
                 part.get("mimeType") == "text/plain"
                 and part.get("body", {}).get("data")
             ):
-                return base64.urlsafe_b64decode(part["body"]["data"]).decode(
-                    "utf-8", errors="replace"
-                )
+                return decode_body(part["body"]["data"])
 
         for part in parts:
             if (
@@ -827,9 +830,7 @@ class SmartReplyService:
             ):
                 from bs4 import BeautifulSoup
 
-                html = base64.urlsafe_b64decode(part["body"]["data"]).decode(
-                    "utf-8", errors="replace"
-                )
+                html = decode_body(part["body"]["data"])
                 return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
 
         for part in parts:
