@@ -85,6 +85,7 @@ from app.models.inbox_thread_state import InboxThreadState
 from app.models.inbox_label import InboxLabel, InboxThreadLabel
 from app.models.api_key import ApiKey
 from app.models.app_credential import AppCredential
+from app.models.org_llm_key import OrgLlmKey
 
 __all__ = [
     "SystemSetting",
@@ -186,4 +187,5 @@ __all__ = [
     "InboxThreadLabel",
     "ApiKey",
     "AppCredential",
+    "OrgLlmKey",
 ]

@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import RateLimitStateMiddleware, limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys, credentials
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys, credentials, settings as settings_router
 from app.routers.public_api import public_app
 
 settings = get_settings()
@@ -155,7 +155,7 @@ async def lifespan(app: FastAPI):
 _is_prod = settings.app_env.lower() == "production"
 
 app = FastAPI(
-    title="Landline — Lead Generation API",
+    title="DoAide Prospect — Lead Generation API",
     description=(
         "B2B lead generation backend for Apprend Technologies. "
         "Discovers, scores, and engages manufacturing companies in the US and Canada."
@@ -324,6 +324,7 @@ app.include_router(postmaster.public_router, prefix=settings.api_prefix)
 # enforces org_admin via OrgScope. The keys minted here authenticate the public
 # API mounted below.
 app.include_router(api_keys.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(settings_router.router, prefix=settings.api_prefix, dependencies=_auth)
 
 # Public REST API v1 — a mounted sub-application with its own OpenAPI docs at
 # /api/v1/public/docs and X-API-Key authentication enforced per route. It shares
@@ -360,7 +361,7 @@ async def api_health_check():
 async def root():
     """Root endpoint — API info."""
     return {
-        "name": "Landline Lead Generation API",
+        "name": "DoAide Prospect Lead Generation API",
         "by": "Apprend Technologies",
         "docs": "/docs",
         "health": "/health",
