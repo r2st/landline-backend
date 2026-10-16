@@ -17,7 +17,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +30,7 @@ from app.models.email_signature import EmailSignature
 from app.services.email_sender import EmailSender
 from app.services.gmail_sender import GmailSender
 from app.services.smtp_sender import SmtpSender
+from app.services.template_attachments import OutgoingAttachment
 
 logger = logging.getLogger(__name__)
 
@@ -718,6 +719,7 @@ async def send_outreach_email(
     bypass_kill_switch: bool = False,
     skip_spam_scan: bool = False,
     daily_slot_reserved: bool = False,
+    attachments: Optional[Sequence[OutgoingAttachment]] = None,
 ) -> dict:
     """Send one outreach email via the resolved sender.
 
@@ -743,6 +745,10 @@ async def send_outreach_email(
     function walked past it one contact at a time. ``daily_slot_reserved=True``
     is for the queue, which claims its own slot earlier so it can release it
     alongside the send claim and the pacing window.
+
+    ``attachments`` are sent as-is on every transport. They are passed to the
+    transport only when present, so a sender that predates them (or a test
+    double of one) is called exactly as before for a plain email.
     """
     blocked = await check_send_allowed(
         db, to_email, bypass_kill_switch=bypass_kill_switch
@@ -832,6 +838,8 @@ async def send_outreach_email(
     # Wrap in a complete HTML email document with inline styles
     body_html = wrap_html_email(body_html)
 
+    extra = {"attachments": list(attachments)} if attachments else {}
+
     if account is not None:
         sender = _make_sender(account)
         try:
@@ -846,6 +854,7 @@ async def send_outreach_email(
                 in_reply_to=in_reply_to,
                 references=references,
                 list_unsubscribe_url=unsubscribe_url,
+                **extra,
             )
         except Exception:
             # The transport blew up, so nothing went out and the day's allowance
@@ -884,6 +893,7 @@ async def send_outreach_email(
             reply_to=reply_to,
             include_unsubscribe=False,
             list_unsubscribe_url=unsubscribe_url,
+            **extra,
         )
     except Exception:
         await settle_send_volume(db, slot, sent=False)

@@ -1,12 +1,13 @@
 """Amazon SES email sending service."""
 
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 from jinja2.sandbox import SandboxedEnvironment
 
 
 from app.config import get_settings
+from app.services.template_attachments import OutgoingAttachment, build_mime_body
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -73,7 +74,8 @@ class EmailSender:
         body_html: str,
         body_text: Optional[str],
         reply_to: Optional[str],
-        list_unsubscribe_url: str,
+        list_unsubscribe_url: Optional[str],
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> dict:
         """``send_raw_email`` with a MIME document, so headers can be set.
 
@@ -86,12 +88,9 @@ class EmailSender:
         identity, which is a real configured address here rather than a
         connected mailbox.
         """
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-
         from app.services.opt_out import unsubscribe_headers
 
-        message = MIMEMultipart("alternative")
+        message = build_mime_body(body_text, body_html, attachments)
         message["To"] = to_email
         message["From"] = self.sender
         message["Subject"] = subject
@@ -101,9 +100,6 @@ class EmailSender:
             list_unsubscribe_url, self.sender
         ).items():
             message[name] = value
-        if body_text:
-            message.attach(MIMEText(body_text, "plain", "utf-8"))
-        message.attach(MIMEText(body_html, "html", "utf-8"))
 
         return self.client.send_raw_email(
             Source=self.sender,
@@ -163,6 +159,7 @@ class EmailSender:
         reply_to: Optional[str] = None,
         include_unsubscribe: bool = True,
         list_unsubscribe_url: Optional[str] = None,
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> dict:
         """Send an email via SES.
 
@@ -192,7 +189,20 @@ class EmailSender:
             body_html += footer.replace("\n", "<br>")
 
         try:
-            if list_unsubscribe_url:
+            if attachments:
+                # The structured action has no way to carry a file, so there is
+                # no fallback here: a send without the attachment the template
+                # promises is a different email, and it should fail as itself.
+                response = self._send_raw(
+                    to_email=to_email,
+                    subject=subject,
+                    body_html=body_html,
+                    body_text=body_text,
+                    reply_to=reply_to,
+                    list_unsubscribe_url=list_unsubscribe_url,
+                    attachments=attachments,
+                )
+            elif list_unsubscribe_url:
                 try:
                     response = self._send_raw(
                         to_email=to_email,

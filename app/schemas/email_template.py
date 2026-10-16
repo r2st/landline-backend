@@ -26,6 +26,18 @@ class EmailTemplateUpdate(BaseModel):
     is_default: Optional[bool] = None
 
 
+class EmailTemplateAttachmentRead(BaseModel):
+    """An attachment's metadata. The bytes are served by the download route."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    created_at: datetime
+
+
 class EmailTemplateRead(EmailTemplateBase):
     model_config = ConfigDict(from_attributes=True)
 
@@ -35,6 +47,7 @@ class EmailTemplateRead(EmailTemplateBase):
     archived_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    attachments: list[EmailTemplateAttachmentRead] = []
 
 
 # --- Validation ---

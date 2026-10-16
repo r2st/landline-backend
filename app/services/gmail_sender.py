@@ -11,10 +11,8 @@ callers should invoke it via ``asyncio.to_thread``.
 
 import base64
 import logging
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from email.utils import formataddr
-from typing import Optional
+from typing import Optional, Sequence
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -22,6 +20,7 @@ from googleapiclient.errors import HttpError
 
 from app.config import get_settings
 from app.services import crypto, google_oauth
+from app.services.template_attachments import OutgoingAttachment, build_mime_body
 
 logger = logging.getLogger(__name__)
 
@@ -96,17 +95,15 @@ class GmailSender:
         body_text: Optional[str],
         reply_to: Optional[str],
         list_unsubscribe_url: Optional[str] = None,
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> dict:
-        message = MIMEMultipart("alternative")
+        message = build_mime_body(body_text, body_html, attachments)
         message["To"] = to_email
         message["From"] = formataddr((self.display_name or "", self.sender_email))
         message["Subject"] = subject
         if reply_to:
             message["Reply-To"] = reply_to
         _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
-        if body_text:
-            message.attach(MIMEText(body_text, "plain", "utf-8"))
-        message.attach(MIMEText(body_html, "html", "utf-8"))
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
         return {"raw": raw}
 
@@ -121,6 +118,7 @@ class GmailSender:
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
         list_unsubscribe_url: Optional[str] = None,
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> dict:
         """Send a single email. Mirrors EmailSender.send_email's return shape.
 
@@ -133,6 +131,7 @@ class GmailSender:
             body = self._build_mime(
                 to_email, subject, body_html, body_text, reply_to,
                 list_unsubscribe_url=list_unsubscribe_url,
+                attachments=attachments,
             )
 
             # Add threading headers for replies
@@ -142,6 +141,7 @@ class GmailSender:
                     to_email, subject, body_html, body_text, reply_to,
                     in_reply_to=in_reply_to, references=references,
                     list_unsubscribe_url=list_unsubscribe_url,
+                    attachments=attachments,
                 )
 
             # Attach threadId so Gmail groups the message into the right thread
@@ -181,9 +181,10 @@ class GmailSender:
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
         list_unsubscribe_url: Optional[str] = None,
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> dict:
         """Build MIME message with In-Reply-To and References headers for threading."""
-        message = MIMEMultipart("alternative")
+        message = build_mime_body(body_text, body_html, attachments)
         message["To"] = to_email
         message["From"] = formataddr((self.display_name or "", self.sender_email))
         message["Subject"] = subject
@@ -194,8 +195,5 @@ class GmailSender:
         if references:
             message["References"] = references
         _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
-        if body_text:
-            message.attach(MIMEText(body_text, "plain", "utf-8"))
-        message.attach(MIMEText(body_html, "html", "utf-8"))
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
         return {"raw": raw}

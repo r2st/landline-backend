@@ -37,6 +37,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.email_template import EmailSend
+from app.services import template_attachments
 from app.services.email_dispatch import send_outreach_email
 from app.tasks.celery_app import celery_app
 from app.tasks.org_runner import for_each_org
@@ -150,12 +151,17 @@ async def send_due_scheduled_for_session(db: AsyncSession, *, now=None) -> dict:
             continue  # another worker took it
 
         try:
+            # The body was frozen at compose time; the files are read now. An
+            # attachment removed from the template in the meantime was removed
+            # because it should not go out, which includes this send.
+            attachments = await template_attachments.load_for_send(db, row.template_id)
             result = await send_outreach_email(
                 db,
                 to_email=row.to_email,
                 subject=row.subject or "",
                 body_html=row.body_html,
                 sender_account_id=row.sender_account_id,
+                attachments=attachments,
             )
         except Exception as exc:  # noqa: BLE001 — one bad row must not stop the batch
             logger.exception("Scheduled send %s failed", row.id)

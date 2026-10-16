@@ -11,9 +11,10 @@ import logging
 import uuid
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Optional, Union
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +27,7 @@ from app.models.email_template import (
     DELIVERED_STATUSES,
     EmailSend,
     EmailTemplate,
+    EmailTemplateAttachment,
     WIRE_STATUSES,
 )
 from app.models.interaction import Interaction
@@ -40,6 +42,7 @@ from app.schemas.email_template import (
     EmailComposeResult,
     EmailSendPaginatedResponse,
     EmailSendRead,
+    EmailTemplateAttachmentRead,
     EmailTemplateCreate,
     EmailTemplateRead,
     EmailTemplateUpdate,
@@ -53,11 +56,12 @@ from app.schemas.email_template import (
     AIEmailGenerateRequest,
     AIEmailGenerateResponse,
 )
-from app.services import template_validation
+from app.services import template_attachments, template_validation
 from app.services.email_compose import SAMPLE_CONTEXT, build_merge_context, render
 from app.services.ai_email_generator import generate_email as ai_generate_email
 from app.services.email_dispatch import get_account, resolve_sender_info, send_outreach_email
 from app.routers.tracking import generate_tracking_pixel_url
+from app.services.uploads import read_capped
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["email"])
@@ -310,6 +314,122 @@ async def unarchive_email_template(
     return template
 
 
+# --- Attachments ---
+
+async def _get_attachment_or_404(
+    db: AsyncSession, template_id: uuid.UUID, attachment_id: uuid.UUID
+) -> EmailTemplateAttachment:
+    """One attachment, pinned to the template named in the URL.
+
+    The template is looked up first through the org-scoped read, so a foreign
+    template id is a 404 before the attachment id is ever consulted.
+    """
+    await _get_template_or_404(db, template_id)
+    result = await db.execute(
+        select(EmailTemplateAttachment).where(
+            EmailTemplateAttachment.id == attachment_id,
+            EmailTemplateAttachment.template_id == template_id,
+        )
+    )
+    attachment = result.scalars().first()
+    if attachment is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return attachment
+
+
+@router.post(
+    "/email-templates/{template_id}/attachments",
+    response_model=EmailTemplateAttachmentRead,
+    status_code=201,
+)
+async def upload_template_attachment(
+    template_id: uuid.UUID,
+    file: UploadFile = File(..., description="File sent with every email from this template"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Attach a file to a template. It goes out with every email rendered from it.
+
+    Limits are enforced here rather than at send time — see
+    ``app.services.template_attachments`` — because at send time a file that is
+    too large or a blocked type fails every recipient in the batch.
+    """
+    template = await _get_template_or_404(db, template_id)
+    filename = template_attachments.sanitize_filename(file.filename)
+    data = await read_capped(
+        file, template_attachments.MAX_FILE_BYTES, what="Attachment"
+    )
+    template_attachments.check_new_attachment(
+        filename, len(data), [a.size_bytes for a in template.attachments]
+    )
+
+    attachment = EmailTemplateAttachment(
+        template_id=template.id,
+        filename=filename,
+        content_type=template_attachments.resolve_content_type(file.content_type, filename),
+        size_bytes=len(data),
+        content=data,
+    )
+    db.add(attachment)
+    await db.flush()
+    await db.refresh(attachment, attribute_names=["created_at"])
+    logger.info(
+        "Attached %s (%d bytes) to email template %s",
+        attachment.filename, attachment.size_bytes, template_id,
+    )
+    return attachment
+
+
+@router.get("/email-templates/{template_id}/attachments/{attachment_id}")
+async def download_template_attachment(
+    template_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """The attachment's bytes, as a download — never rendered inline.
+
+    ``attachment`` disposition and ``nosniff`` because the content type is
+    whatever the uploader's browser declared: an HTML file served inline from
+    this origin would run with the viewer's session.
+    """
+    attachment = await _get_attachment_or_404(db, template_id, attachment_id)
+    data = (
+        await db.execute(
+            select(EmailTemplateAttachment.content).where(
+                EmailTemplateAttachment.id == attachment.id
+            )
+        )
+    ).scalar_one()
+    return Response(
+        content=data,
+        media_type=attachment.content_type,
+        headers={
+            "Content-Disposition": _content_disposition(attachment.filename),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.delete(
+    "/email-templates/{template_id}/attachments/{attachment_id}", status_code=204
+)
+async def delete_template_attachment(
+    template_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove an attachment. Emails already sent keep the copy they carried."""
+    attachment = await _get_attachment_or_404(db, template_id, attachment_id)
+    await db.delete(attachment)
+    await db.flush()
+    logger.info("Removed attachment %s from email template %s", attachment_id, template_id)
+
+
+def _content_disposition(filename: str) -> str:
+    """``attachment`` with an ASCII fallback name and the RFC 5987 UTF-8 one."""
+    fallback = filename.encode("ascii", "replace").decode("ascii").replace('"', "")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
 @router.post(
     "/email-templates/{template_id}/clone",
     response_model=EmailTemplateRead,
@@ -343,6 +463,15 @@ async def clone_email_template(
         is_default=False,
         is_archived=False,
     )
+    # A variant of a template is a variant of the email it sends, and the files
+    # are part of that email.
+    for item in await template_attachments.load_for_send(db, source.id):
+        clone.attachments.append(EmailTemplateAttachment(
+            filename=item.filename,
+            content_type=item.content_type,
+            size_bytes=len(item.data),
+            content=item.data,
+        ))
     db.add(clone)
     try:
         await db.flush()
@@ -564,6 +693,9 @@ async def send_test_email(
 
     subject = "[TEST] " + render(template.subject, context)
     body_html = render(template.body, context)
+    # The test is of the email as recipients will get it, files included —
+    # a deck that is too large for the recipient's server should fail here.
+    attachments = await template_attachments.load_for_send(db, template.id)
 
     try:
         send_result = await send_outreach_email(
@@ -572,6 +704,7 @@ async def send_test_email(
             subject=subject,
             body_html=body_html,
             sender_account_id=payload.sender_account_id,
+            attachments=attachments,
         )
         status = send_result.get("status", "error")
         detail = send_result.get("reason") or send_result.get("detail")
@@ -639,6 +772,10 @@ async def compose_and_send(
     if sender_user_id is None and sender_info.account_id is not None:
         acct = await get_account(db, sender_info.account_id)
         sender_user_id = getattr(acct, "user_id", None) if acct else None
+
+    # Read once for the batch, not per contact: every recipient gets the same
+    # files, and the bytes are the expensive part of the row.
+    attachments = await template_attachments.load_for_send(db, template.id)
 
     results: list[EmailComposeResult] = []
     sent = skipped = errors = scheduled = 0
@@ -747,6 +884,7 @@ async def compose_and_send(
                 subject=subject,
                 body_html=body_html,
                 sender_account_id=payload.sender_account_id,
+                attachments=attachments,
             )
             status = send_result.get("status", "error")
             message_id = send_result.get("message_id")

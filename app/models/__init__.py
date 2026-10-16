@@ -23,7 +23,7 @@ from app.models.sequence import OutreachSequence, SequenceStep
 from app.models.outreach import OutreachEnrollment, OutreachEvent
 from app.models.contact_engagement import ContactEngagementProfile
 from app.models.interaction import Interaction
-from app.models.email_template import EmailTemplate, EmailSend
+from app.models.email_template import EmailTemplate, EmailTemplateAttachment, EmailSend
 from app.models.follow_up import FollowUp
 from app.models.gmail_account import GmailAccount
 from app.models.smtp_account import SmtpAccount
@@ -102,6 +102,7 @@ __all__ = [
     "ContactEngagementProfile",
     "Interaction",
     "EmailTemplate",
+    "EmailTemplateAttachment",
     "EmailSend",
     "FollowUp",
     "GmailAccount",

@@ -11,11 +11,11 @@ import logging
 import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from email.utils import formataddr
-from typing import Optional
+from typing import Optional, Sequence
 
 from app.services import crypto
+from app.services.template_attachments import OutgoingAttachment, build_mime_body
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +99,9 @@ class SmtpSender:
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
         list_unsubscribe_url: Optional[str] = None,
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> MIMEMultipart:
-        message = MIMEMultipart("alternative")
+        message = build_mime_body(body_text, body_html, attachments)
         message["To"] = to_email
         message["From"] = formataddr((self.display_name or "", self.sender_email))
         message["Subject"] = subject
@@ -112,9 +113,6 @@ class SmtpSender:
         if references:
             message["References"] = references
         _apply_unsubscribe_headers(message, list_unsubscribe_url, self.sender_email)
-        if body_text:
-            message.attach(MIMEText(body_text, "plain", "utf-8"))
-        message.attach(MIMEText(body_html, "html", "utf-8"))
         return message
 
     def send_email(
@@ -128,6 +126,7 @@ class SmtpSender:
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
         list_unsubscribe_url: Optional[str] = None,
+        attachments: Optional[Sequence[OutgoingAttachment]] = None,
     ) -> dict:
         """Send a single email. Mirrors GmailSender.send_email's return shape.
 
@@ -140,6 +139,7 @@ class SmtpSender:
                 to_email, subject, body_html, body_text, reply_to,
                 in_reply_to=in_reply_to, references=references,
                 list_unsubscribe_url=list_unsubscribe_url,
+                attachments=attachments,
             )
             server = self._connect()
             try:

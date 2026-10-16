@@ -7,6 +7,8 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     Index,
+    Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -142,9 +144,56 @@ class EmailTemplate(Base, OrgScopedMixin):
     sends: Mapped[list["EmailSend"]] = relationship(
         "EmailSend", back_populates="template", lazy="selectin"
     )
+    # Metadata only on load — ``content`` is deferred, so listing templates does
+    # not pull every attachment's bytes through the picker. Send paths read the
+    # bytes explicitly via ``app.services.template_attachments``.
+    attachments: Mapped[list["EmailTemplateAttachment"]] = relationship(
+        "EmailTemplateAttachment",
+        back_populates="template",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="(EmailTemplateAttachment.created_at, EmailTemplateAttachment.id)",
+    )
 
     def __repr__(self) -> str:
         return f"<EmailTemplate {self.name} default={self.is_default}>"
+
+
+class EmailTemplateAttachment(Base, OrgScopedMixin):
+    """A file sent with every email rendered from its template.
+
+    The bytes live in Postgres rather than on disk. The API runs on the host and
+    the scheduled-send sweep runs in a container, so a file path written by one
+    is not readable by the other; a row is. The size caps in
+    ``app.services.template_attachments`` keep that cheap.
+    """
+
+    __tablename__ = "email_template_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("email_templates.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    template: Mapped["EmailTemplate"] = relationship(
+        "EmailTemplate", back_populates="attachments"
+    )
+
+    def __repr__(self) -> str:
+        return f"<EmailTemplateAttachment {self.filename} ({self.size_bytes} bytes)>"
 
 
 class EmailSend(Base, OrgScopedMixin):
