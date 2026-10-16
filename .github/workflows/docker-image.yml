@@ -1,0 +1,64 @@
+name: Build Landline Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - requirements-runtime.txt
+      - app/**
+      - alembic/**
+      - alembic.ini
+      - .github/workflows/docker-image.yml
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Optional extra image tag, for example prod-candidate
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY_IMAGE: ghcr.io/r2st/landline-backend
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=${{ github.event.inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image_tag != '' }}
+
+      - id: build-date
+        run: echo "value=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ steps.build-date.outputs.value }}
