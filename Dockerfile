@@ -23,7 +23,7 @@ ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="Landline Backend" \
-      org.opencontainers.image.source="https://github.com/Apprend-Technologies/landline-backend" \
+      org.opencontainers.image.source="https://github.com/r2st/prospect-backend" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"
 

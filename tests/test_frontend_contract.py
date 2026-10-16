@@ -18,7 +18,7 @@ was renamed or never shipped is the one that keeps biting, and it's cheap to
 pin.
 
 Add a line here when the frontend starts calling a new endpoint. If a path here
-has no caller in landline-frontend any more, delete the line rather than
+has no caller in prospect-frontend any more, delete the line rather than
 keeping a route alive for a test.
 """
 
@@ -141,7 +141,7 @@ def _registered() -> set[tuple[str, str]]:
 @pytest.mark.parametrize("method,path", FRONTEND_ROUTES)
 def test_frontend_route_is_registered(method: str, path: str):
     assert (method, path) in _registered(), (
-        f"{method} {path} is called by landline-frontend but is not registered. "
+        f"{method} {path} is called by prospect-frontend but is not registered. "
         "Either the route moved (update the caller) or it was never shipped "
         "(the frontend is calling a contract that doesn't exist)."
     )

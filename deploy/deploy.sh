@@ -8,7 +8,7 @@ set -euo pipefail
 # The production server should not build application code.
 #
 # Usage:
-#   LANDLINE_IMAGE=ghcr.io/apprend-technologies/landline-backend:sha-abc123 ./deploy/deploy.sh
+#   LANDLINE_IMAGE=ghcr.io/r2st/prospect-backend:sha-abc123 ./deploy/deploy.sh
 #   IMAGE_TAG=sha-abc123 ./deploy/deploy.sh
 #   ./deploy/deploy.sh --rollback
 # =============================================================================
@@ -19,7 +19,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 ENV_FILE="${ENV_FILE:-.env.production}"
 IMAGE_ENV_FILE="${IMAGE_ENV_FILE:-.image.env}"
 BACKUP_DIR="${BACKUP_DIR:-$LANDLINE_DIR/backups}"
-REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/r2st/landline-backend}"
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/r2st/prospect-backend}"
 DEPLOY_SERVICES="${DEPLOY_SERVICES:-celery-worker}"
 TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
 

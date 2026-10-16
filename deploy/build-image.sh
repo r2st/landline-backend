@@ -5,7 +5,7 @@ set -euo pipefail
 # The production server should only pull this image.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/r2st/landline-backend}"
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/r2st/prospect-backend}"
 PLATFORMS="${PLATFORMS:-linux/arm64}"
 PUSH="${PUSH:-1}"
 OUTPUT="${OUTPUT:-}"

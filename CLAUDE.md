@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file tells any Claude Code session everything it needs to know to work on the landline-backend codebase effectively.
+This file tells any Claude Code session everything it needs to know to work on the prospect-backend codebase effectively.
 
 ## Project Overview
 Landline is a B2B lead generation and client management platform. FastAPI backend with SQLAlchemy async, PostgreSQL, Redis, Celery Beat.

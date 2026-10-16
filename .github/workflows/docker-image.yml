@@ -23,7 +23,7 @@ permissions:
   packages: write
 
 env:
-  REGISTRY_IMAGE: ghcr.io/r2st/landline-backend
+  REGISTRY_IMAGE: ghcr.io/r2st/prospect-backend
 
 jobs:
   build:

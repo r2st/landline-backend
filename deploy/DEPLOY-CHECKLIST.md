@@ -2,8 +2,8 @@
 
 ## Pre-deployment (do these first)
 
-- [ ] Push landline-backend to GitHub: double-click `deploy/push-to-github.command`
-- [ ] Push landline-frontend to GitHub: double-click `landline-frontend/deploy/push-to-github.command`
+- [ ] Push prospect-backend to GitHub: double-click `deploy/push-to-github.command`
+- [ ] Push prospect-frontend to GitHub: double-click `prospect-frontend/deploy/push-to-github.command`
 - [ ] Open EC2 security group `launch-wizard-3` in AWS Console
   - Add inbound rule: SSH (22) from your IP
   - Add inbound rule: Custom TCP 8443 from 0.0.0.0/0 (Landline API)
@@ -33,7 +33,7 @@
    cat ~/.ssh/landline_deploy.pub
    ```
    Add that public key at **Settings → Deploy keys → Add deploy key** on
-   `Apprend-Technologies/landline-backend`, leaving *Allow write access*
+   `r2st/prospect-backend`, leaving *Allow write access*
    **unchecked**. Confirm with `ssh -T git@github.com`.
 
    Never put a PAT back in the remote URL — it ends up in `.git/config`, in
@@ -42,7 +42,7 @@
 3. Run initial setup (first time only):
    ```bash
    cd /opt
-   sudo git clone git@github.com:Apprend-Technologies/landline-backend.git landline
+   sudo git clone git@github.com:r2st/prospect-backend.git landline
    cd landline
    sudo chmod +x deploy/ec2-setup.sh
    sudo ./deploy/ec2-setup.sh
@@ -79,7 +79,7 @@
 ## Frontend deployment (Amplify)
 
 1. In AWS Amplify Console, create a new app
-2. Connect to `Apprend-Technologies/landline-frontend` repo
+2. Connect to `r2st/prospect-frontend` repo
 3. Framework: Vite (auto-detected from amplify.yml)
 4. Environment variables:
    - `VITE_API_URL` = `https://18.209.12.106:8443` (or your domain)

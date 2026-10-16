@@ -2,19 +2,19 @@
 set -euo pipefail
 
 # =============================================================================
-# Push landline-backend to GitHub under Apprend-Technologies org
+# Push prospect-backend to GitHub under the r2st account
 # Double-click this file in Finder to run in Terminal
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-ORG="Apprend-Technologies"
-REPO_NAME="landline-backend"
+ORG="r2st"
+REPO_NAME="prospect-backend"
 
 cd "$REPO_DIR"
 
 echo "========================================"
-echo "  Push landline-backend to GitHub"
+echo "  Push prospect-backend to GitHub"
 echo "========================================"
 echo ""
 

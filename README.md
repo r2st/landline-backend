@@ -42,7 +42,8 @@ Landline is a standalone B2B lead generation tool designed for Apprend Technolog
 ### 1. Clone and Set Up
 
 ```bash
-cd landline-backend
+git clone https://github.com/r2st/prospect-backend.git
+cd prospect-backend
 python -m venv .venv
 source .venv/bin/activate    # Linux/Mac
 # .venv\Scripts\activate     # Windows
@@ -271,7 +272,7 @@ Tests use an in-memory SQLite database and do not require PostgreSQL or Redis.
 ## Project Structure
 
 ```
-landline-backend/
+prospect-backend/
 ├── alembic/               # Database migrations
 ├── app/
 │   ├── main.py            # FastAPI application entry

@@ -2,7 +2,7 @@
 
 **B2B lead-generation backend for Apprend Technologies: discovers, scores and engages manufacturing companies across the US and Canada.**
 
-- **Repo:** https://github.com/Apprend-Technologies/landline-backend · branch `main`
+- **Repo:** https://github.com/r2st/prospect-backend · branch `main`
 - **Local path:** `apprend_tech/landline-backend`
 - **Frontend:** [`../landline-frontend`](../landline-frontend)
 
