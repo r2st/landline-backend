@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     # Must EXACTLY match an Authorized redirect URI configured in Google Cloud.
-    # e.g. https://landline-api.apprendtechnologies.com/api/v1/gmail/oauth/callback
+    # e.g. https://prospect.doaide.com/api/v1/gmail/oauth/callback
     google_oauth_redirect_uri: str = "http://localhost:8000/api/v1/gmail/oauth/callback"
     # Postmaster Tools OAuth callback (P2 audit). Empty = derive from the Gmail
     # redirect by swapping the path (see postmaster_oauth._redirect_uri).

@@ -132,9 +132,13 @@ def make_unsubscribe_token(email: str, org_id: Optional[uuid.UUID] = None) -> st
 # The endpoint that honours these tokens. It is an API route, not a frontend
 # one: `routers.tracking.unsubscribe` renders its own confirmation page, and the
 # RFC 8058 one-click POST has to land on the same origin.
-UNSUBSCRIBE_ENDPOINT = (
-    "https://landline-api.apprendtechnologies.com:8443/api/v1/track/unsubscribe"
-)
+# Derived from ``tracking_base_url`` so it tracks the deployment rather than
+# being a hardcoded constant that drifts when the domain changes.
+
+
+def _unsubscribe_endpoint() -> str:
+    base = get_settings().tracking_base_url.rstrip("/")
+    return f"{base}/api/v1/track/unsubscribe"
 
 
 def make_unsubscribe_url(email: str, org_id: Optional[uuid.UUID] = None) -> str:
@@ -147,7 +151,7 @@ def make_unsubscribe_url(email: str, org_id: Optional[uuid.UUID] = None) -> str:
     recipient's only way out. Signed with the hardcoded fallback secret, too, so
     even against the right endpoint it would not have verified.
     """
-    return f"{UNSUBSCRIBE_ENDPOINT}?token={make_unsubscribe_token(email, org_id)}"
+    return f"{_unsubscribe_endpoint()}?token={make_unsubscribe_token(email, org_id)}"
 
 
 def unsubscribe_headers(

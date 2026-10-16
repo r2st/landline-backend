@@ -365,7 +365,7 @@ async def test_ses_footer_link_actually_unsubscribes(client, db_session):
     footer = EmailSender()._build_unsubscribe_footer("sesfooter@example.com")
 
     assert "landline.apprendtechnologies.com/unsubscribe" not in footer
-    assert opt_out.UNSUBSCRIBE_ENDPOINT in footer
+    assert opt_out._unsubscribe_endpoint() in footer
 
     token = footer.split("token=", 1)[1].split()[0]
     resp = await client.post(f"/api/v1/track/unsubscribe?token={token}")
@@ -386,8 +386,8 @@ async def test_both_senders_mint_against_the_same_endpoint(db_session):
     dispatch_url = _make_unsubscribe_url("same@example.com")
     ses_footer = EmailSender()._build_unsubscribe_footer("same@example.com")
 
-    assert dispatch_url.split("?")[0] == opt_out.UNSUBSCRIBE_ENDPOINT
-    assert ses_footer.split("token=")[0].endswith(opt_out.UNSUBSCRIBE_ENDPOINT + "?")
+    assert dispatch_url.split("?")[0] == opt_out._unsubscribe_endpoint()
+    assert ses_footer.split("token=")[0].endswith(opt_out._unsubscribe_endpoint() + "?")
 
 
 @pytest.mark.asyncio

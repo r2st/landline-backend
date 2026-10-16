@@ -49,7 +49,7 @@ needs is supplied via environment variables — no secrets are committed.
 2. Application type: **Web application**.
 3. **Authorized redirect URIs** — add the backend callback. It must match
    `GOOGLE_OAUTH_REDIRECT_URI` exactly:
-   - Production:  `https://landline-api.apprendtechnologies.com/api/v1/gmail/oauth/callback`
+   - Production:  `https://prospect.doaide.com/api/v1/gmail/oauth/callback`
    - Local dev:   `http://localhost:8000/api/v1/gmail/oauth/callback`
 4. Copy the generated **Client ID** and **Client Secret**.
 
@@ -60,8 +60,8 @@ Add these to `/opt/landline/.env.production` (and your local `.env`):
 ```dotenv
 GOOGLE_CLIENT_ID=<client id from step 4>
 GOOGLE_CLIENT_SECRET=<client secret from step 4>
-GOOGLE_OAUTH_REDIRECT_URI=https://landline-api.apprendtechnologies.com/api/v1/gmail/oauth/callback
-FRONTEND_URL=https://landline.apprendtechnologies.com
+GOOGLE_OAUTH_REDIRECT_URI=https://prospect.doaide.com/api/v1/gmail/oauth/callback
+FRONTEND_URL=https://prospect.doaide.com
 TOKEN_ENCRYPTION_KEY=<run the command below once and paste the result>
 ```
 
