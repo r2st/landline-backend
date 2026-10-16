@@ -76,7 +76,7 @@ async def test_send(payload: TestSendRequest, db: AsyncSession = Depends(get_db)
     if from_domain:
         auth = await asyncio.to_thread(domain_auth.check_domain_auth, from_domain)
 
-    subject = payload.subject or "Landline deliverability test"
+    subject = payload.subject or "DoAide Prospect deliverability test"
     body = payload.body or _DEFAULT_BODY
 
     send_result = await send_outreach_email(

@@ -351,7 +351,7 @@ async def test_send(
     result = await asyncio.to_thread(
         SmtpSender(account).send_email,
         to_email=to_email,
-        subject="You're all set — Landline test",
+        subject="You're all set — DoAide Prospect test",
         body_html=(
             f"<p>Hey — this is a quick test from Landline to make sure sending from "
             f"<strong>{account.email}</strong> is working.</p>"

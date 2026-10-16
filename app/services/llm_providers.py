@@ -79,7 +79,7 @@ KNOWN_PROVIDERS: dict[str, dict[str, Any]] = {
         "base_url": "https://openrouter.ai/api/v1",
         "supports_vision": True,
         # Attribution headers OpenRouter asks integrators to send.
-        "headers": {"HTTP-Referer": "https://apprend.tech", "X-Title": "Landline"},
+        "headers": {"HTTP-Referer": "https://apprend.tech", "X-Title": "DoAide Prospect"},
     },
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",

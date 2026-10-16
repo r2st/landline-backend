@@ -60,11 +60,11 @@ That's a strong signal. Good time to follow up while they're actively looking. C
         the operator a warm number to dial while interest is fresh.
         """
         subject = f"📞 Phone found for {contact_name} at {company_name}"
-        body = f"""{contact_name} at {company_name} has been engaging with your emails, and Dialtone just found a phone number for them:
+        body = f"""{contact_name} at {company_name} has been engaging with your emails, and Autopilot just found a phone number for them:
 
 {phone}
 
-They're warm — a personal call now could move this forward. Open the company in Landline for the full picture.
+They're warm — a personal call now could move this forward. Open the company in DoAide Prospect for the full picture.
 """
         await self._send_notification(subject, body)
 
@@ -113,7 +113,7 @@ They're warm — a personal call now could move this forward. Open the company i
         )
         if details:
             body += f"\n{details}\n"
-        body += "\nOpen the Domain Health dashboard in Landline for the full breakdown and DNS fixes.\n"
+        body += "\nOpen the Domain Health dashboard in DoAide Prospect for the full breakdown and DNS fixes.\n"
         await self._send_notification(subject, body)
 
     async def _send_notification(

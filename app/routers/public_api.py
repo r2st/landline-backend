@@ -652,7 +652,7 @@ def build_public_app() -> FastAPI:
     route carries.
     """
     public_app = FastAPI(
-        title="Landline Public API",
+        title="DoAide Prospect Public API",
         version="1.0.0",
         description=PUBLIC_API_DESCRIPTION,
         docs_url="/docs",

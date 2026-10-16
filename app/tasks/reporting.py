@@ -31,7 +31,7 @@ def _run_async(coro):
 @celery_app.task(name="app.tasks.reporting.generate_daily_summary")
 def generate_daily_summary():
     """Build and persist today's Dialtone activity summary, then optionally email it."""
-    logger.info("Generating Dialtone daily activity summary")
+    logger.info("Generating Autopilot daily activity summary")
     settings = get_settings()
 
     async def _run():
@@ -58,7 +58,7 @@ def generate_daily_summary():
                     from app.services.notifications import get_notification_service
 
                     notifier = get_notification_service()
-                    subject = f"Dialtone daily activity — {summary.summary_date}"
+                    subject = f"Autopilot daily activity — {summary.summary_date}"
                     body = (
                         f"{summary.narrative}\n\n"
                         f"Emails sent: {summary.emails_sent}\n"

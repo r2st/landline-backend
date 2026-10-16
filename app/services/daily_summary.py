@@ -362,7 +362,7 @@ async def enhance_narrative_with_ai(metrics: dict, base_narrative: str) -> str:
             "You are writing a concise daily activity briefing for a sales team "
             "whose autonomous cold-email agent is named Dialtone. Rewrite the "
             "following factual summary as a warm, professional 2–4 sentence "
-            "briefing, referring to the agent by name as \"Dialtone\". Do not "
+            "briefing, referring to the agent by name as \"Autopilot\". Do not "
             "invent numbers — only use the facts given. Keep it tight.\n\n"
             f"Facts: {base_narrative}\n\n"
             f"Key metrics JSON: {metrics}"

@@ -592,7 +592,7 @@ async def test_send(
     send_result = await asyncio.to_thread(
         GmailSender(account).send_email,
         to_email=to_email,
-        subject="You're all set — Landline test",
+        subject="You're all set — DoAide Prospect test",
         body_html=(
             f"<p>Hey — this is a quick test from Landline to make sure sending from "
             f"<strong>{account.email}</strong> is working.</p>"

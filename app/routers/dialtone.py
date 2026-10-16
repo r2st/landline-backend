@@ -581,7 +581,7 @@ async def _collect_events(
                 id=f"auto_paused:{trip.id}",
                 type="auto_paused",
                 timestamp=_aware(trip.triggered_at),
-                title="Dialtone auto-paused — deliverability danger signal",
+                title="Autopilot auto-paused — deliverability danger signal",
                 description=reason,
                 source="danger_monitor",
                 severity="error",

@@ -14,8 +14,11 @@ set -euo pipefail
 # Usage:  ./backup-db.sh
 # =============================================================================
 
-LANDLINE_DIR="${LANDLINE_DIR:-/opt/landline}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LANDLINE_DIR="${LANDLINE_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+ENV_FILE="${ENV_FILE:-.env.production}"
+IMAGE_ENV_FILE="${IMAGE_ENV_FILE:-.image.env}"
 BACKUP_DIR="$LANDLINE_DIR/backups/db"
 S3_BUCKET="${LANDLINE_BACKUP_BUCKET:-landline-backups-235494810658}"
 DB_NAME="${POSTGRES_DB:-landline_db}"
@@ -27,9 +30,17 @@ ARCHIVE="landline_db_${TIMESTAMP}.sql.gz"
 cd "$LANDLINE_DIR"
 mkdir -p "$BACKUP_DIR"
 
+compose() {
+    local args=(docker compose)
+    [ -f "$ENV_FILE" ] && args+=(--env-file "$ENV_FILE")
+    [ -f "$IMAGE_ENV_FILE" ] && args+=(--env-file "$IMAGE_ENV_FILE")
+    args+=(-f "$COMPOSE_FILE")
+    "${args[@]}" "$@"
+}
+
 echo "[backup] Dumping $DB_NAME at $(date -u +%FT%TZ)"
 # pg_dump runs inside the postgres container; stream the dump out and gzip on host.
-docker compose -f "$COMPOSE_FILE" exec -T postgres \
+compose exec -T postgres \
     pg_dump -U "$DB_USER" --no-owner --clean --if-exists "$DB_NAME" \
     | gzip -9 > "$BACKUP_DIR/$ARCHIVE"
 

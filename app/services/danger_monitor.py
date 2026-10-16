@@ -845,7 +845,7 @@ class DangerMonitor:
             ]
             body = "\n".join(lines)
             await get_notification_service()._send_notification(
-                "🚨 Dialtone auto-paused — deliverability danger signal", body
+                "🚨 Autopilot auto-paused — deliverability danger signal", body
             )
         except Exception:  # pragma: no cover - notification is best-effort
             logger.info("danger monitor: operator alert skipped", exc_info=True)

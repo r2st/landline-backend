@@ -12,6 +12,8 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        # .env also carries compose-only vars (POSTGRES_USER, ...); don't crash on them.
+        extra="ignore",
     )
 
     # Database
@@ -295,7 +297,7 @@ class Settings(BaseSettings):
     census_api_key: str = ""
 
     # App
-    app_name: str = "Landline"
+    app_name: str = "DoAide Prospect"
     app_env: str = "development"
 
     # API key authentication (empty = disabled for backward compat)
