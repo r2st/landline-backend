@@ -102,7 +102,7 @@ services:
       CELERY_BROKER_URL: "redis://redis:6379/0"
       CELERY_RESULT_BACKEND: "redis://redis:6379/1"
       APP_ENV: "staging"
-    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--beat", "--loglevel=info", "--concurrency=1", "-Q", "celery,outreach,scraping,enrichment"]
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--beat", "--schedule=/tmp/celerybeat-schedule", "--loglevel=info", "--concurrency=1", "-Q", "celery,outreach,scraping,enrichment"]
     # Override Dockerfile HEALTHCHECK - Celery has no HTTP server on :8000.
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping --timeout 5 2>&1 | grep -q pong || exit 1"]
