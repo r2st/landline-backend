@@ -87,6 +87,7 @@ from app.models.api_key import ApiKey
 from app.models.app_credential import AppCredential
 from app.models.org_llm_key import OrgLlmKey
 from app.models.discovery_document import DiscoveryDocument
+from app.models.campaign import Campaign, CampaignDailyLog, CampaignProspect
 
 __all__ = [
     "SystemSetting",
@@ -191,4 +192,7 @@ __all__ = [
     "AppCredential",
     "OrgLlmKey",
     "DiscoveryDocument",
+    "Campaign",
+    "CampaignProspect",
+    "CampaignDailyLog",
 ]

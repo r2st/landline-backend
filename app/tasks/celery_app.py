@@ -30,6 +30,7 @@ celery_app.conf.update(
         "app.tasks.enrichment.*": {"queue": "enrichment"},
         "app.tasks.outreach.*": {"queue": "outreach"},
         "app.tasks.scheduled_sends.*": {"queue": "outreach"},
+        "app.tasks.campaigns.*": {"queue": "outreach"},
         "app.tasks.news.*": {"queue": "enrichment"},
         "app.tasks.followups.*": {"queue": "enrichment"},
         "app.tasks.calls.*": {"queue": "enrichment"},
@@ -442,6 +443,12 @@ celery_app.conf.update(
         },
         # Uploaded discovery documents keep their bytes for 30 days; the
         # extracted candidates stay. Daily is plenty for a 30-day window.
+        # Autopilot Outreach: reconcile, discover (daily), draft, and schedule
+        # paced sends for every active campaign.
+        "run-campaign-scheduler": {
+            "task": "app.tasks.campaigns.run_campaign_scheduler",
+            "schedule": 900.0,  # every 15 minutes
+        },
         "purge-expired-discovery-document-files": {
             "task": "app.tasks.discovery_documents.purge_expired_document_files",
             "schedule": crontab(hour=3, minute=40),
@@ -505,3 +512,5 @@ import app.tasks.reporting  # noqa: F401
 import app.tasks.inbox  # noqa: F401
 # Registers the 30-day purge of uploaded discovery document files.
 import app.tasks.discovery_documents  # noqa: F401
+# Registers the Autopilot Outreach scheduler and per-prospect send task.
+import app.tasks.campaigns  # noqa: F401

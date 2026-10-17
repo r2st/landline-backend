@@ -16,7 +16,7 @@ from app.auth import ApiKeyMiddleware
 from app.dependencies import get_current_user
 from app.rate_limit import RateLimitStateMiddleware, limiter
 from app.security import get_configured_secret
-from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys, credentials, settings as settings_router, discovery_documents
+from app.routers import auth, admin, companies, contacts, leads, outreach, dashboard, import_export, email_templates, email_signatures, follow_ups, gmail, smtp, discovery, tracking, ai, groups, news, tactics, pipeline, activity, sequences, suggestions, deals, tasks, interactions, health, clients, reports, emails, knowledge, calls, investors, sentiment, email_testing, intent, coaching, competitive, routing, tenants, integrations, workflows, prospecting, deliverability, orchestration, relationships, meetings, system, email_test, dialtone, replies, smart_reply, domain_health, danger_signals, ab_tests, send_timing, verification, ai_drafts, platform, org, gdpr, deal_agent, referral_agent, social_listening_agent, meeting_agent, client_success_agent, channels, postmaster, analytics, api_keys, credentials, settings as settings_router, discovery_documents, campaigns
 from app.routers.public_api import public_app
 
 settings = get_settings()
@@ -222,6 +222,7 @@ app.include_router(follow_ups.router, prefix=settings.api_prefix, dependencies=_
 app.include_router(gmail.router, prefix=settings.api_prefix)
 app.include_router(smtp.router, prefix=settings.api_prefix)
 app.include_router(discovery_documents.router, prefix=settings.api_prefix, dependencies=_auth)
+app.include_router(campaigns.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(discovery.router, prefix=settings.api_prefix, dependencies=_auth)
 app.include_router(tracking.router, prefix=settings.api_prefix)
 app.include_router(ai.router, prefix=settings.api_prefix, dependencies=_auth)

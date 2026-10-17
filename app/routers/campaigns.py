@@ -1,0 +1,575 @@
+"""Autopilot Outreach campaigns: documents → ICP → prospects → paced Gmail sends.
+
+Mounted at ``/campaigns`` (authenticated, org-scoped). The pipeline itself runs
+in ``app.services.campaigns``, driven by the 15-minute beat; this router only
+creates campaigns, changes their settings and lets an operator review drafts.
+
+Unsubscribe is deliberately *not* here: every campaign send goes through
+``send_outreach_email``, which adds the footer link and the RFC 8058 headers for
+the platform's ``GET/POST /api/v1/unsubscribe``. That records the opt-out on the
+org's durable suppression list, which every send gate reads — a campaign-local
+list would be one the gate can't see.
+
+Agents see their own campaigns; managers and admins see every campaign in their
+org. Org isolation itself comes from the read filter (``OrgScopedMixin``).
+"""
+
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.dependencies import get_current_user
+from app.models.campaign import Campaign, CampaignDailyLog, CampaignProspect
+from app.models.company import Company
+from app.models.contact import Contact
+from app.models.discovery_document import STATUS_READY, DiscoveryDocument
+from app.models.gmail_account import GmailAccount
+from app.models.user import User, UserRole, normalize_role
+from app.services import campaigns as svc
+from app.services import org_gemini
+
+router = APIRouter(prefix="/campaigns", tags=["campaigns"])
+
+AI_KEY_REQUIRED = {
+    "code": "gemini_key_required",
+    "message": (
+        "Add a Gemini API key in Settings → API Keys to run Autopilot Outreach "
+        "(a Groq or OpenRouter key also works)."
+    ),
+}
+_SEES_ALL = {UserRole.ORG_MANAGER.value, UserRole.ORG_ADMIN.value, UserRole.PLATFORM_ADMIN.value}
+
+
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
+class _Settings(BaseModel):
+    daily_send_limit: Optional[int] = Field(None, ge=1, le=svc.MAX_DAILY_LIMIT)
+    send_window_start: Optional[str] = None
+    send_window_end: Optional[str] = None
+    timezone: Optional[str] = None
+    send_on_weekends: Optional[bool] = None
+    review_before_send: Optional[bool] = None
+    attach_documents: Optional[bool] = None
+    gmail_account_id: Optional[uuid.UUID] = None
+
+    @field_validator("send_window_start", "send_window_end")
+    @classmethod
+    def _hhmm(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return svc.parse_hhmm(v).strftime("%H:%M")
+
+    @field_validator("timezone")
+    @classmethod
+    def _tz(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"Unknown timezone: {v}")
+        return v
+
+
+class CampaignCreate(_Settings):
+    name: str = Field(..., min_length=1, max_length=255)
+    document_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=20)
+
+
+class CampaignUpdate(_Settings):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    status: Optional[Literal["active", "paused", "stopped"]] = None
+    icp_json: Optional[dict[str, Any]] = None
+
+
+class CampaignOut(BaseModel):
+    id: uuid.UUID
+    user_id: Optional[uuid.UUID] = None
+    name: str
+    status: str
+    pause_reason: Optional[str] = None
+    document_ids: list[str]
+    document_summary: Optional[str] = None
+    icp_json: Optional[dict[str, Any]] = None
+    gmail_account_id: Optional[uuid.UUID] = None
+    daily_send_limit: int
+    send_window_start: str
+    send_window_end: str
+    timezone: str
+    send_on_weekends: bool
+    review_before_send: bool
+    attach_documents: bool
+    warmup_day: int
+    todays_cap: int
+    last_discovery_on: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CampaignDetail(CampaignOut):
+    metrics: dict[str, Any]
+    daily: list[dict[str, Any]]
+
+
+class ProspectOut(BaseModel):
+    id: uuid.UUID
+    campaign_id: uuid.UUID
+    company_id: Optional[uuid.UUID] = None
+    company_name: Optional[str] = None
+    contact_id: Optional[uuid.UUID] = None
+    contact_name: Optional[str] = None
+    to_email: Optional[str] = None
+    status: str
+    source: Optional[str] = None
+    skip_reason: Optional[str] = None
+    error: Optional[str] = None
+    email_subject: Optional[str] = None
+    email_body: Optional[str] = None
+    gmail_message_id: Optional[str] = None
+    sent_at: Optional[datetime] = None
+    replied_at: Optional[datetime] = None
+    bounced_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class ApproveIn(BaseModel):
+    """Optional edits made while reviewing the draft."""
+
+    email_subject: Optional[str] = Field(None, min_length=1, max_length=150)
+    email_body: Optional[str] = Field(None, min_length=1, max_length=4000)
+
+
+class SkipIn(BaseModel):
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _out(c: Campaign) -> dict:
+    return {
+        "id": c.id,
+        "user_id": c.user_id,
+        "name": c.name,
+        "status": c.status,
+        "pause_reason": c.pause_reason,
+        "document_ids": [str(i) for i in c.document_ids or []],
+        "document_summary": c.document_summary,
+        "icp_json": c.icp_json,
+        "gmail_account_id": c.gmail_account_id,
+        "daily_send_limit": c.daily_send_limit,
+        "send_window_start": c.send_window_start,
+        "send_window_end": c.send_window_end,
+        "timezone": c.timezone,
+        "send_on_weekends": c.send_on_weekends,
+        "review_before_send": c.review_before_send,
+        "attach_documents": c.attach_documents,
+        "warmup_day": c.warmup_day,
+        "todays_cap": svc.ramp_cap(c),
+        "last_discovery_on": c.last_discovery_on.isoformat() if c.last_discovery_on else None,
+        "created_at": c.created_at,
+        "updated_at": c.updated_at,
+    }
+
+
+def _sees_all(user: User) -> bool:
+    return normalize_role(user.role) in _SEES_ALL
+
+
+async def _get_campaign(db: AsyncSession, campaign_id: uuid.UUID, user: User) -> Campaign:
+    c = await db.get(Campaign, campaign_id)
+    # db.get bypasses nothing here: Campaign is org-scoped, but an identity-map
+    # hit skips the SELECT, so the org is checked explicitly as well.
+    if (
+        c is None
+        or c.deleted_at is not None
+        or (user.org_id is not None and c.org_id != user.org_id and not _is_platform_admin(user))
+        or (not _sees_all(user) and c.user_id != user.id)
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
+    return c
+
+
+def _is_platform_admin(user: User) -> bool:
+    return normalize_role(user.role) == UserRole.PLATFORM_ADMIN.value
+
+
+async def _get_prospect(db: AsyncSession, campaign: Campaign, prospect_id: uuid.UUID) -> CampaignProspect:
+    p = (
+        await db.execute(
+            select(CampaignProspect)
+            .where(CampaignProspect.id == prospect_id, CampaignProspect.campaign_id == campaign.id)
+            .limit(1)
+        )
+    ).scalars().first()
+    if p is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Prospect not found")
+    return p
+
+
+async def _resolve_account(
+    db: AsyncSession, user: User, account_id: Optional[uuid.UUID]
+) -> GmailAccount:
+    stmt = select(GmailAccount).where(
+        GmailAccount.status == "connected", GmailAccount.sending_enabled.is_(True)
+    )
+    if account_id is not None:
+        stmt = stmt.where(GmailAccount.id == account_id)
+    else:
+        stmt = stmt.where(GmailAccount.user_id == user.id)
+    acct = (
+        await db.execute(stmt.order_by(GmailAccount.connected_at, GmailAccount.id).limit(1))
+    ).scalars().first()
+    if acct is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "gmail_required",
+                "message": "Connect a Gmail account with sending turned on before starting a campaign.",
+            },
+        )
+    return acct
+
+
+async def _metrics(db: AsyncSession, c: Campaign) -> dict:
+    rows = (
+        await db.execute(
+            select(CampaignProspect.status, func.count(CampaignProspect.id))
+            .where(CampaignProspect.campaign_id == c.id)
+            .group_by(CampaignProspect.status)
+        )
+    ).all()
+    by_status = {s: n for s, n in rows}
+    mailed = sum(by_status.get(s, 0) for s in svc.WIRE)
+    replied = by_status.get("replied", 0)
+    bounced = by_status.get("bounced", 0)
+    return {
+        "by_status": by_status,
+        "total_prospects": sum(by_status.values()),
+        "emails_sent": mailed,
+        "replies": replied,
+        "bounces": bounced,
+        "reply_rate": round(replied / mailed, 4) if mailed else 0.0,
+        "bounce_rate": round(bounced / mailed, 4) if mailed else 0.0,
+        "sent_today": await svc.sent_today(db, c),
+        "todays_cap": svc.ramp_cap(c),
+        "awaiting_review": by_status.get("draft_created", 0),
+    }
+
+
+def _apply_settings(c: Campaign, data: dict) -> None:
+    for field in (
+        "daily_send_limit", "send_window_start", "send_window_end", "timezone",
+        "send_on_weekends", "review_before_send", "attach_documents",
+    ):
+        if field in data and data[field] is not None:
+            setattr(c, field, data[field])
+    if svc.parse_hhmm(c.send_window_start) >= svc.parse_hhmm(c.send_window_end):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The send window must end after it starts.")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@router.post("", response_model=CampaignOut, status_code=status.HTTP_201_CREATED)
+async def create_campaign(
+    payload: CampaignCreate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Create a campaign from discovery documents; the AI writes the ICP now."""
+    ids = list(dict.fromkeys(payload.document_ids))
+    docs = (
+        await db.execute(select(DiscoveryDocument).where(DiscoveryDocument.id.in_(ids)))
+    ).scalars().all()
+    found = {d.id for d in docs}
+    missing = [str(i) for i in ids if i not in found]
+    if missing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Documents not found: {', '.join(missing)}")
+    not_ready = [d.filename for d in docs if d.status != STATUS_READY]
+    if not_ready:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "documents_not_ready", "message": f"Still processing: {', '.join(not_ready)}"},
+        )
+    if not await org_gemini.has_org_llm_key(db, user.org_id):
+        raise HTTPException(status.HTTP_409_CONFLICT, AI_KEY_REQUIRED)
+    account = await _resolve_account(db, user, payload.gmail_account_id)
+
+    try:
+        icp, summary = await svc.build_icp(db, user.org_id, list(docs))
+    except svc.CampaignError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": exc.message})
+    except org_gemini.GeminiKeyMissing:
+        raise HTTPException(status.HTTP_409_CONFLICT, AI_KEY_REQUIRED)
+    except org_gemini.GeminiError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            {"code": "ai_failed", "message": f"Couldn't build a customer profile: {exc}"},
+        )
+
+    c = Campaign(
+        user_id=user.id,
+        name=payload.name.strip(),
+        status="active",
+        document_ids=[str(i) for i in ids],
+        document_summary=summary,
+        icp_json=icp.model_dump(),
+        gmail_account_id=account.id,
+        warmup_day=1,
+        # Column defaults only apply at flush; _apply_settings reads them first.
+        daily_send_limit=20,
+        send_window_start="09:00",
+        send_window_end="18:00",
+        timezone="America/Toronto",
+        send_on_weekends=False,
+        review_before_send=False,
+        attach_documents=False,
+    )
+    _apply_settings(c, payload.model_dump(exclude={"name", "document_ids", "gmail_account_id"}))
+    db.add(c)
+    await db.commit()
+    await db.refresh(c)
+    return _out(c)
+
+
+@router.get("", response_model=list[CampaignOut])
+async def list_campaigns(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    stmt = select(Campaign).where(Campaign.deleted_at.is_(None))
+    if not _sees_all(user):
+        stmt = stmt.where(Campaign.user_id == user.id)
+    if status_filter:
+        stmt = stmt.where(Campaign.status == status_filter)
+    rows = (
+        await db.execute(stmt.order_by(Campaign.created_at.desc(), Campaign.id))
+    ).scalars().all()
+    return [_out(c) for c in rows]
+
+
+@router.get("/{campaign_id}", response_model=CampaignDetail)
+async def get_campaign(
+    campaign_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    c = await _get_campaign(db, campaign_id, user)
+    logs = (
+        await db.execute(
+            select(CampaignDailyLog)
+            .where(CampaignDailyLog.campaign_id == c.id)
+            .order_by(CampaignDailyLog.date.desc())
+            .limit(30)
+        )
+    ).scalars().all()
+    daily = [
+        {
+            "date": log.date.isoformat(),
+            "prospects_found": log.prospects_found,
+            "emails_sent": log.emails_sent,
+            "emails_bounced": log.emails_bounced,
+            "errors": log.errors or [],
+        }
+        for log in logs
+    ]
+    return {**_out(c), "metrics": await _metrics(db, c), "daily": daily}
+
+
+@router.patch("/{campaign_id}", response_model=CampaignOut)
+async def update_campaign(
+    campaign_id: uuid.UUID,
+    payload: CampaignUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Change settings, or pause / resume / stop. A stopped campaign stays stopped."""
+    c = await _get_campaign(db, campaign_id, user)
+    data = payload.model_dump(exclude_unset=True)
+    if c.status == "stopped" and data.get("status") in ("active", "paused"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "A stopped campaign can't be restarted; create a new one.")
+    if data.get("name"):
+        c.name = data["name"].strip()
+    if "icp_json" in data and data["icp_json"] is not None:
+        c.icp_json = svc.Icp.model_validate(data["icp_json"]).model_dump()
+    if data.get("gmail_account_id"):
+        c.gmail_account_id = (await _resolve_account(db, user, data["gmail_account_id"])).id
+    _apply_settings(c, data)
+
+    new_status = data.get("status")
+    if new_status and new_status != c.status:
+        if new_status == "active":
+            # Resuming after an automatic pause: the cause must be fixed first.
+            if c.gmail_account_id is None or await svc.sending_account(db, c) is None:
+                c.gmail_account_id = (await _resolve_account(db, user, None)).id
+            c.pause_reason = None
+            c.next_send_at = None
+        elif new_status in ("paused", "stopped"):
+            c.pause_reason = None
+            # Release scheduled-but-unsent leases; send_prospect would refuse
+            # them anyway, this just keeps the counts honest.
+            pending = (
+                await db.execute(
+                    select(CampaignProspect).where(
+                        CampaignProspect.campaign_id == c.id,
+                        CampaignProspect.status == "approved",
+                        CampaignProspect.scheduled_for.isnot(None),
+                    )
+                )
+            ).scalars().all()
+            for p in pending:
+                p.scheduled_for = None
+        if new_status == "stopped":
+            unsent = (
+                await db.execute(
+                    select(CampaignProspect).where(
+                        CampaignProspect.campaign_id == c.id,
+                        CampaignProspect.status.in_(svc.PENDING),
+                    )
+                )
+            ).scalars().all()
+            for p in unsent:
+                p.status, p.skip_reason = "skipped", "Campaign stopped"
+        c.status = new_status
+    await db.commit()
+    await db.refresh(c)
+    return _out(c)
+
+
+@router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_campaign(
+    campaign_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Soft delete: the prospect rows stay, because they are what makes "never
+    the same address twice" true for the campaigns that come after this one."""
+    c = await _get_campaign(db, campaign_id, user)
+    c.status = "stopped"
+    c.deleted_at = datetime.now(timezone.utc)
+    unsent = (
+        await db.execute(
+            select(CampaignProspect).where(
+                CampaignProspect.campaign_id == c.id, CampaignProspect.status.in_(svc.PENDING)
+            )
+        )
+    ).scalars().all()
+    for p in unsent:
+        p.status, p.skip_reason = "skipped", "Campaign deleted"
+    await db.commit()
+
+
+@router.get("/{campaign_id}/prospects")
+async def list_prospects(
+    campaign_id: uuid.UUID,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    c = await _get_campaign(db, campaign_id, user)
+    base = select(CampaignProspect).where(CampaignProspect.campaign_id == c.id)
+    if status_filter:
+        base = base.where(CampaignProspect.status == status_filter)
+    total = (
+        await db.execute(select(func.count()).select_from(base.subquery()))
+    ).scalar_one()
+    rows = (
+        await db.execute(
+            base.order_by(CampaignProspect.created_at.desc(), CampaignProspect.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).scalars().all()
+
+    company_ids = {p.company_id for p in rows if p.company_id}
+    contact_ids = {p.contact_id for p in rows if p.contact_id}
+    companies = {
+        cid: name for cid, name in (
+            await db.execute(select(Company.id, Company.name).where(Company.id.in_(company_ids)))
+        ).all()
+    } if company_ids else {}
+    contacts = {
+        cid: " ".join(x for x in (first, last) if x) or None
+        for cid, first, last in (
+            await db.execute(
+                select(Contact.id, Contact.first_name, Contact.last_name).where(Contact.id.in_(contact_ids))
+            )
+        ).all()
+    } if contact_ids else {}
+
+    items = [
+        ProspectOut(
+            id=p.id, campaign_id=p.campaign_id,
+            company_id=p.company_id, company_name=companies.get(p.company_id),
+            contact_id=p.contact_id, contact_name=contacts.get(p.contact_id),
+            to_email=p.to_email, status=p.status, source=p.source,
+            skip_reason=p.skip_reason, error=p.error,
+            email_subject=p.email_subject, email_body=p.email_body,
+            gmail_message_id=p.gmail_message_id,
+            sent_at=p.sent_at, replied_at=p.replied_at, bounced_at=p.bounced_at,
+            created_at=p.created_at,
+        )
+        for p in rows
+    ]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.post("/{campaign_id}/prospects/{prospect_id}/approve", response_model=ProspectOut)
+async def approve_prospect(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    payload: Optional[ApproveIn] = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Approve a reviewed draft (optionally edited) for sending."""
+    c = await _get_campaign(db, campaign_id, user)
+    p = await _get_prospect(db, c, prospect_id)
+    if p.status not in ("draft_created", "approved"):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Can't approve a prospect that is '{p.status}'.")
+    if payload is not None:
+        if payload.email_subject:
+            p.email_subject = " ".join(payload.email_subject.split())
+        if payload.email_body:
+            p.email_body = payload.email_body.strip()
+    if not p.email_subject or not p.email_body:
+        raise HTTPException(status.HTTP_409_CONFLICT, "There is no draft to approve yet.")
+    p.status = "approved"
+    p.approved_at = p.approved_at or datetime.now(timezone.utc)
+    p.error = None
+    await db.commit()
+    await db.refresh(p)
+    return ProspectOut.model_validate(p, from_attributes=True)
+
+
+@router.post("/{campaign_id}/prospects/{prospect_id}/skip", response_model=ProspectOut)
+async def skip_prospect(
+    campaign_id: uuid.UUID,
+    prospect_id: uuid.UUID,
+    payload: Optional[SkipIn] = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    c = await _get_campaign(db, campaign_id, user)
+    p = await _get_prospect(db, c, prospect_id)
+    if p.status not in svc.PENDING:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Can't skip a prospect that is '{p.status}'.")
+    p.status = "skipped"
+    p.skip_reason = (payload.reason if payload and payload.reason else None) or "Skipped by operator"
+    p.scheduled_for = None
+    await db.commit()
+    await db.refresh(p)
+    return ProspectOut.model_validate(p, from_attributes=True)
