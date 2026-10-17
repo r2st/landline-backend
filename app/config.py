@@ -160,6 +160,11 @@ class Settings(BaseSettings):
     # 2.5-flash is a thinking model; its reasoning tokens share max_tokens with
     # the answer. "low" keeps structured-extraction answers from being starved.
     discovery_gemini_reasoning_effort: str = "low"
+    # Discovery *search* needs Google Search grounding, which only the native
+    # generateContent API exposes — not the OpenAI shim above.
+    gemini_native_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    # Thinking tokens for the grounded search call; 0 disables thinking.
+    discovery_search_thinking_budget: int = 1024
     # Groq — free tier, very fast, generous per-day request cap.
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"

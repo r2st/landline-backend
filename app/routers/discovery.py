@@ -18,13 +18,14 @@ easy to add and easy to forget to wire up.
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func as sqla_func, select
 
 from app.database import get_db
+from app.dependencies import OrgScope, get_org_scope
 from app.models.company import Company
 from app.models.discovered_business import DiscoveredBusiness
 from app.models.discovery_search import DiscoverySearch
@@ -42,7 +43,7 @@ from app.schemas.discovery import (
     ImportBusinessRequest,
     ImportBusinessResponse,
 )
-from app.services import api_credits
+from app.services import api_credits, gemini_discovery, org_gemini
 from app.services.enrichment import get_enrichment_service
 from app.services.ingestion import get_ingestion_service
 from app.services.places_discovery import PROVIDER, get_places_service
@@ -66,6 +67,14 @@ class CompanySearchRequest(BaseModel):
     min_employees: Optional[int] = None
     max_employees: Optional[int] = None
     per_page: int = Field(10, ge=1, le=25)
+    # "gemini" runs the search on the org's own Gemini key with Google Search
+    # grounding instead of Apollo — same response shape either way.
+    source: Literal["apollo", "gemini"] = "apollo"
+
+
+GEMINI_KEY_REQUIRED_MESSAGE = (
+    "Add your Gemini API key in Settings → API Keys to search with Gemini."
+)
 
 
 class EnrichCompanyRequest(BaseModel):
@@ -90,17 +99,119 @@ def _search_error_message(status: str, error: str | None) -> str | None:
     return error
 
 
+def _company_row(outcome) -> dict:
+    return {
+        "name": outcome.record.name,
+        "domain": outcome.record.domain,
+        "status": "imported" if outcome.created else (
+            "error" if outcome.error else "exists"
+        ),
+        "id": str(outcome.company_id) if outcome.company_id else None,
+        "industry": outcome.record.industry,
+        "employee_count": outcome.record.employee_count,
+        "city": outcome.record.city,
+        "state": outcome.record.state,
+        "dedup_confidence": outcome.dedup.confidence,
+        "error": outcome.error,
+    }
+
+
+@router.post("/search-companies-gemini")
+async def search_companies_gemini(
+    payload: CompanySearchRequest,
+    db: AsyncSession = Depends(get_db),
+    scope: OrgScope = Depends(get_org_scope),
+):
+    """Search the web with the org's Gemini (Google Search grounding) and import.
+
+    Same response shape as the Apollo search, so the Discovery tab renders it
+    unchanged, plus ``source``, grounding ``sources`` and per-company
+    ``description`` / ``location`` / ``contacts``. Failures come back as a
+    non-``ok`` ``search_status`` with an operator-readable ``search_error`` —
+    exactly how the Apollo path reports a refused key — rather than as an HTTP
+    error the tab would show as "something went wrong".
+    """
+    base = {
+        "source": gemini_discovery.SOURCE,
+        "total": 0,
+        "imported": 0,
+        "already_existed": 0,
+        "search_status": "ok",
+        "search_error": None,
+        "search_error_code": None,
+        "credits_spent": 0,
+        "errors": [],
+        "companies": [],
+        "sources": [],
+    }
+    if scope.org_id is None:
+        raise HTTPException(status_code=400, detail="No organization context")
+    try:
+        records, extras, sources = await gemini_discovery.search_companies(
+            db,
+            scope.org_id,
+            industry=payload.industry,
+            location=payload.location,
+            keywords=payload.keywords,
+            min_employees=payload.min_employees,
+            max_employees=payload.max_employees,
+            limit=payload.per_page,
+        )
+    except org_gemini.GeminiKeyMissing:
+        return {
+            **base,
+            "search_status": "skipped",
+            "search_error": GEMINI_KEY_REQUIRED_MESSAGE,
+            "search_error_code": "gemini_key_required",
+        }
+    except org_gemini.GeminiError as exc:
+        return {**base, "search_status": "error", "search_error": str(exc)}
+
+    result = await get_ingestion_service().ingest(db, records)
+    companies = []
+    for outcome in result.outcomes:
+        extra = extras.get(id(outcome.record), {})
+        companies.append({
+            **_company_row(outcome),
+            "country": outcome.record.country,
+            "website": outcome.record.website,
+            "description": extra.get("description"),
+            "location": extra.get("location"),
+            "contacts": [
+                {
+                    "name": " ".join(p for p in (c.first_name, c.last_name) if p) or None,
+                    "title": c.title,
+                    "email": c.email,
+                    "linkedin": c.linkedin_url,
+                }
+                for c in outcome.record.contacts
+            ],
+        })
+    return {
+        **base,
+        "total": len(companies),
+        "imported": result.companies_created,
+        "already_existed": result.companies_matched,
+        "errors": result.errors,
+        "companies": companies,
+        "sources": sources,
+    }
+
+
 @router.post("/search-companies")
 async def search_companies(
     payload: CompanySearchRequest,
     db: AsyncSession = Depends(get_db),
+    scope: OrgScope = Depends(get_org_scope),
 ):
-    """Search Apollo for companies matching criteria and import them.
+    """Search Apollo (or, with ``source="gemini"``, Gemini) and import.
 
     Two steps now, deliberately: Apollo returns records, the ingestion service
     persists them under the one shared dedup rule. ``get_db`` owns the commit —
     the service used to commit mid-request on its own.
     """
+    if payload.source == "gemini":
+        return await search_companies_gemini(payload, db, scope)
     service = get_enrichment_service()
     search = await service.search_companies(
         db,
@@ -114,23 +225,9 @@ async def search_companies(
     )
     result = await get_ingestion_service().ingest(db, search.records)
 
-    companies = []
-    for outcome in result.outcomes:
-        companies.append({
-            "name": outcome.record.name,
-            "domain": outcome.record.domain,
-            "status": "imported" if outcome.created else (
-                "error" if outcome.error else "exists"
-            ),
-            "id": str(outcome.company_id) if outcome.company_id else None,
-            "industry": outcome.record.industry,
-            "employee_count": outcome.record.employee_count,
-            "city": outcome.record.city,
-            "state": outcome.record.state,
-            "dedup_confidence": outcome.dedup.confidence,
-            "error": outcome.error,
-        })
+    companies = [_company_row(outcome) for outcome in result.outcomes]
     return {
+        "source": "apollo",
         "total": len(companies),
         "imported": result.companies_created,
         "already_existed": result.companies_matched,

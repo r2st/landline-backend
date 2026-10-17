@@ -21,8 +21,10 @@ import json
 import logging
 import re
 import uuid
-from typing import Optional, TypeVar
+from dataclasses import dataclass, field
+from typing import Generic, Optional, TypeVar
 
+import httpx
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,6 +150,144 @@ async def generate_json(
         ) from exc
     logger.info("Org %s Gemini answer from %s", org_id, model)
     return parse_json_answer(content, schema)
+
+
+@dataclass
+class GroundedAnswer(Generic[T]):
+    """A grounded Gemini answer plus the web pages Google Search grounded it on."""
+
+    data: T
+    sources: list[dict] = field(default_factory=list)
+    model: str = ""
+
+
+def _json_object_text(content: str) -> str:
+    """The JSON object inside a grounded answer.
+
+    Grounded calls cannot use JSON mode (Gemini rejects ``responseMimeType``
+    alongside the search tool), so the model sometimes wraps the object in a
+    sentence or a fence. Take the outermost ``{...}``.
+    """
+    text = _FENCE.sub("", content or "").strip()
+    if text.startswith("{"):
+        return text
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _grounding_sources(candidate: dict) -> list[dict]:
+    chunks = ((candidate.get("groundingMetadata") or {}).get("groundingChunks")) or []
+    sources: list[dict] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        web = chunk.get("web") or {}
+        uri = web.get("uri")
+        if not uri or uri in seen:
+            continue
+        seen.add(uri)
+        sources.append({"title": web.get("title") or "", "url": uri})
+    return sources
+
+
+async def generate_grounded_json(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    system: str,
+    prompt: str,
+    schema: type[T],
+    max_tokens: int = 8192,
+    temperature: float | None = 0.2,
+    timeout: float = 120.0,
+) -> GroundedAnswer[T]:
+    """Ask the org's Gemini, grounded on Google Search, for JSON matching ``schema``.
+
+    Search grounding is only on the native ``generateContent`` API, so this is
+    the one call here that does not go through ``chat_completion``. It keeps the
+    same contract: the org's key only, no platform fallback, the private per-org
+    breaker, and errors that are safe to show and never carry the key.
+    """
+    key = await get_org_gemini_key(db, org_id)
+    if key is None:
+        raise GeminiKeyMissing()
+
+    settings = get_settings()
+    name = f"gemini-org-{org_id}"
+    if _breaker.is_open(name):
+        raise GeminiError(
+            "Gemini has failed several times in a row for this workspace — "
+            "wait a couple of minutes, then try again."
+        )
+
+    model = settings.discovery_gemini_model
+    generation: dict = {"maxOutputTokens": max_tokens}
+    if temperature is not None:
+        generation["temperature"] = temperature
+    budget = settings.discovery_search_thinking_budget
+    if budget is not None and budget >= 0:
+        generation["thinkingConfig"] = {"thinkingBudget": budget}
+    payload = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": generation,
+    }
+    url = f"{settings.gemini_native_base_url.rstrip('/')}/models/{model}:generateContent"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as http:
+            resp = await http.post(
+                url,
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        _breaker.record_failure(name)
+        logger.warning("Org %s grounded Gemini call returned HTTP %s", org_id, status)
+        if status == 429:
+            raise GeminiError(
+                "Gemini rate limit or quota reached for your API key — wait a "
+                "minute, or check the key's quota in Google AI Studio."
+            ) from exc
+        if status in (400, 401, 403):
+            raise GeminiError(
+                "Gemini refused the request. Check that the Gemini API key in "
+                "Settings → API Keys is valid and allows Google Search grounding."
+            ) from exc
+        raise GeminiError("Gemini is unavailable right now — try again shortly.") from exc
+    except Exception as exc:  # transport error, timeout, non-JSON body
+        _breaker.record_failure(name)
+        logger.warning(
+            "Org %s grounded Gemini call failed (%s)", org_id, type(exc).__name__
+        )
+        raise GeminiError("Gemini request failed — try again shortly.") from exc
+
+    candidates = data.get("candidates") or []
+    candidate = candidates[0] if candidates else {}
+    parts = (candidate.get("content") or {}).get("parts") or []
+    content = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    if not content.strip():
+        _breaker.record_failure(name)
+        logger.warning(
+            "Org %s grounded Gemini returned no text (finish_reason=%s, block=%s)",
+            org_id,
+            candidate.get("finishReason"),
+            (data.get("promptFeedback") or {}).get("blockReason"),
+        )
+        raise GeminiError("Gemini returned an empty answer — try again.")
+
+    _breaker.record_success(name)
+    logger.info("Org %s grounded Gemini answer from %s", org_id, model)
+    return GroundedAnswer(
+        data=parse_json_answer(_json_object_text(content), schema),
+        sources=_grounding_sources(candidate),
+        model=model,
+    )
 
 
 def reset_breaker() -> None:
