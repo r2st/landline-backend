@@ -114,6 +114,7 @@ async def test_bad_files_are_reported_and_good_ones_still_upload(client, db_sess
     body = resp.json()
     assert [d["filename"] for d in body["documents"]] == ["leads.csv"]
     assert [r["filename"] for r in body["rejected"]] == ["fake.pdf", "tool.exe"]
+    assert [r["index"] for r in body["rejected"]] == [1, 2]
     assert all(r["error"] for r in body["rejected"])
     assert await _doc_count(db_session) == 1
 
@@ -128,7 +129,7 @@ async def test_all_files_bad_is_422_and_stores_nothing(client, db_session):
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert detail["message"]
-    assert len(detail["rejected"]) == 2
+    assert [r["index"] for r in detail["rejected"]] == [0, 1]
     assert await _doc_count(db_session) == 0
 
 

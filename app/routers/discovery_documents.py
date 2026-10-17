@@ -57,6 +57,7 @@ class DocumentDetail(DocumentSummary):
 
 
 class RejectedFile(BaseModel):
+    index: int  # position in the uploaded ``files`` list
     filename: str
     error: str
 
@@ -195,11 +196,13 @@ async def upload_documents(
 
     docs: list[DiscoveryDocument] = []
     rejected: list[dict] = []
-    for file in files:
+    for index, file in enumerate(files):
         try:
             docs.append(await _store_upload(db, scope, org_id, file))
         except document_extract.DocumentRejected as exc:
-            rejected.append({"filename": sanitize_filename(file.filename), "error": str(exc)})
+            rejected.append(
+                {"index": index, "filename": sanitize_filename(file.filename), "error": str(exc)}
+            )
 
     if not docs:
         raise HTTPException(
