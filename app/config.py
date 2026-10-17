@@ -156,7 +156,12 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
     # Discovery document features (upload → extract → draft) call Gemini with
     # the *org's own* key from org_llm_keys — never the platform chain above.
-    discovery_gemini_model: str = "gemini-2.5-flash"
+    # Comma-separated, tried in order: a 404 moves to the next one. Google
+    # closes older models to *new* accounts while still listing them — keys
+    # created in AI Studio from late 2026 (the "AQ." format) get a 404 on
+    # gemini-2.5-flash that older keys don't — so a single pinned id breaks
+    # every newly onboarded org. The "-latest" alias is Google-maintained.
+    discovery_gemini_model: str = "gemini-3.8-flash,gemini-flash-latest,gemini-2.5-flash"
     # 2.5-flash is a thinking model; its reasoning tokens share max_tokens with
     # the answer. "low" keeps structured-extraction answers from being starved.
     discovery_gemini_reasoning_effort: str = "low"

@@ -68,6 +68,8 @@ class _FakeGemini:
 
     requests: list = []
     status = 200
+    # Per-model override, e.g. {"gemini-3.8-flash": 404}.
+    model_status: dict = {}
     text = json.dumps(ANSWER)
     sources = [{"web": {"uri": "https://example.com/a", "title": "acme-stamping.com"}}]
 
@@ -88,15 +90,18 @@ class _FakeGemini:
                 "groundingMetadata": {"groundingChunks": type(self).sources},
             }]
         }
-        return httpx.Response(
-            type(self).status, json=body, request=httpx.Request("POST", url),
-        )
+        model = url.rsplit("/models/", 1)[-1].split(":", 1)[0]
+        status = type(self).model_status.get(model, type(self).status)
+        if status == 404:
+            body = {"error": {"code": 404, "message": "no longer available to new users"}}
+        return httpx.Response(status, json=body, request=httpx.Request("POST", url))
 
 
 @pytest.fixture
 def gemini(monkeypatch):
     _FakeGemini.requests = []
     _FakeGemini.status = 200
+    _FakeGemini.model_status = {}
     _FakeGemini.text = json.dumps(ANSWER)
     monkeypatch.setattr(org_gemini.httpx, "AsyncClient", _FakeGemini)
     return _FakeGemini
@@ -178,7 +183,7 @@ async def test_request_is_grounded_and_key_travels_in_a_header(client, db_sessio
     assert "responseMimeType" not in req["json"]["generationConfig"]
     assert req["headers"]["x-goog-api-key"] == KEY
     assert KEY not in req["url"]
-    assert req["url"].endswith(f"/models/{get_settings().discovery_gemini_model}:generateContent")
+    assert req["url"].endswith(f"/models/{org_gemini.discovery_models()[0]}:generateContent")
     prompt = req["json"]["contents"][0]["parts"][0]["text"]
     assert "metal stamping" in prompt and "Ohio" in prompt and "automotive" in prompt
 
@@ -293,3 +298,78 @@ def test_blank_query_keeps_the_filter_only_prompt():
         min_employees=None, max_employees=None, limit=5,
     )
     assert prompt.startswith("Find up to 5 companies matching:\n- Industry: metal stamping")
+
+
+@pytest.fixture
+def three_models(monkeypatch):
+    monkeypatch.setattr(get_settings(), "discovery_gemini_model", "new-flash, latest-flash,old-flash")
+    return ("new-flash", "latest-flash", "old-flash")
+
+
+@pytest.mark.asyncio
+async def test_a_model_closed_to_the_key_falls_through_to_the_next(
+    client, db_session, gemini, three_models
+):
+    # Newer AI Studio keys ("AQ." format) get 404 on models closed to new
+    # accounts; the search must move on rather than fail.
+    await _save_key(db_session)
+    gemini.model_status = {"new-flash": 404}
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "ok", body
+    assert body["total"] == 2
+    tried = [r["url"].rsplit("/models/", 1)[-1].split(":")[0] for r in gemini.requests]
+    assert tried == ["new-flash", "latest-flash"]
+
+
+@pytest.mark.asyncio
+async def test_every_model_404_says_so(client, db_session, gemini, three_models):
+    await _save_key(db_session)
+    gemini.status = 404
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "error"
+    assert "models" in body["search_error"].lower()
+    assert len(gemini.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_key_refusal_does_not_walk_the_model_list(
+    client, db_session, gemini, three_models
+):
+    # 403 is about the key, which every model shares.
+    await _save_key(db_session)
+    gemini.status = 403
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "error"
+    assert len(gemini.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_spent_per_model_quota_falls_through_to_the_next(
+    client, db_session, gemini, three_models
+):
+    # Free-tier quota is per model per day, so a 429 says nothing of a sibling.
+    await _save_key(db_session)
+    gemini.model_status = {"new-flash": 429}
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "ok", body
+    assert len(gemini.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_every_model_out_of_quota_says_quota(client, db_session, gemini, three_models):
+    await _save_key(db_session)
+    gemini.status = 429
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert "quota" in body["search_error"].lower()
+    assert len(gemini.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_new_format_key_is_sent_unchanged(client, db_session, gemini):
+    db_session.add(OrgLlmKey(
+        org_id=APPREND_ORG_ID, provider="gemini",
+        key_encrypted=crypto.encrypt("AQ.Ab8_test-new-format_key"), key_hint="••••",
+    ))
+    await db_session.commit()
+    await client.post(URL, json=SEARCH)
+    assert gemini.requests[0]["headers"]["x-goog-api-key"] == "AQ.Ab8_test-new-format_key"

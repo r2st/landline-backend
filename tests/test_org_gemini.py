@@ -81,7 +81,10 @@ async def test_uses_org_key_model_and_private_breaker(db_session, monkeypatch):
     assert out.companies == ["Acme"]
     (spec,) = seen["providers"]
     assert spec.api_key == "org-a-secret-key"
-    assert spec.models == ("gemini-2.5-flash",)
+    # An ordered fallback list, so chat_completion walks past a model that
+    # 404s for newer keys instead of failing the whole call.
+    assert spec.models == org_gemini.discovery_models()
+    assert len(spec.models) > 1 and "gemini-flash-latest" in spec.models
     assert spec.extra_body["response_format"] == {"type": "json_object"}
     assert spec.name == f"gemini-org-{APPREND_ORG_ID}"
     # Never the shared platform breaker.
@@ -124,3 +127,10 @@ async def test_upstream_failure_message_never_contains_key(db_session, monkeypat
             db_session, APPREND_ORG_ID, system="s", prompt="p", schema=_Answer
         )
     assert "super-secret-gemini-key" not in str(exc.value)
+
+
+def test_discovery_models_parses_the_comma_list(monkeypatch):
+    monkeypatch.setattr(get_settings(), "discovery_gemini_model", " a-flash , ,b-flash ")
+    assert org_gemini.discovery_models() == ("a-flash", "b-flash")
+    monkeypatch.setattr(get_settings(), "discovery_gemini_model", "")
+    assert org_gemini.discovery_models() == ("gemini-flash-latest",)

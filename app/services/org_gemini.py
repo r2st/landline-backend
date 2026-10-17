@@ -79,6 +79,13 @@ async def has_org_gemini_key(db: AsyncSession, org_id: uuid.UUID) -> bool:
     return (await get_org_gemini_key(db, org_id)) is not None
 
 
+def discovery_models() -> tuple[str, ...]:
+    """``discovery_gemini_model`` as an ordered fallback list."""
+    raw = get_settings().discovery_gemini_model or ""
+    models = tuple(m.strip() for m in raw.split(",") if m.strip())
+    return models or ("gemini-flash-latest",)
+
+
 def gemini_provider(org_id: uuid.UUID, api_key: str) -> ProviderSpec:
     settings = get_settings()
     extra: dict = {"response_format": {"type": "json_object"}}
@@ -89,7 +96,7 @@ def gemini_provider(org_id: uuid.UUID, api_key: str) -> ProviderSpec:
         name=f"gemini-org-{org_id}",
         base_url=settings.gemini_base_url or KNOWN_PROVIDERS["gemini"]["base_url"],
         api_key=api_key,
-        models=(settings.discovery_gemini_model,),
+        models=discovery_models(),
         extra_body=extra,
         supports_vision=True,
     )
@@ -221,7 +228,6 @@ async def generate_grounded_json(
             "wait a couple of minutes, then try again."
         )
 
-    model = settings.discovery_gemini_model
     generation: dict = {"maxOutputTokens": max_tokens}
     if temperature is not None:
         generation["temperature"] = temperature
@@ -234,17 +240,31 @@ async def generate_grounded_json(
         "tools": [{"google_search": {}}],
         "generationConfig": generation,
     }
-    url = f"{settings.gemini_native_base_url.rstrip('/')}/models/{model}:generateContent"
+    base = settings.gemini_native_base_url.rstrip("/")
+    models = discovery_models()
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as http:
-            resp = await http.post(
-                url,
-                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            for i, model in enumerate(models):
+                resp = await http.post(
+                    f"{base}/models/{model}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=payload,
+                )
+                # Both are properties of the model, not the key, so the next
+                # model is a real chance (same rule as chat_completion): 404 is
+                # a model retired or closed to accounts created after a cutoff;
+                # 429 on the free tier is a per-model daily allowance (20/day
+                # on some models), so a spent model says nothing of its sibling.
+                if resp.status_code in (404, 429) and i < len(models) - 1:
+                    logger.warning(
+                        "Org %s grounded Gemini model %s returned %s — trying %s",
+                        org_id, model, resp.status_code, models[i + 1],
+                    )
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         _breaker.record_failure(name)
@@ -253,6 +273,11 @@ async def generate_grounded_json(
             raise GeminiError(
                 "Gemini rate limit or quota reached for your API key — wait a "
                 "minute, or check the key's quota in Google AI Studio."
+            ) from exc
+        if status == 404:
+            raise GeminiError(
+                "None of the configured Gemini models is available to your API "
+                "key. Ask your administrator to update DISCOVERY_GEMINI_MODEL."
             ) from exc
         if status in (400, 401, 403):
             raise GeminiError(
