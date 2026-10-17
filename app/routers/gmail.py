@@ -92,6 +92,21 @@ def _callback_html(ok: bool, message: str) -> str:
             window.opener.postMessage(payload, "{origin}");
           }}
         }} catch (e) {{}}
+        // The SPA sends COOP: same-origin, which severs window.opener once the
+        // popup visits Google. This page is served same-origin under /api, so
+        // also notify the app via BroadcastChannel and a localStorage event.
+        try {{
+          if (window.BroadcastChannel) {{
+            var bc = new BroadcastChannel(payload.source);
+            bc.postMessage(payload);
+            bc.close();
+          }}
+        }} catch (e) {{}}
+        try {{
+          payload.t = Date.now();
+          localStorage.setItem(payload.source, JSON.stringify(payload));
+          localStorage.removeItem(payload.source);
+        }} catch (e) {{}}
         setTimeout(function () {{ window.close(); }}, 1200);
       }})();
     </script>
