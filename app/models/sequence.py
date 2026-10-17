@@ -110,6 +110,11 @@ class OutreachSequence(Base, OrgScopedMixin):
     # "injection_molding". NULL for general/custom sequences.
     industry: Mapped[str | None] = mapped_column(String(80))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Copy approved word for word by a person (Discovery document sends): the
+    # first-touch composer and the sequence optimizer leave it untouched.
+    send_as_written: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     # Voice the AI copywriter writes this sequence in — see SEQUENCE_TONES.
     # NOT NULL with a server default: the generator reads this on every compose,

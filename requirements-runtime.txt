@@ -26,3 +26,7 @@ jinja2==3.1.4
 itsdangerous==2.2.0
 python-jose[cryptography]==3.3.0
 pgvector==0.3.6
+# Discovery document upload: PDF / XLSX / DOCX text extraction
+pypdf==5.1.0
+openpyxl==3.1.5
+python-docx==1.1.2

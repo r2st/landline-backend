@@ -120,6 +120,19 @@ FRONTEND_ROUTES = [
     ("POST", "/api/v1/investors/documents"),
     ("DELETE", "/api/v1/investors/documents/{document_id}"),
     ("DELETE", "/api/v1/investors/interactions/{interaction_id}"),
+    # Discovery.jsx "From a document" — useDiscoveryDocuments.js.
+    ("GET", "/api/v1/discovery/documents/ai-status"),
+    ("GET", "/api/v1/discovery/documents"),
+    ("POST", "/api/v1/discovery/documents"),
+    ("GET", "/api/v1/discovery/documents/{document_id}"),
+    ("DELETE", "/api/v1/discovery/documents/{document_id}"),
+    ("POST", "/api/v1/discovery/documents/{document_id}/import"),
+    ("POST", "/api/v1/discovery/documents/{document_id}/draft"),
+    ("POST", "/api/v1/discovery/documents/{document_id}/preview"),
+    ("POST", "/api/v1/discovery/documents/{document_id}/send"),
+    ("GET", "/api/v1/discovery/documents/{document_id}/outreach"),
+    # DocumentDiscovery FollowUpStatus — pause / resume follow-ups.
+    ("PATCH", "/api/v1/sequences/{sequence_id}/status"),
     # Platform.jsx — platform-admin promote/demote management.
     ("GET", "/api/v1/platform/admins"),
     ("POST", "/api/v1/platform/promote-admin"),

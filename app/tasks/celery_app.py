@@ -440,6 +440,12 @@ celery_app.conf.update(
             "task": "app.tasks.lead_monitor.check_lead_gen_health",
             "schedule": crontab(hour=21, minute=30),
         },
+        # Uploaded discovery documents keep their bytes for 30 days; the
+        # extracted candidates stay. Daily is plenty for a 30-day window.
+        "purge-expired-discovery-document-files": {
+            "task": "app.tasks.discovery_documents.purge_expired_document_files",
+            "schedule": crontab(hour=3, minute=40),
+        },
     },
 )
 
@@ -497,3 +503,5 @@ import app.tasks.client_success  # noqa: F401
 # beat-dispatched summary silently fails with an unregistered-task error.
 import app.tasks.reporting  # noqa: F401
 import app.tasks.inbox  # noqa: F401
+# Registers the 30-day purge of uploaded discovery document files.
+import app.tasks.discovery_documents  # noqa: F401

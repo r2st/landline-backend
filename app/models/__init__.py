@@ -86,6 +86,7 @@ from app.models.inbox_label import InboxLabel, InboxThreadLabel
 from app.models.api_key import ApiKey
 from app.models.app_credential import AppCredential
 from app.models.org_llm_key import OrgLlmKey
+from app.models.discovery_document import DiscoveryDocument
 
 __all__ = [
     "SystemSetting",
@@ -189,4 +190,5 @@ __all__ = [
     "ApiKey",
     "AppCredential",
     "OrgLlmKey",
+    "DiscoveryDocument",
 ]

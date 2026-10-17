@@ -393,6 +393,33 @@ def send_sequence_step(self, enrollment_id: str):
                         "enrollment_id": enrollment_id,
                     }
 
+                # Follow-ups stop on reply. SmartReply flips the enrollment to
+                # 'replied' when it matches the inbound message, but a reply can
+                # also be recorded by another path (tracking webhook, manual
+                # log) that only writes the event. Either one ends the cadence:
+                # a follow-up to someone who already answered is the worst
+                # email the sequence can send.
+                if (enrollment.current_step or 1) > 1:
+                    has_reply = (
+                        await db.execute(
+                            select(OutreachEvent.id)
+                            .where(
+                                OutreachEvent.enrollment_id == enrollment.id,
+                                OutreachEvent.event_type == "replied",
+                            )
+                            .limit(1)
+                        )
+                    ).first()
+                    if has_reply is not None:
+                        enrollment.status = "replied"
+                        enrollment.completed_at = datetime.now(timezone.utc)
+                        await db.commit()
+                        logger.info(
+                            "Enrollment %s stopped: contact already replied", enrollment_id
+                        )
+                        return {"status": "skipped", "reason": "contact_replied",
+                                "enrollment_id": enrollment_id}
+
                 # Load contact
                 result = await db.execute(
                     select(Contact).where(Contact.id == enrollment.contact_id)
@@ -899,11 +926,19 @@ def send_sequence_step(self, enrollment_id: str):
                 # static render untouched. On a first batch per sequence the copy
                 # is queued for a human instead of sent — cold outreach is
                 # irreversible and charged against the sending domain.
-                from app.services.ai_compose import compose_step
+                # A sequence marked ``send_as_written`` carries copy a person
+                # already reviewed and approved word for word (the Discovery
+                # document flow): neither the composer nor the optimizer may
+                # rewrite it, and it must not be parked for a second review.
+                send_as_written = bool(getattr(sequence, "send_as_written", False))
+                from app.services.ai_compose import ComposeResult, compose_step
 
-                composed = await compose_step(
-                    db, enrollment, contact, company, step, subject, body
-                )
+                if send_as_written:
+                    composed = ComposeResult("send", subject, body, reason="send as written")
+                else:
+                    composed = await compose_step(
+                        db, enrollment, contact, company, step, subject, body
+                    )
                 if composed.action == "review":
                     # Park the enrollment. Deliberately NOT _advance_step: the
                     # step has not been sent, and advancing would silently skip
@@ -943,9 +978,12 @@ def send_sequence_step(self, enrollment_id: str):
                 # optimizer is fail-safe: it returns a plain "send" on any error
                 # or when disabled, so this never blocks a send.
                 optimizer = get_sequence_optimizer()
-                decision = await optimizer.decide(
-                    db, enrollment, contact, company, step, subject, body
-                )
+                if send_as_written:
+                    decision = {"action": "send", "reasoning": "sequence sends as written"}
+                else:
+                    decision = await optimizer.decide(
+                        db, enrollment, contact, company, step, subject, body
+                    )
                 record_decision(enrollment, enrollment.current_step, decision)
                 action = decision.get("action", "send")
 
