@@ -56,6 +56,21 @@ class DocumentDetail(DocumentSummary):
     stats: dict[str, Any] = Field(default_factory=dict)
 
 
+class RejectedFile(BaseModel):
+    filename: str
+    error: str
+
+
+class BatchUploadResult(BaseModel):
+    documents: list[DocumentSummary]
+    rejected: list[RejectedFile] = Field(default_factory=list)
+
+
+# One request can carry this many files; each is still capped at
+# ``document_extract.MAX_FILE_BYTES``.
+MAX_BATCH_FILES = 10
+
+
 class ImportRequest(BaseModel):
     candidate_ids: list[str] = Field(..., min_length=1, max_length=5000)
 
@@ -109,25 +124,13 @@ async def ai_status(
     return {"gemini_key_configured": await org_gemini.has_org_gemini_key(db, org_id)}
 
 
-@router.post("", response_model=DocumentSummary, status_code=status.HTTP_202_ACCEPTED)
-async def upload_document(
-    background: BackgroundTasks,
-    file: UploadFile = File(...),
-    scope: OrgScope = Depends(get_org_scope),
-    db: AsyncSession = Depends(get_db),
-):
-    """Store the file and start extraction in the background (poll the detail)."""
-    org_id = _require_org(scope)
-    if not await org_gemini.has_org_gemini_key(db, org_id):
-        raise HTTPException(status_code=409, detail=GEMINI_KEY_REQUIRED)
-
+async def _store_upload(
+    db: AsyncSession, scope: OrgScope, org_id: uuid.UUID, file: UploadFile
+) -> DiscoveryDocument:
+    """Validate and stage one file as a parsing document (raises DocumentRejected)."""
     content = await file.read(document_extract.MAX_FILE_BYTES + 1)
     filename = sanitize_filename(file.filename)
-    try:
-        file_type = document_extract.classify(filename, content)
-    except document_extract.DocumentRejected as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
+    file_type = document_extract.classify(filename, content)
     doc = DiscoveryDocument(
         org_id=org_id,
         filename=filename,
@@ -140,12 +143,76 @@ async def upload_document(
     db.add(doc)
     await db.flush()
     await db.refresh(doc)
+    logger.info("Discovery document %s (%s, %d bytes) uploaded", doc.id, file_type, len(content))
+    return doc
+
+
+@router.post("", response_model=DocumentSummary, status_code=status.HTTP_202_ACCEPTED)
+async def upload_document(
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store the file and start extraction in the background (poll the detail)."""
+    org_id = _require_org(scope)
+    if not await org_gemini.has_org_gemini_key(db, org_id):
+        raise HTTPException(status_code=409, detail=GEMINI_KEY_REQUIRED)
+
+    try:
+        doc = await _store_upload(db, scope, org_id, file)
+    except document_extract.DocumentRejected as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     summary = _summary(doc)
     # Commit before the background job runs so its own session can see the row.
     await db.commit()
     background.add_task(svc.process_document, session_factory, doc.id, org_id)
-    logger.info("Discovery document %s (%s, %d bytes) uploaded", doc.id, file_type, len(content))
     return summary
+
+
+@router.post("/batch", response_model=BatchUploadResult, status_code=status.HTTP_202_ACCEPTED)
+async def upload_documents(
+    background: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload several files at once — each becomes its own document.
+
+    Files are judged one by one: a bad file is listed in ``rejected`` and the
+    rest still go through. Only when *no* file is usable is the request a 422.
+    Extraction runs in the background, one document after another, so a batch
+    doesn't fire every Gemini call at once.
+    """
+    org_id = _require_org(scope)
+    if not await org_gemini.has_org_gemini_key(db, org_id):
+        raise HTTPException(status_code=409, detail=GEMINI_KEY_REQUIRED)
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Upload at most {MAX_BATCH_FILES} files at a time.",
+        )
+
+    docs: list[DiscoveryDocument] = []
+    rejected: list[dict] = []
+    for file in files:
+        try:
+            docs.append(await _store_upload(db, scope, org_id, file))
+        except document_extract.DocumentRejected as exc:
+            rejected.append({"filename": sanitize_filename(file.filename), "error": str(exc)})
+
+    if not docs:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "None of these files could be used.", "rejected": rejected},
+        )
+
+    summaries = [_summary(d) for d in docs]
+    # Commit before the background jobs run so their own sessions see the rows.
+    await db.commit()
+    for doc in docs:
+        background.add_task(svc.process_document, session_factory, doc.id, org_id)
+    return {"documents": summaries, "rejected": rejected}
 
 
 @router.get("", response_model=list[DocumentSummary])
