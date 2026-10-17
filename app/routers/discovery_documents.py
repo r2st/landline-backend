@@ -74,6 +74,8 @@ MAX_BATCH_FILES = 10
 
 class ImportRequest(BaseModel):
     candidate_ids: list[str] = Field(..., min_length=1, max_length=5000)
+    # Extracted contact ids to bring along; omit to import everyone listed.
+    contact_ids: Optional[list[str]] = Field(None, max_length=20000)
 
 
 def _require_org(scope: OrgScope) -> uuid.UUID:
@@ -264,7 +266,7 @@ async def import_document_candidates(
     doc = await get_owned_document(db, scope, document_id)
     if doc.status != "ready":
         raise HTTPException(status_code=409, detail="This document hasn't finished processing.")
-    return await svc.import_candidates(db, doc, body.candidate_ids)
+    return await svc.import_candidates(db, doc, body.candidate_ids, body.contact_ids)
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

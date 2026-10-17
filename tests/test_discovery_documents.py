@@ -236,6 +236,46 @@ async def test_upload_extract_and_import(client, db_session, fake_gemini, bg_ses
 
 
 @pytest.mark.asyncio
+async def test_import_only_chosen_contacts(client, db_session, fake_gemini, bg_sessions):
+    await _save_key(db_session)
+    resp = await client.post(
+        "/api/v1/discovery/documents", files={"file": ("leads.csv", CSV, "text/csv")}
+    )
+    doc_id = resp.json()["id"]
+    acme = (await client.get(f"/api/v1/discovery/documents/{doc_id}")).json()["candidates"][0]
+    first, second = acme["contacts"][0], acme["contacts"][1]
+
+    imp = await client.post(
+        f"/api/v1/discovery/documents/{doc_id}/import",
+        json={"candidate_ids": [acme["id"]], "contact_ids": [first["id"]]},
+    )
+    assert imp.status_code == 200, imp.text
+    assert imp.json()["contacts_created"] == 1
+    assert len(imp.json()["contact_ids"]) == 1
+
+    company = (await db_session.execute(
+        select(Company).where(Company.domain == "acme-stamping.com")
+    )).scalar_one()
+    emails = (await db_session.execute(
+        select(Contact.email).where(Contact.company_id == company.id)
+    )).scalars().all()
+    assert emails == [first["email"]]
+    after = (await client.get(f"/api/v1/discovery/documents/{doc_id}")).json()["candidates"][0]
+    assert after["contacts"][0]["imported_contact_id"]
+    assert not after["contacts"][1].get("imported_contact_id")
+
+    # Coming back for the second person merges into the same company.
+    again = await client.post(
+        f"/api/v1/discovery/documents/{doc_id}/import",
+        json={"candidate_ids": [acme["id"]], "contact_ids": [second["id"]]},
+    )
+    assert again.json()["companies_created"] == 0
+    assert again.json()["contacts_created"] == 1
+    final = (await client.get(f"/api/v1/discovery/documents/{doc_id}")).json()["candidates"][0]
+    assert all(c.get("imported_contact_id") for c in final["contacts"])
+
+
+@pytest.mark.asyncio
 async def test_bad_file_is_422(client, db_session):
     await _save_key(db_session)
     resp = await client.post(

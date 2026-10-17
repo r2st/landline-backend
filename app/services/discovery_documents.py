@@ -11,6 +11,7 @@ eternal spinner.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import re
 import uuid
@@ -53,7 +54,10 @@ async def mark_stale(db: AsyncSession, doc: DiscoveryDocument) -> None:
         await db.flush()
 
 
-def _to_record(cand: dict) -> CandidateRecord:
+def _to_record(cand: dict, contact_ids: Optional[set[str]] = None) -> CandidateRecord:
+    contacts = cand.get("contacts", [])
+    if contact_ids is not None:
+        contacts = [c for c in contacts if c.get("id") in contact_ids]
     return CandidateRecord(
         name=cand["name"],
         domain=cand.get("domain"),
@@ -74,7 +78,7 @@ def _to_record(cand: dict) -> CandidateRecord:
                 linkedin_url=c.get("linkedin_url"),
                 source=SOURCE,
             )
-            for c in cand.get("contacts", [])
+            for c in contacts
         ],
     )
 
@@ -138,23 +142,38 @@ async def process_document(
 
 
 async def import_candidates(
-    db: AsyncSession, doc: DiscoveryDocument, candidate_ids: list[str]
+    db: AsyncSession,
+    doc: DiscoveryDocument,
+    candidate_ids: list[str],
+    contact_ids: Optional[list[str]] = None,
 ) -> dict:
     """Create/merge the selected candidates as companies + contacts.
+
+    ``contact_ids`` (extracted contact ids) narrows which people come along;
+    None imports every contact of each selected candidate. Re-importing a
+    candidate to add more of its people is safe: the company dedups.
 
     Returns per-candidate outcomes plus the ids of every contact (new or
     pre-existing) with an email, which is what the draft/send steps work on.
     """
     extracted = dict(doc.extracted or {})
-    candidates = [dict(c) for c in extracted.get("candidates", [])]
+    # Deep copy: nested contact dicts are edited below, and an in-place edit
+    # would also change the loaded value, so the JSONB change went undetected
+    # whenever no company-level field changed (e.g. adding a second person).
+    candidates = copy.deepcopy(extracted.get("candidates", []))
     wanted = set(candidate_ids)
     selected = [c for c in candidates if c["id"] in wanted]
     if not selected:
         return {"companies_created": 0, "companies_matched": 0, "contacts_created": 0,
                 "contact_ids": [], "outcomes": []}
 
+    chosen = set(contact_ids) if contact_ids is not None else None
+
+    def _wanted(c: dict) -> bool:
+        return chosen is None or c.get("id") in chosen
+
     svc = get_ingestion_service()
-    result = await svc.ingest(db, [_to_record(c) for c in selected], score=True)
+    result = await svc.ingest(db, [_to_record(c, chosen) for c in selected], score=True)
     by_id = {c["id"]: c for c in candidates}
     outcomes = []
     for cand, outcome in zip(selected, result.outcomes):
@@ -165,7 +184,9 @@ async def import_candidates(
     # Contacts are deduped by email globally, so look them up by email rather
     # than trusting only the ones this call created.
     emails = sorted({
-        c["email"].lower() for cand in selected for c in cand.get("contacts", []) if c.get("email")
+        c["email"].lower()
+        for cand in selected for c in cand.get("contacts", [])
+        if c.get("email") and _wanted(c)
     })
     contact_ids: list[str] = []
     if emails:
@@ -179,6 +200,8 @@ async def import_candidates(
             email_to_id.setdefault(email.lower(), str(cid))
         for cand in selected:
             for c in by_id[cand["id"]].get("contacts", []):
+                if not _wanted(c):
+                    continue
                 cid = email_to_id.get((c.get("email") or "").lower())
                 if cid:
                     c["imported_contact_id"] = cid
