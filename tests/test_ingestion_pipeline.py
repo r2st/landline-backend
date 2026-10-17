@@ -555,7 +555,9 @@ async def test_permanent_4xx_is_not_retried(db_session, monkeypatch):
 
     result = await svc.search_companies(db_session, industry="x", per_page=5)
 
-    assert result.status == "error"
+    # Its own status, not "error": the UI's remedy for "error" is "try again",
+    # which can never fix a plan limit.
+    assert result.status == "unauthorized"
     assert "free plan" in result.error, "the operator needs the reason, not just a number"
     rows = (await db_session.execute(select(ApiCreditLedger))).scalars().all()
     assert rows[0].details["attempts"] == 1, "a plan limit was retried like a blip"

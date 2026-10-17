@@ -137,7 +137,7 @@ class ApolloCallResult:
     """One attempted Apollo call."""
 
     data: Optional[dict] = None
-    # ok | rate_limited | error | budget_exhausted | skipped
+    # ok | rate_limited | error | budget_exhausted | skipped | unauthorized
     status: str = "ok"
     attempts: int = 0
     credits: int = 0
@@ -153,7 +153,7 @@ class ApolloSearchResult:
     """The outcome of a (possibly paginated) company search."""
 
     records: list[CandidateRecord] = field(default_factory=list)
-    # ok | rate_limited | budget_exhausted | error | skipped
+    # ok | rate_limited | budget_exhausted | error | skipped | unauthorized
     status: str = "ok"
     pages_fetched: int = 0
     credits_spent: int = 0
@@ -322,11 +322,16 @@ class ApolloEnrichmentService:
                     # logged ten identical "Apollo enrich error … HTTP 422" lines
                     # every five minutes for days, with nothing saying the
                     # provider was simply out of credits (observed 2026-07-24).
-                    status = (
-                        "budget_exhausted"
-                        if _is_provider_credit_exhaustion(response)
-                        else "error"
-                    )
+                    if _is_provider_credit_exhaustion(response):
+                        status = "budget_exhausted"
+                    elif response.status_code in (401, 403):
+                        # Apollo refusing the key, or the plan behind it ("not
+                        # included in your Free plan"). No retry, filter or wait
+                        # changes that, so it must not read as a transient
+                        # "error" whose remedy is "try again".
+                        status = "unauthorized"
+                    else:
+                        status = "error"
                     break
                 data = response.json()
                 status = "ok"
@@ -367,6 +372,13 @@ class ApolloEnrichmentService:
                 "Apollo %s halted: the Apollo account is out of lead credits. "
                 "Enrichment will keep returning nothing until the plan is topped "
                 "up — https://app.apollo.io/#/settings/plans/upgrade (%s)",
+                operation, last_error,
+            )
+        elif status == "unauthorized":
+            logger.warning(
+                "Apollo %s refused: the API key was rejected or the Apollo plan "
+                "does not include this endpoint. Check APOLLO_API_KEY and the "
+                "plan at https://www.apollo.io/pricing (%s)",
                 operation, last_error,
             )
         elif status != "ok":

@@ -76,6 +76,20 @@ class EnrichCompanyRequest(BaseModel):
     )
 
 
+def _search_error_message(status: str, error: str | None) -> str | None:
+    """Operator-facing reason for a search that did not complete."""
+    if status == "ok":
+        return None
+    if status == "skipped" and error == "no_api_key":
+        return "Apollo is not configured: no Apollo API key is set for this deployment."
+    if status == "unauthorized":
+        return (
+            "Apollo refused the request: the API key was rejected or the Apollo "
+            f"plan does not include company search. {error or ''}"
+        ).strip()
+    return error
+
+
 @router.post("/search-companies")
 async def search_companies(
     payload: CompanySearchRequest,
@@ -120,9 +134,13 @@ async def search_companies(
         "total": len(companies),
         "imported": result.companies_created,
         "already_existed": result.companies_matched,
-        # 'ok' | 'rate_limited' | 'budget_exhausted' | 'error' | 'skipped' —
+        # 'ok' | 'rate_limited' | 'budget_exhausted' | 'error' | 'skipped' |
+        # 'unauthorized' —
         # a rate-limited search must not read as "found nothing".
         "search_status": search.status,
+        # Why a non-'ok' search stopped, in words an operator can act on —
+        # "Apollo not configured" must not surface as a bare failure.
+        "search_error": _search_error_message(search.status, search.error),
         "credits_spent": search.credits_spent,
         "errors": result.errors,
         "companies": companies,
