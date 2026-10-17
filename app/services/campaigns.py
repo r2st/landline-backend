@@ -56,6 +56,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import undefer
 
 from app.models.bounce_record import BounceRecord
 from app.models.campaign import Campaign, CampaignDailyLog, CampaignProspect
@@ -231,14 +232,18 @@ ICP_SYSTEM = (
 DOC_TEXT_LIMIT = 12000
 
 
-async def _document_text(doc: DiscoveryDocument) -> str:
+async def _document_text(db: AsyncSession, doc: DiscoveryDocument) -> str:
     """Readable text for one document: the file if it's still held, else what was extracted."""
     import asyncio
 
     from app.services import document_extract
 
     parts: list[str] = []
-    content = doc.content
+    # ``content`` is deferred; touching ``doc.content`` would lazy-load it, which
+    # an async session cannot do (MissingGreenlet). Select the column explicitly.
+    content = (
+        await db.execute(select(DiscoveryDocument.content).where(DiscoveryDocument.id == doc.id))
+    ).scalar_one_or_none()
     if content:
         try:
             parsed = await asyncio.to_thread(document_extract.parse_document, doc.file_type, content)
@@ -279,7 +284,7 @@ async def build_icp(
     db: AsyncSession, org_id: uuid.UUID, docs: list[DiscoveryDocument]
 ) -> tuple[Icp, str]:
     """``(icp, document_summary)``. Raises ``org_gemini.GeminiKeyMissing`` / ``GeminiError``."""
-    texts = [t for t in [await _document_text(d) for d in docs] if t]
+    texts = [t for t in [await _document_text(db, d) for d in docs] if t]
     if not texts:
         raise CampaignError("documents_empty", "These documents have no readable text to build a profile from.")
     icp = await org_gemini.generate_json(
@@ -772,7 +777,9 @@ async def _attachments(db: AsyncSession, campaign: Campaign) -> list:
     ids = [uuid.UUID(str(i)) for i in campaign.document_ids or []]
     docs = (
         await db.execute(
-            select(DiscoveryDocument).where(
+            select(DiscoveryDocument)
+            .options(undefer(DiscoveryDocument.content))
+            .where(
                 DiscoveryDocument.id.in_(ids),
                 DiscoveryDocument.file_type.in_(list(ATTACHABLE_TYPES)),
             )

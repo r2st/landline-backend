@@ -331,3 +331,60 @@ async def test_warmup_advances_only_after_a_day_that_sent(db_session):
     await db_session.flush()
     await svc.advance_warmup(db_session, c, MIDWEEK + timedelta(days=2))
     assert c.warmup_day == 2
+
+
+# ── regressions ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_build_icp_reads_the_deferred_document_bytes_on_a_fresh_session(
+    db_session, db_engine, monkeypatch
+):
+    """``content`` is deferred: a lazy load from an async session raises
+    MissingGreenlet, which surfaced in production as POST /campaigns failing."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.services import org_gemini
+
+    doc = DiscoveryDocument(filename="pitch.txt", file_type="txt", size_bytes=15,
+                            status=STATUS_READY, content=b"We sell widgets", extracted={})
+    db_session.add(doc)
+    await db_session.commit()
+    prompts = []
+
+    async def fake_json(db, org_id, *, prompt, schema, **kw):
+        prompts.append(prompt)
+        return schema(summary="Widgets")
+
+    monkeypatch.setattr(org_gemini, "generate_json", fake_json)
+    fresh = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh() as s:
+        loaded = (await s.execute(select(DiscoveryDocument).where(DiscoveryDocument.id == doc.id))).scalars().one()
+        icp, summary = await svc.build_icp(s, APPREND_ORG_ID, [loaded])
+    assert summary == "Widgets"
+    assert "We sell widgets" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_a_route_crash_is_not_reported_as_bad_credentials(client, db_session, monkeypatch):
+    """The auth middleware used to wrap call_next in the token try/except, so any
+    exception from an authenticated route came back as a 401."""
+    from app.models.user import User
+
+    admin = (await db_session.execute(
+        select(User).where(User.email == "_default_test_admin@landline.app")
+    )).scalars().first()
+    doc = DiscoveryDocument(filename="a.txt", file_type="txt", size_bytes=1, status=STATUS_READY)
+    db_session.add_all([doc, _gmail(user_id=admin.id), OrgLlmKey(
+        org_id=APPREND_ORG_ID, provider="gemini", key_encrypted=crypto.encrypt("k"), key_hint="••••",
+    )])
+    await db_session.commit()
+
+    async def boom(*a, **kw):
+        raise RuntimeError("route bug")
+
+    monkeypatch.setattr(svc, "build_icp", boom)
+    try:
+        resp = await client.post("/api/v1/campaigns", json={"name": "x", "document_ids": [str(doc.id)]})
+    except RuntimeError:
+        return  # propagated as a server error — correct
+    assert resp.status_code != 401, resp.text

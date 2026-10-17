@@ -92,15 +92,19 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
+            valid = False
             try:
                 from app.security import decode_token
                 payload = decode_token(token)
-                if payload.get("type") == "access":
-                    return await call_next(request)
+                valid = payload.get("type") == "access"
             except JWTError:
                 pass  # invalid/expired token → fall through to 401
             except Exception:  # noqa: BLE001 — never leak an auth-path error as 200
                 logger.exception("Auth middleware error validating token")
+            # Outside the try: an exception raised by the *route* must surface as
+            # the 500 it is, not be caught above and reported as bad credentials.
+            if valid:
+                return await call_next(request)
 
         logger.warning("Rejected request to %s — invalid or missing credentials", path)
         return JSONResponse(
