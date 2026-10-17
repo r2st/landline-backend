@@ -161,7 +161,7 @@ class Settings(BaseSettings):
     # created in AI Studio from late 2026 (the "AQ." format) get a 404 on
     # gemini-2.5-flash that older keys don't — so a single pinned id breaks
     # every newly onboarded org. The "-latest" alias is Google-maintained.
-    discovery_gemini_model: str = "gemini-3.8-flash,gemini-flash-latest,gemini-2.5-flash"
+    discovery_gemini_model: str = "gemini-3.5-flash,gemini-3.6-flash"
     # 2.5-flash is a thinking model; its reasoning tokens share max_tokens with
     # the answer. "low" keeps structured-extraction answers from being starved.
     discovery_gemini_reasoning_effort: str = "low"
@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     # under Settings → API Keys (provider "groq" / "openrouter"). Comma lists,
     # tried in order. Neither has search grounding: Discovery search on them is
     # training-data only, and says so in its response.
-    discovery_groq_models: str = "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+    discovery_groq_models: str = "qwen/qwen3.8-27b,openai/gpt-oss-120b"
     discovery_openrouter_models: str = (
         "meta-llama/llama-3.3-70b-instruct:free,google/gemini-2.0-flash-exp:free"
     )

@@ -274,7 +274,7 @@ async def generate_json(
     schema: type[T],
     max_tokens: int = 8192,
     temperature: float | None = 0.2,
-    timeout: float = 90.0,
+    timeout: float = 30.0,
 ) -> T:
     """Ask the org's providers (Gemini → Groq → OpenRouter) for JSON matching ``schema``.
 
