@@ -154,6 +154,12 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     gemini_model: str = "gemini-2.0-flash"
+    # Discovery document features (upload → extract → draft) call Gemini with
+    # the *org's own* key from org_llm_keys — never the platform chain above.
+    discovery_gemini_model: str = "gemini-2.5-flash"
+    # 2.5-flash is a thinking model; its reasoning tokens share max_tokens with
+    # the answer. "low" keeps structured-extraction answers from being starved.
+    discovery_gemini_reasoning_effort: str = "low"
     # Groq — free tier, very fast, generous per-day request cap.
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
