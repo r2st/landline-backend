@@ -5,9 +5,10 @@ so AI features use it instead of the platform default.
 """
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +25,19 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 class LlmKeyUpdate(BaseModel):
     api_key: str = Field(..., min_length=1, max_length=500)
-    provider: str = Field("gemini", max_length=50)
+    # Only Gemini is read back (GET/DELETE here and ``services.org_gemini``); a
+    # key stored under any other name would report "saved" and never be used.
+    provider: Literal["gemini"] = "gemini"
+
+    @field_validator("api_key")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        # Whitespace-only would be stored as "" — has_key=True here while
+        # Discovery still sees no key.
+        v = v.strip()
+        if not v:
+            raise ValueError("API key must not be blank")
+        return v
 
 
 class LlmKeyRead(BaseModel):
@@ -67,7 +80,7 @@ async def set_llm_key(
 ):
     """Set or replace the org's custom LLM API key."""
     _require_org_admin(scope)
-    api_key = body.api_key.strip()
+    api_key = body.api_key
 
     row = (
         await db.execute(
