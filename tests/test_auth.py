@@ -179,6 +179,19 @@ async def test_me_authenticated(client: AsyncClient, agent_user: User):
 
 
 @pytest.mark.asyncio
+async def test_me_returns_each_callers_own_email(
+    client: AsyncClient, admin_user: User, agent_user: User
+):
+    """The Settings profile renders /auth/me's email; two users logged in
+    against one deployment must each get their own address back."""
+    for user in (admin_user, agent_user):
+        resp = await client.get("/api/v1/auth/me", headers=_auth_header(user))
+        assert resp.status_code == 200
+        assert resp.json()["email"] == user.email
+        assert resp.json()["id"] == str(user.id)
+
+
+@pytest.mark.asyncio
 async def test_me_no_token(unauth_client: AsyncClient):
     resp = await unauth_client.get("/api/v1/auth/me")
     assert resp.status_code == 401
