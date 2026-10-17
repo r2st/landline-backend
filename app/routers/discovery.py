@@ -61,6 +61,10 @@ IMPORT_RATE_LIMIT = "60/minute"
 
 
 class CompanySearchRequest(BaseModel):
+    # Free-text description of the companies wanted, e.g. "SaaS companies in
+    # Bangalore focused on healthcare". Gemini search leads with it; Apollo
+    # has no free-text search and ignores it.
+    query: str = Field("", max_length=2000)
     industry: str = Field("", description="Industry keyword, e.g. 'injection molding'")
     location: str = Field("", description="Location, e.g. 'Ohio, United States'")
     keywords: list[str] = Field(default_factory=list, description="Additional keyword filters")
@@ -150,6 +154,7 @@ async def search_companies_gemini(
         records, extras, sources = await gemini_discovery.search_companies(
             db,
             scope.org_id,
+            query=payload.query,
             industry=payload.industry,
             location=payload.location,
             keywords=payload.keywords,

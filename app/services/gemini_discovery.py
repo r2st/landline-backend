@@ -79,6 +79,7 @@ class GeminiSearchAnswer(BaseModel):
 
 def build_prompt(
     *,
+    query: str = "",
     industry: str,
     location: str,
     keywords: list[str],
@@ -98,12 +99,20 @@ def build_prompt(
         lo = min_employees if min_employees is not None else 1
         hi = max_employees if max_employees is not None else "any"
         criteria.append(f"- Employees: {lo} to {hi}")
-    if not criteria:
-        criteria.append("- Any industry and location")
+    query = (query or "").strip()
+    if query:
+        # The operator's own description is the primary input; the structured
+        # filters only narrow it.
+        head = f"Find up to {limit} companies matching this description:\n{query}\n"
+        if criteria:
+            head += "\nThey must also satisfy these filters:\n" + "\n".join(criteria) + "\n"
+    else:
+        if not criteria:
+            criteria.append("- Any industry and location")
+        head = f"Find up to {limit} companies matching:\n" + "\n".join(criteria) + "\n"
     return (
-        f"Find up to {limit} companies matching:\n"
-        + "\n".join(criteria)
-        + "\n\nFor each, list up to 3 key decision-makers (founder, CEO, owner, "
+        head
+        + "\nFor each, list up to 3 key decision-makers (founder, CEO, owner, "
         "or heads of operations, sales or purchasing).\n\n"
         "Return exactly this JSON shape:\n"
         '{"companies": [{"name": str, "domain": str (bare website domain, e.g. '
@@ -239,6 +248,7 @@ async def search_companies(
     db: AsyncSession,
     org_id: uuid.UUID,
     *,
+    query: str = "",
     industry: str = "",
     location: str = "",
     keywords: Optional[list[str]] = None,
@@ -248,6 +258,7 @@ async def search_companies(
 ) -> tuple[list[CandidateRecord], dict[int, dict], list[dict]]:
     """Run the grounded search. Raises ``org_gemini.GeminiKeyMissing`` / ``GeminiError``."""
     prompt = build_prompt(
+        query=query,
         industry=industry,
         location=location,
         keywords=keywords or [],

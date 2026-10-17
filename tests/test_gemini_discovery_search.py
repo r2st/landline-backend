@@ -260,3 +260,36 @@ async def test_requires_auth(unauth_client):
 ])
 def test_parse_employee_count(raw, expected):
     assert gemini_discovery.parse_employee_count(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_free_text_query_leads_the_prompt_before_the_filters(client, db_session, gemini):
+    await _save_key(db_session)
+    query = "SaaS companies in Bangalore focused on healthcare"
+    resp = await client.post(URL, json={**SEARCH, "query": query})
+    assert resp.status_code == 200, resp.text
+    prompt = gemini.requests[0]["json"]["contents"][0]["parts"][0]["text"]
+    assert query in prompt
+    # The description comes first; the structured filters only narrow it.
+    assert prompt.index(query) < prompt.index("metal stamping")
+    assert prompt.index(query) < prompt.index("Ohio")
+
+
+@pytest.mark.asyncio
+async def test_query_alone_is_a_complete_search(client, db_session, gemini):
+    await _save_key(db_session)
+    query = "SaaS companies in Bangalore focused on healthcare"
+    resp = await client.post(URL, json={"query": query})
+    assert resp.json()["search_status"] == "ok"
+    prompt = gemini.requests[0]["json"]["contents"][0]["parts"][0]["text"]
+    assert query in prompt
+    assert "Any industry and location" not in prompt
+    assert "must also satisfy" not in prompt
+
+
+def test_blank_query_keeps_the_filter_only_prompt():
+    prompt = gemini_discovery.build_prompt(
+        query="   ", industry="metal stamping", location="Ohio", keywords=[],
+        min_employees=None, max_employees=None, limit=5,
+    )
+    assert prompt.startswith("Find up to 5 companies matching:\n- Industry: metal stamping")
