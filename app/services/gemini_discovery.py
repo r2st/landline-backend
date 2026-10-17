@@ -6,6 +6,11 @@ criteria and answers with JSON; this module turns that answer into the same
 :class:`~app.services.ingestion.CandidateRecord` shape the Apollo path feeds the
 ingestion service, so both sources dedup and persist under one rule.
 
+When Gemini can't serve (quota, a model closed to the key, no Gemini key), the
+org's Groq or OpenRouter key answers instead — **from training data, with no
+web search**. Those results carry ``grounded=False`` and a notice, are stored
+with the fallback provider as their ``source``, and keep no emails at all.
+
 **Emails are the field to distrust.** A language model asked for a contact's
 email will happily produce a plausible ``first.last@domain`` it never saw. An
 invented address that bounces costs the sending domain reputation, so an email
@@ -19,6 +24,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
@@ -38,6 +44,16 @@ SYSTEM = (
     "domain, a person or an email address: if you cannot find a value, use null. "
     "Only include an email when it is published on the web for that person or "
     "company. Answer with a single JSON object and nothing else."
+)
+
+# For Groq/OpenRouter, which cannot search: no promise of a web search, and a
+# firmer instruction to leave out what it isn't sure of.
+FALLBACK_SYSTEM = (
+    "You are a B2B market researcher. You have no web access: answer from what "
+    "you know. Only include companies you are confident are real and still "
+    "operating. Never invent a company, a domain or a person: if you are not "
+    "sure of a value, use null. Do not guess email addresses — always use null "
+    "for email. Answer with a single JSON object and nothing else."
 )
 
 _EMAIL = re.compile(r"^[^@\s]+@([^@\s]+\.[^@\s]+)$")
@@ -176,6 +192,8 @@ def to_records(
     min_employees: Optional[int],
     max_employees: Optional[int],
     limit: int,
+    source: str = SOURCE,
+    keep_emails: bool = True,
 ) -> tuple[list[CandidateRecord], dict[int, dict]]:
     """Validated records, plus display-only extras keyed by record ``id()``.
 
@@ -205,7 +223,9 @@ def to_records(
         contacts: list[ContactRecord] = []
         for person in company.contacts[:5]:
             first, last = _split_name(person.name)
-            email = _email_on_domain(person.email, domain)
+            # Ungrounded answers come from training data: an address there is
+            # stale at best, so none is kept (see module doc on emails).
+            email = _email_on_domain(person.email, domain) if keep_emails else None
             linkedin = _linkedin(person.linkedin)
             if not (first or email):
                 continue
@@ -215,7 +235,7 @@ def to_records(
                 email=email,
                 title=_clean(person.title),
                 linkedin_url=linkedin,
-                source=SOURCE,
+                source=source,
                 raw=person.model_dump(),
             ))
 
@@ -231,7 +251,7 @@ def to_records(
             state=state,
             website=f"https://{domain}" if domain else None,
             contacts=contacts,
-            source=SOURCE,
+            source=source,
             raw=company.model_dump(),
         )
         records.append(record)
@@ -242,6 +262,16 @@ def to_records(
         if len(records) >= limit:
             break
     return records, extras
+
+
+@dataclass
+class SearchResult:
+    records: list[CandidateRecord]
+    extras: dict[int, dict]
+    sources: list[dict]
+    provider: str  # "gemini" | "groq" | "openrouter"
+    grounded: bool
+    notice: Optional[str]
 
 
 async def search_companies(
@@ -255,8 +285,11 @@ async def search_companies(
     min_employees: Optional[int] = None,
     max_employees: Optional[int] = None,
     limit: int = 10,
-) -> tuple[list[CandidateRecord], dict[int, dict], list[dict]]:
-    """Run the grounded search. Raises ``org_gemini.GeminiKeyMissing`` / ``GeminiError``."""
+) -> SearchResult:
+    """Run the search: grounded Gemini, else Groq/OpenRouter from training data.
+
+    Raises ``org_gemini.GeminiKeyMissing`` / ``GeminiError``.
+    """
     prompt = build_prompt(
         query=query,
         industry=industry,
@@ -267,13 +300,26 @@ async def search_companies(
         limit=limit,
     )
     answer = await org_gemini.generate_grounded_json(
-        db, org_id, system=SYSTEM, prompt=prompt, schema=GeminiSearchAnswer,
+        db, org_id, system=SYSTEM, fallback_system=FALLBACK_SYSTEM,
+        prompt=prompt, schema=GeminiSearchAnswer,
     )
     records, extras = to_records(
-        answer.data, min_employees=min_employees, max_employees=max_employees, limit=limit,
+        answer.data,
+        min_employees=min_employees,
+        max_employees=max_employees,
+        limit=limit,
+        source=answer.provider,
+        keep_emails=answer.grounded,
     )
     logger.info(
-        "Gemini discovery for org %s: %d returned, %d kept",
-        org_id, len(answer.data.companies), len(records),
+        "Discovery search for org %s via %s (grounded=%s): %d returned, %d kept",
+        org_id, answer.provider, answer.grounded, len(answer.data.companies), len(records),
     )
-    return records, extras, answer.sources
+    return SearchResult(
+        records=records,
+        extras=extras,
+        sources=answer.sources,
+        provider=answer.provider,
+        grounded=answer.grounded,
+        notice=answer.notice,
+    )

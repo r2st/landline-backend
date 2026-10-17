@@ -185,7 +185,28 @@ async def test_upload_without_gemini_key_is_409_and_stores_nothing(client, db_se
     assert resp.json()["detail"]["code"] == "gemini_key_required"
     assert (await db_session.execute(select(DiscoveryDocument))).first() is None
     status = await client.get("/api/v1/discovery/documents/ai-status")
-    assert status.json() == {"gemini_key_configured": False}
+    assert status.json() == {
+        "gemini_key_configured": False, "ai_key_configured": False, "providers": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_groq_key_alone_unlocks_document_discovery(
+    client, db_session, fake_gemini, bg_sessions
+):
+    db_session.add(OrgLlmKey(
+        org_id=APPREND_ORG_ID, provider="groq",
+        key_encrypted=crypto.encrypt("gsk-test-groq"), key_hint="••••",
+    ))
+    await db_session.commit()
+    status = (await client.get("/api/v1/discovery/documents/ai-status")).json()
+    assert status == {
+        "gemini_key_configured": False, "ai_key_configured": True, "providers": ["groq"],
+    }
+    resp = await client.post(
+        "/api/v1/discovery/documents", files={"file": ("leads.csv", CSV, "text/csv")}
+    )
+    assert resp.status_code == 202, resp.text
 
 
 @pytest.mark.asyncio

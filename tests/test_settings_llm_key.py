@@ -80,3 +80,40 @@ async def test_non_admin_cannot_save(client, make_user, auth_headers):
     agent = await make_user("agent-llm@landline.app", role=UserRole.AGENT.value)
     r = await client.put(URL, json={"api_key": "AIzaSyAgent"}, headers=auth_headers(agent))
     assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_groq_and_openrouter_keys_are_saved_per_provider(client, db_session):
+    assert (await client.put(URL, json={"api_key": "gem-key-1111"})).status_code == 200
+    r = await client.put(URL, json={"api_key": "gsk_groq_2222", "provider": "groq"})
+    assert r.status_code == 200 and r.json()["provider"] == "groq"
+    r = await client.put(URL, json={"api_key": "sk-or-3333", "provider": "openrouter"})
+    assert r.status_code == 200
+
+    # The old no-param GET still means Gemini.
+    assert (await client.get(URL)).json()["provider"] == "gemini"
+    g = (await client.get(URL, params={"provider": "groq"})).json()
+    assert g["has_key"] is True and "gsk_groq_2222" not in g["key_hint"]
+
+    listing = (await client.get("/api/v1/settings/llm-keys")).json()
+    assert [k["provider"] for k in listing] == ["gemini", "groq", "openrouter"]
+    assert all(k["has_key"] for k in listing)
+
+    keys = await org_gemini.get_org_llm_keys(db_session, APPREND_ORG_ID)
+    assert keys == {"gemini": "gem-key-1111", "groq": "gsk_groq_2222", "openrouter": "sk-or-3333"}
+
+
+@pytest.mark.asyncio
+async def test_deleting_groq_leaves_gemini(client, db_session):
+    await client.put(URL, json={"api_key": "gem-key-1111"})
+    await client.put(URL, json={"api_key": "gsk_groq_2222", "provider": "groq"})
+    assert (await client.delete(URL, params={"provider": "groq"})).status_code == 204
+    assert list(await org_gemini.get_org_llm_keys(db_session, APPREND_ORG_ID)) == ["gemini"]
+    listing = (await client.get("/api/v1/settings/llm-keys")).json()
+    assert [k["has_key"] for k in listing] == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_rejected_on_get_and_delete(client):
+    assert (await client.get(URL, params={"provider": "openai"})).status_code == 422
+    assert (await client.delete(URL, params={"provider": "openai"})).status_code == 422

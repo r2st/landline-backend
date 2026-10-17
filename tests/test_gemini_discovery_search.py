@@ -82,8 +82,20 @@ class _FakeGemini:
     async def __aexit__(self, *exc):
         return False
 
+    # Groq / OpenRouter (OpenAI shape), keyed by host fragment.
+    chat_status: dict = {}
+    chat_text = json.dumps(ANSWER)
+
     async def post(self, url, headers=None, json=None):
         type(self).requests.append({"url": url, "headers": headers, "json": json})
+        if "generativelanguage" not in url:
+            host = "groq" if "groq.com" in url else "openrouter"
+            status = type(self).chat_status.get(host, 200)
+            body = {"choices": [{"message": {"content": type(self).chat_text},
+                                 "finish_reason": "stop"}]}
+            if status != 200:
+                body = {"error": {"message": "nope"}}
+            return httpx.Response(status, json=body, request=httpx.Request("POST", url))
         body = {
             "candidates": [{
                 "content": {"parts": [{"text": type(self).text}]},
@@ -103,6 +115,8 @@ def gemini(monkeypatch):
     _FakeGemini.status = 200
     _FakeGemini.model_status = {}
     _FakeGemini.text = json.dumps(ANSWER)
+    _FakeGemini.chat_status = {}
+    _FakeGemini.chat_text = json.dumps(ANSWER)
     monkeypatch.setattr(org_gemini.httpx, "AsyncClient", _FakeGemini)
     return _FakeGemini
 
@@ -373,3 +387,112 @@ async def test_new_format_key_is_sent_unchanged(client, db_session, gemini):
     await db_session.commit()
     await client.post(URL, json=SEARCH)
     assert gemini.requests[0]["headers"]["x-goog-api-key"] == "AQ.Ab8_test-new-format_key"
+
+
+# --- Groq / OpenRouter fallbacks ------------------------------------------
+
+
+async def _save(db_session, provider, key):
+    db_session.add(OrgLlmKey(
+        org_id=APPREND_ORG_ID, provider=provider,
+        key_encrypted=crypto.encrypt(key), key_hint="••••",
+    ))
+    await db_session.commit()
+
+
+def _hosts(fake):
+    out = []
+    for r in fake.requests:
+        h = "gemini" if "generativelanguage" in r["url"] else (
+            "groq" if "groq.com" in r["url"] else "openrouter")
+        if not out or out[-1] != h:
+            out.append(h)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_gemini_failure_falls_back_to_groq_ungrounded(client, db_session, gemini):
+    await _save(db_session, "gemini", KEY)
+    await _save(db_session, "groq", "gsk-test-groq")
+    gemini.status = 429  # every Gemini model out of quota
+    resp = await client.post(URL, json=SEARCH)
+    body = resp.json()
+    assert body["search_status"] == "ok", body
+    assert _hosts(gemini) == ["gemini", "groq"]
+    assert body["provider"] == "groq"
+    assert body["grounded"] is False
+    assert body["sources"] == []
+    assert "training data" in body["notice"] and "not a live web search" in body["notice"]
+    assert "quota" in body["notice"].lower()  # says why Gemini didn't serve
+    assert body["total"] == 2
+    # Training-data emails are stale at best: none kept, even on-domain ones.
+    assert all(c["email"] is None for co in body["companies"] for c in co["contacts"])
+    company = (await db_session.execute(
+        select(Company).where(Company.domain == "acme-stamping.com")
+    )).scalars().first()
+    assert company.source == "groq"
+    assert "gsk-test-groq" not in resp.text and KEY not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_fallback_prompt_does_not_promise_a_web_search(client, db_session, gemini):
+    await _save(db_session, "gemini", KEY)
+    await _save(db_session, "groq", "gsk-test-groq")
+    gemini.status = 404
+    await client.post(URL, json=SEARCH)
+    groq_req = next(r for r in gemini.requests if "groq.com" in r["url"])
+    system = groq_req["json"]["messages"][0]
+    assert system["role"] == "system"
+    assert "no web access" in system["content"]
+    assert "Google Search" not in system["content"]
+    assert groq_req["json"]["response_format"] == {"type": "json_object"}
+    assert "reasoning_effort" not in groq_req["json"]
+    assert groq_req["headers"]["Authorization"] == "Bearer gsk-test-groq"
+
+
+@pytest.mark.asyncio
+async def test_groq_failure_falls_through_to_openrouter(client, db_session, gemini):
+    await _save(db_session, "gemini", KEY)
+    await _save(db_session, "groq", "gsk-test-groq")
+    await _save(db_session, "openrouter", "sk-or-test")
+    gemini.status = 429
+    gemini.chat_status = {"groq": 429}
+    gemini.chat_text = "Here you go:\n" + json.dumps(ANSWER)  # prose around JSON
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "ok", body
+    assert _hosts(gemini) == ["gemini", "groq", "openrouter"]
+    assert body["provider"] == "openrouter" and body["grounded"] is False
+    or_req = next(r for r in gemini.requests if "openrouter.ai" in r["url"])
+    assert "response_format" not in or_req["json"]
+
+
+@pytest.mark.asyncio
+async def test_groq_only_org_can_search_without_gemini(client, db_session, gemini):
+    await _save(db_session, "groq", "gsk-test-groq")
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "ok", body
+    assert _hosts(gemini) == ["groq"]
+    assert body["grounded"] is False
+    assert body["notice"].startswith("No Gemini key is saved")
+
+
+@pytest.mark.asyncio
+async def test_grounded_gemini_success_never_calls_the_fallbacks(client, db_session, gemini):
+    await _save(db_session, "gemini", KEY)
+    await _save(db_session, "groq", "gsk-test-groq")
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert _hosts(gemini) == ["gemini"]
+    assert body["provider"] == "gemini" and body["grounded"] is True
+    assert body["notice"] is None
+
+
+@pytest.mark.asyncio
+async def test_every_provider_failing_names_them_all(client, db_session, gemini):
+    await _save(db_session, "gemini", KEY)
+    await _save(db_session, "groq", "gsk-test-groq")
+    gemini.status = 429
+    gemini.chat_status = {"groq": 503}
+    body = (await client.post(URL, json=SEARCH)).json()
+    assert body["search_status"] == "error"
+    assert "Gemini" in body["search_error"] and "Groq" in body["search_error"]
+    assert body["companies"] == []

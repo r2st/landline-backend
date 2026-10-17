@@ -170,6 +170,14 @@ class Settings(BaseSettings):
     gemini_native_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     # Thinking tokens for the grounded search call; 0 disables thinking.
     discovery_search_thinking_budget: int = 1024
+    # Fallbacks after Gemini for the Discovery features, on keys the org saves
+    # under Settings → API Keys (provider "groq" / "openrouter"). Comma lists,
+    # tried in order. Neither has search grounding: Discovery search on them is
+    # training-data only, and says so in its response.
+    discovery_groq_models: str = "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+    discovery_openrouter_models: str = (
+        "meta-llama/llama-3.3-70b-instruct:free,google/gemini-2.0-flash-exp:free"
+    )
     # Groq — free tier, very fast, generous per-day request cap.
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"

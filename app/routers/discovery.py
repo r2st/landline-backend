@@ -77,7 +77,8 @@ class CompanySearchRequest(BaseModel):
 
 
 GEMINI_KEY_REQUIRED_MESSAGE = (
-    "Add your Gemini API key in Settings → API Keys to search with Gemini."
+    "Add a Gemini API key in Settings → API Keys to search with Gemini "
+    "(a Groq or OpenRouter key also works, without live web search)."
 )
 
 
@@ -130,7 +131,9 @@ async def search_companies_gemini(
 
     Same response shape as the Apollo search, so the Discovery tab renders it
     unchanged, plus ``source``, grounding ``sources`` and per-company
-    ``description`` / ``location`` / ``contacts``. Failures come back as a
+    ``description`` / ``location`` / ``contacts``. When Gemini can't serve, the
+    org's Groq/OpenRouter key answers from training data: ``grounded`` is then
+    False and ``notice`` explains it — show it with the results. Failures come back as a
     non-``ok`` ``search_status`` with an operator-readable ``search_error`` —
     exactly how the Apollo path reports a refused key — rather than as an HTTP
     error the tab would show as "something went wrong".
@@ -147,11 +150,17 @@ async def search_companies_gemini(
         "errors": [],
         "companies": [],
         "sources": [],
+        # Which provider answered, and whether that answer is web-grounded.
+        # Only Gemini searches the web; a Groq/OpenRouter fallback answers from
+        # training data, and ``notice`` says so for the UI to show.
+        "provider": None,
+        "grounded": False,
+        "notice": None,
     }
     if scope.org_id is None:
         raise HTTPException(status_code=400, detail="No organization context")
     try:
-        records, extras, sources = await gemini_discovery.search_companies(
+        found = await gemini_discovery.search_companies(
             db,
             scope.org_id,
             query=payload.query,
@@ -172,10 +181,10 @@ async def search_companies_gemini(
     except org_gemini.GeminiError as exc:
         return {**base, "search_status": "error", "search_error": str(exc)}
 
-    result = await get_ingestion_service().ingest(db, records)
+    result = await get_ingestion_service().ingest(db, found.records)
     companies = []
     for outcome in result.outcomes:
-        extra = extras.get(id(outcome.record), {})
+        extra = found.extras.get(id(outcome.record), {})
         companies.append({
             **_company_row(outcome),
             "country": outcome.record.country,
@@ -199,7 +208,10 @@ async def search_companies_gemini(
         "already_existed": result.companies_matched,
         "errors": result.errors,
         "companies": companies,
-        "sources": sources,
+        "sources": found.sources,
+        "provider": found.provider,
+        "grounded": found.grounded,
+        "notice": found.notice,
     }
 
 

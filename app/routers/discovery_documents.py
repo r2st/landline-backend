@@ -1,9 +1,10 @@
 """Discovery from documents: upload → AI-extracted candidates → import.
 
 Mounted at ``/discovery/documents`` (authenticated, org-scoped). The AI runs on
-the org's own Gemini key (``services.org_gemini``); with none saved, upload is
-refused with ``409 {"code": "gemini_key_required"}`` before anything is stored,
-so the UI can send the user to Settings → API Keys.
+the org's own keys (``services.org_gemini``): Gemini, then Groq, then OpenRouter
+as fallbacks. With none saved, upload is refused with
+``409 {"code": "gemini_key_required"}`` before anything is stored, so the UI can
+send the user to Settings → API Keys.
 
 See docs/features/discovery-document-outreach.md.
 """
@@ -34,7 +35,10 @@ session_factory = async_session_factory
 
 GEMINI_KEY_REQUIRED = {
     "code": "gemini_key_required",
-    "message": "Add your Gemini API key in Settings → API Keys to use document discovery.",
+    "message": (
+        "Add a Gemini API key in Settings → API Keys to use document discovery "
+        "(a Groq or OpenRouter key also works)."
+    ),
 }
 
 
@@ -122,9 +126,18 @@ async def ai_status(
     scope: OrgScope = Depends(get_org_scope),
     db: AsyncSession = Depends(get_db),
 ):
-    """Whether this org has a Gemini key — so the UI can show the banner up front."""
+    """Which Discovery keys this org has — so the UI can show the banner up front.
+
+    ``ai_key_configured`` is what gates the features (any provider will do);
+    ``gemini_key_configured`` stays for clients that predate the fallbacks.
+    """
     org_id = _require_org(scope)
-    return {"gemini_key_configured": await org_gemini.has_org_gemini_key(db, org_id)}
+    providers = list(await org_gemini.get_org_llm_keys(db, org_id))
+    return {
+        "gemini_key_configured": "gemini" in providers,
+        "ai_key_configured": bool(providers),
+        "providers": providers,
+    }
 
 
 async def _store_upload(
@@ -159,7 +172,7 @@ async def upload_document(
 ):
     """Store the file and start extraction in the background (poll the detail)."""
     org_id = _require_org(scope)
-    if not await org_gemini.has_org_gemini_key(db, org_id):
+    if not await org_gemini.has_org_llm_key(db, org_id):
         raise HTTPException(status_code=409, detail=GEMINI_KEY_REQUIRED)
 
     try:
@@ -188,7 +201,7 @@ async def upload_documents(
     doesn't fire every Gemini call at once.
     """
     org_id = _require_org(scope)
-    if not await org_gemini.has_org_gemini_key(db, org_id):
+    if not await org_gemini.has_org_llm_key(db, org_id):
         raise HTTPException(status_code=409, detail=GEMINI_KEY_REQUIRED)
     if len(files) > MAX_BATCH_FILES:
         raise HTTPException(

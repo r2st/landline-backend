@@ -1,13 +1,16 @@
 """User-facing settings — per-org LLM key management.
 
-Mounted at ``/settings``. Lets org admins bring their own Gemini API key
-so AI features use it instead of the platform default.
+Mounted at ``/settings``. Lets org admins bring their own API keys for the
+Discovery features: Gemini, plus Groq and OpenRouter as fallbacks used when
+Gemini is out of quota or unavailable (see ``services.org_gemini``). One key per
+provider; ``?provider=`` on GET/DELETE defaults to ``gemini`` so clients that
+predate the fallbacks keep working.
 """
 
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,17 +20,22 @@ from app.dependencies import OrgScope, get_org_scope
 from app.models.org_llm_key import OrgLlmKey
 from app.models.user import UserRole
 from app.services import crypto
+from app.services.org_gemini import DISCOVERY_PROVIDERS
 from app.services.credential_store import mask
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 
+Provider = Literal["gemini", "groq", "openrouter"]
+assert set(Provider.__args__) == set(DISCOVERY_PROVIDERS)
+
+
 class LlmKeyUpdate(BaseModel):
     api_key: str = Field(..., min_length=1, max_length=500)
-    # Only Gemini is read back (GET/DELETE here and ``services.org_gemini``); a
-    # key stored under any other name would report "saved" and never be used.
-    provider: Literal["gemini"] = "gemini"
+    # Exactly the providers ``services.org_gemini`` reads back; a key stored
+    # under any other name would report "saved" and never be used.
+    provider: Provider = "gemini"
 
     @field_validator("api_key")
     @classmethod
@@ -55,20 +63,48 @@ def _require_org_admin(scope: OrgScope) -> None:
     scope.check_permission(UserRole.ORG_ADMIN.value)
 
 
-@router.get("/llm-key", response_model=LlmKeyRead)
-async def get_llm_key(
+async def _key_row(db: AsyncSession, provider: str) -> OrgLlmKey | None:
+    # No unique constraint on (org_id, provider): newest wins, id breaks ties —
+    # the same row ``org_gemini.get_org_llm_keys`` reads.
+    return (
+        await db.execute(
+            select(OrgLlmKey)
+            .where(OrgLlmKey.provider == provider)
+            .order_by(OrgLlmKey.updated_at.desc(), OrgLlmKey.id)
+            .limit(1)
+        )
+    ).scalars().first()
+
+
+@router.get("/llm-keys", response_model=list[LlmKeyRead])
+async def list_llm_keys(
     scope: OrgScope = Depends(get_org_scope),
     db: AsyncSession = Depends(get_db),
 ):
-    """Check whether the org has a custom LLM key set."""
+    """Every supported provider, in fallback order, with whether a key is saved."""
     _require_org_admin(scope)
-    row = (
-        await db.execute(
-            select(OrgLlmKey).where(OrgLlmKey.provider == "gemini")
-        )
-    ).scalar_one_or_none()
+    out = []
+    for provider in DISCOVERY_PROVIDERS:
+        row = await _key_row(db, provider)
+        out.append(LlmKeyRead(
+            provider=provider,
+            key_hint=row.key_hint if row else "",
+            has_key=row is not None,
+        ))
+    return out
+
+
+@router.get("/llm-key", response_model=LlmKeyRead)
+async def get_llm_key(
+    provider: Provider = Query("gemini"),
+    scope: OrgScope = Depends(get_org_scope),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check whether the org has a key set for ``provider``."""
+    _require_org_admin(scope)
+    row = await _key_row(db, provider)
     if row is None:
-        return LlmKeyRead(provider="gemini", key_hint="", has_key=False)
+        return LlmKeyRead(provider=provider, key_hint="", has_key=False)
     return LlmKeyRead(provider=row.provider, key_hint=row.key_hint, has_key=True)
 
 
@@ -82,11 +118,7 @@ async def set_llm_key(
     _require_org_admin(scope)
     api_key = body.api_key
 
-    row = (
-        await db.execute(
-            select(OrgLlmKey).where(OrgLlmKey.provider == body.provider)
-        )
-    ).scalar_one_or_none()
+    row = await _key_row(db, body.provider)
 
     if row is None:
         row = OrgLlmKey(provider=body.provider)
@@ -107,17 +139,21 @@ async def set_llm_key(
 
 @router.delete("/llm-key", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_llm_key(
+    provider: Provider = Query("gemini"),
     scope: OrgScope = Depends(get_org_scope),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove the org's custom LLM key, reverting to the platform default."""
+    """Remove the org's key for ``provider``."""
     _require_org_admin(scope)
-    row = (
-        await db.execute(
-            select(OrgLlmKey).where(OrgLlmKey.provider == "gemini")
-        )
-    ).scalar_one_or_none()
-    if row is not None:
+    # Every row for the provider: a leftover duplicate would otherwise surface
+    # as "still saved" right after the user removed it.
+    rows = (
+        await db.execute(select(OrgLlmKey).where(OrgLlmKey.provider == provider))
+    ).scalars().all()
+    for row in rows:
         await db.delete(row)
+    if rows:
         await db.flush()
-        logger.info("Org %s LLM key removed by %s", scope.org_id, scope.user.email)
+        logger.info(
+            "Org %s LLM key (%s) removed by %s", scope.org_id, provider, scope.user.email
+        )
